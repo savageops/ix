@@ -1,0 +1,11 @@
+.{
+    .name = .ix_zig,
+    .version = "0.1.0",
+    .fingerprint = 0xfa7a82587d9fdbb7,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

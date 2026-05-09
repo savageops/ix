@@ -1,0 +1,1344 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>IX-Zig Benchmark Dashboard</title>
+    <style>
+      :root {
+        --bg: #070c15;
+        --panel: #111b2f;
+        --panel-2: #192845;
+        --text: #f4f8ff;
+        --muted: #9db2d8;
+        --good: #2dd28c;
+        --warn: #f3b04a;
+        --bad: #ff6f70;
+        --accent: #6ec7ff;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        background:
+          radial-gradient(circle at 10% 8%, #223a64 0%, rgba(34, 58, 100, 0) 42%),
+          radial-gradient(circle at 85% 10%, #244d57 0%, rgba(36, 77, 87, 0) 36%),
+          var(--bg);
+      }
+      .wrap {
+        max-width: 1320px;
+        margin: 0 auto;
+        padding: 18px;
+        display: grid;
+        gap: 14px;
+      }
+      .card {
+        background: linear-gradient(180deg, var(--panel), var(--panel-2));
+        border: 1px solid rgba(255, 255, 255, 0.09);
+        border-radius: 14px;
+        padding: 14px;
+      }
+      h1, h2 { margin: 0 0 8px; }
+      h1 { font-size: 24px; }
+      h2 { font-size: 18px; }
+      .muted { color: var(--muted); }
+      .status-line {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 18px;
+        font-size: 13px;
+      }
+      .metrics {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 10px;
+      }
+      .metric {
+        padding: 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(0, 0, 0, 0.22);
+      }
+      .metric .label {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .metric .value {
+        margin-top: 4px;
+        font-size: 21px;
+        font-weight: 700;
+        letter-spacing: 0.2px;
+      }
+      .good { color: var(--good); }
+      .warn { color: var(--warn); }
+      .bad { color: var(--bad); }
+      canvas {
+        width: 100%;
+        height: 320px;
+        border-radius: 12px;
+        background: rgba(0, 0, 0, 0.22);
+      }
+      .grid-2 {
+        display: grid;
+        gap: 12px;
+        grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+      }
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+      }
+      th, td {
+        text-align: left;
+        padding: 7px 8px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        vertical-align: top;
+      }
+      th {
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.2px;
+      }
+      .empty {
+        margin: 6px 0 0;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .hint-list {
+        margin: 0;
+        padding-left: 18px;
+        display: grid;
+        gap: 9px;
+        font-size: 13px;
+      }
+      .hint-title {
+        font-weight: 700;
+      }
+      .severity-high { color: var(--bad); }
+      .severity-medium { color: var(--warn); }
+      .severity-info { color: var(--accent); }
+      .pill {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        font-size: 11px;
+        font-weight: 600;
+      }
+      .section-bar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+      .segmented-control {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+      .segmented-control button {
+        appearance: none;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        background: rgba(0, 0, 0, 0.22);
+        color: var(--muted);
+        border-radius: 999px;
+        padding: 6px 10px;
+        font: inherit;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+      }
+      .segmented-control button.is-active {
+        color: var(--text);
+        border-color: rgba(110, 199, 255, 0.6);
+        background: rgba(110, 199, 255, 0.16);
+        box-shadow: inset 0 0 0 1px rgba(110, 199, 255, 0.18);
+      }
+      .trend-legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        margin: 10px 0 6px;
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .trend-legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+      }
+      .trend-legend-swatch {
+        width: 22px;
+        height: 0;
+        border-top: 3px solid currentColor;
+        border-radius: 999px;
+      }
+      .trend-meta {
+        margin: 0 0 8px;
+        font-size: 12px;
+      }
+      #run-table td[title] {
+        cursor: help;
+      }
+      @media (max-width: 720px) {
+        .section-bar {
+          align-items: flex-start;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="wrap">
+      <section class="card">
+        <h1>IX-Zig Benchmark Monitor</h1>
+        <p class="muted">Median and p95 ranges, slowdown phase attribution, and live run diagnostics.</p>
+        <p class="muted">This page summarizes the live diagnostics feed from <code>npm run bench:loop</code> and surfaces the latest raw ripgrep benchsuite artifact from <code>npm run bench:report</code> for provenance.</p>
+        <p class="muted">Canonical raw baseline: <code>bench:report</code>. Live monitor feed: <code>bench:loop</code> into <code>tools/reports/live-metrics.jsonl</code>.</p>
+        <div class="status-line">
+          <div>Connection: <span id="connection-state" class="warn">connecting</span></div>
+          <div>Data window: <span id="window-state">n/a</span></div>
+          <div>Latest run: <span id="latest-state">n/a</span></div>
+        </div>
+        <div class="status-line">
+          <div>Live summary source: <span id="live-source-state">n/a</span></div>
+          <div>Latest benchsuite raw: <span id="benchsuite-source-state">n/a</span></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Global Summary</h2>
+        <div class="metrics" id="metric-grid"></div>
+      </section>
+
+      <section class="grid-2">
+        <section class="card">
+          <h2>Recent Vs Overall</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Signal</th>
+                <th>Overall</th>
+                <th>Recent</th>
+              </tr>
+            </thead>
+            <tbody id="compare-table"></tbody>
+          </table>
+          <p class="empty" id="compare-empty" hidden>No comparison data yet.</p>
+        </section>
+
+        <section class="card">
+          <h2>Action Hints</h2>
+          <ul class="hint-list" id="hint-list"></ul>
+          <p class="empty" id="hint-empty" hidden>No guidance yet.</p>
+        </section>
+      </section>
+
+      <section class="card">
+        <h2>Derived Signals</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Signal</th>
+              <th>Value</th>
+              <th>Status</th>
+              <th>How To Read It</th>
+            </tr>
+          </thead>
+          <tbody id="signal-table"></tbody>
+        </table>
+        <p class="empty" id="signal-empty" hidden>No derived signals yet.</p>
+      </section>
+
+      <section class="card">
+        <h2>Competitor Summary</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Competitor</th>
+              <th>Measured Runs</th>
+              <th>Median ms</th>
+              <th>P95 ms</th>
+              <th>Median Ratio (IX/competitor)</th>
+              <th>IX Faster %</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="competitor-table"></tbody>
+        </table>
+        <p class="empty" id="competitor-empty" hidden>No competitor data yet.</p>
+      </section>
+
+      <section class="card">
+        <div class="section-bar">
+          <h2>Ratio Trend (IX/rg + IX/previous + IX/rust)</h2>
+          <div class="segmented-control" id="trend-window-controls" role="group" aria-label="Ratio trend window">
+            <button type="button" data-trend-window="1h" aria-pressed="false">1h</button>
+            <button type="button" data-trend-window="12h" aria-pressed="true" class="is-active">12h</button>
+            <button type="button" data-trend-window="1d" aria-pressed="false">1 day</button>
+            <button type="button" data-trend-window="7d" aria-pressed="false">7 days</button>
+            <button type="button" data-trend-window="all" aria-pressed="false">All time</button>
+          </div>
+        </div>
+        <div class="trend-legend" aria-hidden="true">
+          <span class="trend-legend-item" style="color:#6ec7ff"><span class="trend-legend-swatch"></span>IX/rg</span>
+          <span class="trend-legend-item" style="color:#ff7a8a"><span class="trend-legend-swatch"></span>IX/previous</span>
+          <span class="trend-legend-item" style="color:#a78bfa"><span class="trend-legend-swatch"></span>IX/rust</span>
+          <span class="trend-legend-item" style="color:#f3b04a"><span class="trend-legend-swatch"></span>1.0x parity</span>
+        </div>
+        <p class="muted trend-meta" id="trend-meta">n/a</p>
+        <canvas id="ratio-trend" width="1280" height="320"></canvas>
+        <p class="muted">1.0x baseline means parity. Above 1.0x means IX is slower. Below 1.0x means IX is faster. The previous-build and rust-IX lanes only render when their binaries are configured for the run.</p>
+      </section>
+
+      <section class="grid-2">
+        <section class="card">
+          <h2>Per-Profile Ranges</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Profile</th>
+                <th>Runs</th>
+                <th>Median Ratio</th>
+                <th>P95 Ratio</th>
+                <th>Slower %</th>
+                <th>Goal-Hit %</th>
+                <th>Volatility (CV)</th>
+                <th>Dominant Slow Phase</th>
+              </tr>
+            </thead>
+            <tbody id="profile-table"></tbody>
+          </table>
+          <p class="empty" id="profile-empty" hidden>No profile data yet.</p>
+        </section>
+
+        <section class="card">
+          <h2>Phase Time Ranges (ms)</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Phase</th>
+                <th>Min</th>
+                <th>Median</th>
+                <th>P95</th>
+                <th>Max</th>
+              </tr>
+            </thead>
+            <tbody id="phase-table"></tbody>
+          </table>
+          <p class="empty" id="phase-empty" hidden>No phase metrics yet.</p>
+        </section>
+      </section>
+
+      <section class="card">
+        <h2>Recent Runs</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Profile</th>
+              <th>IX ms</th>
+              <th>vs rg</th>
+              <th>vs prev</th>
+              <th>vs rust</th>
+            </tr>
+          </thead>
+          <tbody id="run-table"></tbody>
+        </table>
+        <p class="empty" id="run-empty" hidden>No runs yet.</p>
+      </section>
+
+      <section class="card">
+        <h2>Top Slowdown Outliers</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Profile</th>
+              <th>Ratio</th>
+              <th>Hotspot</th>
+              <th>Discover ms</th>
+              <th>Scan ms</th>
+              <th>Aggregate ms</th>
+            </tr>
+          </thead>
+          <tbody id="slowdown-table"></tbody>
+        </table>
+        <p class="empty" id="slowdown-empty" hidden>No slowdown outliers yet.</p>
+      </section>
+
+      <section class="card">
+        <h2>Metrics Index</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Metric</th>
+              <th>How To Read It</th>
+            </tr>
+          </thead>
+          <tbody id="index-table"></tbody>
+        </table>
+        <p class="empty" id="index-empty" hidden>No index data yet.</p>
+      </section>
+
+      <section class="card">
+        <h2>Slowest Files (Latest Run)</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Path</th>
+              <th>Duration ms</th>
+              <th>Bytes</th>
+            </tr>
+          </thead>
+          <tbody id="slow-table"></tbody>
+        </table>
+        <p class="empty" id="slow-empty" hidden>No slow-file data yet.</p>
+      </section>
+    </main>
+
+    <script>
+      const ratioCanvas = document.getElementById("ratio-trend");
+      const ratioCtx = ratioCanvas.getContext("2d");
+      const metricGrid = document.getElementById("metric-grid");
+      const compareTable = document.getElementById("compare-table");
+      const profileTable = document.getElementById("profile-table");
+      const phaseTable = document.getElementById("phase-table");
+      const runTable = document.getElementById("run-table");
+      const slowdownTable = document.getElementById("slowdown-table");
+      const hintList = document.getElementById("hint-list");
+      const indexTable = document.getElementById("index-table");
+      const slowTable = document.getElementById("slow-table");
+      const connState = document.getElementById("connection-state");
+      const windowState = document.getElementById("window-state");
+      const latestState = document.getElementById("latest-state");
+      const liveSourceState = document.getElementById("live-source-state");
+      const benchsuiteSourceState = document.getElementById("benchsuite-source-state");
+      const trendMeta = document.getElementById("trend-meta");
+      const compareEmpty = document.getElementById("compare-empty");
+      const signalTable = document.getElementById("signal-table");
+      const signalEmpty = document.getElementById("signal-empty");
+      const competitorTable = document.getElementById("competitor-table");
+      const competitorEmpty = document.getElementById("competitor-empty");
+      const profileEmpty = document.getElementById("profile-empty");
+      const phaseEmpty = document.getElementById("phase-empty");
+      const runEmpty = document.getElementById("run-empty");
+      const slowdownEmpty = document.getElementById("slowdown-empty");
+      const hintEmpty = document.getElementById("hint-empty");
+      const indexEmpty = document.getElementById("index-empty");
+      const slowEmpty = document.getElementById("slow-empty");
+      const trendWindowButtons = Array.from(document.querySelectorAll("[data-trend-window]"));
+
+      const history = [];
+      const seenRunIds = new Set();
+      let summary = null;
+      let sources = null;
+      let selectedTrendWindow = "12h";
+      const RECENT_RUN_CONTEXT_MIN_SAMPLES = 5;
+      const STABLE_LOSER_MIN_SLOWER_RUN_PCT = 55;
+      const trendWindows = {
+        "1h": { label: "1h", ms: 60 * 60 * 1000 },
+        "12h": { label: "12h", ms: 12 * 60 * 60 * 1000 },
+        "1d": { label: "1 day", ms: 24 * 60 * 60 * 1000 },
+        "7d": { label: "7 days", ms: 7 * 24 * 60 * 60 * 1000 },
+        all: { label: "all time", ms: null },
+      };
+
+      function asNum(value, fallback = 0) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : fallback;
+      }
+
+      function fmt(value, digits = 2) {
+        return asNum(value).toFixed(digits);
+      }
+
+      function ratioClass(ratio) {
+        if (ratio <= 0) return "muted";
+        if (ratio < 1) return "good";
+        if (ratio === 1) return "warn";
+        return "bad";
+      }
+
+      function ratioLabel(ratio) {
+        if (!Number.isFinite(ratio) || ratio <= 0) {
+          return "n/a";
+        }
+        const delta = Math.abs((ratio - 1) * 100);
+        if (ratio < 1) {
+          return `${ratio.toFixed(3)}x (${delta.toFixed(2)}% faster)`;
+        }
+        if (ratio > 1) {
+          return `${ratio.toFixed(3)}x (${delta.toFixed(2)}% slower)`;
+        }
+        return `${ratio.toFixed(3)}x (parity)`;
+      }
+
+      function quantileSorted(sortedValues, percentile) {
+        if (!sortedValues.length) {
+          return 0;
+        }
+        if (sortedValues.length === 1) {
+          return sortedValues[0];
+        }
+        const clamped = Math.min(1, Math.max(0, percentile));
+        const index = Math.min(
+          sortedValues.length - 1,
+          Math.max(0, Math.floor((sortedValues.length - 1) * clamped)),
+        );
+        return sortedValues[index];
+      }
+
+      function isAuthoritativeComparator(metrics) {
+        return metrics?.authority === "authoritative";
+      }
+
+      function isTimingOnlyComparator(metrics) {
+        return metrics?.authority === "timing_only";
+      }
+
+      function contextShowsStableLoser(context) {
+        if (!context || context.runs < RECENT_RUN_CONTEXT_MIN_SAMPLES) {
+          return false;
+        }
+        return context.median > 1 && context.slowerRunPct >= STABLE_LOSER_MIN_SLOWER_RUN_PCT;
+      }
+
+      function buildProfileCompetitorContext(name) {
+        const grouped = new Map();
+        for (const run of history) {
+          const metrics = competitorRunMetrics(run, name);
+          if (!metrics.available || !run?.profile || !Number.isFinite(metrics.ratio) || metrics.ratio <= 0) {
+            continue;
+          }
+          const bucket = grouped.get(run.profile) || {
+            ratios: [],
+            slowerRuns: 0,
+            authoritativeRatios: [],
+            authoritativeSlowerRuns: 0,
+            authoritativeRuns: 0,
+            timingOnlyRuns: 0,
+            unknownAuthorityRuns: 0,
+          };
+          bucket.ratios.push(metrics.ratio);
+          if (metrics.ratio > 1) {
+            bucket.slowerRuns += 1;
+          }
+          if (isAuthoritativeComparator(metrics)) {
+            bucket.authoritativeRuns += 1;
+            bucket.authoritativeRatios.push(metrics.ratio);
+            if (metrics.ratio > 1) {
+              bucket.authoritativeSlowerRuns += 1;
+            }
+          } else if (isTimingOnlyComparator(metrics)) {
+            bucket.timingOnlyRuns += 1;
+          } else {
+            bucket.unknownAuthorityRuns += 1;
+          }
+          grouped.set(run.profile, bucket);
+        }
+
+        const context = new Map();
+        for (const [profile, bucket] of grouped.entries()) {
+          const preferAuthoritative = (name === "iex_previous" || name === "iex_rust") && bucket.authoritativeRatios.length > 0;
+          const ratios = preferAuthoritative ? bucket.authoritativeRatios : bucket.ratios;
+          const sorted = ratios.slice().sort((left, right) => left - right);
+          const slowerRuns = preferAuthoritative ? bucket.authoritativeSlowerRuns : bucket.slowerRuns;
+          context.set(profile, {
+            runs: sorted.length,
+            totalRuns: bucket.ratios.length,
+            median: quantileSorted(sorted, 0.5),
+            p95: quantileSorted(sorted, 0.95),
+            slowerRunPct: sorted.length ? (slowerRuns / sorted.length) * 100 : 0,
+            authoritativeRuns: bucket.authoritativeRuns,
+            timingOnlyRuns: bucket.timingOnlyRuns,
+            unknownAuthorityRuns: bucket.unknownAuthorityRuns,
+            stableBaseline: preferAuthoritative ? "authoritative" : "all-available",
+          });
+        }
+        return context;
+      }
+
+      function contextualRatioClass(ratio, context, metrics = null) {
+        const base = ratioClass(ratio);
+        if (base !== "bad") {
+          return base;
+        }
+        if (isTimingOnlyComparator(metrics)) {
+          return "warn";
+        }
+        if (!context || context.runs < RECENT_RUN_CONTEXT_MIN_SAMPLES) {
+          return "bad";
+        }
+        if (contextShowsStableLoser(context)) {
+          return "bad";
+        }
+        const transientCeiling = Math.max(1.02, context.p95);
+        return ratio <= transientCeiling ? "warn" : "bad";
+      }
+
+      function contextualRatioTitle(ratio, context, label, metrics = null) {
+        if (!Number.isFinite(ratio) || ratio <= 0) {
+          return `${label}: unavailable`;
+        }
+        if (isTimingOnlyComparator(metrics)) {
+          const caveat = metrics?.caveat || "match-count parity is missing";
+          return `${label}: timing-only comparison (${caveat})`;
+        }
+        if (!context || context.runs < RECENT_RUN_CONTEXT_MIN_SAMPLES) {
+          return `${label}: single-run ratio ${fmt(ratio, 3)}x with insufficient profile baseline`;
+        }
+        const authoritySuffix = context.stableBaseline === "authoritative"
+          ? ` using authoritative baseline (${context.runs}/${context.totalRuns} runs)`
+          : "";
+        const transientCeiling = Math.max(1.02, context.p95);
+        if (contextShowsStableLoser(context) && ratio > 1) {
+          return `${label}: stable profile loss frontier${authoritySuffix}; median ${fmt(context.median, 3)}x, slower-run share ${fmt(context.slowerRunPct)}%, p95 ${fmt(context.p95, 3)}x over ${context.runs} runs`;
+        }
+        if (ratio > 1 && ratio <= transientCeiling) {
+          return `${label}: transient in-band miss${authoritySuffix}; median ${fmt(context.median, 3)}x, p95 ${fmt(context.p95, 3)}x over ${context.runs} runs`;
+        }
+        if (ratio > 1) {
+          return `${label}: out-of-band spike${authoritySuffix}; median ${fmt(context.median, 3)}x, p95 ${fmt(context.p95, 3)}x over ${context.runs} runs`;
+        }
+        return `${label}: profile median ${fmt(context.median, 3)}x, p95 ${fmt(context.p95, 3)}x over ${context.runs} runs${authoritySuffix}`;
+      }
+
+      function connectionLabel(connected) {
+        connState.textContent = connected ? "connected" : "disconnected";
+        connState.className = connected ? "good" : "bad";
+      }
+
+      function sourceLabel(source) {
+        if (!source) {
+          return "n/a";
+        }
+        const path = source.artifactPath || "missing";
+        if (!source.available) {
+          return `${source.command} -> ${path}`;
+        }
+        const updatedAt = source.updatedAt
+          ? ` (${new Date(source.updatedAt).toLocaleString()})`
+          : "";
+        return `${source.command} -> ${path}${updatedAt}`;
+      }
+
+      function ingestRuns(runs) {
+        let changed = false;
+        for (const run of runs || []) {
+          if (!run || !run.runId || seenRunIds.has(run.runId)) {
+            continue;
+          }
+          history.push(run);
+          seenRunIds.add(run.runId);
+          changed = true;
+        }
+        if (changed) {
+          history.sort((left, right) => String(left.timestamp).localeCompare(String(right.timestamp)));
+        }
+        return changed;
+      }
+
+      function currentSummary() {
+        return summary || {
+          runCount: history.length,
+          ratio: { median: 0, p95: 0, min: 0, max: 0, cvPct: 0 },
+          speedupPct: { median: 0, p95: 0 },
+          trend: { direction: "stable", driftPct: 0 },
+          selfImprovement: {
+            available: false,
+            windowSize: 0,
+            baselineIexMs: 0,
+            recentIexMs: 0,
+            improvementPct: 0,
+            direction: "insufficient-data",
+            profileCoveragePct: 0,
+            baselineRunCount: 0,
+            recentRunCount: 0,
+          },
+          health: { score: 0, grade: "n/a", classification: "n/a", performanceClass: "n/a" },
+          goalHits: { count: 0, pct: 0 },
+          outliers: { count: 0, pct: 0, thresholdRatio: 0, dominantProfile: "n/a" },
+          hints: [],
+          signals: [],
+          competitorSummary: [],
+          primaryChallenger: null,
+          metricIndex: [],
+          recent: {
+            runCount: 0,
+            ratio: { median: 0, p95: 0, cvPct: 0 },
+            slowerRuns: { count: 0, pct: 0 },
+            goalHits: { count: 0, pct: 0 },
+          },
+          overall: {
+            runCount: 0,
+            ratio: { median: 0, p95: 0, cvPct: 0 },
+            slowerRuns: { count: 0, pct: 0 },
+            goalHits: { count: 0, pct: 0 },
+          },
+          slowerRuns: { count: 0, pct: 0, dominantPhaseByMedianShare: "n/a" },
+          dominantHotspot: "n/a",
+          phaseMs: {},
+          byProfile: [],
+          window: {
+            startTimestamp: history[0]?.timestamp || null,
+            endTimestamp: history[history.length - 1]?.timestamp || null,
+          },
+          latest: null,
+        };
+      }
+
+      function severityClass(severity) {
+        if (severity === "high") return "severity-high";
+        if (severity === "medium") return "severity-medium";
+        return "severity-info";
+      }
+
+      function timestampMs(value) {
+        const parsed = Date.parse(value);
+        return Number.isFinite(parsed) ? parsed : null;
+      }
+
+      function trendWindowConfig() {
+        return trendWindows[selectedTrendWindow] || trendWindows["12h"];
+      }
+
+      function filteredTrendRuns() {
+        if (!history.length) {
+          return [];
+        }
+        const windowConfig = trendWindowConfig();
+        if (!windowConfig.ms) {
+          return history.slice();
+        }
+        const latestTimestamp = timestampMs(history[history.length - 1]?.timestamp) ?? Date.now();
+        const cutoff = latestTimestamp - windowConfig.ms;
+        return history.filter((run) => {
+          const runTimestamp = timestampMs(run?.timestamp);
+          return runTimestamp !== null && runTimestamp >= cutoff;
+        });
+      }
+
+      function trendRatioFor(run, lane) {
+        const iex = asNum(run?.iexMs, 0);
+        if (iex <= 0) {
+          return null;
+        }
+        if (lane === "rg") {
+          const rg = asNum(run?.rgMs, 0);
+          if (rg <= 0) {
+            return null;
+          }
+          return asNum(run?.iexToRgRatio, iex / rg);
+        }
+        if (lane === "previous") {
+          const competitor = competitorRunMetrics(run, "iex_previous");
+          return competitor.available ? competitor.ratio : null;
+        }
+        if (lane === "rust") {
+          const competitor = competitorRunMetrics(run, "iex_rust");
+          return competitor.available ? competitor.ratio : null;
+        }
+        return null;
+      }
+
+      function competitorRunMetrics(run, name) {
+        const iex = asNum(run?.iexMs, 0);
+        const competitor = run?.competitors?.[name];
+        const durationMs = asNum(competitor?.durationMs, 0);
+        const available = Boolean(competitor?.available && iex > 0 && durationMs > 0);
+        const ratio = available ? iex / durationMs : null;
+        const speedupPct = available ? ((durationMs - iex) / durationMs) * 100 : null;
+        const authority =
+          typeof competitor?.comparatorAuthority === "string"
+            ? competitor.comparatorAuthority
+            : typeof run?.previousIexAuthority === "string"
+              ? run.previousIexAuthority
+              : null;
+        const matchCountParity =
+          typeof competitor?.matchCountParity === "boolean"
+            ? competitor.matchCountParity
+            : typeof run?.previousIexMatchCountParity === "boolean"
+              ? run.previousIexMatchCountParity
+              : null;
+        const caveat = competitor?.caveat || run?.previousIexCaveat || null;
+        return {
+          competitor,
+          available,
+          durationMs,
+          ratio,
+          speedupPct,
+          authority,
+          matchCountParity,
+          caveat,
+        };
+      }
+
+      function competitorSummaryEntry(name) {
+        const competitors = currentSummary()?.competitorSummary || [];
+        return competitors.find((entry) => entry.name === name) || null;
+      }
+
+      function updateTrendWindowButtons() {
+        trendWindowButtons.forEach((button) => {
+          const isActive = button.dataset.trendWindow === selectedTrendWindow;
+          button.classList.toggle("is-active", isActive);
+          button.setAttribute("aria-pressed", isActive ? "true" : "false");
+        });
+      }
+
+      function signalStatusClass(status) {
+        if (status === "good") return "good";
+        if (status === "warn") return "warn";
+        if (status === "bad") return "bad";
+        return "muted";
+      }
+
+      function classificationBadgeClass(kind) {
+        if (kind === "stable" || kind === "strong" || kind === "good") return "good";
+        if (kind === "watch" || kind === "volatile" || kind === "mixed" || kind === "risk") return "warn";
+        if (kind === "critical" || kind === "regressed") return "bad";
+        return "muted";
+      }
+
+      function renderStatus() {
+        const sum = currentSummary();
+        const start = sum?.window?.startTimestamp;
+        const end = sum?.window?.endTimestamp;
+        if (start && end) {
+          windowState.textContent = `${new Date(start).toLocaleString()} -> ${new Date(end).toLocaleString()}`;
+        } else {
+          windowState.textContent = "n/a";
+        }
+        const latest = sum?.latest || history[history.length - 1];
+        if (latest?.timestamp) {
+          latestState.textContent = `${new Date(latest.timestamp).toLocaleTimeString()} (${latest.profile || "unknown"})`;
+        } else {
+          latestState.textContent = "n/a";
+        }
+        liveSourceState.textContent = sourceLabel(sources?.liveDiagnostics);
+        benchsuiteSourceState.textContent = sourceLabel(sources?.benchsuiteRaw);
+      }
+
+      function renderMetrics() {
+        const sum = currentSummary();
+        const ratio = sum?.ratio || {};
+        const speedup = sum?.speedupPct || {};
+        const slower = sum?.slowerRuns || {};
+        const health = sum?.health || {};
+        const trend = sum?.trend || {};
+        const outliers = sum?.outliers || {};
+        const goalHits = sum?.goalHits || {};
+        const selfImprovement = sum?.selfImprovement || {};
+        const primaryChallenger = sum?.primaryChallenger || null;
+        const previousIex = competitorSummaryEntry("iex_previous");
+        const previousIexAvailable = previousIex?.status === "available";
+        const previousIexAuthoritative = previousIex?.ratioBaseline === "authoritative";
+        const previousIexTimingOnly =
+          previousIexAvailable && !previousIexAuthoritative && asNum(previousIex?.timingOnlyRuns, 0) > 0;
+        const previousIexMedian = asNum(previousIex?.iexRatio?.median, 0);
+        const previousIexRatioText = previousIexAuthoritative
+          ? `<span class="${ratioClass(previousIexMedian)}">${ratioLabel(previousIexMedian)}</span>`
+          : previousIexTimingOnly
+            ? `<span class="warn">timing-only (${asNum(previousIex?.timingOnlyRuns, 0)} runs)</span>`
+            : "n/a";
+        const medianRatio = asNum(ratio.median, 0);
+        const p95Ratio = asNum(ratio.p95, 0);
+        const selfPct = asNum(selfImprovement.improvementPct, 0);
+        const selfClass = !selfImprovement.available
+          ? "muted"
+          : selfPct > 0
+            ? "good"
+            : selfPct < 0
+              ? "bad"
+              : "warn";
+        const selfLabel = selfImprovement.available
+          ? `${fmt(selfPct)}% (${selfImprovement.direction || "stable"})`
+          : "n/a";
+        const metrics = [
+          ["Runs", String(sum?.runCount ?? history.length)],
+          ["Median Ratio", `<span class="${ratioClass(medianRatio)}">${ratioLabel(medianRatio)}</span>`],
+          ["P95 Ratio", `<span class="${ratioClass(p95Ratio)}">${ratioLabel(p95Ratio)}</span>`],
+          ["Median Speedup %", `${fmt(speedup.median)}%`],
+          ["Self Improvement %", `<span class="${selfClass}">${selfLabel}</span>`],
+          ["Health", `<span class="${classificationBadgeClass(health.classification)}">${fmt(health.score)} / 100 (${health.grade || "n/a"})</span>`],
+          ["Health Class", `<span class="pill ${classificationBadgeClass(health.classification)}">${health.classification || "n/a"}</span>`],
+          ["Performance Class", `<span class="pill ${classificationBadgeClass(health.performanceClass)}">${health.performanceClass || "n/a"}</span>`],
+          ["Trend", `${trend.direction || "stable"} (${fmt(trend.driftPct)}%)`],
+          ["Slower Runs", `${asNum(slower.count, 0)} (${fmt(slower.pct)}%)`],
+          ["Goal Hits", `${asNum(goalHits.count, 0)} (${fmt(goalHits.pct)}%)`],
+          ["Outlier Budget", `${asNum(outliers.count, 0)} (${fmt(outliers.pct)}%)`],
+          ["Dominant Slow Phase", `${slower.dominantPhaseByMedianShare || "n/a"}`],
+          ["Dominant Hotspot", `${sum?.dominantHotspot || "n/a"}`],
+          ["Ratio Range", `${fmt(ratio.min, 3)}x -> ${fmt(ratio.max, 3)}x`],
+          ["Ratio CV", `${fmt(ratio.cvPct)}%`],
+          ["Primary Challenger", `${primaryChallenger?.name || "n/a"}`],
+          [
+            "IX/Challenger",
+            primaryChallenger
+              ? `<span class="${ratioClass(asNum(primaryChallenger?.iexRatio?.median, 0))}">${ratioLabel(asNum(primaryChallenger?.iexRatio?.median, 0))}</span>`
+              : "n/a",
+          ],
+          [
+            "IX/Previous",
+            previousIexRatioText,
+          ],
+        ];
+        metricGrid.innerHTML = metrics
+          .map(([label, value]) => `<div class="metric"><div class="label">${label}</div><div class="value">${value}</div></div>`)
+          .join("");
+      }
+
+      function renderComparison() {
+        const sum = currentSummary();
+        const overall = sum?.overall || {};
+        const recent = sum?.recent || {};
+        const selfImprovement = sum?.selfImprovement || {};
+        const challenger = sum?.primaryChallenger || null;
+        const previousIex = competitorSummaryEntry("iex_previous");
+        const previousIexAvailable = previousIex?.status === "available";
+        const previousIexAuthoritative = previousIex?.ratioBaseline === "authoritative";
+        const previousIexTimingOnly =
+          previousIexAvailable && !previousIexAuthoritative && asNum(previousIex?.timingOnlyRuns, 0) > 0;
+        const previousIexOverallRatio = previousIexAuthoritative
+          ? `${fmt(previousIex.iexRatio?.median, 3)}x`
+          : previousIexTimingOnly
+            ? `timing-only (${asNum(previousIex?.timingOnlyRuns, 0)} runs)`
+            : "n/a";
+        const previousIexRecentRatio = previousIexAuthoritative
+          ? `${fmt(previousIex.iexRatio?.p95, 3)}x p95`
+          : previousIexTimingOnly
+            ? "match-count caveat"
+            : "n/a";
+        const selfWindowLabel = selfImprovement.windowSize > 0
+          ? `prev ${selfImprovement.windowSize}`
+          : "baseline";
+        const selfRecentLabel = selfImprovement.windowSize > 0
+          ? `last ${selfImprovement.windowSize}`
+          : "recent";
+        const rows = [
+          ["Run count", `${asNum(overall.runCount, 0)}`, `${asNum(recent.runCount, 0)}`],
+          ["Median ratio", `${fmt(overall?.ratio?.median, 3)}x`, `${fmt(recent?.ratio?.median, 3)}x`],
+          ["P95 ratio", `${fmt(overall?.ratio?.p95, 3)}x`, `${fmt(recent?.ratio?.p95, 3)}x`],
+          ["P99 ratio", `${fmt(overall?.ratio?.p99, 3)}x`, `${fmt(recent?.ratio?.p99, 3)}x`],
+          ["Slower runs %", `${fmt(overall?.slowerRuns?.pct)}%`, `${fmt(recent?.slowerRuns?.pct)}%`],
+          ["Goal-hit %", `${fmt(overall?.goalHits?.pct)}%`, `${fmt(recent?.goalHits?.pct)}%`],
+          ["Volatility CV", `${fmt(overall?.ratio?.cvPct)}%`, `${fmt(recent?.ratio?.cvPct)}%`],
+          ["Robust CV", `${fmt(overall?.ratio?.robustCvPct)}%`, `${fmt(recent?.ratio?.robustCvPct)}%`],
+          ["MAD", `${fmt(overall?.ratio?.mad, 3)}x`, `${fmt(recent?.ratio?.mad, 3)}x`],
+          ["Step jitter", `${fmt(overall?.ratio?.meanAbsDelta, 3)}x`, `${fmt(recent?.ratio?.meanAbsDelta, 3)}x`],
+          ["Scan share", `${fmt(overall?.phaseSharePct?.scanPct?.median)}%`, `${fmt(recent?.phaseSharePct?.scanPct?.median)}%`],
+          [
+            "Primary challenger",
+            challenger?.name || "n/a",
+            challenger ? `${fmt(challenger.durationMs?.median)} ms median` : "n/a",
+          ],
+          [
+            "IX/challenger ratio",
+            challenger ? `${fmt(challenger.iexRatio?.median, 3)}x` : "n/a",
+            challenger ? `${fmt(challenger.iexRatio?.p95, 3)}x p95` : "n/a",
+          ],
+          [
+            "IX/previous ratio",
+            previousIexOverallRatio,
+            previousIexRecentRatio,
+          ],
+          [
+            "Previous IX ms",
+            previousIexAvailable ? `${fmt(previousIex.durationMs?.median)} median` : "n/a",
+            previousIexAvailable ? `${fmt(previousIex.durationMs?.p95)} p95` : "n/a",
+          ],
+          [
+            "Self IX Median ms",
+            selfImprovement.available ? `${fmt(selfImprovement.baselineIexMs)} (${selfWindowLabel})` : "n/a",
+            selfImprovement.available ? `${fmt(selfImprovement.recentIexMs)} (${selfRecentLabel})` : "n/a",
+          ],
+          [
+            "Self Improvement %",
+            selfImprovement.available ? `${fmt(selfImprovement.improvementPct)}%` : "n/a",
+            selfImprovement.available ? `${fmt(selfImprovement.profileCoveragePct)}% profile coverage` : "n/a",
+          ],
+        ];
+        compareTable.innerHTML = rows
+          .map(([signal, left, right]) => `<tr><td>${signal}</td><td>${left}</td><td>${right}</td></tr>`)
+          .join("");
+        compareEmpty.hidden = rows.length > 0;
+      }
+
+      function renderHints() {
+        const hints = currentSummary()?.hints || [];
+        hintList.innerHTML = hints
+          .map((hint) => {
+            const cls = severityClass(hint.severity);
+            return `<li>
+              <span class="hint-title ${cls}">[${hint.severity}] ${hint.title}</span><br />
+              <span>${hint.hint}</span><br />
+              <span class="muted">${hint.why}</span>
+            </li>`;
+          })
+          .join("");
+        hintEmpty.hidden = hints.length > 0;
+      }
+
+      function renderSignals() {
+        const signals = currentSummary()?.signals || [];
+        signalTable.innerHTML = signals
+          .map((signal) => {
+            const cls = signalStatusClass(signal.status);
+            return `<tr>
+              <td>${signal.label}</td>
+              <td>${signal.display}</td>
+              <td><span class="pill ${cls}">${signal.status || "n/a"}</span></td>
+              <td>${signal.read}</td>
+            </tr>`;
+          })
+          .join("");
+        signalEmpty.hidden = signals.length > 0;
+      }
+
+      function renderCompetitors() {
+        const competitors = currentSummary()?.competitorSummary || [];
+        competitorTable.innerHTML = competitors
+          .map((competitor) => {
+            const ratio = asNum(competitor?.iexRatio?.median, 0);
+            const status = competitor?.status || "n/a";
+            const statusClass = status === "available" ? "good" : "warn";
+            return `<tr>
+              <td>${competitor.label || competitor.name}</td>
+              <td>${asNum(competitor.availableRuns, 0)} / ${asNum(competitor.runCount, 0)}</td>
+              <td>${competitor.status === "available" ? fmt(competitor?.durationMs?.median) : "n/a"}</td>
+              <td>${competitor.status === "available" ? fmt(competitor?.durationMs?.p95) : "n/a"}</td>
+              <td class="${ratioClass(ratio)}">${competitor.status === "available" ? ratioLabel(ratio) : "n/a"}</td>
+              <td>${competitor.status === "available" ? `${fmt(competitor.iexWinPct)}%` : "n/a"}</td>
+              <td><span class="pill ${statusClass}">${status}</span></td>
+            </tr>`;
+          })
+          .join("");
+        competitorEmpty.hidden = competitors.length > 0;
+      }
+
+      function renderMetricIndex() {
+        const entries = currentSummary()?.metricIndex || [];
+        indexTable.innerHTML = entries
+          .map((item) => `<tr><td>${item.label}</td><td>${item.read}</td></tr>`)
+          .join("");
+        indexEmpty.hidden = entries.length > 0;
+      }
+
+      function drawRatioTrend() {
+        ratioCtx.clearRect(0, 0, ratioCanvas.width, ratioCanvas.height);
+        updateTrendWindowButtons();
+        const runs = filteredTrendRuns();
+        if (!runs.length) {
+          trendMeta.textContent = `No runs in the ${trendWindowConfig().label} window yet.`;
+          return;
+        }
+
+        const rgRatios = runs.map((run) => trendRatioFor(run, "rg"));
+        const previousRatios = runs.map((run) => trendRatioFor(run, "previous"));
+        const rustRatios = runs.map((run) => trendRatioFor(run, "rust"));
+        const ratios = [...rgRatios, ...previousRatios, ...rustRatios].filter((value) => Number.isFinite(value) && value > 0);
+        if (!ratios.length) {
+          trendMeta.textContent = `No comparable ratio data is available in the ${trendWindowConfig().label} window.`;
+          return;
+        }
+
+        const pad = 34;
+        const w = ratioCanvas.width - pad * 2;
+        const h = ratioCanvas.height - pad * 2;
+        const minCandidate = Math.min(...ratios, 1);
+        const maxCandidate = Math.max(...ratios, 1);
+        const minY = Math.min(0.75, minCandidate);
+        const maxY = Math.max(1.25, maxCandidate);
+        const startLabel = runs[0]?.timestamp ? new Date(runs[0].timestamp).toLocaleString() : "n/a";
+        const endLabel = runs[runs.length - 1]?.timestamp ? new Date(runs[runs.length - 1].timestamp).toLocaleString() : "n/a";
+        const previousCoverage = previousRatios.filter((value) => Number.isFinite(value) && value > 0).length;
+        const rustCoverage = rustRatios.filter((value) => Number.isFinite(value) && value > 0).length;
+        trendMeta.textContent = `Showing ${trendWindowConfig().label} • ${runs.length} runs • ${startLabel} -> ${endLabel} • previous IX coverage ${previousCoverage}/${runs.length} • rust IX coverage ${rustCoverage}/${runs.length}`;
+
+        function yFor(value) {
+          return pad + h - ((value - minY) / (maxY - minY || 1)) * h;
+        }
+
+        function xFor(index) {
+          return pad + (index / Math.max(1, runs.length - 1)) * w;
+        }
+
+        ratioCtx.strokeStyle = "#29436f";
+        ratioCtx.lineWidth = 1;
+        for (let i = 0; i <= 5; i += 1) {
+          const y = pad + (h / 5) * i;
+          ratioCtx.beginPath();
+          ratioCtx.moveTo(pad, y);
+          ratioCtx.lineTo(pad + w, y);
+          ratioCtx.stroke();
+        }
+
+        const baselineY = yFor(1.0);
+        ratioCtx.strokeStyle = "rgba(243,176,74,0.95)";
+        ratioCtx.lineWidth = 1.6;
+        ratioCtx.beginPath();
+        ratioCtx.moveTo(pad, baselineY);
+        ratioCtx.lineTo(pad + w, baselineY);
+        ratioCtx.stroke();
+
+        function drawSeries(series, color) {
+          let started = false;
+          ratioCtx.strokeStyle = color;
+          ratioCtx.lineWidth = 2.2;
+          ratioCtx.beginPath();
+          series.forEach((value, index) => {
+            if (!(Number.isFinite(value) && value > 0)) {
+              if (started) {
+                ratioCtx.stroke();
+                ratioCtx.beginPath();
+                started = false;
+              }
+              return;
+            }
+            const x = xFor(index);
+            const y = yFor(value);
+            if (!started) {
+              ratioCtx.moveTo(x, y);
+              started = true;
+            } else {
+              ratioCtx.lineTo(x, y);
+            }
+          });
+          if (started) {
+            ratioCtx.stroke();
+          }
+        }
+
+        drawSeries(rgRatios, "#6ec7ff");
+        drawSeries(previousRatios, "#ff7a8a");
+        drawSeries(rustRatios, "#a78bfa");
+      }
+
+      function renderProfileTable() {
+        const rows = currentSummary()?.byProfile || [];
+        profileTable.innerHTML = rows
+          .map((row) => {
+            const medianRatio = asNum(row?.ratio?.median, 0);
+            const p95Ratio = asNum(row?.ratio?.p95, 0);
+            return `<tr>
+              <td>${row.profile}</td>
+              <td>${row.runs}</td>
+              <td class="${ratioClass(medianRatio)}">${ratioLabel(medianRatio)}</td>
+              <td class="${ratioClass(p95Ratio)}">${ratioLabel(p95Ratio)}</td>
+              <td>${fmt(row.slowerRunPct)}%</td>
+              <td>${fmt(row.goalHitPct)}%</td>
+              <td>${fmt(row?.ratio?.cvPct)}%</td>
+              <td>${row.dominantPhaseByMedianShare || "n/a"}</td>
+            </tr>`;
+          })
+          .join("");
+        profileEmpty.hidden = rows.length > 0;
+      }
+
+      function renderPhaseTable() {
+        const phases = currentSummary()?.phaseMs || {};
+        const phaseNames = ["discover", "scan", "aggregate", "total"];
+        const rows = phaseNames
+          .map((name) => ({ name, data: phases[name] }))
+          .filter((row) => row.data);
+        phaseTable.innerHTML = rows
+          .map((row) => `<tr>
+            <td>${row.name}</td>
+            <td>${fmt(row.data.min)}</td>
+            <td>${fmt(row.data.median)}</td>
+            <td>${fmt(row.data.p95)}</td>
+            <td>${fmt(row.data.max)}</td>
+          </tr>`)
+          .join("");
+        phaseEmpty.hidden = rows.length > 0;
+      }
+
+      function runCellHtml(label, ratio, speedupPct, competitorMs, cssClass, allMs) {
+        if (!Number.isFinite(ratio) || ratio <= 0) {
+          return `<td class="muted">n/a</td>`;
+        }
+        const pct = fmt(speedupPct);
+        const sign = speedupPct >= 0 ? "+" : "";
+        const lines = [`${label}: ${fmt(competitorMs)}ms (${fmt(ratio, 3)}x)`];
+        if (allMs) {
+          lines.push("");
+          lines.push(`IX-Zig: ${fmt(allMs.iex)}ms`);
+          if (allMs.rg > 0) lines.push(`ripgrep: ${fmt(allMs.rg)}ms`);
+          if (allMs.prev > 0) lines.push(`previous: ${fmt(allMs.prev)}ms`);
+          if (allMs.rust > 0) lines.push(`Rust IX: ${fmt(allMs.rust)}ms`);
+          lines.push("");
+          lines.push(`hotspot: ${allMs.hotspot || "n/a"}`);
+        }
+        const title = lines.join("\n");
+        return `<td class="${cssClass}" title="${title}">${sign}${pct}%</td>`;
+      }
+
+      function renderRunTable() {
+        const rows = history.slice(-20).reverse();
+        const previousContextByProfile = buildProfileCompetitorContext("iex_previous");
+        const rustContextByProfile = buildProfileCompetitorContext("iex_rust");
+        runTable.innerHTML = rows
+          .map((run) => {
+            const rg = asNum(run.rgMs, 0);
+            const iex = asNum(run.iexMs, 0);
+            const rgRatio = asNum(run.iexToRgRatio, rg > 0 ? iex / rg : 0);
+            const rgSpeedup = asNum(run.speedupPct, 0);
+
+            const previous = competitorRunMetrics(run, "iex_previous");
+            const previousContext = previousContextByProfile.get(run.profile) || null;
+            const previousCssClass = previous.available
+              ? contextualRatioClass(previous.ratio, previousContext, previous)
+              : "muted";
+
+            const rust = competitorRunMetrics(run, "iex_rust");
+            const rustContext = rustContextByProfile.get(run.profile) || null;
+            const rustCssClass = rust.available
+              ? contextualRatioClass(rust.ratio, rustContext, rust)
+              : "muted";
+
+            const allMs = {
+              iex,
+              rg,
+              prev: previous.available ? previous.durationMs : 0,
+              rust: rust.available ? rust.durationMs : 0,
+              hotspot: run.hotspot || "n/a",
+            };
+
+            const rgCell = runCellHtml("ripgrep", rgRatio, rgSpeedup, rg, ratioClass(rgRatio), allMs);
+            const prevCell = previous.available
+              ? runCellHtml("previous", previous.ratio, previous.speedupPct, previous.durationMs, previousCssClass, allMs)
+              : `<td class="muted">n/a</td>`;
+            const rustCell = rust.available
+              ? runCellHtml("Rust IX", rust.ratio, rust.speedupPct, rust.durationMs, rustCssClass, allMs)
+              : `<td class="muted">n/a</td>`;
+
+            return `<tr>
+              <td>${new Date(run.timestamp).toLocaleString()}</td>
+              <td>${run.profile}</td>
+              <td>${fmt(iex)}ms</td>
+              ${rgCell}
+              ${prevCell}
+              ${rustCell}
+            </tr>`;
+          })
+          .join("");
+        runEmpty.hidden = rows.length > 0;
+      }
+
+      function renderSlowdownTable() {
+        const rows = currentSummary()?.slowdownTimeline || [];
+        slowdownTable.innerHTML = rows
+          .slice(0, 20)
+          .map((row) => {
+            const ratio = asNum(row.ratio, 0);
+            const phase = row.phaseMs || {};
+            return `<tr>
+              <td>${new Date(row.timestamp).toLocaleString()}</td>
+              <td>${row.profile}</td>
+              <td class="${ratioClass(ratio)}">${fmt(ratio, 3)}x</td>
+              <td>${row.hotspot || "n/a"}</td>
+              <td>${fmt(phase.discover)}</td>
+              <td>${fmt(phase.scan)}</td>
+              <td>${fmt(phase.aggregate)}</td>
+            </tr>`;
+          })
+          .join("");
+        slowdownEmpty.hidden = rows.length > 0;
+      }
+
+      function renderSlowestFiles() {
+        const latest = history[history.length - 1];
+        const rows = latest?.slowestFiles || [];
+        slowTable.innerHTML = rows
+          .map((row) => `<tr><td>${row.path}</td><td>${fmt(row.duration_ms)}</td><td>${row.bytes}</td></tr>`)
+          .join("");
+        slowEmpty.hidden = rows.length > 0;
+      }
+
+      function renderAll() {
+        renderStatus();
+        renderMetrics();
+        renderComparison();
+        renderHints();
+        renderSignals();
+        renderCompetitors();
+        drawRatioTrend();
+        renderProfileTable();
+        renderPhaseTable();
+        renderRunTable();
+        renderSlowdownTable();
+        renderMetricIndex();
+        renderSlowestFiles();
+      }
+
+      async function bootstrapHttp() {
+        const [historyResp, summaryResp] = await Promise.all([
+          fetch("/api/history"),
+          fetch("/api/summary"),
+        ]);
+        const historyData = await historyResp.json();
+        const summaryData = await summaryResp.json();
+        ingestRuns(historyData.history || []);
+        summary = summaryData.summary || null;
+        sources = summaryData.sources || null;
+        renderAll();
+      }
+
+      function connectEvents() {
+        const stream = new EventSource("/events");
+
+        stream.addEventListener("open", () => {
+          connectionLabel(true);
+        });
+
+        stream.addEventListener("error", () => {
+          connectionLabel(false);
+        });
+
+        stream.addEventListener("bootstrap", (event) => {
+          const payload = JSON.parse(event.data);
+          ingestRuns(payload.history || []);
+          summary = payload.summary || summary;
+          sources = payload.sources || sources;
+          renderAll();
+        });
+
+        stream.addEventListener("run", (event) => {
+          const run = JSON.parse(event.data);
+          const changed = ingestRuns([run]);
+          if (changed) {
+            renderAll();
+          }
+        });
+
+        stream.addEventListener("summary", (event) => {
+          const payload = JSON.parse(event.data);
+          summary = payload.summary || summary;
+          sources = payload.sources || sources;
+          renderAll();
+        });
+      }
+
+      async function main() {
+        connectionLabel(false);
+        trendWindowButtons.forEach((button) => {
+          button.addEventListener("click", () => {
+            selectedTrendWindow = button.dataset.trendWindow || "12h";
+            drawRatioTrend();
+          });
+        });
+        try {
+          await bootstrapHttp();
+        } catch (error) {
+          console.error("bootstrap failure", error);
+        }
+        connectEvents();
+      }
+
+      main();
+    </script>
+  </body>
+</html>

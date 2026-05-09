@@ -1,0 +1,12 @@
+{
+  "name": "ix-zig-bench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench:once": "node tools/scripts/run-once-benchmark.mjs",
+    "bench:loop": "node tools/scripts/bench-loop-suite.mjs",
+    "bench:loop:infinite": "node tools/scripts/bench-loop-suite.mjs --loops 0",
+    "dashboard": "node tools/scripts/dashboard-server.mjs"
+  }
+}

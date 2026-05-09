@@ -1,0 +1,10 @@
+/.zig-cache/
+/zig-out/
+/zig-pkg/
+/.docs/
+/.refs/
+/.untrack/
+/tools/reports/
+/tools/scripts/competitors.json
+Created*
+node_modules/
