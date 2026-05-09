@@ -17,6 +17,14 @@ pub const MAX_RETAINED_HITS = 4096;
 
 const TRIGRAM_MIN_PRUNE_BYTES: usize = 64 * 1024;
 
+/// Comptime predicate specialization for single-predicate plans. When passed to
+/// scanOpenFileIntoShardImpl / recordLineIntoShardImpl, the per-line match
+/// dispatch collapses to a direct call at compile time — zero runtime switches.
+const MonoSpec = struct {
+    kind: expr.PredicateKind,
+    strategy: expr.MatcherStrategy,
+};
+
 pub const SearchError = error{};
 
 pub const SearchHit = struct {
@@ -336,9 +344,11 @@ fn scanFileIntoShard(
     };
 }
 
-/// Core per-file scan for the parallel path. Identical logic to
-/// scanOpenFile but writes into a ShardReport instead of SearchReport.
-fn scanOpenFileIntoShard(
+/// Comptime-generic per-file scan. When mono is non-null, the per-line match
+/// dispatch is fully monomorphized — zero runtime switches in the inner loop.
+/// When null, falls back to the runtime multi-predicate path.
+fn scanOpenFileIntoShardImpl(
+    comptime mono: ?MonoSpec,
     io: std.Io,
     allocator: std.mem.Allocator,
     file: std.Io.File,
@@ -356,7 +366,7 @@ fn scanOpenFileIntoShard(
     const first_read = try file.readPositional(io, &.{&read_buffer}, 0);
     if (first_read == 0) {
         shard.files_scanned += 1;
-        recordLineIntoShard(allocator, display_path, "", 1, request, plan, shard, false);
+        recordLineIntoShardImpl(mono, allocator, display_path, "", 1, request, plan, shard, false);
         const file_ms = elapsedMs(io, file_started);
         shard.scan_work_ms_total += file_ms;
         if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
@@ -423,10 +433,10 @@ fn scanOpenFileIntoShard(
             if (sz.indexOfByte(chunk[chunk_index..], '\n')) |relative_newline| {
                 const line_part = chunk[chunk_index .. chunk_index + relative_newline];
                 if (carry.items.len == 0) {
-                    recordLineIntoShard(allocator, display_path, line_part, line_number, request, plan, shard, chunk_casefold);
+                    recordLineIntoShardImpl(mono, allocator, display_path, line_part, line_number, request, plan, shard, chunk_casefold);
                 } else {
                     try carry.appendSlice(allocator, line_part);
-                    recordLineIntoShard(allocator, display_path, carry.items, line_number, request, plan, shard, chunk_casefold);
+                    recordLineIntoShardImpl(mono, allocator, display_path, carry.items, line_number, request, plan, shard, chunk_casefold);
                     carry.clearRetainingCapacity();
                 }
                 if (shard.truncated) break;
@@ -450,11 +460,68 @@ fn scanOpenFileIntoShard(
     }
 
     if (!shard.truncated and (carry.items.len > 0 or ended_with_newline)) {
-        recordLineIntoShard(allocator, display_path, carry.items, line_number, request, plan, shard, chunk_casefold);
+        recordLineIntoShardImpl(mono, allocator, display_path, carry.items, line_number, request, plan, shard, chunk_casefold);
     }
     const file_ms = elapsedMs(io, file_started);
     shard.scan_work_ms_total += file_ms;
     if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+}
+
+/// Runtime wrapper — dispatches to Impl with null mono (generic path).
+fn scanOpenFileIntoShard(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    display_path: []const u8,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    trigram_admission: trigram.Admission,
+    shard: *ShardReport,
+) anyerror!void {
+    return scanOpenFileIntoShardImpl(null, io, allocator, file, display_path, request, plan, trigram_admission, shard);
+}
+
+/// Comptime-generic per-line processor. When mono is non-null (single-predicate
+/// plan), match dispatch is fully resolved at compile time. When null, falls
+/// back to the runtime multi-predicate path.
+fn recordLineIntoShardImpl(
+    comptime mono: ?MonoSpec,
+    allocator: std.mem.Allocator,
+    display_path: []const u8,
+    raw_line: []const u8,
+    line_number: usize,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    shard: *ShardReport,
+    chunk_casefolded: bool,
+) void {
+    const line = std.mem.trimEnd(u8, raw_line, "\r");
+    if (request.stats_only) {
+        const ci = if (chunk_casefolded) false else request.case_insensitive;
+        const count = if (mono) |m|
+            predicateMatchCountMono(m.kind, m.strategy, line, plan.predicates[0], ci, chunk_casefolded)
+        else
+            statsOnlyMatchCount(line, plan, ci, chunk_casefolded);
+        shard.matches_found += count;
+        return;
+    }
+    const column = if (mono) |m|
+        predicateColumnMono(m.kind, m.strategy, line, plan.predicates[0], request.case_insensitive)
+    else
+        matchingColumn(line, plan, request.case_insensitive);
+    if (column) |col| {
+        shard.matches_found += 1;
+        const under_request_limit = if (request.max_hits) |max_hits| shard.hit_count < max_hits else true;
+        if (under_request_limit and shard.hit_count < MAX_RETAINED_HITS) {
+            shard.hits[shard.hit_count] = .{
+                .path = display_path,
+                .line = line_number,
+                .column = col,
+                .preview = allocator.dupe(u8, line) catch line,
+            };
+            shard.hit_count += 1;
+        }
+    }
 }
 
 fn recordLineIntoShard(
@@ -465,48 +532,87 @@ fn recordLineIntoShard(
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     shard: *ShardReport,
-    /// True when the chunk buffer was lowercased in-place before line splitting.
-    /// Only ever true in stats_only mode (no preview bytes needed).
     chunk_casefolded: bool,
 ) void {
-    const line = std.mem.trimEnd(u8, raw_line, "\r");
-    if (request.stats_only) {
-        // When pre-lowercased pass case_insensitive=false — matching is already done.
-        const ci = if (chunk_casefolded) false else request.case_insensitive;
-        const count = statsOnlyMatchCount(line, plan, ci, chunk_casefolded);
-        shard.matches_found += count;
-        return;
-    }
-    // chunk_casefolded is never true in hit-collecting mode (original bytes needed for preview).
-    if (matchingColumn(line, plan, request.case_insensitive)) |column| {
-        shard.matches_found += 1;
-        const under_request_limit = if (request.max_hits) |max_hits| shard.hit_count < max_hits else true;
-        if (under_request_limit and shard.hit_count < MAX_RETAINED_HITS) {
-            shard.hits[shard.hit_count] = .{
-                .path = display_path,
-                .line = line_number,
-                .column = column,
-                .preview = allocator.dupe(u8, line) catch line,
-            };
-            shard.hit_count += 1;
+    recordLineIntoShardImpl(null, allocator, display_path, raw_line, line_number, request, plan, shard, chunk_casefolded);
+}
+
+/// Worker thread entry point. For single-predicate plans, dispatches to a
+/// comptime-monomorphized file loop where per-line match overhead is zero.
+fn shardWorker(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+    if (plan.predicate_count == 1) {
+        dispatchMonoShardLoop(io, allocator, files, request, plan, trigram_admission, shard);
+    } else {
+        for (files) |entry| {
+            if (shard.truncated) break;
+            scanFileIntoShard(io, allocator, entry.path, request, plan, trigram_admission, shard);
         }
     }
 }
 
-/// Worker thread entry point. Scans its assigned shard of files.
-fn shardWorker(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
-    for (files) |entry| {
-        if (shard.truncated) break;
-        scanFileIntoShard(io, allocator, entry.path, request, plan, trigram_admission, shard);
+fn dynamicShardWorker(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+    if (plan.predicate_count == 1) {
+        dispatchMonoDynamicLoop(io, allocator, next_file, files, request, plan, trigram_admission, shard);
+    } else {
+        while (!shard.truncated) {
+            const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
+            if (index >= files.len) break;
+            scanFileIntoShard(io, allocator, files[index].path, request, plan, trigram_admission, shard);
+        }
     }
 }
 
-fn dynamicShardWorker(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+/// Resolve single-predicate plan to comptime-known kind+strategy, then enter
+/// monomorphized file loop. Dispatch happens once per worker thread.
+fn dispatchMonoShardLoop(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+    const pred = plan.predicates[0];
+    switch (pred.kind) {
+        .literal => monoShardLoop(.{ .kind = .literal, .strategy = .literal }, io, allocator, files, request, plan, trigram_admission, shard),
+        .prefix => monoShardLoop(.{ .kind = .prefix, .strategy = .prefix }, io, allocator, files, request, plan, trigram_admission, shard),
+        .suffix => monoShardLoop(.{ .kind = .suffix, .strategy = .suffix }, io, allocator, files, request, plan, trigram_admission, shard),
+        .regex => switch (pred.strategy) {
+            inline else => |strategy| monoShardLoop(.{ .kind = .regex, .strategy = strategy }, io, allocator, files, request, plan, trigram_admission, shard),
+        },
+    }
+}
+
+fn monoShardLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+    for (files) |entry| {
+        if (shard.truncated) break;
+        scanFileIntoShardMono(mono, io, allocator, entry.path, request, plan, trigram_admission, shard);
+    }
+}
+
+fn dispatchMonoDynamicLoop(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+    const pred = plan.predicates[0];
+    switch (pred.kind) {
+        .literal => monoDynamicLoop(.{ .kind = .literal, .strategy = .literal }, io, allocator, next_file, files, request, plan, trigram_admission, shard),
+        .prefix => monoDynamicLoop(.{ .kind = .prefix, .strategy = .prefix }, io, allocator, next_file, files, request, plan, trigram_admission, shard),
+        .suffix => monoDynamicLoop(.{ .kind = .suffix, .strategy = .suffix }, io, allocator, next_file, files, request, plan, trigram_admission, shard),
+        .regex => switch (pred.strategy) {
+            inline else => |strategy| monoDynamicLoop(.{ .kind = .regex, .strategy = strategy }, io, allocator, next_file, files, request, plan, trigram_admission, shard),
+        },
+    }
+}
+
+fn monoDynamicLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
     while (!shard.truncated) {
         const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
         if (index >= files.len) break;
-        scanFileIntoShard(io, allocator, files[index].path, request, plan, trigram_admission, shard);
+        scanFileIntoShardMono(mono, io, allocator, files[index].path, request, plan, trigram_admission, shard);
     }
+}
+
+/// Monomorphized file opener — calls scanOpenFileIntoShardImpl with comptime mono.
+fn scanFileIntoShardMono(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, display_path: []const u8, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+    const file = std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false }) catch {
+        shard.files_skipped += 1;
+        return;
+    };
+    defer file.close(io);
+    scanOpenFileIntoShardImpl(mono, io, allocator, file, display_path, request, plan, trigram_admission, shard) catch {
+        shard.had_error = true;
+    };
 }
 
 fn shouldUseDynamicWorkClaim(plan: expr.ExpressionPlan, file_count: usize) bool {
@@ -1087,6 +1193,15 @@ fn predicateMatchCount(line: []const u8, predicate: expr.Predicate, case_insensi
     };
 }
 
+/// Comptime-specialized match count for monomorphized single-predicate path.
+fn predicateMatchCountMono(comptime kind: expr.PredicateKind, comptime strategy: expr.MatcherStrategy, line: []const u8, predicate: expr.Predicate, case_insensitive: bool, chunk_casefolded: bool) usize {
+    return switch (kind) {
+        .literal => countLiteral(line, predicate.value, case_insensitive),
+        .regex => predicateMatchCountByStrategyMono(strategy, line, predicate, case_insensitive, chunk_casefolded),
+        .prefix, .suffix => if (predicateColumnMono(kind, strategy, line, predicate, case_insensitive) != null) 1 else 0,
+    };
+}
+
 fn countRegexStatsOnly(line: []const u8, pattern: []const u8, case_insensitive: bool) usize {
     if (isSurroundingWordLiteralPattern(pattern)) {
         const col = pcre_regex.column(line, pattern, case_insensitive) catch
@@ -1097,15 +1212,11 @@ fn countRegexStatsOnly(line: []const u8, pattern: []const u8, case_insensitive: 
         regex.count(line, pattern, case_insensitive);
 }
 
-/// chunk_casefolded: the line bytes are already lowercased (chunk was
-/// casefolded in-place).  For casefold-literal strategies this means
-/// the body is guaranteed lowercase and the line is lowercase, so we
-/// can use case-sensitive matching (false) instead of per-line casefold.
-fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool, chunk_casefolded: bool) usize {
-    return switch (predicate.strategy) {
+/// Comptime-specialized match count dispatch for stats-only mode.
+/// chunk_casefolded: line bytes already lowercased in-place → skip per-line casefold.
+fn predicateMatchCountByStrategyMono(comptime strategy: expr.MatcherStrategy, line: []const u8, predicate: expr.Predicate, case_insensitive: bool, chunk_casefolded: bool) usize {
+    return switch (strategy) {
         .regex_plain_literal => blk: {
-            // Pure literals (no backslash escapes) use SIMD-backed countLiteral.
-            // Escaped patterns (e.g. `re:foo\.bar`) fall through to regex literal matcher.
             if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null) {
                 break :blk countLiteral(line, predicate.value, case_insensitive);
             }
@@ -1113,8 +1224,6 @@ fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, ca
         },
         .regex_ascii_casefold_literal => blk: {
             const body = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
-            // When chunk_casefolded: line is pre-lowercased & body is verified lowercase
-            // (planIsFullyCasefoldLiteral guarantee) → case-sensitive search suffices.
             const effective_ci = if (chunk_casefolded) false else true;
             if (std.mem.indexOfScalar(u8, body, '\\') == null) {
                 break :blk countLiteral(line, body, effective_ci);
@@ -1129,6 +1238,13 @@ fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, ca
         },
         .regex_literal_alternates => if (literalAlternatesColumn(line, predicate.value, case_insensitive) != null) 1 else 0,
         else => countRegexWithPrefilter(line, predicate.value, case_insensitive),
+    };
+}
+
+/// Runtime dispatch wrapper — inline else forwards to comptime-specialized Mono.
+fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool, chunk_casefolded: bool) usize {
+    return switch (predicate.strategy) {
+        inline else => |strategy| predicateMatchCountByStrategyMono(strategy, line, predicate, case_insensitive, chunk_casefolded),
     };
 }
 
@@ -1229,15 +1345,22 @@ fn predicateColumn(line: []const u8, predicate: expr.Predicate, case_insensitive
     };
 }
 
-/// Strategy-aware regex dispatch. The expression parser classifies regex
-/// patterns into strategy tiers (see expr.MatcherStrategy). Patterns that
-/// are structurally literals (e.g. `re:(?i)sherlock` → casefold literal)
-/// bypass the recursive backtracking engine and use StringZilla-backed
-/// literal search instead. Only `regex_full` falls through to the regex.
-fn regexColumnByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool) ?usize {
-    return switch (predicate.strategy) {
+/// Comptime-specialized predicate column for monomorphized single-predicate path.
+/// Both kind and strategy are comptime-known — all switches collapse.
+fn predicateColumnMono(comptime kind: expr.PredicateKind, comptime strategy: expr.MatcherStrategy, line: []const u8, predicate: expr.Predicate, case_insensitive: bool) ?usize {
+    return switch (kind) {
+        .literal => if (indexOfLiteral(line, predicate.value, case_insensitive)) |index| index + 1 else null,
+        .prefix => if (startsWithLiteral(line, predicate.value, case_insensitive)) 1 else null,
+        .suffix => if (endsWithLiteral(line, predicate.value, case_insensitive)) line.len - predicate.value.len + 1 else null,
+        .regex => regexColumnByStrategyMono(strategy, line, predicate, case_insensitive),
+    };
+}
+
+/// Comptime-specialized regex column dispatch. When `strategy` is comptime-known,
+/// the switch collapses to a single branch — zero runtime dispatch overhead.
+fn regexColumnByStrategyMono(comptime strategy: expr.MatcherStrategy, line: []const u8, predicate: expr.Predicate, case_insensitive: bool) ?usize {
+    return switch (strategy) {
         .regex_plain_literal => {
-            // Pure literals (no backslash escapes) use SIMD-backed indexOfLiteral.
             if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null) {
                 return if (indexOfLiteral(line, predicate.value, case_insensitive)) |index| index + 1 else null;
             }
@@ -1264,7 +1387,17 @@ fn regexColumnByStrategy(line: []const u8, predicate: expr.Predicate, case_insen
         .regex_literal_alternates => {
             return literalAlternatesColumn(line, predicate.value, case_insensitive);
         },
+        // regex_full, regex_fixed_width_bytes, regex_decomposition_candidate_lines,
+        // and non-regex strategies all fall through to prefilter + regex engine.
         else => regexWithLiteralPrefilter(line, predicate.value, case_insensitive),
+    };
+}
+
+/// Runtime strategy dispatch — inline else converts each runtime branch to a
+/// comptime-known call into regexColumnByStrategyMono.
+fn regexColumnByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool) ?usize {
+    return switch (predicate.strategy) {
+        inline else => |strategy| regexColumnByStrategyMono(strategy, line, predicate, case_insensitive),
     };
 }
 
