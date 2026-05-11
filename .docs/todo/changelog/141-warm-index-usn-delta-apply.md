@@ -4,7 +4,7 @@ type: parent
 protocol_version: "2.1"
 spec_status: approved
 category: feature
-status: pending
+status: done
 epic_boundary: "Make NTFS USN the primary Windows freshness source for the warm index. This chain moves from invalidation-only mutation handling to actual delta application."
 subtodo_start: /todo/pending/141a-warm-index-usn-delta-apply.md
 subtodo_final: /todo/pending/141o-warm-index-usn-delta-apply.md
@@ -93,22 +93,22 @@ The research identifies USN as the serious Windows-native delta feed. Directory 
 
 | File | Phase | Role | Status |
 |------|-------|------|--------|
-| `/todo/pending/141-warm-index-usn-delta-apply.md` | parent | Chain root | pending |
+| `/todo/changelog/141-warm-index-usn-delta-apply.md` | parent | Chain root | archived |
 | `/todo/changelog/141a-warm-index-usn-delta-apply.md` | a | Baseline / contract lock | archived |
 | `/todo/changelog/141b-warm-index-usn-delta-apply.md` | b | USN FFI skeleton | archived |
 | `/todo/changelog/141c-warm-index-usn-delta-apply.md` | c | Volume identity | archived |
 | `/todo/changelog/141d-warm-index-usn-delta-apply.md` | d | Cursor persistence | archived |
 | `/todo/changelog/141e-warm-index-usn-delta-apply.md` | e | Journal availability probe | archived |
 | `/todo/changelog/141f-warm-index-usn-delta-apply.md` | f | Read batch loop | archived |
-| `/todo/pending/141g-warm-index-usn-delta-apply.md` | g | Record path resolution | pending |
-| `/todo/pending/141h-warm-index-usn-delta-apply.md` | h | Delta task mapping | pending |
-| `/todo/pending/141i-warm-index-usn-delta-apply.md` | i | Batch coalescing | pending |
-| `/todo/pending/141j-warm-index-usn-delta-apply.md` | j | Continuity failure | pending |
-| `/todo/pending/141k-warm-index-usn-delta-apply.md` | k | Directory watch fallback | pending |
-| `/todo/pending/141l-warm-index-usn-delta-apply.md` | l | Delta apply integration | pending |
-| `/todo/pending/141m-warm-index-usn-delta-apply.md` | m | USN tests/smokes | pending |
-| `/todo/pending/141n-warm-index-usn-delta-apply.md` | n | Docs update | pending |
-| `/todo/pending/141o-warm-index-usn-delta-apply.md` | o | Verification / closeout | pending |
+| `/todo/changelog/141g-warm-index-usn-delta-apply.md` | g | Record path resolution | archived |
+| `/todo/changelog/141h-warm-index-usn-delta-apply.md` | h | Delta task mapping | archived |
+| `/todo/changelog/141i-warm-index-usn-delta-apply.md` | i | Batch coalescing | archived |
+| `/todo/changelog/141j-warm-index-usn-delta-apply.md` | j | Continuity failure | archived |
+| `/todo/changelog/141k-warm-index-usn-delta-apply.md` | k | Directory watch fallback | archived |
+| `/todo/changelog/141l-warm-index-usn-delta-apply.md` | l | Delta apply integration | archived |
+| `/todo/changelog/141m-warm-index-usn-delta-apply.md` | m | USN tests/smokes | archived |
+| `/todo/changelog/141n-warm-index-usn-delta-apply.md` | n | Docs update | archived |
+| `/todo/changelog/141o-warm-index-usn-delta-apply.md` | o | Verification / closeout | archived |
 
 Chain is complete when all rows read `archived` and all files are in `/todo/changelog/`.
 

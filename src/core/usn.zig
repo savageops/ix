@@ -1,5 +1,8 @@
 const std = @import("std");
 
+const catalog = @import("catalog.zig");
+const generation = @import("generation.zig");
+const postings = @import("postings.zig");
 const windows = std.os.windows;
 
 pub const CURSOR_MAGIC: [8]u8 = .{ 'I', 'X', 'U', 'S', 'N', '0', '0', '1' };
@@ -16,6 +19,20 @@ pub const FILE_ANY_ACCESS: windows.DWORD = 0;
 
 pub const FSCTL_QUERY_USN_JOURNAL: windows.DWORD = ctlCode(FILE_DEVICE_FILE_SYSTEM, 61, METHOD_BUFFERED, FILE_ANY_ACCESS);
 pub const FSCTL_READ_USN_JOURNAL: windows.DWORD = ctlCode(FILE_DEVICE_FILE_SYSTEM, 46, METHOD_NEITHER, FILE_ANY_ACCESS);
+
+pub const FILE_NOTIFY_CHANGE_FILE_NAME: windows.DWORD = 0x0000_0001;
+pub const FILE_NOTIFY_CHANGE_DIR_NAME: windows.DWORD = 0x0000_0002;
+pub const FILE_NOTIFY_CHANGE_ATTRIBUTES: windows.DWORD = 0x0000_0004;
+pub const FILE_NOTIFY_CHANGE_SIZE: windows.DWORD = 0x0000_0008;
+pub const FILE_NOTIFY_CHANGE_LAST_WRITE: windows.DWORD = 0x0000_0010;
+pub const FILE_NOTIFY_CHANGE_CREATION: windows.DWORD = 0x0000_0040;
+pub const IX_DIRECTORY_WATCH_NOTIFY_FILTER: windows.DWORD =
+    FILE_NOTIFY_CHANGE_FILE_NAME |
+    FILE_NOTIFY_CHANGE_DIR_NAME |
+    FILE_NOTIFY_CHANGE_ATTRIBUTES |
+    FILE_NOTIFY_CHANGE_SIZE |
+    FILE_NOTIFY_CHANGE_LAST_WRITE |
+    FILE_NOTIFY_CHANGE_CREATION;
 
 pub const USN_REASON_DATA_OVERWRITE: windows.DWORD = 0x0000_0001;
 pub const USN_REASON_DATA_EXTEND: windows.DWORD = 0x0000_0002;
@@ -128,8 +145,119 @@ pub const UsnRecordSummary = struct {
     minor_version: u16,
     record_length: windows.DWORD,
     reason: windows.DWORD,
+    file_reference: JournalFileReference,
+    parent_reference: JournalFileReference,
     file_name_offset: u16,
     file_name_length: u16,
+};
+
+pub const JournalFileReference = union(enum) {
+    v2: u64,
+    v3: FileId128,
+
+    pub fn eql(self: JournalFileReference, other: JournalFileReference) bool {
+        return switch (self) {
+            .v2 => |lhs| switch (other) {
+                .v2 => |rhs| lhs == rhs,
+                .v3 => false,
+            },
+            .v3 => |lhs| switch (other) {
+                .v2 => false,
+                .v3 => |rhs| std.mem.eql(u8, &lhs.identifier, &rhs.identifier),
+            },
+        };
+    }
+};
+
+pub const CatalogReferenceEntry = struct {
+    journal_reference: JournalFileReference,
+    file_id: catalog.FileId,
+};
+
+pub const CatalogReferenceResolver = struct {
+    entries: []const CatalogReferenceEntry = &.{},
+
+    pub fn resolve(self: CatalogReferenceResolver, journal_reference: JournalFileReference) ?catalog.FileId {
+        for (self.entries) |entry| {
+            if (entry.journal_reference.eql(journal_reference)) return entry.file_id;
+        }
+        return null;
+    }
+};
+
+pub const PendingPathLookup = struct {
+    file_reference: JournalFileReference,
+    parent_reference: JournalFileReference,
+    file_name_offset: u16,
+    file_name_length: u16,
+};
+
+pub const RecordPathResolution = union(enum) {
+    catalog_file_id: catalog.FileId,
+    pending_path_lookup: PendingPathLookup,
+};
+
+pub const DeltaTaskKind = enum {
+    upsert_file,
+    delete_file,
+    reconcile_root,
+};
+
+pub const DeltaTask = struct {
+    kind: DeltaTaskKind,
+    reason: windows.DWORD,
+    resolution: ?RecordPathResolution = null,
+};
+
+pub const ContinuityFailureKind = enum {
+    lost_cursor,
+    journal_wrapped,
+    batch_overflow,
+};
+
+pub const ContinuityDecision = union(enum) {
+    apply_delta,
+    reconcile_root: ContinuityFailureKind,
+};
+
+pub const FreshnessBackendKind = enum {
+    usn_delta,
+    directory_watch_invalidate,
+};
+
+pub const FreshnessBackend = struct {
+    kind: FreshnessBackendKind,
+    notify_filter: windows.DWORD = 0,
+    fallback_reason: []const u8 = "",
+
+    pub fn requiresRootReconcile(self: FreshnessBackend) bool {
+        return self.kind == .directory_watch_invalidate;
+    }
+};
+
+pub const DeltaApplyMode = enum {
+    incremental_segment_update,
+    root_reconcile_publish,
+};
+
+pub const DeltaApplyPlan = struct {
+    mode: DeltaApplyMode,
+    upsert_count: usize = 0,
+    delete_count: usize = 0,
+    reconcile_required: bool = false,
+
+    pub fn publishesFullGeneration(self: DeltaApplyPlan) bool {
+        return self.mode == .root_reconcile_publish;
+    }
+};
+
+pub const DeltaGenerationInput = struct {
+    root: []const u8,
+    root_fingerprint: catalog.RootFingerprint,
+    epoch: generation.Epoch,
+    parent_epoch: ?generation.Epoch = null,
+    catalog_files: []const catalog.CatalogFileInput,
+    postings_files: []const postings.PostingsFileInput,
 };
 
 pub const ReadBatchResult = struct {
@@ -201,6 +329,17 @@ pub extern "kernel32" fn DeviceIoControl(
     nOutBufferSize: windows.DWORD,
     lpBytesReturned: ?*windows.DWORD,
     lpOverlapped: ?*anyopaque,
+) callconv(.winapi) windows.BOOL;
+
+pub extern "kernel32" fn ReadDirectoryChangesW(
+    hDirectory: windows.HANDLE,
+    lpBuffer: ?*anyopaque,
+    nBufferLength: windows.DWORD,
+    bWatchSubtree: windows.BOOL,
+    dwNotifyFilter: windows.DWORD,
+    lpBytesReturned: ?*windows.DWORD,
+    lpOverlapped: ?*anyopaque,
+    lpCompletionRoutine: ?*anyopaque,
 ) callconv(.winapi) windows.BOOL;
 
 pub fn ctlCode(device_type: windows.DWORD, function: windows.DWORD, method: windows.DWORD, access: windows.DWORD) windows.DWORD {
@@ -313,6 +452,178 @@ pub fn parseReadBatch(allocator: std.mem.Allocator, bytes: []const u8, options: 
     };
 }
 
+pub fn resolveRecordPath(summary: UsnRecordSummary, resolver: CatalogReferenceResolver) RecordPathResolution {
+    if (resolver.resolve(summary.file_reference)) |file_id| {
+        return .{ .catalog_file_id = file_id };
+    }
+
+    return .{ .pending_path_lookup = .{
+        .file_reference = summary.file_reference,
+        .parent_reference = summary.parent_reference,
+        .file_name_offset = summary.file_name_offset,
+        .file_name_length = summary.file_name_length,
+    } };
+}
+
+pub fn mapRecordToDeltaTask(summary: UsnRecordSummary, resolver: CatalogReferenceResolver) DeltaTask {
+    const upsert_bits = USN_REASON_DATA_OVERWRITE |
+        USN_REASON_DATA_EXTEND |
+        USN_REASON_DATA_TRUNCATION |
+        USN_REASON_FILE_CREATE |
+        USN_REASON_RENAME_NEW_NAME;
+    const delete_bits = USN_REASON_FILE_DELETE | USN_REASON_RENAME_OLD_NAME;
+    const has_upsert = (summary.reason & upsert_bits) != 0;
+    const has_delete = (summary.reason & delete_bits) != 0;
+    const resolution = resolveRecordPath(summary, resolver);
+
+    if (has_upsert and !has_delete) {
+        return .{
+            .kind = .upsert_file,
+            .reason = summary.reason,
+            .resolution = resolution,
+        };
+    }
+    if (has_delete and !has_upsert) {
+        return .{
+            .kind = .delete_file,
+            .reason = summary.reason,
+            .resolution = resolution,
+        };
+    }
+
+    return .{
+        .kind = .reconcile_root,
+        .reason = summary.reason,
+        .resolution = resolution,
+    };
+}
+
+pub fn coalesceDeltaTasks(allocator: std.mem.Allocator, tasks: []const DeltaTask) ![]DeltaTask {
+    var coalesced = std.ArrayList(DeltaTask).empty;
+    errdefer coalesced.deinit(allocator);
+    var reconcile_reason: windows.DWORD = 0;
+
+    for (tasks) |task| {
+        reconcile_reason |= task.reason;
+        if (task.kind == .reconcile_root or task.resolution == null) {
+            coalesced.deinit(allocator);
+            return singletonDeltaTask(allocator, .{
+                .kind = .reconcile_root,
+                .reason = reconcile_reason,
+                .resolution = task.resolution,
+            });
+        }
+
+        var replaced = false;
+        for (coalesced.items) |*existing| {
+            if (recordPathResolutionEql(existing.resolution.?, task.resolution.?)) {
+                existing.* = .{
+                    .kind = task.kind,
+                    .reason = existing.reason | task.reason,
+                    .resolution = task.resolution,
+                };
+                replaced = true;
+                break;
+            }
+        }
+        if (!replaced) try coalesced.append(allocator, task);
+    }
+
+    return coalesced.toOwnedSlice(allocator);
+}
+
+pub fn evaluateDeltaContinuity(previous: ?JournalCursor, current: JournalCursor, batch: ReadBatchResult) ContinuityDecision {
+    const previous_cursor = previous orelse return .{ .reconcile_root = .lost_cursor };
+    if (!previous_cursor.canContinue(current)) return .{ .reconcile_root = .journal_wrapped };
+    if (batch.truncated_by_limit) return .{ .reconcile_root = .batch_overflow };
+    return .apply_delta;
+}
+
+pub fn continuityReconcileTask(decision: ContinuityDecision) ?DeltaTask {
+    return switch (decision) {
+        .apply_delta => null,
+        .reconcile_root => .{
+            .kind = .reconcile_root,
+            .reason = 0,
+            .resolution = null,
+        },
+    };
+}
+
+pub fn chooseFreshnessBackend(availability: JournalAvailability) FreshnessBackend {
+    if (availability.canUseUsn()) {
+        return .{
+            .kind = .usn_delta,
+            .notify_filter = 0,
+            .fallback_reason = "",
+        };
+    }
+
+    return .{
+        .kind = .directory_watch_invalidate,
+        .notify_filter = IX_DIRECTORY_WATCH_NOTIFY_FILTER,
+        .fallback_reason = availability.fallback_reason,
+    };
+}
+
+pub fn directoryWatchInvalidationTask(backend: FreshnessBackend) ?DeltaTask {
+    if (!backend.requiresRootReconcile()) return null;
+    return .{
+        .kind = .reconcile_root,
+        .reason = 0,
+        .resolution = null,
+    };
+}
+
+pub fn planDeltaApply(tasks: []const DeltaTask) DeltaApplyPlan {
+    var plan = DeltaApplyPlan{ .mode = .incremental_segment_update };
+    for (tasks) |task| {
+        switch (task.kind) {
+            .upsert_file => plan.upsert_count += 1,
+            .delete_file => plan.delete_count += 1,
+            .reconcile_root => {
+                plan.mode = .root_reconcile_publish;
+                plan.reconcile_required = true;
+            },
+        }
+        if (task.resolution) |resolution| {
+            switch (resolution) {
+                .catalog_file_id => {},
+                .pending_path_lookup => {
+                    plan.mode = .root_reconcile_publish;
+                    plan.reconcile_required = true;
+                },
+            }
+        } else {
+            plan.mode = .root_reconcile_publish;
+            plan.reconcile_required = true;
+        }
+    }
+    return plan;
+}
+
+pub fn publishDeltaGeneration(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    paths: generation.GenerationPaths,
+    input: DeltaGenerationInput,
+) !generation.ReaderPin {
+    if (input.catalog_files.len != input.postings_files.len) return error.DeltaApplyInputCountMismatch;
+
+    const catalog_bytes = try catalog.buildCatalogBytes(allocator, input.root, input.epoch, input.catalog_files);
+    defer allocator.free(catalog_bytes);
+    const postings_segment = try postings.buildPostingsSegment(allocator, input.root_fingerprint, input.epoch, input.postings_files);
+    defer postings_segment.deinit(allocator);
+    const postings_bytes = try postings.serializePostingsSegment(allocator, postings_segment);
+    defer allocator.free(postings_bytes);
+
+    const payloads = [_]generation.SegmentPayload{
+        .{ .kind = .catalog, .relative_path = "catalog.ixcat", .bytes = catalog_bytes },
+        .{ .kind = .postings, .relative_path = "postings.ixpost", .bytes = postings_bytes },
+    };
+    return generation.publishGenerationPayloads(io, allocator, paths, input.root_fingerprint, input.epoch, input.parent_epoch, &payloads);
+}
+
 pub fn serializeJournalCursor(allocator: std.mem.Allocator, cursor: JournalCursor) ![]u8 {
     try validateJournalCursor(cursor);
 
@@ -412,9 +723,21 @@ fn parseRecordSummary(bytes: []const u8) !UsnRecordSummary {
     if (record_length < @sizeOf(UsnRecordHeader)) return error.InvalidUsnRecordLength;
     if (record_length > bytes.len) return error.TruncatedUsnRecord;
 
-    const reason_offset: usize, const file_name_length_offset: usize, const file_name_offset_offset: usize = switch (major_version) {
-        2 => .{ 40, 56, 58 },
-        3 => .{ 56, 72, 74 },
+    const file_reference: JournalFileReference, const parent_reference: JournalFileReference, const reason_offset: usize, const file_name_length_offset: usize, const file_name_offset_offset: usize = switch (major_version) {
+        2 => .{
+            .{ .v2 = readU64At(bytes, 8) },
+            .{ .v2 = readU64At(bytes, 16) },
+            40,
+            56,
+            58,
+        },
+        3 => .{
+            .{ .v3 = readFileId128At(bytes, 8) },
+            .{ .v3 = readFileId128At(bytes, 24) },
+            56,
+            72,
+            74,
+        },
         else => return error.UnsupportedUsnRecordVersion,
     };
     if (record_length < file_name_offset_offset + @sizeOf(u16)) return error.TruncatedUsnRecord;
@@ -429,6 +752,8 @@ fn parseRecordSummary(bytes: []const u8) !UsnRecordSummary {
         .minor_version = minor_version,
         .record_length = record_length,
         .reason = reason,
+        .file_reference = file_reference,
+        .parent_reference = parent_reference,
         .file_name_offset = file_name_offset,
         .file_name_length = file_name_length,
     };
@@ -443,6 +768,38 @@ fn readU32At(bytes: []const u8, offset: usize) u32 {
         (@as(u32, bytes[offset + 1]) << 8) |
         (@as(u32, bytes[offset + 2]) << 16) |
         (@as(u32, bytes[offset + 3]) << 24);
+}
+
+fn readU64At(bytes: []const u8, offset: usize) u64 {
+    var value: u64 = 0;
+    var index: usize = 0;
+    while (index < @sizeOf(u64)) : (index += 1) value |= @as(u64, bytes[offset + index]) << @intCast(index * 8);
+    return value;
+}
+
+fn readFileId128At(bytes: []const u8, offset: usize) FileId128 {
+    var id = FileId128{};
+    @memcpy(&id.identifier, bytes[offset .. offset + id.identifier.len]);
+    return id;
+}
+
+fn singletonDeltaTask(allocator: std.mem.Allocator, task: DeltaTask) ![]DeltaTask {
+    const tasks = try allocator.alloc(DeltaTask, 1);
+    tasks[0] = task;
+    return tasks;
+}
+
+fn recordPathResolutionEql(lhs: RecordPathResolution, rhs: RecordPathResolution) bool {
+    return switch (lhs) {
+        .catalog_file_id => |lhs_file_id| switch (rhs) {
+            .catalog_file_id => |rhs_file_id| lhs_file_id == rhs_file_id,
+            .pending_path_lookup => false,
+        },
+        .pending_path_lookup => |lhs_lookup| switch (rhs) {
+            .catalog_file_id => false,
+            .pending_path_lookup => |rhs_lookup| lhs_lookup.file_reference.eql(rhs_lookup.file_reference),
+        },
+    };
 }
 
 fn fileSystemKindFromByte(byte: u8) ?FileSystemKind {
@@ -522,6 +879,13 @@ const ByteCursor = struct {
 test "usn control codes match winioctl contract" {
     try std.testing.expectEqual(@as(windows.DWORD, 0x0009_00f4), FSCTL_QUERY_USN_JOURNAL);
     try std.testing.expectEqual(@as(windows.DWORD, 0x0009_00bb), FSCTL_READ_USN_JOURNAL);
+}
+
+test "directory watch fallback constants cover invalidating file tree changes" {
+    try std.testing.expect((IX_DIRECTORY_WATCH_NOTIFY_FILTER & FILE_NOTIFY_CHANGE_FILE_NAME) != 0);
+    try std.testing.expect((IX_DIRECTORY_WATCH_NOTIFY_FILTER & FILE_NOTIFY_CHANGE_DIR_NAME) != 0);
+    try std.testing.expect((IX_DIRECTORY_WATCH_NOTIFY_FILTER & FILE_NOTIFY_CHANGE_SIZE) != 0);
+    try std.testing.expect((IX_DIRECTORY_WATCH_NOTIFY_FILTER & FILE_NOTIFY_CHANGE_LAST_WRITE) != 0);
 }
 
 test "usn ffi structs preserve Windows field offsets" {
@@ -704,6 +1068,32 @@ test "journal availability rejects malformed journal data as invalid" {
     try std.testing.expectEqualStrings("invalid_journal", invalid.fallback_reason);
 }
 
+test "freshness backend uses usn when available and directory watch as invalidating fallback" {
+    const volume = VolumeIdentity{
+        .root_fingerprint = 0x9999,
+        .volume_serial_number = 0x1234,
+        .filesystem = .ntfs,
+    };
+    const usable = classifyJournalAvailability(volume, .{ .journal = .{
+        .usn_journal_id = 9,
+        .first_usn = 1,
+        .next_usn = 20,
+        .lowest_valid_usn = 1,
+    } });
+    const usn_backend = chooseFreshnessBackend(usable);
+    try std.testing.expectEqual(FreshnessBackendKind.usn_delta, usn_backend.kind);
+    try std.testing.expect(!usn_backend.requiresRootReconcile());
+    try std.testing.expectEqual(@as(?DeltaTask, null), directoryWatchInvalidationTask(usn_backend));
+
+    const inaccessible = classifyJournalAvailability(volume, .inaccessible);
+    const watch_backend = chooseFreshnessBackend(inaccessible);
+    try std.testing.expectEqual(FreshnessBackendKind.directory_watch_invalidate, watch_backend.kind);
+    try std.testing.expect(watch_backend.requiresRootReconcile());
+    try std.testing.expectEqual(IX_DIRECTORY_WATCH_NOTIFY_FILTER, watch_backend.notify_filter);
+    try std.testing.expectEqualStrings("journal_inaccessible", watch_backend.fallback_reason);
+    try std.testing.expectEqual(DeltaTaskKind.reconcile_root, directoryWatchInvalidationTask(watch_backend).?.kind);
+}
+
 test "usn read batch request carries cursor timeout and byte wait" {
     const volume = VolumeIdentity{
         .root_fingerprint = 0x1111,
@@ -736,6 +1126,8 @@ test "usn read batch parser reads bounded records" {
     try std.testing.expectEqual(@as(usize, 1), parsed.records.len);
     try std.testing.expect(parsed.truncated_by_limit);
     try std.testing.expectEqual(USN_REASON_FILE_CREATE, parsed.records[0].reason);
+    try std.testing.expect(parsed.records[0].file_reference.eql(.{ .v2 = 1 }));
+    try std.testing.expect(parsed.records[0].parent_reference.eql(.{ .v2 = 1 }));
 }
 
 test "usn read batch parser rejects hostile buffers and cancellation" {
@@ -747,6 +1139,280 @@ test "usn read batch parser rejects hostile buffers and cancellation" {
     try std.testing.expectError(error.OperationCancelled, parseReadBatch(std.testing.allocator, bytes.items, .{ .cancelled = true }));
     try std.testing.expectError(error.UsnBatchTooLarge, parseReadBatch(std.testing.allocator, bytes.items, .{ .max_bytes = 4 }));
     try std.testing.expectError(error.TruncatedUsnRecord, parseReadBatch(std.testing.allocator, bytes.items[0 .. bytes.items.len - 1], .{}));
+}
+
+test "usn record path resolution maps known file references to catalog ids" {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(std.testing.allocator);
+    try appendI64(&bytes, std.testing.allocator, 200);
+    try appendFakeUsnRecordV2(&bytes, std.testing.allocator, USN_REASON_DATA_OVERWRITE, "known.zig");
+
+    const parsed = try parseReadBatch(std.testing.allocator, bytes.items, .{});
+    defer parsed.deinit(std.testing.allocator);
+    const resolver = CatalogReferenceResolver{ .entries = &.{
+        .{ .journal_reference = .{ .v2 = 1 }, .file_id = 77 },
+    } };
+
+    const resolution = resolveRecordPath(parsed.records[0], resolver);
+    switch (resolution) {
+        .catalog_file_id => |file_id| try std.testing.expectEqual(@as(catalog.FileId, 77), file_id),
+        .pending_path_lookup => return error.TestExpectedEqual,
+    }
+}
+
+test "usn record path resolution preserves pending lookup identity and name bounds" {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(std.testing.allocator);
+    try appendI64(&bytes, std.testing.allocator, 200);
+    try appendFakeUsnRecordV2(&bytes, std.testing.allocator, USN_REASON_FILE_CREATE, "missing.zig");
+
+    const parsed = try parseReadBatch(std.testing.allocator, bytes.items, .{});
+    defer parsed.deinit(std.testing.allocator);
+    const resolution = resolveRecordPath(parsed.records[0], .{});
+
+    switch (resolution) {
+        .catalog_file_id => return error.TestExpectedEqual,
+        .pending_path_lookup => |lookup| {
+            try std.testing.expect(lookup.file_reference.eql(.{ .v2 = 1 }));
+            try std.testing.expect(lookup.parent_reference.eql(.{ .v2 = 1 }));
+            try std.testing.expectEqual(@as(u16, 60), lookup.file_name_offset);
+            try std.testing.expectEqual(@as(u16, 22), lookup.file_name_length);
+        },
+    }
+}
+
+test "usn delta task mapping translates content creates and deletes" {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(std.testing.allocator);
+    try appendI64(&bytes, std.testing.allocator, 200);
+    try appendFakeUsnRecordV2(&bytes, std.testing.allocator, USN_REASON_FILE_CREATE, "created.zig");
+    try appendFakeUsnRecordV2(&bytes, std.testing.allocator, USN_REASON_RENAME_OLD_NAME, "old.zig");
+
+    const parsed = try parseReadBatch(std.testing.allocator, bytes.items, .{});
+    defer parsed.deinit(std.testing.allocator);
+    const resolver = CatalogReferenceResolver{ .entries = &.{
+        .{ .journal_reference = .{ .v2 = 1 }, .file_id = 88 },
+    } };
+
+    const upsert = mapRecordToDeltaTask(parsed.records[0], resolver);
+    try std.testing.expectEqual(DeltaTaskKind.upsert_file, upsert.kind);
+    try std.testing.expectEqual(USN_REASON_FILE_CREATE, upsert.reason);
+    switch (upsert.resolution.?) {
+        .catalog_file_id => |file_id| try std.testing.expectEqual(@as(catalog.FileId, 88), file_id),
+        .pending_path_lookup => return error.TestExpectedEqual,
+    }
+
+    const delete = mapRecordToDeltaTask(parsed.records[1], resolver);
+    try std.testing.expectEqual(DeltaTaskKind.delete_file, delete.kind);
+    try std.testing.expectEqual(USN_REASON_RENAME_OLD_NAME, delete.reason);
+}
+
+test "usn delta task mapping reconciles ambiguous reason masks" {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(std.testing.allocator);
+    try appendI64(&bytes, std.testing.allocator, 200);
+    try appendFakeUsnRecordV2(&bytes, std.testing.allocator, USN_REASON_FILE_DELETE | USN_REASON_FILE_CREATE, "ambiguous.zig");
+    try appendFakeUsnRecordV2(&bytes, std.testing.allocator, USN_REASON_CLOSE, "close.zig");
+
+    const parsed = try parseReadBatch(std.testing.allocator, bytes.items, .{});
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(DeltaTaskKind.reconcile_root, mapRecordToDeltaTask(parsed.records[0], .{}).kind);
+    try std.testing.expectEqual(DeltaTaskKind.reconcile_root, mapRecordToDeltaTask(parsed.records[1], .{}).kind);
+}
+
+test "usn delta task coalescing keeps last mutation for duplicate identities" {
+    const resolution = RecordPathResolution{ .catalog_file_id = 12 };
+    const tasks = [_]DeltaTask{
+        .{
+            .kind = .upsert_file,
+            .reason = USN_REASON_FILE_CREATE,
+            .resolution = resolution,
+        },
+        .{
+            .kind = .upsert_file,
+            .reason = USN_REASON_DATA_EXTEND,
+            .resolution = resolution,
+        },
+        .{
+            .kind = .delete_file,
+            .reason = USN_REASON_FILE_DELETE,
+            .resolution = resolution,
+        },
+    };
+
+    const coalesced = try coalesceDeltaTasks(std.testing.allocator, &tasks);
+    defer std.testing.allocator.free(coalesced);
+    try std.testing.expectEqual(@as(usize, 1), coalesced.len);
+    try std.testing.expectEqual(DeltaTaskKind.delete_file, coalesced[0].kind);
+    try std.testing.expectEqual(USN_REASON_FILE_CREATE | USN_REASON_DATA_EXTEND | USN_REASON_FILE_DELETE, coalesced[0].reason);
+}
+
+test "usn delta task coalescing collapses reconcile batches" {
+    const lookup = RecordPathResolution{ .pending_path_lookup = .{
+        .file_reference = .{ .v2 = 10 },
+        .parent_reference = .{ .v2 = 1 },
+        .file_name_offset = 60,
+        .file_name_length = 8,
+    } };
+    const tasks = [_]DeltaTask{
+        .{
+            .kind = .upsert_file,
+            .reason = USN_REASON_FILE_CREATE,
+            .resolution = lookup,
+        },
+        .{
+            .kind = .reconcile_root,
+            .reason = USN_REASON_CLOSE,
+            .resolution = null,
+        },
+    };
+
+    const coalesced = try coalesceDeltaTasks(std.testing.allocator, &tasks);
+    defer std.testing.allocator.free(coalesced);
+    try std.testing.expectEqual(@as(usize, 1), coalesced.len);
+    try std.testing.expectEqual(DeltaTaskKind.reconcile_root, coalesced[0].kind);
+    try std.testing.expectEqual(USN_REASON_FILE_CREATE | USN_REASON_CLOSE, coalesced[0].reason);
+}
+
+test "usn continuity decision escalates lost wrapped and overflowed cursors" {
+    const volume = VolumeIdentity{
+        .root_fingerprint = 0x1234,
+        .volume_serial_number = 0x77,
+        .filesystem = .ntfs,
+    };
+    const previous = try cursorFromJournalData(volume, .{
+        .usn_journal_id = 1,
+        .first_usn = 1,
+        .next_usn = 50,
+        .lowest_valid_usn = 1,
+    });
+    const current_continuous = try cursorFromJournalData(volume, .{
+        .usn_journal_id = 1,
+        .first_usn = 1,
+        .next_usn = 80,
+        .lowest_valid_usn = 40,
+    });
+    const current_wrapped = try cursorFromJournalData(volume, .{
+        .usn_journal_id = 1,
+        .first_usn = 1,
+        .next_usn = 90,
+        .lowest_valid_usn = 60,
+    });
+    const empty_batch = ReadBatchResult{
+        .next_start_usn = 80,
+        .records = &.{},
+    };
+    const overflow_batch = ReadBatchResult{
+        .next_start_usn = 80,
+        .records = &.{},
+        .truncated_by_limit = true,
+    };
+
+    try std.testing.expectEqual(ContinuityFailureKind.lost_cursor, evaluateDeltaContinuity(null, current_continuous, empty_batch).reconcile_root);
+    try std.testing.expectEqual(ContinuityFailureKind.journal_wrapped, evaluateDeltaContinuity(previous, current_wrapped, empty_batch).reconcile_root);
+    try std.testing.expectEqual(ContinuityFailureKind.batch_overflow, evaluateDeltaContinuity(previous, current_continuous, overflow_batch).reconcile_root);
+
+    const task = continuityReconcileTask(evaluateDeltaContinuity(previous, current_wrapped, empty_batch)).?;
+    try std.testing.expectEqual(DeltaTaskKind.reconcile_root, task.kind);
+}
+
+test "usn continuity decision permits continuous bounded delta" {
+    const volume = VolumeIdentity{
+        .root_fingerprint = 0x1234,
+        .volume_serial_number = 0x77,
+        .filesystem = .ntfs,
+    };
+    const previous = try cursorFromJournalData(volume, .{
+        .usn_journal_id = 1,
+        .first_usn = 1,
+        .next_usn = 50,
+        .lowest_valid_usn = 1,
+    });
+    const current = try cursorFromJournalData(volume, .{
+        .usn_journal_id = 1,
+        .first_usn = 1,
+        .next_usn = 80,
+        .lowest_valid_usn = 40,
+    });
+    const batch = ReadBatchResult{
+        .next_start_usn = 80,
+        .records = &.{},
+    };
+
+    try std.testing.expectEqual(ContinuityDecision.apply_delta, evaluateDeltaContinuity(previous, current, batch));
+    try std.testing.expectEqual(@as(?DeltaTask, null), continuityReconcileTask(.apply_delta));
+}
+
+test "usn delta apply planning distinguishes surgical and reconcile batches" {
+    const surgical = [_]DeltaTask{
+        .{
+            .kind = .upsert_file,
+            .reason = USN_REASON_DATA_EXTEND,
+            .resolution = .{ .catalog_file_id = 1 },
+        },
+        .{
+            .kind = .delete_file,
+            .reason = USN_REASON_FILE_DELETE,
+            .resolution = .{ .catalog_file_id = 2 },
+        },
+    };
+    const surgical_plan = planDeltaApply(&surgical);
+    try std.testing.expectEqual(DeltaApplyMode.incremental_segment_update, surgical_plan.mode);
+    try std.testing.expect(!surgical_plan.publishesFullGeneration());
+    try std.testing.expectEqual(@as(usize, 1), surgical_plan.upsert_count);
+    try std.testing.expectEqual(@as(usize, 1), surgical_plan.delete_count);
+
+    const reconcile = [_]DeltaTask{
+        .{
+            .kind = .upsert_file,
+            .reason = USN_REASON_FILE_CREATE,
+            .resolution = .{ .pending_path_lookup = .{
+                .file_reference = .{ .v2 = 4 },
+                .parent_reference = .{ .v2 = 1 },
+                .file_name_offset = 60,
+                .file_name_length = 18,
+            } },
+        },
+    };
+    const reconcile_plan = planDeltaApply(&reconcile);
+    try std.testing.expectEqual(DeltaApplyMode.root_reconcile_publish, reconcile_plan.mode);
+    try std.testing.expect(reconcile_plan.publishesFullGeneration());
+    try std.testing.expect(reconcile_plan.reconcile_required);
+}
+
+test "usn delta generation publish writes refreshed catalog postings and manifest" {
+    const root = ".zig-cache\\ix-usn-delta-generation-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const root_identity = try catalog.identifyRoot(std.testing.allocator, root);
+    defer root_identity.deinit(std.testing.allocator);
+    const paths = try generation.buildGenerationPaths(std.testing.allocator, root, 7);
+    defer paths.deinit(std.testing.allocator);
+    const catalog_files = [_]catalog.CatalogFileInput{
+        .{
+            .path = "src/main.zig",
+            .size = 11,
+            .mtime_ns = 123,
+            .sample = "const a = 1;",
+        },
+    };
+    const postings_files = [_]postings.PostingsFileInput{
+        .{ .file_id = 1, .bytes = "const a = 1;" },
+    };
+
+    const pin = try publishDeltaGeneration(std.testing.io, std.testing.allocator, paths, .{
+        .root = root,
+        .root_fingerprint = root_identity.fingerprint,
+        .epoch = 7,
+        .catalog_files = &catalog_files,
+        .postings_files = &postings_files,
+    });
+    try std.testing.expectEqual(@as(generation.Epoch, 7), pin.epoch);
+    try std.testing.expectEqual(root_identity.fingerprint, pin.root_fingerprint);
+    try std.testing.expectEqual(@as(usize, 2), pin.segment_count);
 }
 
 fn appendFakeUsnRecordV2(bytes: *std.ArrayList(u8), allocator: std.mem.Allocator, reason: windows.DWORD, name: []const u8) !void {
