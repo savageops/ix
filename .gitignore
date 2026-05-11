@@ -10,3 +10,4 @@
 /.ix-trigram-warm-*.cache
 Created*
 node_modules/
+data/keys.sqlite
