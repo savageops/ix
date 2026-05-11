@@ -11,6 +11,28 @@ const trigram = @import("trigram.zig");
 // FFI overhead across ~600K calls per search (~3 ms total). Used on the hottest
 // paths: newline scanning, binary sniffing, and literal matching.
 const simd = @import("simd.zig");
+const sz = @import("sz.zig");
+
+const windows = std.os.windows;
+
+extern "kernel32" fn ReadDirectoryChangesW(
+    hDirectory: windows.HANDLE,
+    lpBuffer: ?*anyopaque,
+    nBufferLength: windows.DWORD,
+    bWatchSubtree: windows.BOOL,
+    dwNotifyFilter: windows.DWORD,
+    lpBytesReturned: ?*windows.DWORD,
+    lpOverlapped: ?*anyopaque,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(.winapi) windows.BOOL;
+
+extern "kernel32" fn OpenProcess(
+    dwDesiredAccess: windows.DWORD,
+    bInheritHandle: windows.BOOL,
+    dwProcessId: windows.DWORD,
+) callconv(.winapi) ?windows.HANDLE;
+
+extern "kernel32" fn CloseHandle(hObject: windows.HANDLE) callconv(.winapi) windows.BOOL;
 
 // ---------------------------------------------------------------------------
 // NT Object Path Bypass (Windows)
@@ -93,9 +115,15 @@ fn openFileNt(io: std.Io, display_path: []const u8) !std.Io.File {
 pub const MAX_RETAINED_HITS = 4096;
 
 const TRIGRAM_MIN_PRUNE_BYTES: usize = 64 * 1024;
+const BYTE_SHARD_MIN_FILE_BYTES: usize = 8 * 1024 * 1024;
+const BYTE_SHARD_MIN_RANGE_BYTES: usize = 4 * 1024 * 1024;
+const BYTE_SHARD_LINE_BOUNDARY_SEARCH_LIMIT: usize = 1024 * 1024;
 const EVIDENCE_FRONTIER_CACHE_MAGIC = "IXEVIDENCE2";
+const EVIDENCE_FRONTIER_LIVE_MAGIC = "IXEVIDENCELIVE1";
 const EVIDENCE_FRONTIER_CACHE_READ_LIMIT = 64 * 1024 * 1024;
+const EVIDENCE_FRONTIER_LIVE_READ_LIMIT = 4096;
 const EVIDENCE_FRONTIER_CACHE_CANDIDATE_LIMIT = 262144;
+const EVIDENCE_FRONTIER_LIVE_TTL_NS: i96 = 120 * std.time.ns_per_s;
 
 /// Comptime predicate specialization for single-predicate plans. When passed to
 /// scanOpenFileIntoShardImpl / recordLineIntoShardImpl, the per-line match
@@ -196,11 +224,43 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         .hit_count = 0,
     };
 
+    const trigram_admission = trigram.admit(plan);
+    const trigram_program = TrigramAdmissionProgram.compile(trigram_admission);
+    initTrigramStats(&report.stats.trigram_acceleration, trigram_admission, request.case_insensitive);
+
+    if (prepareLiveEvidenceFrontier(io, allocator, request, plan, trigram_admission, &report)) |live_prepared| {
+        initNtCwdPrefix(io);
+        const scan_started = std.Io.Timestamp.now(io, .awake);
+        const active_files = live_prepared.active_files.?;
+        const thread_count = effectiveThreadCount(request, active_files.len);
+        report.outer_scan_threads = thread_count;
+        if (thread_count > 1) shuffleFiles(active_files);
+        const discovered: []const DiscoveredFile = active_files;
+        if (discovered.len == 0) {
+            // Fully pruned live frontier.
+        } else if (thread_count <= 1 or discovered.len < 4) {
+            for (discovered) |entry| {
+                try scanDiscoveredFile(io, allocator, entry.path, request, plan, trigram_admission, &trigram_program, &report);
+                if (report.truncated) break;
+            }
+        } else {
+            try parallelScanFiles(io, allocator, discovered, request, plan, trigram_admission, &trigram_program, thread_count, .{}, &report);
+        }
+        report.scan_ms = elapsedMs(io, scan_started);
+        const aggregate_started = std.Io.Timestamp.now(io, .awake);
+        report.aggregate_ms = elapsedMs(io, aggregate_started);
+        report.total_ms = elapsedMs(io, total_started);
+        refreshStats(&report);
+        return report;
+    }
+
     // Phase 1: Discover all files via serial directory walk.
     const discover_started = std.Io.Timestamp.now(io, .awake);
     var file_list = try FileList.initWithCapacity(allocator, 512);
-    for (roots.items[0..roots.count]) |root| {
-        try discoverFiles(io, allocator, root.original, request, &file_list, &report);
+    if (!try discoverRootsParallelTopLevel(io, allocator, roots, request, &file_list, &report)) {
+        for (roots.items[0..roots.count]) |root| {
+            try discoverFiles(io, allocator, root.original, request, &file_list, &report);
+        }
     }
     report.discover_ms = elapsedMs(io, discover_started);
 
@@ -210,9 +270,6 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
 
     // Phase 2: Scan files — thread count adapts to corpus size after discovery.
     const scan_started = std.Io.Timestamp.now(io, .awake);
-    const trigram_admission = trigram.admit(plan);
-    const trigram_program = TrigramAdmissionProgram.compile(trigram_admission);
-    initTrigramStats(&report.stats.trigram_acceleration, trigram_admission, request.case_insensitive);
     const discovered_mut = file_list.mutableItems();
     const evidence_prepared = prepareEvidenceFrontier(io, allocator, request, plan, trigram_admission, discovered_mut, &report);
     const active_files = evidence_prepared.active_files orelse discovered_mut;
@@ -333,6 +390,7 @@ fn shuffleFiles(files: []DiscoveredFile) void {
 }
 
 const EvidenceFrontierCache = struct {
+    file_count: usize,
     pruned_files: usize,
     pruned_bytes: usize,
     skipped_files: usize,
@@ -368,6 +426,32 @@ const EvidenceFrontierPrepared = struct {
     runtime: EvidenceFrontierRuntime = .{},
 };
 
+fn prepareLiveEvidenceFrontier(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    admission: trigram.Admission,
+    report: *SearchReport,
+) ?EvidenceFrontierPrepared {
+    if (request.nexus_disabled) return null;
+    if (!evidenceFrontierEligible(request, plan, admission)) return null;
+    const key = evidenceFrontierKey(request, plan);
+    const cache_path = std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key}) catch return null;
+    const live_path = evidenceFrontierLivePath(allocator, cache_path) catch return null;
+    if (!loadEvidenceFrontierLive(io, allocator, live_path, key)) return null;
+    const cache = loadEvidenceFrontierCacheFast(io, allocator, cache_path, key) orelse return null;
+
+    var evidence_files: std.ArrayList(DiscoveredFile) = .empty;
+    for (cache.candidates) |candidate| evidence_files.append(allocator, .{ .path = candidate }) catch return null;
+    report.files_discovered = cache.file_count;
+    report.files_scanned += cache.pruned_files;
+    report.bytes_scanned += cache.pruned_bytes;
+    report.files_skipped += cache.skipped_files;
+    report.stats.trigram_acceleration.pruned_files += cache.pruned_files;
+    return .{ .active_files = evidence_files.toOwnedSlice(allocator) catch return null };
+}
+
 fn prepareEvidenceFrontier(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -377,6 +461,7 @@ fn prepareEvidenceFrontier(
     files: []DiscoveredFile,
     report: *SearchReport,
 ) EvidenceFrontierPrepared {
+    if (request.nexus_disabled) return .{};
     if (!evidenceFrontierEligible(request, plan, admission)) return .{};
     const signature = computeDiscoveredSignature(io, files) catch return .{};
     const key = evidenceFrontierKey(request, plan);
@@ -424,26 +509,40 @@ fn evidenceFrontierKey(request: cli.SearchRequest, plan: expr.ExpressionPlan) u6
 
 fn computeDiscoveredSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
     _ = io;
+    var xor_acc: u64 = 0;
+    var sum_acc: u64 = 0;
+    for (files) |entry| {
+        const item_hash = hashBytes64(0x4556_4944_5041_5448, entry.path);
+        xor_acc ^= item_hash;
+        sum_acc +%= item_hash;
+    }
     var hasher = std.hash.Wyhash.init(0x4556_4944_5349_474e);
     hashU64(&hasher, files.len);
-    for (files) |entry| {
-        hasher.update(entry.path);
-    }
+    hashU64(&hasher, xor_acc);
+    hashU64(&hasher, sum_acc);
     return hasher.final();
 }
 
 fn computeContentSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
-    var hasher = std.hash.Wyhash.init(0x4556_4944_434f_4e54);
-    hashU64(&hasher, files.len);
+    var xor_acc: u64 = 0;
+    var sum_acc: u64 = 0;
     for (files) |entry| {
         var file = try openFileNt(io, entry.path);
         defer file.close(io);
         const stat = try file.stat(io);
-        hasher.update(entry.path);
-        hashU64(&hasher, stat.size);
-        hashU64(&hasher, @bitCast(stat.inode));
-        hashTimestamp(&hasher, stat.mtime);
+        var item = std.hash.Wyhash.init(0x4556_4944_4649_4c45);
+        item.update(entry.path);
+        hashU64(&item, stat.size);
+        hashU64(&item, @bitCast(stat.inode));
+        hashTimestamp(&item, stat.mtime);
+        const item_hash = item.final();
+        xor_acc ^= item_hash;
+        sum_acc +%= item_hash;
     }
+    var hasher = std.hash.Wyhash.init(0x4556_4944_434f_4e54);
+    hashU64(&hasher, files.len);
+    hashU64(&hasher, xor_acc);
+    hashU64(&hasher, sum_acc);
     return hasher.final();
 }
 
@@ -485,7 +584,10 @@ fn loadEvidenceFrontierCache(
     if (parseCacheU64(lines.next() orelse return null, "key=") != key) return null;
     if (parseCacheU64(lines.next() orelse return null, "signature=") != signature) return null;
     const content_signature = parseCacheU64(lines.next() orelse return null, "content_signature=");
-    if (parseCacheUsize(lines.next() orelse return null, "file_count=") != files.len) return null;
+    const file_count = parseCacheUsize(lines.next() orelse return null, "file_count=");
+    if (file_count != files.len) return null;
+    const live_content_signature = computeContentSignature(io, files) catch return null;
+    if (content_signature != live_content_signature) return null;
     const pruned_files = parseCacheUsize(lines.next() orelse return null, "pruned_files=");
     const pruned_bytes = parseCacheUsize(lines.next() orelse return null, "pruned_bytes=");
     const skipped_files = parseCacheUsize(lines.next() orelse return null, "skipped_files=");
@@ -501,12 +603,143 @@ fn loadEvidenceFrontierCache(
     }
     if (candidates.items.len != candidate_count) return null;
     return .{
+        .file_count = file_count,
         .pruned_files = pruned_files,
         .pruned_bytes = pruned_bytes,
         .skipped_files = skipped_files,
         .content_signature = content_signature,
         .candidates = candidates.toOwnedSlice(allocator) catch return null,
     };
+}
+
+fn loadEvidenceFrontierCacheFast(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    key: u64,
+) ?EvidenceFrontierCache {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(EVIDENCE_FRONTIER_CACHE_READ_LIMIT)) catch return null;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return null, "\r"), EVIDENCE_FRONTIER_CACHE_MAGIC)) return null;
+    if (parseCacheU64(lines.next() orelse return null, "key=") != key) return null;
+    _ = parseCacheU64(lines.next() orelse return null, "signature=");
+    const content_signature = parseCacheU64(lines.next() orelse return null, "content_signature=");
+    const file_count = parseCacheUsize(lines.next() orelse return null, "file_count=");
+    const pruned_files = parseCacheUsize(lines.next() orelse return null, "pruned_files=");
+    const pruned_bytes = parseCacheUsize(lines.next() orelse return null, "pruned_bytes=");
+    const skipped_files = parseCacheUsize(lines.next() orelse return null, "skipped_files=");
+    const candidate_count = parseCacheUsize(lines.next() orelse return null, "candidates=");
+    if (candidate_count > EVIDENCE_FRONTIER_CACHE_CANDIDATE_LIMIT) return null;
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return null, "\r"), "--")) return null;
+
+    var candidates: std.ArrayList([]const u8) = .empty;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (line.len == 0) continue;
+        candidates.append(allocator, line) catch return null;
+    }
+    if (candidates.items.len != candidate_count) return null;
+    return .{
+        .file_count = file_count,
+        .pruned_files = pruned_files,
+        .pruned_bytes = pruned_bytes,
+        .skipped_files = skipped_files,
+        .content_signature = content_signature,
+        .candidates = candidates.toOwnedSlice(allocator) catch return null,
+    };
+}
+
+fn evidenceFrontierLivePath(allocator: std.mem.Allocator, cache_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}.live", .{cache_path});
+}
+
+fn loadEvidenceFrontierLive(io: std.Io, allocator: std.mem.Allocator, path: []const u8, key: u64) bool {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(EVIDENCE_FRONTIER_LIVE_READ_LIMIT)) catch return false;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return false, "\r"), EVIDENCE_FRONTIER_LIVE_MAGIC)) return false;
+    if (parseCacheU64(lines.next() orelse return false, "key=") != key) return false;
+    const created_ns = parseCacheI96(lines.next() orelse return false, "created_ns=") orelse return false;
+    const owner_pid = parseCacheUsize(lines.next() orelse return false, "pid=");
+    const state_line = std.mem.trimEnd(u8, lines.next() orelse return false, "\r");
+    if (!std.mem.eql(u8, state_line, "state=clean")) return false;
+    const now_ns = std.Io.Timestamp.now(io, .real).nanoseconds;
+    if (now_ns < created_ns) return false;
+    if (builtin.os.tag == .windows) {
+        if (!processIsAlive(@intCast(owner_pid))) return false;
+    } else if (now_ns - created_ns > EVIDENCE_FRONTIER_LIVE_TTL_NS) {
+        return false;
+    }
+    return true;
+}
+
+fn writeEvidenceFrontierLive(io: std.Io, cache_path: []const u8, key: u64) void {
+    var live_buf: [1024]u8 = undefined;
+    const live_path = std.fmt.bufPrint(&live_buf, "{s}.live", .{cache_path}) catch return;
+    var file = std.Io.Dir.cwd().createFile(io, live_path, .{ .truncate = true }) catch return;
+    defer file.close(io);
+    var buffer: [512]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    writer.interface.print("{s}\nkey={x}\ncreated_ns={}\npid={}\nstate=clean\n", .{
+        EVIDENCE_FRONTIER_LIVE_MAGIC,
+        key,
+        std.Io.Timestamp.now(io, .real).nanoseconds,
+        currentProcessId(),
+    }) catch return;
+    writer.interface.flush() catch return;
+}
+
+fn currentProcessId() u32 {
+    if (builtin.os.tag == .windows) return windows.GetCurrentProcessId();
+    return 0;
+}
+
+fn processIsAlive(pid: windows.DWORD) bool {
+    if (pid == 0) return false;
+    const PROCESS_QUERY_LIMITED_INFORMATION: windows.DWORD = 0x0000_1000;
+    const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, windows.BOOL.FALSE, pid) orelse return false;
+    _ = CloseHandle(handle);
+    return true;
+}
+
+pub fn holdEvidenceFrontierLive(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest, plan: expr.ExpressionPlan) void {
+    if (request.nexus_disabled) return;
+    const admission = trigram.admit(plan);
+    if (!evidenceFrontierEligible(request, plan, admission)) return;
+    if (request.path_count == 0) return;
+    const key = evidenceFrontierKey(request, plan);
+    const cache_path = std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key}) catch return;
+    const live_path = evidenceFrontierLivePath(allocator, cache_path) catch return;
+    std.Io.Dir.cwd().access(io, live_path, .{}) catch return;
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
+
+    if (builtin.os.tag == .windows) {
+        holdEvidenceFrontierLiveWindows(io, request.paths[0]);
+    } else {
+        std.Thread.sleep(@as(u64, 120) * std.time.ns_per_s);
+    }
+}
+
+fn holdEvidenceFrontierLiveWindows(io: std.Io, root_path: []const u8) void {
+    const dir = std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var buffer: [64 * 1024]u8 align(4) = undefined;
+    var bytes_returned: windows.DWORD = 0;
+    const filter: windows.DWORD =
+        0x0000_0001 | // FILE_NOTIFY_CHANGE_FILE_NAME
+        0x0000_0002 | // FILE_NOTIFY_CHANGE_DIR_NAME
+        0x0000_0008 | // FILE_NOTIFY_CHANGE_SIZE
+        0x0000_0010 | // FILE_NOTIFY_CHANGE_LAST_WRITE
+        0x0000_0040; // FILE_NOTIFY_CHANGE_CREATION
+    _ = ReadDirectoryChangesW(
+        dir.handle,
+        &buffer,
+        @intCast(buffer.len),
+        windows.BOOL.TRUE,
+        filter,
+        &bytes_returned,
+        null,
+        null,
+    );
 }
 
 fn writeEvidenceFrontierCache(
@@ -535,6 +768,7 @@ fn writeEvidenceFrontierCache(
     }) catch return;
     for (built.candidates) |candidate| writer.interface.print("{s}\n", .{candidate.path}) catch return;
     writer.interface.flush() catch return;
+    writeEvidenceFrontierLive(io, path, key);
 }
 
 fn parseCacheU64(line: []const u8, prefix: []const u8) u64 {
@@ -549,9 +783,21 @@ fn parseCacheUsize(line: []const u8, prefix: []const u8) usize {
     return std.fmt.parseUnsigned(usize, trimmed[prefix.len..], 10) catch 0;
 }
 
+fn parseCacheI96(line: []const u8, prefix: []const u8) ?i96 {
+    const trimmed = std.mem.trimEnd(u8, line, "\r");
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return null;
+    return std.fmt.parseInt(i96, trimmed[prefix.len..], 10) catch null;
+}
+
 fn hashU64(hasher: *std.hash.Wyhash, value: u64) void {
     var mutable = value;
     hasher.update(std.mem.asBytes(&mutable));
+}
+
+fn hashBytes64(seed: u64, bytes: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(seed);
+    hasher.update(bytes);
+    return hasher.final();
 }
 
 fn hashTimestamp(hasher: *std.hash.Wyhash, timestamp: std.Io.Timestamp) void {
@@ -573,8 +819,18 @@ fn discoverFiles(
 ) anyerror!void {
     // Try opening as a file first. If it's a directory, recurse.
     const file = std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false }) catch |file_err| switch (file_err) {
-        error.IsDir, error.AccessDenied => {
+        error.IsDir => {
             try discoverDirectory(io, allocator, path, request, file_list, report);
+            return;
+        },
+        error.AccessDenied => {
+            discoverDirectory(io, allocator, path, request, file_list, report) catch |dir_err| switch (dir_err) {
+                error.AccessDenied, error.NotDir => {
+                    recordReportAccessError(report, "discovery", "open_file", path, file_err);
+                    report.files_skipped += 1;
+                },
+                else => return dir_err,
+            };
             return;
         },
         else => return file_err,
@@ -593,10 +849,26 @@ fn discoverDirectory(
     file_list: *FileList,
     report: *SearchReport,
 ) anyerror!void {
-    const dir = try std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.AccessDenied => {
+            recordReportAccessError(report, "discovery", "open_dir", path, err);
+            report.files_skipped += 1;
+            return;
+        },
+        else => return err,
+    };
     defer dir.close(io);
     var iterator = dir.iterate();
-    while (try iterator.next(io)) |entry| {
+    while (true) {
+        const maybe_entry = iterator.next(io) catch |err| switch (err) {
+            error.AccessDenied => {
+                recordReportAccessError(report, "discovery", "iterate_dir", path, err);
+                report.files_skipped += 1;
+                return;
+            },
+            else => return err,
+        };
+        const entry = maybe_entry orelse break;
         if (!request.hidden and isHiddenPath(entry.name)) {
             report.files_skipped += 1;
             continue;
@@ -613,6 +885,188 @@ fn discoverDirectory(
     }
 }
 
+const DiscoveryShardReport = struct {
+    file_list: FileList,
+    files_discovered: usize = 0,
+    files_skipped: usize = 0,
+    access_errors: core_stats.AccessErrorStats = .{},
+    had_error: bool = false,
+};
+
+fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) bool {
+    const requested_threads = request.threads orelse return false;
+    if (requested_threads <= 1) return false;
+    if (roots.count == 0) return false;
+    for (roots.items[0..roots.count]) |root| {
+        if (!root.is_directory) return false;
+    }
+    return true;
+}
+
+fn discoverRootsParallelTopLevel(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    roots: PreparedRoots,
+    request: cli.SearchRequest,
+    file_list: *FileList,
+    report: *SearchReport,
+) !bool {
+    if (!shouldUseParallelDiscovery(request, roots)) return false;
+
+    var top_dirs = try FileList.initWithCapacity(allocator, 64);
+    for (roots.items[0..roots.count]) |root| {
+        try discoverRootTopLevel(io, allocator, root.original, request, &top_dirs, file_list, report);
+    }
+
+    const top_dir_items = top_dirs.mutableItems();
+    if (top_dir_items.len == 0) return true;
+
+    const requested_threads = request.threads orelse 1;
+    const actual_threads = @min(@max(requested_threads, 1), top_dir_items.len);
+    if (actual_threads <= 1 or top_dir_items.len < 2) {
+        for (top_dir_items) |entry| {
+            try discoverDirectory(io, allocator, entry.path, request, file_list, report);
+        }
+        return true;
+    }
+
+    const shards = try allocator.alloc(DiscoveryShardReport, actual_threads);
+    for (shards) |*shard| {
+        shard.* = .{ .file_list = try FileList.initWithCapacity(allocator, 512) };
+    }
+
+    var next_dir: usize = 0;
+    const worker_count = actual_threads - 1;
+    const threads = try allocator.alloc(std.Thread, worker_count);
+    for (0..worker_count) |i| {
+        const shard_index = i + 1;
+        threads[i] = try std.Thread.spawn(.{}, discoveryShardWorker, .{ io, allocator, &next_dir, top_dir_items, request, &shards[shard_index] });
+    }
+    discoveryShardWorker(io, allocator, &next_dir, top_dir_items, request, &shards[0]);
+    for (threads) |thread| thread.join();
+
+    for (shards) |*shard| {
+        if (shard.had_error) return error.Unexpected;
+        report.files_discovered += shard.files_discovered;
+        report.files_skipped += shard.files_skipped;
+        report.stats.access_errors.merge(shard.access_errors);
+        for (shard.file_list.mutableItems()) |entry| {
+            try file_list.append(allocator, entry);
+        }
+    }
+    return true;
+}
+
+fn discoverRootTopLevel(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    request: cli.SearchRequest,
+    top_dirs: *FileList,
+    file_list: *FileList,
+    report: *SearchReport,
+) !void {
+    const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.AccessDenied => {
+            recordReportAccessError(report, "discovery", "open_dir", path, err);
+            report.files_skipped += 1;
+            return;
+        },
+        else => return err,
+    };
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (true) {
+        const maybe_entry = iterator.next(io) catch |err| switch (err) {
+            error.AccessDenied => {
+                recordReportAccessError(report, "discovery", "iterate_dir", path, err);
+                report.files_skipped += 1;
+                return;
+            },
+            else => return err,
+        };
+        const entry = maybe_entry orelse break;
+        if (!request.hidden and isHiddenPath(entry.name)) {
+            report.files_skipped += 1;
+            continue;
+        }
+        const child_path = try joinPathForward(allocator, path, entry.name);
+        switch (entry.kind) {
+            .file => {
+                report.files_discovered += 1;
+                try file_list.append(allocator, .{ .path = child_path });
+            },
+            .directory => try top_dirs.append(allocator, .{ .path = child_path }),
+            else => {},
+        }
+    }
+}
+
+fn discoveryShardWorker(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    next_dir: *usize,
+    dirs: []const DiscoveredFile,
+    request: cli.SearchRequest,
+    shard: *DiscoveryShardReport,
+) void {
+    while (true) {
+        const index = @atomicRmw(usize, next_dir, .Add, 1, .monotonic);
+        if (index >= dirs.len) break;
+        discoverDirectoryShard(io, allocator, dirs[index].path, request, shard) catch {
+            shard.had_error = true;
+            return;
+        };
+    }
+}
+
+fn discoverDirectoryShard(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    request: cli.SearchRequest,
+    shard: *DiscoveryShardReport,
+) anyerror!void {
+    const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.AccessDenied => {
+            shard.access_errors.record("discovery", "open_dir", path, err);
+            shard.files_skipped += 1;
+            return;
+        },
+        else => return err,
+    };
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (true) {
+        const maybe_entry = iterator.next(io) catch |err| switch (err) {
+            error.AccessDenied => {
+                shard.access_errors.record("discovery", "iterate_dir", path, err);
+                shard.files_skipped += 1;
+                return;
+            },
+            else => return err,
+        };
+        const entry = maybe_entry orelse break;
+        if (!request.hidden and isHiddenPath(entry.name)) {
+            shard.files_skipped += 1;
+            continue;
+        }
+        const child_path = try joinPathForward(allocator, path, entry.name);
+        switch (entry.kind) {
+            .file => {
+                shard.files_discovered += 1;
+                try shard.file_list.append(allocator, .{ .path = child_path });
+            },
+            .directory => try discoverDirectoryShard(io, allocator, child_path, request, shard),
+            else => {},
+        }
+    }
+}
+
+fn recordReportAccessError(report: *SearchReport, phase: []const u8, operation: []const u8, path: []const u8, err: anyerror) void {
+    report.stats.access_errors.record(phase, operation, path, err);
+}
+
 /// Thread-local shard report. Each worker thread accumulates results here
 /// without any synchronization. Merged into the main SearchReport after
 /// all threads join.
@@ -623,6 +1077,7 @@ const ShardReport = struct {
     matches_found: usize,
     scan_work_ms_total: f64,
     trigram_stats: core_stats.TrigramAccelerationStats,
+    byte_shard_stats: core_stats.ByteShardKernelStats,
     slowest_path: []const u8,
     slowest_bytes: usize,
     slowest_ms: f64,
@@ -637,6 +1092,7 @@ const ShardReport = struct {
     evidence_pruned_bytes: usize,
     evidence_skipped_files: usize,
     evidence_had_error: bool,
+    access_errors: core_stats.AccessErrorStats,
 
     const empty: ShardReport = .{
         .bytes_scanned = 0,
@@ -645,6 +1101,7 @@ const ShardReport = struct {
         .matches_found = 0,
         .scan_work_ms_total = 0,
         .trigram_stats = .{},
+        .byte_shard_stats = .{},
         .slowest_path = "",
         .slowest_bytes = 0,
         .slowest_ms = 0,
@@ -659,8 +1116,13 @@ const ShardReport = struct {
         .evidence_pruned_bytes = 0,
         .evidence_skipped_files = 0,
         .evidence_had_error = false,
+        .access_errors = .{},
     };
 };
+
+fn recordShardAccessError(shard: *ShardReport, phase: []const u8, operation: []const u8, path: []const u8, err: anyerror) void {
+    shard.access_errors.record(phase, operation, path, err);
+}
 
 fn recordEvidenceCandidate(shard: *ShardReport, display_path: []const u8) void {
     if (!shard.evidence_capture) return;
@@ -699,11 +1161,22 @@ fn scanDiscoveredFile(
 ) anyerror!void {
     // Open via NT object path to bypass RtlGetFullPathName_U PEB lock contention.
     const file = openFileNt(io, display_path) catch |err| switch (err) {
-        error.IsDir, error.AccessDenied => return,
+        error.IsDir, error.AccessDenied => {
+            report.files_skipped += 1;
+            recordReportAccessError(report, "scan", "open_file", display_path, err);
+            return;
+        },
         else => return err,
     };
     defer file.close(io);
-    try scanOpenFile(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, report);
+    scanOpenFile(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, report) catch |err| switch (err) {
+        error.AccessDenied => {
+            report.files_skipped += 1;
+            recordReportAccessError(report, "scan", "read_file", display_path, err);
+            return;
+        },
+        else => return err,
+    };
 }
 
 /// Scan a single file into a ShardReport (thread-local, no sync needed).
@@ -717,14 +1190,21 @@ fn scanFileIntoShard(
     trigram_program: *const TrigramAdmissionProgram,
     shard: *ShardReport,
 ) void {
-    const file = openFileNt(io, display_path) catch {
+    const file = openFileNt(io, display_path) catch |err| {
         shard.files_skipped += 1;
+        recordShardAccessError(shard, "scan", "open_file", display_path, err);
         recordEvidenceSkipped(shard);
         return;
     };
     defer file.close(io);
-    scanOpenFileIntoShard(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch {
-        shard.had_error = true;
+    scanOpenFileIntoShard(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch |err| {
+        if (err == error.AccessDenied) {
+            shard.files_skipped += 1;
+            recordShardAccessError(shard, "scan", "read_file", display_path, err);
+            recordEvidenceSkipped(shard);
+        } else {
+            shard.had_error = true;
+        }
     };
 }
 
@@ -784,6 +1264,17 @@ fn scanFileMmap(
         shard.slowest_bytes = file_bytes;
     }
 
+    if (request.stats_only and shouldRunByteShardBeforeAdmission(plan)) {
+        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats)) |count| {
+            shard.matches_found += count;
+            recordEvidenceCandidate(shard, display_path);
+            const file_ms = elapsedMs(io, file_started);
+            shard.scan_work_ms_total += file_ms;
+            if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            return;
+        }
+    }
+
     if (mono) |m| {
         if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
             if (!request.case_insensitive and simd.indexOf(data, needle) == null) {
@@ -811,6 +1302,14 @@ fn scanFileMmap(
     // For casefold-literal patterns in stats_only mode, this handles the
     // case-insensitive counting without buffer modification.
     if (request.stats_only) {
+        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats)) |count| {
+            shard.matches_found += count;
+            recordEvidenceCandidate(shard, display_path);
+            const file_ms = elapsedMs(io, file_started);
+            shard.scan_work_ms_total += file_ms;
+            if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            return;
+        }
         if (wholeBufferFastCount(data, plan, request.case_insensitive, false)) |count| {
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
@@ -860,6 +1359,266 @@ fn scanFileMmap(
     const file_ms = elapsedMs(io, file_started);
     shard.scan_work_ms_total += file_ms;
     if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+}
+
+fn trySerialMmapFastPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    display_path: []const u8,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    trigram_admission: trigram.Admission,
+    trigram_program: *const TrigramAdmissionProgram,
+    report: *SearchReport,
+    file_started: std.Io.Timestamp,
+) bool {
+    if (!request.stats_only or !plan.usesSingleLiteralCounter()) return false;
+
+    var shard = ShardReport.empty;
+    scanFileMmap(null, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, &shard, file_started) catch return false;
+    var shards = [_]ShardReport{shard};
+    mergeShardsIntoReport(shards[0..], report);
+    return true;
+}
+
+const ByteShardStrategy = enum {
+    literal_occurrence,
+    word_boundary_line,
+
+    fn text(self: ByteShardStrategy) []const u8 {
+        return switch (self) {
+            .literal_occurrence => "literal",
+            .word_boundary_line => "word_boundary_literal",
+        };
+    }
+};
+
+const ByteShardPlan = struct {
+    strategy: ByteShardStrategy,
+    needle: []const u8,
+    case_insensitive: bool = false,
+};
+
+const ByteShardRange = struct {
+    logical_start: usize,
+    logical_end: usize,
+    widened_start: usize,
+    widened_end: usize,
+    line_aligned: bool = false,
+};
+
+const WordBoundaryRangeCount = struct {
+    matches: usize = 0,
+    verified_candidates: usize = 0,
+    rejected_candidates: usize = 0,
+};
+
+const ByteShardJob = struct {
+    io: std.Io,
+    data: []const u8,
+    plan: ByteShardPlan,
+    logical_start: usize,
+    logical_end: usize,
+    widened_start: usize,
+    widened_end: usize,
+    line_aligned: bool = false,
+    matches: usize = 0,
+    boundary_verified_candidates: usize = 0,
+    boundary_rejected_candidates: usize = 0,
+    elapsed_ns: u64 = 0,
+};
+
+fn tryByteShardFastCount(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    data: []const u8,
+    stats: *core_stats.ByteShardKernelStats,
+) ?usize {
+    if (!request.stats_only or request.case_insensitive) return null;
+    if (data.len < BYTE_SHARD_MIN_FILE_BYTES) return null;
+    const shard_plan = byteShardPlan(plan) orelse return null;
+    if (shard_plan.case_insensitive) return null;
+    if (shard_plan.needle.len < 2 or shard_plan.needle.len > data.len) return null;
+
+    const requested_threads = request.threads orelse availableThreads();
+    const max_threads = @max(@as(usize, 1), requested_threads);
+    const ranges_by_size = (data.len + BYTE_SHARD_MIN_RANGE_BYTES - 1) / BYTE_SHARD_MIN_RANGE_BYTES;
+    const range_count = @min(max_threads, ranges_by_size);
+    if (range_count < 2) return null;
+
+    const logical_chunk = (data.len + range_count - 1) / range_count;
+    var jobs = allocator.alloc(ByteShardJob, range_count) catch return null;
+    defer allocator.free(jobs);
+
+    for (jobs, 0..) |*job, index| {
+        const logical_start = @min(index * logical_chunk, data.len);
+        const logical_end = @min(logical_start + logical_chunk, data.len);
+        const range = byteShardRangeFor(data, shard_plan, logical_start, logical_end, index, range_count) orelse return null;
+        job.* = .{
+            .io = io,
+            .data = data,
+            .plan = shard_plan,
+            .logical_start = range.logical_start,
+            .logical_end = range.logical_end,
+            .widened_start = range.widened_start,
+            .widened_end = range.widened_end,
+            .line_aligned = range.line_aligned,
+        };
+    }
+
+    const worker_count = range_count - 1;
+    var threads = allocator.alloc(std.Thread, worker_count) catch return null;
+    defer allocator.free(threads);
+    var spawned: usize = 0;
+    while (spawned < worker_count) : (spawned += 1) {
+        const job_index = spawned + 1;
+        threads[spawned] = std.Thread.spawn(.{}, byteShardWorker, .{&jobs[job_index]}) catch {
+            for (threads[0..spawned]) |thread| thread.join();
+            return null;
+        };
+    }
+
+    byteShardWorker(&jobs[0]);
+    for (threads[0..spawned]) |thread| thread.join();
+
+    var total: usize = 0;
+    var logical_bytes: usize = 0;
+    var widened_bytes: usize = 0;
+    var line_aligned_ranges: usize = 0;
+    var boundary_verified_candidates: usize = 0;
+    var boundary_rejected_candidates: usize = 0;
+    var range_elapsed_total: u64 = 0;
+    var max_range_elapsed: u64 = 0;
+    for (jobs) |job| {
+        total += job.matches;
+        logical_bytes += job.logical_end - job.logical_start;
+        widened_bytes += job.widened_end - job.widened_start;
+        if (job.line_aligned) line_aligned_ranges += 1;
+        boundary_verified_candidates += job.boundary_verified_candidates;
+        boundary_rejected_candidates += job.boundary_rejected_candidates;
+        range_elapsed_total += job.elapsed_ns;
+        max_range_elapsed = @max(max_range_elapsed, job.elapsed_ns);
+    }
+    stats.enabled = true;
+    stats.strategy = shard_plan.strategy.text();
+    stats.files_profiled += 1;
+    stats.range_calls += range_count;
+    stats.line_aligned_ranges += line_aligned_ranges;
+    stats.logical_range_bytes += logical_bytes;
+    stats.widened_range_bytes += widened_bytes;
+    stats.overlap_bytes += widened_bytes - logical_bytes;
+    stats.boundary_verified_candidates += boundary_verified_candidates;
+    stats.boundary_rejected_candidates += boundary_rejected_candidates;
+    stats.range_elapsed_ns_total += range_elapsed_total;
+    stats.max_range_elapsed_ns = @max(stats.max_range_elapsed_ns, max_range_elapsed);
+    stats.matches += total;
+    return total;
+}
+
+fn byteShardWorker(job: *ByteShardJob) void {
+    const started = std.Io.Timestamp.now(job.io, .awake);
+    switch (job.plan.strategy) {
+        .literal_occurrence => {
+            job.matches = countLiteralLogicalRange(job.data, job.plan.needle, job.logical_start, job.logical_end, job.widened_start, job.widened_end);
+        },
+        .word_boundary_line => {
+            const counted = countWordBoundaryLiteralLogicalLinesRange(job.data, job.plan.needle, job.logical_start, job.logical_end);
+            job.matches = counted.matches;
+            job.boundary_verified_candidates = counted.verified_candidates;
+            job.boundary_rejected_candidates = counted.rejected_candidates;
+        },
+    }
+    job.elapsed_ns = @intFromFloat(elapsedMs(job.io, started) * 1_000_000.0);
+}
+
+fn countLiteralLogicalRange(data: []const u8, needle: []const u8, logical_start: usize, logical_end: usize, widened_start: usize, widened_end: usize) usize {
+    if (needle.len == 0 or logical_start >= logical_end or widened_start >= widened_end) return 0;
+    const end = @min(widened_end, data.len);
+    var total: usize = 0;
+    var cursor = @min(widened_start, end);
+    while (cursor + needle.len <= end) {
+        const index = sz.indexOf(data[cursor..end], needle) orelse break;
+        const match_start = cursor + index;
+        if (match_start >= logical_end) break;
+        if (match_start >= logical_start) total += 1;
+        cursor = match_start + needle.len;
+    }
+    return total;
+}
+
+fn shouldRunByteShardBeforeAdmission(plan: expr.ExpressionPlan) bool {
+    const shard_plan = byteShardPlan(plan) orelse return false;
+    return shard_plan.strategy == .word_boundary_line;
+}
+
+fn byteShardPlan(plan: expr.ExpressionPlan) ?ByteShardPlan {
+    if (plan.predicate_count != 1) return null;
+    const predicate = plan.predicates[0];
+    return switch (predicate.kind) {
+        .literal => if (predicate.value.len >= 2) .{
+            .strategy = .literal_occurrence,
+            .needle = predicate.value,
+        } else null,
+        .regex => switch (predicate.strategy) {
+            .regex_plain_literal => if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null and predicate.value.len >= 2) .{
+                .strategy = .literal_occurrence,
+                .needle = predicate.value,
+            } else null,
+            .regex_word_boundary_literal => blk: {
+                const body = stripWordBoundaryAnchors(predicate.value);
+                break :blk if (body.len >= 2) .{
+                    .strategy = .word_boundary_line,
+                    .needle = body,
+                } else null;
+            },
+            else => null,
+        },
+        else => null,
+    };
+}
+
+fn byteShardRangeFor(data: []const u8, plan: ByteShardPlan, logical_start: usize, logical_end: usize, index: usize, range_count: usize) ?ByteShardRange {
+    return switch (plan.strategy) {
+        .literal_occurrence => blk: {
+            const overlap = plan.needle.len - 1;
+            break :blk .{
+                .logical_start = logical_start,
+                .logical_end = logical_end,
+                .widened_start = logical_start -| overlap,
+                .widened_end = @min(logical_end + overlap, data.len),
+            };
+        },
+        .word_boundary_line => byteShardLineOwnedRange(data, logical_start, logical_end, index, range_count),
+    };
+}
+
+fn byteShardLineOwnedRange(data: []const u8, nominal_start: usize, nominal_end: usize, index: usize, range_count: usize) ?ByteShardRange {
+    const start = if (index == 0)
+        @min(nominal_start, data.len)
+    else
+        findOwnedLineBoundaryAfter(data, nominal_start) orelse return null;
+    const end = if (index + 1 >= range_count)
+        data.len
+    else
+        findOwnedLineBoundaryAfter(data, nominal_end) orelse return null;
+    if (start > end) return null;
+    return .{
+        .logical_start = start,
+        .logical_end = end,
+        .widened_start = start,
+        .widened_end = end,
+        .line_aligned = true,
+    };
+}
+
+fn findOwnedLineBoundaryAfter(data: []const u8, position: usize) ?usize {
+    if (position >= data.len) return data.len;
+    const end = @min(data.len, position + BYTE_SHARD_LINE_BOUNDARY_SEARCH_LIMIT);
+    const relative = simd.indexOfByte(data[position..end], '\n') orelse return null;
+    return position + relative + 1;
 }
 
 /// Comptime-generic per-file scan. When mono is non-null, the per-line match
@@ -1194,13 +1953,21 @@ fn monoDynamicLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Alloc
 
 /// Monomorphized file opener — calls scanOpenFileIntoShardImpl with comptime mono.
 fn scanFileIntoShardMono(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, display_path: []const u8, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
-    const file = openFileNt(io, display_path) catch {
+    const file = openFileNt(io, display_path) catch |err| {
         shard.files_skipped += 1;
+        recordShardAccessError(shard, "scan", "open_file", display_path, err);
+        recordEvidenceSkipped(shard);
         return;
     };
     defer file.close(io);
-    scanOpenFileIntoShardImpl(mono, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch {
-        shard.had_error = true;
+    scanOpenFileIntoShardImpl(mono, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch |err| {
+        if (err == error.AccessDenied) {
+            shard.files_skipped += 1;
+            recordShardAccessError(shard, "scan", "read_file", display_path, err);
+            recordEvidenceSkipped(shard);
+        } else {
+            shard.had_error = true;
+        }
     };
 }
 
@@ -1298,7 +2065,9 @@ fn mergeShardsIntoReport(shards: []const ShardReport, report: *SearchReport) voi
         report.files_skipped += shard.files_skipped;
         report.matches_found += shard.matches_found;
         report.scan_work_ms_total += shard.scan_work_ms_total;
+        report.stats.access_errors.merge(shard.access_errors);
         mergeTrigramStats(&report.stats.trigram_acceleration, shard.trigram_stats);
+        mergeByteShardStats(&report.stats.byte_shard_kernel, shard.byte_shard_stats);
         if (shard.slowest_ms >= report.slowest_ms) {
             report.slowest_ms = shard.slowest_ms;
             report.slowest_path = shard.slowest_path;
@@ -1464,15 +2233,24 @@ fn refreshStats(report: *SearchReport) void {
         .aggregate_merge_ms = report.aggregate_ms,
         .aggregate_finalize_ms = 0,
     };
+    const byte_sharded = report.stats.byte_shard_kernel.enabled;
+    const byte_shard_ranges = if (report.stats.byte_shard_kernel.files_profiled > 0)
+        report.stats.byte_shard_kernel.range_calls / report.stats.byte_shard_kernel.files_profiled
+    else
+        0;
+    const byte_shard_chunk = if (report.stats.byte_shard_kernel.range_calls > 0)
+        report.stats.byte_shard_kernel.logical_range_bytes / report.stats.byte_shard_kernel.range_calls
+    else
+        0;
     report.stats.concurrency = .{
         .available_threads = report.available_threads,
         .outer_scan_threads = report.outer_scan_threads,
-        .execution_mode = "materialized",
-        .sharding_enabled = false,
-        .sharded_files = 0,
-        .max_shard_threads = 0,
-        .max_shard_ranges = 0,
-        .max_shard_chunk_bytes = 0,
+        .execution_mode = if (byte_sharded) "byte_sharded" else "materialized",
+        .sharding_enabled = byte_sharded,
+        .sharded_files = report.stats.byte_shard_kernel.files_profiled,
+        .max_shard_threads = byte_shard_ranges,
+        .max_shard_ranges = byte_shard_ranges,
+        .max_shard_chunk_bytes = byte_shard_chunk,
     };
     report.stats.recordSlowFile(report.slowest_path, report.slowest_ms, report.slowest_bytes, false);
 }
@@ -1493,6 +2271,24 @@ fn mergeTrigramStats(target: *core_stats.TrigramAccelerationStats, source: core_
     target.pruned_files += source.pruned_files;
     target.verified_files += source.verified_files;
     target.ineligible_files += source.ineligible_files;
+}
+
+fn mergeByteShardStats(target: *core_stats.ByteShardKernelStats, source: core_stats.ByteShardKernelStats) void {
+    target.enabled = target.enabled or source.enabled;
+    if (source.enabled) target.strategy = source.strategy;
+    target.files_profiled += source.files_profiled;
+    target.range_calls += source.range_calls;
+    target.line_aligned_ranges += source.line_aligned_ranges;
+    target.logical_range_bytes += source.logical_range_bytes;
+    target.widened_range_bytes += source.widened_range_bytes;
+    target.overlap_bytes += source.overlap_bytes;
+    target.boundary_verified_candidates += source.boundary_verified_candidates;
+    target.boundary_rejected_candidates += source.boundary_rejected_candidates;
+    target.range_elapsed_ns_total += source.range_elapsed_ns_total;
+    target.max_range_elapsed_ns = @max(target.max_range_elapsed_ns, source.max_range_elapsed_ns);
+    target.reduce_elapsed_ns_total += source.reduce_elapsed_ns_total;
+    target.max_reduce_elapsed_ns = @max(target.max_reduce_elapsed_ns, source.max_reduce_elapsed_ns);
+    target.matches += source.matches;
 }
 
 const TRIGRAM_ADMISSION_CAPACITY = 4096;
@@ -1668,6 +2464,10 @@ fn scanOpenFile(
     }
     const single_chunk = first_read < read_buffer.len;
     const file_bytes: usize = if (single_chunk) first_read else @intCast(try file.length(io));
+
+    if (!single_chunk and trySerialMmapFastPath(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, report, file_started)) {
+        return;
+    }
 
     report.files_scanned += 1;
     report.bytes_scanned += file_bytes;
@@ -1911,6 +2711,15 @@ fn wholeBufferRegexCount(buffer: []const u8, predicate: expr.Predicate, case_ins
                 break :blk countLiteral(buffer, body, effective_ci);
             }
             break :blk countRegexLiteral(buffer, body, effective_ci);
+        },
+        .regex_word_boundary_literal => blk: {
+            if (case_insensitive) break :blk null;
+            break :blk countWordBoundaryLiteralLines(buffer, stripWordBoundaryAnchors(predicate.value));
+        },
+        .regex_ascii_casefold_word_boundary_literal => blk: {
+            if (!chunk_casefolded) break :blk null;
+            const after_flag = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            break :blk countWordBoundaryLiteralLines(buffer, stripWordBoundaryAnchors(after_flag));
         },
         else => null,
     };
@@ -2424,7 +3233,7 @@ fn countLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) us
     var total: usize = 0;
     var start: usize = 0;
     while (start + needle.len <= line.len) {
-        const index = simd.indexOf(line[start..], needle) orelse break;
+        const index = sz.indexOf(line[start..], needle) orelse break;
         total += 1;
         start += index + needle.len;
     }
@@ -2556,6 +3365,64 @@ fn wordBoundaryLiteralColumn(line: []const u8, needle: []const u8, case_insensit
     return null;
 }
 
+fn countWordBoundaryLiteralLines(buffer: []const u8, needle: []const u8) usize {
+    if (needle.len == 0) return 0;
+    var total: usize = 0;
+    var start: usize = 0;
+    while (start + needle.len <= buffer.len) {
+        const index = simd.indexOf(buffer[start..], needle) orelse break;
+        const abs = start + index;
+        if (wordBoundaryLiteralAt(buffer, needle, abs)) {
+            total += 1;
+            if (simd.indexOfByte(buffer[abs..], '\n')) |nl| {
+                start = abs + nl + 1;
+            } else {
+                break;
+            }
+        } else {
+            start = abs + 1;
+        }
+    }
+    return total;
+}
+
+fn countWordBoundaryLiteralLogicalLinesRange(buffer: []const u8, needle: []const u8, logical_start: usize, logical_end: usize) WordBoundaryRangeCount {
+    if (needle.len == 0 or logical_start >= logical_end) return .{};
+    const end = @min(logical_end, buffer.len);
+    var counted = WordBoundaryRangeCount{};
+    var start = @min(logical_start, end);
+    while (start + needle.len <= end) {
+        const index = simd.indexOf(buffer[start..end], needle) orelse break;
+        const abs = start + index;
+        if (abs + needle.len > end) break;
+        counted.verified_candidates += 1;
+        if (wordBoundaryLiteralAt(buffer, needle, abs)) {
+            counted.matches += 1;
+            if (simd.indexOfByte(buffer[abs..end], '\n')) |nl| {
+                start = abs + nl + 1;
+            } else {
+                break;
+            }
+        } else {
+            counted.rejected_candidates += 1;
+            start = abs + 1;
+        }
+    }
+    return counted;
+}
+
+fn wordBoundaryLiteralAt(buffer: []const u8, needle: []const u8, abs: usize) bool {
+    if (needle.len == 0 or abs + needle.len > buffer.len) return false;
+    const left_is_word = abs > 0 and isWordChar(buffer[abs - 1]);
+    const right_index = abs + needle.len;
+    const right_is_word = right_index < buffer.len and isWordChar(buffer[right_index]);
+    const first_is_word = isWordChar(needle[0]);
+    const last_is_word = isWordChar(needle[needle.len - 1]);
+    const left_ok = left_is_word != first_is_word or abs == 0;
+    const right_ok = right_is_word != last_is_word or right_index == buffer.len;
+    return left_ok and right_ok;
+}
+
 fn isWordChar(byte: u8) bool {
     return std.ascii.isAlphanumeric(byte) or byte == '_';
 }
@@ -2654,6 +3521,103 @@ test "file admission needle lowers only contract-safe predicate shapes" {
     try std.testing.expect(fileAdmissionNeedle(.regex, .regex_full, full_plan.predicates[0]) == null);
 }
 
+test "whole buffer word-boundary literal counts matching lines" {
+    const buffer =
+        "PM_RESUME once PM_RESUME twice\n" ++
+        "XPM_RESUME rejected\n" ++
+        "PM_RESUME_tail rejected\n" ++
+        "PM_RESUME accepted\n";
+    try std.testing.expectEqual(@as(usize, 2), countWordBoundaryLiteralLines(buffer, "PM_RESUME"));
+}
+
+test "byte shard logical range counts seam matches once" {
+    const data = "xxSherlock HolmesyySherlock Holmeszz";
+    const needle = "Sherlock Holmes";
+    const seam = 10;
+    const overlap = needle.len - 1;
+    const left = countLiteralLogicalRange(data, needle, 0, seam, 0, @min(seam + overlap, data.len));
+    const right = countLiteralLogicalRange(data, needle, seam, data.len, seam -| overlap, data.len);
+    try std.testing.expectEqual(@as(usize, 2), left + right);
+}
+
+test "byte shard logical range preserves non-overlapping semantics" {
+    const data = "aaaaa";
+    const needle = "aaa";
+    const seam = 2;
+    const overlap = needle.len - 1;
+    const left = countLiteralLogicalRange(data, needle, 0, seam, 0, @min(seam + overlap, data.len));
+    const right = countLiteralLogicalRange(data, needle, seam, data.len, seam -| overlap, data.len);
+    try std.testing.expectEqual(countLiteral(data, needle, false), left + right);
+}
+
+test "byte shard plan admits word-boundary line kernels" {
+    const literal_plan = try expr.parse("lit:Sherlock Holmes");
+    const literal = byteShardPlan(literal_plan).?;
+    try std.testing.expectEqual(ByteShardStrategy.literal_occurrence, literal.strategy);
+    try std.testing.expectEqualStrings("Sherlock Holmes", literal.needle);
+
+    const regex_literal = try expr.parse("re:Sherlock Holmes");
+    const regex_plain = byteShardPlan(regex_literal).?;
+    try std.testing.expectEqual(ByteShardStrategy.literal_occurrence, regex_plain.strategy);
+    try std.testing.expectEqualStrings("Sherlock Holmes", regex_plain.needle);
+
+    const regex_word = try expr.parse("re:\\bSherlock Holmes\\b");
+    const word = byteShardPlan(regex_word).?;
+    try std.testing.expectEqual(ByteShardStrategy.word_boundary_line, word.strategy);
+    try std.testing.expectEqualStrings("Sherlock Holmes", word.needle);
+
+    const regex_casefold_word = try expr.parse("re:(?i)\\bSherlock Holmes\\b");
+    try std.testing.expect(byteShardPlan(regex_casefold_word) == null);
+}
+
+test "word-boundary byte range counts exact line-owned semantics" {
+    const buffer =
+        "PM_RESUME at start\n" ++
+        "left_PM_RESUME rejected\n" ++
+        "PM_RESUME_right rejected\n" ++
+        "two PM_RESUME then PM_RESUME same line\n" ++
+        "tail PM_RESUME";
+
+    const all = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", 0, buffer.len);
+    try std.testing.expectEqual(@as(usize, 3), all.matches);
+    try std.testing.expect(all.verified_candidates >= 5);
+    try std.testing.expect(all.rejected_candidates >= 2);
+    try std.testing.expectEqual(countWordBoundaryLiteralLines(buffer, "PM_RESUME"), all.matches);
+}
+
+test "word-boundary byte ranges preserve whole-buffer count across seams" {
+    const buffer =
+        "alpha PM_RESUME\n" ++
+        "beta_PM_RESUME rejected\n" ++
+        "gamma PM_RESUME omega\n" ++
+        "PM_RESUME_delta rejected\n" ++
+        "last PM_RESUME";
+    const expected = countWordBoundaryLiteralLines(buffer, "PM_RESUME");
+    const seams = [_]usize{ 1, 7, 16, 29, 47, buffer.len - 1 };
+    for (seams) |seam| {
+        const left_end = findOwnedLineBoundaryAfter(buffer, seam) orelse buffer.len;
+        const left = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", 0, left_end);
+        const right = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", left_end, buffer.len);
+        try std.testing.expectEqual(expected, left.matches + right.matches);
+    }
+}
+
+test "word-boundary byte ranges count boundary and final-line cases once" {
+    const buffer =
+        "PM_RESUME\n" ++
+        "split prefix PM_RESUME suffix\n" ++
+        "no newline PM_RESUME";
+    const first_end = findOwnedLineBoundaryAfter(buffer, 1).?;
+    const second_end = findOwnedLineBoundaryAfter(buffer, first_end + 1).?;
+    const first = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", 0, first_end);
+    const second = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", first_end, second_end);
+    const third = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", second_end, buffer.len);
+    try std.testing.expectEqual(@as(usize, 1), first.matches);
+    try std.testing.expectEqual(@as(usize, 1), second.matches);
+    try std.testing.expectEqual(@as(usize, 1), third.matches);
+    try std.testing.expectEqual(countWordBoundaryLiteralLines(buffer, "PM_RESUME"), first.matches + second.matches + third.matches);
+}
+
 test "trigram gate disables case-insensitive byte semantics" {
     const plan = try expr.parse("lit:Needle");
     const admission = trigram.admit(plan);
@@ -2680,7 +3644,7 @@ test "evidence frontier cache round trips IXEVIDENCE2 identity and candidates" {
     };
     var candidates = [_]DiscoveredFile{files[1]};
     const signature = try computeDiscoveredSignature(io, &files);
-    const content_signature: u64 = 0xfeed_cafe_0123_4567;
+    const content_signature = try computeContentSignature(io, &files);
     writeEvidenceFrontierCache(io, path, 0xabc, signature, content_signature, files.len, .{
         .pruned_files = 1,
         .pruned_bytes = 4096,
@@ -2722,6 +3686,29 @@ test "evidence frontier cache rejects stale or malformed artifact headers" {
     try std.testing.expect(loadEvidenceFrontierCache(io, allocator, path, key, signature, &files) == null);
 }
 
+test "evidence frontier signatures are independent of discovery order" {
+    const io = std.testing.io;
+    const forward = [_]DiscoveredFile{
+        .{ .path = "src/main.zig" },
+        .{ .path = "src/core/search.zig" },
+        .{ .path = "src/core/stats.zig" },
+    };
+    const reversed = [_]DiscoveredFile{
+        .{ .path = "src/core/stats.zig" },
+        .{ .path = "src/core/search.zig" },
+        .{ .path = "src/main.zig" },
+    };
+
+    try std.testing.expectEqual(
+        try computeDiscoveredSignature(io, &forward),
+        try computeDiscoveredSignature(io, &reversed),
+    );
+    try std.testing.expectEqual(
+        try computeContentSignature(io, &forward),
+        try computeContentSignature(io, &reversed),
+    );
+}
+
 test "evidence frontier prepare narrows active files and accounts cached prunes" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2740,7 +3727,10 @@ test "evidence frontier prepare narrows active files and accounts cached prunes"
     const key = evidenceFrontierKey(request, plan);
     const cache_path = try std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key});
     defer std.Io.Dir.cwd().deleteFile(io, cache_path) catch {};
-    writeEvidenceFrontierCache(io, cache_path, key, signature, 0x9876, files.len, .{
+    const live_path = try evidenceFrontierLivePath(allocator, cache_path);
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
+    const content_signature = try computeContentSignature(io, &files);
+    writeEvidenceFrontierCache(io, cache_path, key, signature, content_signature, files.len, .{
         .pruned_files = 1,
         .pruned_bytes = 123,
         .skipped_files = 4,
@@ -2761,7 +3751,7 @@ test "evidence frontier prepare narrows active files and accounts cached prunes"
     try std.testing.expectEqual(@as(usize, 1), report.stats.trigram_acceleration.pruned_files);
 }
 
-test "content signature changes when file size mutates but stays off foreground admission" {
+test "evidence frontier rejects stale content signature before foreground admission" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -2773,9 +3763,22 @@ test "content signature changes when file size mutates but stays off foreground 
     const file_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/epoch.txt", .{&tmp.sub_path});
     const files = [_]DiscoveredFile{.{ .path = file_path }};
     const before = try computeContentSignature(io, &files);
+    const signature = try computeDiscoveredSignature(io, &files);
+    const cache_path = ".ix-evidence-test-stale-content.cache";
+    defer std.Io.Dir.cwd().deleteFile(io, cache_path) catch {};
+    const live_path = try evidenceFrontierLivePath(allocator, cache_path);
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
+    var retained = [_]DiscoveredFile{files[0]};
+    writeEvidenceFrontierCache(io, cache_path, 0x44, signature, before, files.len, .{
+        .pruned_files = 0,
+        .pruned_bytes = 0,
+        .skipped_files = 0,
+        .candidates = &retained,
+    });
     try tmp.dir.writeFile(io, .{ .sub_path = "epoch.txt", .data = "needle plus more bytes\n" });
     const after = try computeContentSignature(io, &files);
     try std.testing.expect(before != after);
+    try std.testing.expect(loadEvidenceFrontierCache(io, allocator, cache_path, 0x44, signature, &files) == null);
 }
 
 test "search run consumes evidence frontier and scans only retained candidates" {
@@ -2794,6 +3797,8 @@ test "search run consumes evidence frontier and scans only retained candidates" 
     const key = evidenceFrontierKey(request, plan);
     const cache_path = try std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key});
     defer std.Io.Dir.cwd().deleteFile(io, cache_path) catch {};
+    const live_path = try evidenceFrontierLivePath(allocator, cache_path);
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
 
     var discovery_report = testSearchReport(request.expression, plan);
     var discovered = try FileList.initWithCapacity(allocator, 4);
@@ -2803,7 +3808,8 @@ test "search run consumes evidence frontier and scans only retained candidates" 
     const signature = try computeDiscoveredSignature(io, files);
 
     var retained = [_]DiscoveredFile{candidateFromDiscovered(files) orelse return error.TestExpectedCacheHit};
-    writeEvidenceFrontierCache(io, cache_path, key, signature, 0xace, files.len, .{
+    const content_signature = try computeContentSignature(io, files);
+    writeEvidenceFrontierCache(io, cache_path, key, signature, content_signature, files.len, .{
         .pruned_files = 1,
         .pruned_bytes = 64,
         .skipped_files = 0,
@@ -2811,6 +3817,7 @@ test "search run consumes evidence frontier and scans only retained candidates" 
     });
 
     const report = try run(io, allocator, request, plan);
+    try std.testing.expectEqual(@as(f64, 0), report.discover_ms);
     try std.testing.expectEqual(@as(usize, 1), report.matches_found);
     try std.testing.expectEqual(@as(usize, 1), report.hit_count);
     try std.testing.expectEqualStrings(retained[0].path, report.hits[0].path);
@@ -2845,6 +3852,7 @@ fn testSearchRequest(expression: []const u8, path: []const u8) cli.SearchRequest
         .threads = null,
         .emit_report = null,
         .nexus_build = false,
+        .nexus_disabled = false,
     };
     request.paths[0] = path;
     return request;

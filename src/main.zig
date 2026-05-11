@@ -64,49 +64,53 @@ pub fn main(init: std.process.Init) !void {
     switch (invocation.command) {
         .help => |topic| try output.writeHelp(stdout, topic),
         .search => |request| {
+            var effective_request = request;
+            effective_request.nexus_disabled = nexusDisabled(init);
             const plan = expr.parse(request.expression) catch |err| {
                 try output.writeError(stderr, "invalid_expression", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
             };
-            const report = search.run(init.io, allocator, request, plan) catch |err| {
+            const report = search.run(init.io, allocator, effective_request, plan) catch |err| {
                 try output.writeError(stderr, "search_failed", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
             };
-            if (request.emit_report) |path| output.writeSearchJsonReportToFile(init.io, path, report) catch |err| {
+            if (effective_request.emit_report) |path| output.writeSearchJsonReportToFile(init.io, path, report) catch |err| {
                 try output.writeError(stderr, "emit_report_failed", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
             };
-            if (shouldLaunchNexusSidecar(report)) launchNexusSidecar(init.io, allocator, argv[0], request);
-            if (request.json) {
+            if (shouldLaunchNexusSidecar(effective_request, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
+            if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
             } else {
-                if (!request.stats_only) try output.writeSearchHits(stdout, report);
+                if (!effective_request.stats_only) try output.writeSearchHits(stdout, report);
                 try output.writeSearchReport(stdout, report);
             }
         },
         .matches => |request| {
+            var effective_request = request;
+            effective_request.nexus_disabled = nexusDisabled(init);
             const plan = expr.parse(request.expression) catch |err| {
                 try output.writeError(stderr, "invalid_expression", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
             };
-            const report = search.run(init.io, allocator, request, plan) catch |err| {
+            const report = search.run(init.io, allocator, effective_request, plan) catch |err| {
                 try output.writeError(stderr, "search_failed", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
             };
-            if (request.emit_report) |path| output.writeSearchJsonReportToFile(init.io, path, report) catch |err| {
+            if (effective_request.emit_report) |path| output.writeSearchJsonReportToFile(init.io, path, report) catch |err| {
                 try output.writeError(stderr, "emit_report_failed", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
             };
-            if (shouldLaunchNexusSidecar(report)) launchNexusSidecar(init.io, allocator, argv[0], request);
-            if (request.json) {
+            if (shouldLaunchNexusSidecar(effective_request, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
+            if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
-            } else if (!request.stats_only) {
+            } else if (!effective_request.stats_only) {
                 try output.writeSearchHits(stdout, report);
             }
         },
@@ -168,12 +172,19 @@ pub fn main(init: std.process.Init) !void {
         .nexus => |request| {
             const plan = expr.parse(request.expression) catch std.process.exit(0);
             _ = search.run(init.io, allocator, request, plan) catch std.process.exit(0);
+            search.holdEvidenceFrontierLive(init.io, allocator, request, plan);
         },
     }
     try stdout.flush();
 }
 
-fn shouldLaunchNexusSidecar(report: search.SearchReport) bool {
+fn nexusDisabled(init: std.process.Init) bool {
+    const value = init.environ_map.getPtr("IX_NEXUS") orelse return false;
+    return std.mem.eql(u8, value.*, "0") or std.ascii.eqlIgnoreCase(value.*, "false") or std.ascii.eqlIgnoreCase(value.*, "off");
+}
+
+fn shouldLaunchNexusSidecar(request: cli.SearchRequest, report: search.SearchReport) bool {
+    if (request.nexus_disabled) return false;
     return report.stats.trigram_acceleration.pruned_files == 0;
 }
 
@@ -272,9 +283,12 @@ fn appendRepeated(allocator: std.mem.Allocator, list: *std.ArrayList(u8), byte: 
 }
 
 test "nexus sidecar launch is gated after evidence-pruned foreground reuse" {
-    try std.testing.expect(shouldLaunchNexusSidecar(testSearchReportForSidecar(0)));
-    try std.testing.expect(!shouldLaunchNexusSidecar(testSearchReportForSidecar(1)));
-    try std.testing.expect(!shouldLaunchNexusSidecar(testSearchReportForSidecar(79041)));
+    const enabled = testSearchRequestForSidecar(false);
+    const disabled = testSearchRequestForSidecar(true);
+    try std.testing.expect(shouldLaunchNexusSidecar(enabled, testSearchReportForSidecar(0)));
+    try std.testing.expect(!shouldLaunchNexusSidecar(enabled, testSearchReportForSidecar(1)));
+    try std.testing.expect(!shouldLaunchNexusSidecar(enabled, testSearchReportForSidecar(79041)));
+    try std.testing.expect(!shouldLaunchNexusSidecar(disabled, testSearchReportForSidecar(0)));
 }
 
 test "windows command argument quoting preserves spaces quotes and trailing slashes" {
@@ -333,6 +347,26 @@ fn testSearchReportForSidecar(pruned_files: usize) search.SearchReport {
     };
     report.stats.trigram_acceleration.pruned_files = pruned_files;
     return report;
+}
+
+fn testSearchRequestForSidecar(nexus_disabled: bool) cli.SearchRequest {
+    return .{
+        .expression = "lit:needle",
+        .paths = undefined,
+        .path_count = 1,
+        .json = true,
+        .stats_only = true,
+        .hidden = false,
+        .line_numbers = false,
+        .fixed_strings = false,
+        .case_insensitive = false,
+        .follow_symlinks = false,
+        .max_hits = null,
+        .threads = null,
+        .emit_report = null,
+        .nexus_build = false,
+        .nexus_disabled = nexus_disabled,
+    };
 }
 
 test {

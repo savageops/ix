@@ -99,11 +99,15 @@ pub const FastCountDensityStats = struct {
 
 pub const ByteShardKernelStats = struct {
     enabled: bool = false,
+    strategy: []const u8 = "none",
     files_profiled: usize = 0,
     range_calls: usize = 0,
+    line_aligned_ranges: usize = 0,
     logical_range_bytes: usize = 0,
     widened_range_bytes: usize = 0,
     overlap_bytes: usize = 0,
+    boundary_verified_candidates: usize = 0,
+    boundary_rejected_candidates: usize = 0,
     range_elapsed_ns_total: u64 = 0,
     max_range_elapsed_ns: u64 = 0,
     reduce_elapsed_ns_total: u64 = 0,
@@ -120,6 +124,70 @@ pub const TrigramAccelerationStats = struct {
     pruned_files: usize = 0,
     verified_files: usize = 0,
     ineligible_files: usize = 0,
+};
+
+pub const AccessErrorSample = struct {
+    phase: []const u8 = "",
+    operation: []const u8 = "",
+    path: []const u8 = "",
+    error_name: []const u8 = "",
+};
+
+pub const AccessErrorStats = struct {
+    total: usize = 0,
+    access_denied: usize = 0,
+    discovery: usize = 0,
+    scan: usize = 0,
+    directory_open: usize = 0,
+    directory_iterate: usize = 0,
+    file_open: usize = 0,
+    file_read: usize = 0,
+    sample_count: usize = 0,
+    samples: [8]AccessErrorSample = [_]AccessErrorSample{.{}} ** 8,
+
+    pub fn record(self: *AccessErrorStats, phase: []const u8, operation: []const u8, path: []const u8, err: anyerror) void {
+        self.total += 1;
+        if (err == error.AccessDenied) self.access_denied += 1;
+        if (std.mem.eql(u8, phase, "discovery")) {
+            self.discovery += 1;
+        } else if (std.mem.eql(u8, phase, "scan")) {
+            self.scan += 1;
+        }
+        if (std.mem.eql(u8, operation, "open_dir")) {
+            self.directory_open += 1;
+        } else if (std.mem.eql(u8, operation, "iterate_dir")) {
+            self.directory_iterate += 1;
+        } else if (std.mem.eql(u8, operation, "open_file")) {
+            self.file_open += 1;
+        } else if (std.mem.eql(u8, operation, "read_file")) {
+            self.file_read += 1;
+        }
+        if (self.sample_count < self.samples.len) {
+            self.samples[self.sample_count] = .{
+                .phase = phase,
+                .operation = operation,
+                .path = path,
+                .error_name = @errorName(err),
+            };
+            self.sample_count += 1;
+        }
+    }
+
+    pub fn merge(self: *AccessErrorStats, other: AccessErrorStats) void {
+        self.total += other.total;
+        self.access_denied += other.access_denied;
+        self.discovery += other.discovery;
+        self.scan += other.scan;
+        self.directory_open += other.directory_open;
+        self.directory_iterate += other.directory_iterate;
+        self.file_open += other.file_open;
+        self.file_read += other.file_read;
+        for (other.samples[0..other.sample_count]) |sample| {
+            if (self.sample_count >= self.samples.len) break;
+            self.samples[self.sample_count] = sample;
+            self.sample_count += 1;
+        }
+    }
 };
 
 pub const FallbackLineScanStats = struct {
@@ -162,6 +230,7 @@ pub const SearchStats = struct {
     fast_count_density: FastCountDensityStats = .{},
     byte_shard_kernel: ByteShardKernelStats = .{},
     trigram_acceleration: TrigramAccelerationStats = .{},
+    access_errors: AccessErrorStats = .{},
     fallback_line_scan: ?FallbackLineScanStats = null,
     timings: PhaseTimings = .{},
     concurrency: ConcurrencyStats = .{},
@@ -190,4 +259,16 @@ test "search stats owns rust-compatible top-level schema defaults" {
     try std.testing.expectEqualStrings("materialized", snapshot.concurrency.execution_mode);
     try std.testing.expectEqualStrings("linux_amd_asic_reg_giant_header", snapshot.linux_dominant_file.target_class);
     try std.testing.expectEqual(@as(usize, 1), snapshot.slowest_file_count);
+}
+
+test "access errors record bounded partial-search diagnostics" {
+    var snapshot = SearchStats{};
+    snapshot.access_errors.record("discovery", "open_dir", "C:/locked", error.AccessDenied);
+    snapshot.access_errors.record("scan", "open_file", "C:/locked/file.txt", error.AccessDenied);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.access_errors.total);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.access_errors.access_denied);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.access_errors.discovery);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.access_errors.scan);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.access_errors.sample_count);
+    try std.testing.expectEqualStrings("open_dir", snapshot.access_errors.samples[0].operation);
 }

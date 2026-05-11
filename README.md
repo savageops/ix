@@ -2,9 +2,9 @@
 
 # IX
 
-**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Thread-sharded execution. Exact-verified output.**
+**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Admission-bytecode lane. Thread-sharded execution. Exact-verified output.**
 
-*AVX2 SIMD literal scan · Boolean predicate algebra · Arena-allocated pipeline · Zero vendored dependencies*
+*AVX2 SIMD literal scan · Boolean predicate algebra · Arena-allocated pipeline · Vendored C kernels compiled into one binary*
 
 ---
 
@@ -16,7 +16,7 @@
 [![Hot Path](https://img.shields.io/badge/Hot%20Path-Zero%20Mutex-06b6d4)](#execution-model)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0f766e)](LICENSE)
 
-[Origin](#origin) · [What It Is](#what-it-is) · [Use It](#use-it) · [How It Works](#how-it-works) · [What Is Inside](#what-is-inside) · [Trigram Acceleration](#exact-trigram-acceleration) · [Roadmap](#roadmap)
+[Origin](#origin) · [What It Is](#what-it-is) · [Use It](#use-it) · [How It Works](#how-it-works) · [What Is Inside](#what-is-inside) · [Trigram Acceleration](#exact-trigram-acceleration) · [Admission Bytecode](#admission-bytecode-lane) · [Roadmap](#roadmap)
 
 </div>
 
@@ -38,7 +38,9 @@ What ships today is not a port. It is a search engine rebuilt from the ground up
 
 IX is a search engine built around one constraint: the fastest path to an exact result. Queries written in the IX expression language — `lit:`, `re:`, `prefix:`, `suffix:`, boolean `&&` / `||` — are each classified into the narrowest execution strategy before touching a byte of input.
 
-Literal queries land on StringZilla's AVX2 `memmem` — 32 bytes per cycle through 256-bit YMM lanes. Regex patterns with extractable literals bypass the regex engine and hit the SIMD path directly. Full regex patterns compile through PCRE2 10.44 with JIT — the pattern is compiled to native machine code once per thread and reused for every line. AND-queries extract mandatory trigrams and reject ineligible files before a single line is scanned. File scans shard across threads with thread-local accumulation — zero mutex contention on the hot path.
+Literal queries land on the SIMD byte-search path — 32 bytes per cycle through 256-bit vector lanes. Regex patterns with extractable literals bypass the regex engine and hit the SIMD path directly. Full regex patterns compile through PCRE2 10.44 with JIT — the pattern is compiled to native machine code once per thread and reused for every line. AND/OR queries extract mandatory trigram evidence and reject ineligible files before a single line is scanned. File scans shard across threads with thread-local accumulation — zero mutex contention on the hot path.
+
+The first executable admission slice now compiles trigram evidence once per query into a compact rolling membership program and threads that immutable program through the serial, mmap, and worker scan paths. The larger retained architecture lane is still `PathAdmission -> FileAdmissionBytecode -> ByteKernel -> LineVerifier`: reject work before line splitting and before PCRE2, using path predicates, file metadata, PCRE2-proven byte facts, and one-pass trigram evidence.
 
 > [!NOTE]
 > Acceleration rejects candidates. It never creates matches.
@@ -111,10 +113,11 @@ This is a translator, not a second grammar.
 ```mermaid
 flowchart LR
     A["argv"] --> B["Command\nParser"]
-    B --> C["ExpressionPlan\n+ Trigram Gate"]
+    B --> C["ExpressionPlan\n+ Proof Program"]
     C --> D["Strategy\nClassification"]
     D --> E["File\nDiscovery"]
-    E --> F["Thread\nPartition"]
+    E --> P["Admission\nProgram"]
+    P --> F["Thread\nPartition"]
     F --> S0["Shard 0"]
     F --> S1["Shard 1"]
     F --> SN["Shard N"]
@@ -146,7 +149,8 @@ Each query is classified by shape and routed to the narrowest execution path:
 |:------|:---------|
 | Root pruning | Deduplicate, contained-by eviction, reverse containment (swap-remove O(1)) |
 | File discovery | Custom recursive walker — serial `readdir` traversal, hidden-file filtering, zero gitignore parsing overhead |
-| Trigram admission | Reject files ineligible by mandatory-byte evidence |
+| Admission program | Current first slice: compiled `TrigramAdmissionProgram` over query evidence; planned full pipeline adds path class, file metadata, binary prefix, and PCRE2 byte facts |
+| Trigram admission | Exact negative gate: reject files ineligible by mandatory-byte evidence using one rolling pass over each candidate buffer |
 | File-scan sharding | Distribute files across N threads, each with thread-local `ShardReport` |
 | Shard accumulation | Thread-local counters + hit buffers — zero mutex contention |
 | Merge | Combine shard reports after all threads join |
@@ -167,19 +171,24 @@ Each query is classified by shape and routed to the narrowest execution path:
 | Zig/C boundary | `sz_shim.c` — StringZilla is header-only (`static inline`); Zig's `@cImport` can't link those, so the shim forces the C compiler to emit real linkable symbols. Include chain `immintrin.h → mm_malloc.h → stdlib.h` requires `link_libc = true` in `build.zig`. |
 | PCRE2 integration | Vendored PCRE2 10.44 source at `.refs/pcre2/` compiled via `addCSourceFiles` in `build.zig` (27 translation units). Static `config.h` enables `SUPPORT_JIT`, `SUPPORT_UNICODE`, and `PCRE2_STATIC`. The sljit backend at `.refs/pcre2/src/sljit/` compiles regex patterns to native x86 machine code. `pcre_regex.zig` wraps the C API via `@cImport` with a threadlocal single-entry compile cache — zero overhead on cache hit, one JIT compilation per unique pattern per thread. |
 | Query model | Typed `ExpressionPlan`, boolean composition, explicit literal / regex / prefix / suffix predicates with trigram evidence extraction |
+| Admission bytecode | First executable slice lives in `search.zig` as `TrigramAdmissionProgram`: open-addressed trigram membership, per-group counters, `AND`/`OR` satisfaction masks, and no heap allocation during execution. Planned full `FileAdmissionProgram`: `RejectByPathClass`, `RejectByExtSet`, `RejectBinaryPrefix`, `RequireAnyFirstByteSet`, `RequireLastCodeUnit`, `RequireMinLength`, `RequireTrigramGroups`. |
 | Regex engine | PCRE2 10.44 with JIT compilation — patterns are compiled to native x86 machine code via sljit, cached per-thread, and reused for every line. A threadlocal single-entry cache gives compile-once semantics without changing function signatures. If PCRE2 cannot compile a pattern (e.g. unsupported syntax), the caller falls back to the Zig-native recursive backtracking verifier transparently via `pcre_regex.column(...) catch regex.column(...)`. |
 | Regex fallback | Zig-native recursive backtracking — serves as the safety net for patterns PCRE2 rejects. Supports grouped alternation with group-end-to-suffix handoff (`(session\|handshake)\b` works because the `\b` check fires at the exact byte after the branch ends). |
 | Strategy classification | `MatcherStrategy` — literal (direct SIMD), casefold-literal (ASCII normalization), word-boundary (literal + boundary verifier), literal-alternates (multi-pattern), prefix-prefilter (partial scan + PCRE2 JIT verify), full-regex (PCRE2 JIT) |
 | File scan | Two-phase: serial file discovery (readdir), then parallel partition across worker threads with thread-local `ShardReport` (no mutex in hot path) |
-| Trigram gate | Exact-byte mandatory-trigram rejection; predicate evidence admission — conjunctions (AND) require all evidence groups, disjunctions (OR) fail if any branch unindexed |
+| Trigram gate | Exact-byte mandatory-trigram rejection; predicate evidence admission — conjunctions (AND) require all evidence groups, disjunctions (OR) fail if any branch is unindexed; candidate files execute a single rolling trigram stream over compiled query membership |
+| Word-boundary byte shard | Stats-only `re:\bLITERAL\b` plans lower to `ByteShardPlan.strategy = word_boundary_literal` for large mmap-backed files. Each shard owns complete newline-aligned logical lines, scans candidates with `simd.indexOf`, verifies exact `\b` boundaries, counts at most one match per owned line, and falls back before risking double counts on long unbounded lines. |
+| Nexus evidence frontier | Public `search` / `matches` launch a hidden `__ix_nexus` sidecar after the foreground report is computed. The sidecar is stats-only, stdout/stderr-silent, no-window on Windows, and writes `.ix-evidence-{key}.cache` only from the background path. Foreground searches never synchronously build the artifact; they consume a validated expression/root/path-set frontier if it already exists and skip redundant sidecar rebuilds after a successful evidence-pruned reuse. |
+| Byte kernels | Current hot kernels are Zig `@Vector(32, u8)` and StringZilla AVX2. Planned narrow C shim additions are limited to primitives Zig cannot emit cleanly: `ix_count_byte_avx2`, `ix_ascii_ci_memmem_avx2`, and `ix_trigram_admit_scalar_or_avx2`. |
 | Inspect | Bounded read-only windows, match-context mode, `ix.inspect.*` sentinels, `ix.next.v1` continuation hints for agent pagination |
 | Explain | Structured plan JSON, strategy annotation, proof-program lowering — queries classified as `conjunctive_literal_evidence`, `conjunctive_regex_with_mandatory_evidence`, `disjunctive_byte_evidence`, or `verifier_only` with trigram terms and verifier type |
-| Stats schema | Telemetry model with full timing breakdown — `discover_ms`, `scan_ms`, `aggregate_ms`, `scan_work_ms_total` across all shards. Per-file slowest-path profiling. Trigram acceleration stats: candidate files checked, pruned, verified, ineligible. |
+| Stats schema | Telemetry model with full timing breakdown — `discover_ms`, `scan_ms`, `aggregate_ms`, `scan_work_ms_total` across all shards. Per-file slowest-path profiling. Trigram acceleration stats: candidate files checked, pruned, verified, ineligible. Byte-shard telemetry reports strategy, profiled files, range calls, line-aligned ranges, boundary candidates verified/rejected, logical bytes, elapsed range time, and matches owned by the byte kernel. |
 | Memory model | Arena allocator from process init — all allocations live for process lifetime, zero individual frees. Short-lived CLI process; arena released on exit. No deallocation overhead in the hot path. |
 
 ### Scan-Path Optimizations
 
 - **Whole-buffer fast count** — single-chunk files (< 1 MiB) with single-predicate stats-only queries skip line splitting entirely. Match count is computed over the raw buffer in one pass, eliminating newline scanning and per-line dispatch.
+- **Word-boundary byte-sharded fast count** — stats-only `re:\bLITERAL\b` on large mmap-backed files bypasses materialized line splitting. The planner emits a `word_boundary_literal` byte-shard descriptor; shards claim newline-owned byte ranges, verify boundary predicates around each candidate literal hit, and count one logical-line match per owned line. Unsupported or unsafe ranges fall back to the materialized verifier.
 - **Chunk casefold** — case-insensitive queries with all-lowercase literal predicates casefold the 1 MiB read buffer in-place once per chunk instead of per-line. Reduces ~100k `toLower` calls to ~500 AVX2 vector passes on a 500-file corpus.
 - **SIMD ASCII casefold** — custom `@Vector(32, u8)` pipeline: wrapping-subtract `'A'` (maps A-Z to 0-25), compare `< 26` to mask uppercase, select-OR `0x20`. 32 bytes per iteration, scalar tail for remainder.
 - **Adaptive thread scaling** — thread count is `ceil(sqrt(file_count / 8))`, capped at CPU count. Avoids Windows `CreateThread` spawn cost (~210μs) dominating scan work on small corpora.
@@ -232,10 +241,195 @@ Mixed (lit:a && (lit:b || lit:c)):
   -> otherwise: AND of a's trigrams with union of b,c trigrams
 ```
 
-Today the trigram gate operates per-scan: evidence is extracted at query parse time and checked against each file's raw bytes inline. The `explain` command surfaces the proof program — mandatory trigrams, admission mode, and evidence groups — via `corpus.zig`.
+Today the trigram gate operates per-scan: evidence is extracted at query parse time, compiled once into `TrigramAdmissionProgram`, then checked against each candidate file's raw bytes inline. The retained implementation performs one streaming rolling-trigram pass over each candidate buffer instead of repeated substring probes per required trigram.
+
+```text
+rolling = (b[i-2] << 16) | (b[i-1] << 8) | b[i]
+if rolling in query_set:
+  mark term/group seen
+
+AND admission:
+  all evidence groups satisfied
+
+OR admission:
+  any indexed branch group satisfied
+```
+
+The `explain` command surfaces the proof program — mandatory trigrams, admission mode, and evidence groups — via `corpus.zig`. The first hot-path executable form now uses the same evidence contract for trigram rejection; the next lane extends that contract into full file-admission bytecode.
 
 > [!TIP]
 > **Planned**: persistent `CorpusIndex` with durable trigram postings, mmap-backed epoch checkpoints, and adaptive posting-list representations (dense bitset / Roaring / sorted `u32` / inline singleton by evidence density). See [Roadmap](#roadmap).
+
+---
+
+## Admission Bytecode Lane
+
+This lane was selected after the 2026-05-11 Rust IX comparison on the Linux bench corpus:
+
+```text
+Zig total: 681.5082 ms
+Rust IX total: 620.3549 ms
+gap: 9.86%
+discovery: 174.7226 ms
+scan: 506.5152 ms
+files discovered: 79088
+```
+
+The measured gap is dominated by discovery plus scan admission, not by final result aggregation. The pipeline target is:
+
+```text
+SearchRequest + ExpressionPlan
+  └─ compile FileAdmissionProgram
+      ├─ PathAdmission
+      │   ├─ hidden/generated/vendor policy
+      │   └─ extension/type predicates
+      ├─ MetadataAdmission
+      │   ├─ minimum length
+      │   └─ binary prefix sniff
+      ├─ RegexMetadataAdmission
+      │   ├─ PCRE2_INFO_FIRSTBITMAP
+      │   ├─ PCRE2_INFO_FIRSTCODETYPE / FIRSTCODEUNIT
+      │   ├─ PCRE2_INFO_LASTCODETYPE / LASTCODEUNIT
+      │   ├─ PCRE2_INFO_MINLENGTH
+      │   └─ PCRE2_INFO_JITSIZE
+      ├─ TrigramAdmission
+      │   └─ one-pass rolling evidence kernel
+      └─ LineVerifier
+          ├─ literal / prefix / suffix verifier
+          ├─ PCRE2 JIT verifier
+          └─ Zig fallback verifier
+```
+
+Implemented first slice:
+
+```text
+TrigramAdmissionProgram
+  ├─ compile once from trigram.Admission
+  ├─ open-addressed 4096-slot trigram membership table
+  ├─ group_masks[slot] marks every evidence group containing that trigram
+  ├─ one rolling 24-bit key per input byte after byte 2
+  ├─ seen_slots prevents duplicate file occurrences from double-counting
+  ├─ group_seen_counts tracks per-predicate evidence satisfaction
+  └─ satisfied_group_mask decides AND/OR admission early
+```
+
+For single-predicate literal / prefix / suffix / regex-word-boundary plans, a contract-safe whole-file mandatory needle admission runs before trigram admission. That fast path rejects files with one SIMD substring probe when the exact predicate shape proves the byte sequence is mandatory; trigram admission remains the multi-evidence boolean gate.
+
+2026-05-11 post-slice measurement on the same Linux corpus profile, 9 measured samples / 2 warmups:
+
+```text
+Zig total: 652.9729 ms
+Rust IX total: 631.6790 ms
+gap: 3.37%
+discovery: 182.8081 ms
+scan: 469.9454 ms
+files discovered: 79088
+```
+
+Cold-lane word-boundary byte-shard verifier erasure:
+
+```text
+Target:
+  expression: re:\bPM_RESUME\b
+  corpus: E:\Workspaces\01_Projects\01_Github\iEx\.refs\ripgrep\benchsuite\linux
+  mode: IX_NEXUS=0, --json --stats-only --threads 32
+
+Planner:
+  strategy: regex_word_boundary_literal -> ByteShardPlan.word_boundary_literal
+  range ownership: newline-aligned logical lines
+  candidate scan: simd.indexOf over mmap-backed byte ranges
+  verifier: wordBoundaryLiteralAt on candidate boundaries
+  fallback: materialized path when line ownership cannot be proven
+
+2026-05-11 7-sample gate:
+  previous reference median wall: 637.615 ms
+  current median wall: 609.966 ms
+  delta: -27.649 ms (-4.34%)
+  matches: 9
+  files scanned: 79085
+  bytes scanned: 1340745076
+  execution_mode: byte_sharded
+  byte_shard_kernel.strategy: word_boundary_literal
+  byte_shard_kernel.files_profiled: 10
+  byte_shard_kernel.range_calls: 40
+  byte_shard_kernel.line_aligned_ranges: 40
+
+Guard lanes:
+  lit:Sherlock Holmes, en.sample.txt, --threads 8:
+    previous reference median wall: 38.043 ms
+    current median wall: 34.788 ms
+    delta: -8.56%
+  lit:the, Linux corpus, --threads 32:
+    current median wall: 613.823 ms
+    matches: 1469971
+```
+
+Interpretation: this removes the materialized verifier lane for large negative word-boundary files and proves the byte-shard control plane for `\bLITERAL\b`. It is a retained cold-lane improvement, not a 10x class jump. The remaining PM_RESUME cost is dominated by discovery/open/admission and nested shard scheduling because the matching files are small while the byte-sharded files are mostly large negatives.
+
+Nexus evidence-frontier sidecar:
+
+```text
+Foreground cold search:
+  command: ix-zig search "re:\bPM_RESUME\b" <linux bench corpus> --json --stats-only
+  foreground cache writes: 0
+  sidecar: __ix_nexus <expression> <root> --json --stats-only
+  Windows launch: CreateProcessW, DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW
+  artifact: .ix-evidence-e98d5d68a37c0b3.cache
+  artifact magic: IXEVIDENCE2
+  write-side content epoch: hash(path, size, inode/file-index, mtime) over the discovered set
+  foreground content stat walk: 0
+
+2026-05-11 regression gate, 9 samples:
+  current foreground cold + sidecar spawn:
+    average wall: 677.1841 ms
+    median wall: 680.6401 ms
+    average total: 666.0318 ms
+    median total: 671.4816 ms
+    median scan: 506.6930 ms
+    pruned from evidence: 0
+
+  current evidence-hot:
+    average wall: 165.0266 ms
+    median wall: 164.1002 ms
+    average total: 158.3406 ms
+    median total: 157.1446 ms
+    median scan: 7.0478 ms
+    pruned from evidence: 79041 files
+
+  committed baseline before this slice (51f8b3b):
+    cold average wall: 672.0882 ms
+    cold median wall: 666.4609 ms
+    hot average wall: 203.0736 ms
+    hot median wall: 203.6417 ms
+    hot median scan: 8.1764 ms
+
+  Rust IX direct:
+    average wall: 649.4291 ms
+    median wall: 653.0254 ms
+    median total: 632.7093 ms
+```
+
+The evidence frontier is the first invisible sidecar slice, not the final persistent corpus index. It validates the discovered path set and a write-side content epoch before foreground reuse, so stale retained frontiers fail closed instead of producing false negatives after content edits. The current freshness owner uses portable file metadata (`path`, size, inode/file-index, and mtime); the planned NTFS USN journal invalidator remains the next Windows-specific step because it can prove the same epoch boundary without charging a full foreground metadata walk on very large trees.
+
+Planned full opcode surface:
+
+```text
+RejectByPathClass
+RejectByExtSet
+RejectBinaryPrefix
+RequireAnyFirstByteSet
+RequireLastCodeUnit
+RequireMinLength
+RequireTrigramGroups
+```
+
+Design constraints:
+
+- Admission bytecode is pure data compiled once per query.
+- Execution performs no heap allocation.
+- Every opcode is a negative gate only; the exact verifier still owns match creation.
+- PCRE2 metadata can only be lowered when PCRE2 proves the fact. Heuristic mandatory-literal inference is not allowed to reject files.
+- C is admitted only as a kernel layer under stable Zig-owned opcodes.
 
 ---
 
@@ -266,7 +460,8 @@ src/
     expr.zig        IX expression grammar and strategy classification
     pcre_regex.zig  PCRE2 JIT regex engine (compile-once, match-many)
     regex.zig       Zig-native backtracking regex (fallback)
-    search.zig      scan pipeline — discover, shard, scan, merge, aggregate
+    search.zig      scan pipeline — discover, admission, shard, scan, merge, aggregate
+    simd.zig        Zig @Vector byte-search kernels
     inspect.zig     bounded file windows and match context
     trigram.zig     trigram extraction and admission gates
     stats.zig       telemetry model
@@ -282,8 +477,13 @@ src/
 <summary><strong>Execution Core</strong> — scan path, hot loop, strategy dispatch</summary>
 <br>
 
+- **Executable admission bytecode** — promote the remaining `corpus.zig` proof-program lowering into the hot path as full `FileAdmissionProgram`. Compile once from `ExpressionPlan`, `SearchRequest`, and PCRE2 metadata; execute as allocation-free opcodes before line splitting. Initial opcode set: `RejectByPathClass`, `RejectByExtSet`, `RejectBinaryPrefix`, `RequireAnyFirstByteSet`, `RequireLastCodeUnit`, `RequireMinLength`, `RequireTrigramGroups`. The first `RequireTrigramGroups`-class executable slice is now live as `TrigramAdmissionProgram`; the remaining work is path, metadata, and PCRE2 fact lowering.
+- **One-pass rolling trigram admission** — implemented: repeated `bytesContainTrigram` scans were replaced with a single streaming proof pass over each candidate buffer. The program maintains compact query membership and per-group satisfaction counters; `AND`/`OR` admission is decided from group state, collapsing `mandatory_trigram_count × file_bytes` behavior into `file_bytes + evidence_hits`.
+- **PCRE2 metadata lowering** — query `PCRE2_INFO_FIRSTBITMAP`, first code unit, last required code unit, minimum length, and JIT size after pattern compilation. Lower only PCRE2-proven facts into admission bytecode; never infer mandatory regex literals heuristically where alternation or optional branches can create false negatives.
+- **Narrow C byte-kernel shim** — add C only beneath stable Zig-owned opcodes when benchmarks prove a primitive is the ceiling. Candidate functions: `ix_count_byte_avx2`, `ix_ascii_ci_memmem_avx2`, and `ix_trigram_admit_scalar_or_avx2`. The Zig control plane, query planner, and verifier ownership remain canonical.
 - **Aho-Corasick automaton for literal alternates** — single-pass multi-pattern matching via failure-link automaton. Current `literalAlternatesColumn` scans each alternate independently (N passes over the line). Automaton-based: one pass, O(line_length) regardless of pattern count. State transitions flattened to 256-wide arrays per state for cache-line-aligned lookup.
 - **Multi-chunk whole-buffer fast count** — extend `wholeBufferFastCount` beyond the single-chunk (<1 MiB) gate. Accumulate literal occurrence counts across chunk boundaries via overlap region verification: last `needle.len - 1` bytes of chunk N concatenated with first `needle.len - 1` bytes of chunk N+1, Rabin-Karp rolling hash detects boundary-spanning candidates, full verify on collision. Eliminates line splitting for stats-only queries on files of any size.
+- **Word-boundary byte-shard C kernel** — after the Zig-owned `ByteShardPlan.word_boundary_literal` lane proved correctness and positive median movement, the admissible C boundary is now only the inner candidate counter: `ix_count_word_boundary_literal_lines_avx2(data, len, needle, needle_len, ranges, out_counts)`. The Zig planner, newline-owned range proof, fallback gate, and tests remain canonical; C may replace candidate scan and ASCII boundary classification only after PMU/timing proves that loop is the ceiling.
 - **Boyer-Moore-Horspool shift table for case-insensitive search** — replace the full-line `asciiLowerBuf` + `sz.indexOf` pipeline. Precompute bad-character shift table over both cases of each byte. Anchor search at the rarest byte in the needle via `memchr2` (upper + lower variant), then verify from anchor position using the shift table. Skips the 2 KiB stack casefold copy entirely.
 - **`comptime` strategy specialization** — monomorphize `scanOpenFileIntoShard` per `MatcherStrategy` variant at compile time. Each variant gets a dedicated function body with the strategy-specific dispatch inlined. Function pointer selected once at parse time, called for every file. Eliminates the `switch (predicate.strategy)` branch in the inner loop — the branch predictor never sees it.
 - **LTO across Zig/C boundary** — enable link-time optimization (`.want_lto = true` on C source steps in `build.zig`) so the compiler can inline StringZilla's `sz_find` / `sz_find_byte` directly into the Zig scan loop. Currently, the C shim creates an opaque call boundary that prevents the compiler from scheduling SIMD instructions across the Zig/C seam. With LTO, the `VPCMPEQB` → `VPMOVMSKB` → `TZCNT` sequence becomes part of the Zig function's instruction stream.

@@ -114,7 +114,6 @@ pub const ExpressionPlan = struct {
         if (predicate.kind != .regex) return self.supportsParallelFastCountRanges();
         return switch (predicate.strategy) {
             .regex_literal_alternates,
-            .regex_word_boundary_literal,
             .regex_ascii_casefold_word_boundary_literal,
             => false,
             else => self.supportsParallelFastCountRanges(),
@@ -406,4 +405,11 @@ test "plan exposes rust capability predicates" {
     const alternates = try parse("re:alpha|beta");
     try std.testing.expect(alternates.supportsParallelFastCountRanges());
     try std.testing.expect(!alternates.supportsOuterParallelShardFastCount());
+
+    const word = try parse("re:\\bPM_RESUME\\b");
+    try std.testing.expect(word.supportsByteMode());
+    try std.testing.expect(word.supportsParallelFastCountRanges());
+    try std.testing.expect(word.supportsOuterParallelShardFastCount());
+    try std.testing.expect(word.usesSingleLiteralCounter());
+    try std.testing.expectEqual(@as(?usize, 13), word.fastMatchCountRangeOverlap());
 }
