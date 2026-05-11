@@ -6,5 +6,7 @@
 /.untrack/
 /tools/reports/
 /tools/scripts/competitors.json
+/.ix-evidence-*.cache
+/.ix-trigram-warm-*.cache
 Created*
 node_modules/

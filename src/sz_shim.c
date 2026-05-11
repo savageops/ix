@@ -50,6 +50,17 @@ char const *ix_sz_find_byte(char const *haystack, size_t h_len,
 }
 
 /*
+ * Byteset search — SIMD "find first byte in set" equivalent.
+ * On Haswell uses VPSHUFB nibble-mask to classify 32 bytes/cycle.
+ * Used by the regex fallback engine to skip non-candidate start
+ * positions via a precomputed start-set bitmap.
+ */
+char const *ix_sz_find_byteset(char const *haystack, size_t h_len,
+                               sz_byteset_t const *set) {
+    return sz_find_byteset(haystack, (sz_size_t)h_len, set);
+}
+
+/*
  * Byte equality — SIMD memcmp equivalent.
  * Compares two buffers using SIMD-width chunks. Currently unused in
  * hot paths but available for future case-insensitive prefilters.

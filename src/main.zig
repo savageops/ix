@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("cli/args.zig");
 const output = @import("cli/output.zig");
 const expr = @import("core/expr.zig");
@@ -78,6 +79,7 @@ pub fn main(init: std.process.Init) !void {
                 try stderr.flush();
                 std.process.exit(1);
             };
+            if (shouldLaunchNexusSidecar(report)) launchNexusSidecar(init.io, allocator, argv[0], request);
             if (request.json) {
                 try output.writeSearchJsonReport(stdout, report);
             } else {
@@ -101,6 +103,7 @@ pub fn main(init: std.process.Init) !void {
                 try stderr.flush();
                 std.process.exit(1);
             };
+            if (shouldLaunchNexusSidecar(report)) launchNexusSidecar(init.io, allocator, argv[0], request);
             if (request.json) {
                 try output.writeSearchJsonReport(stdout, report);
             } else if (!request.stats_only) {
@@ -162,8 +165,174 @@ pub fn main(init: std.process.Init) !void {
             };
             try output.writeExplain(stdout, plan);
         },
+        .nexus => |request| {
+            const plan = expr.parse(request.expression) catch std.process.exit(0);
+            _ = search.run(init.io, allocator, request, plan) catch std.process.exit(0);
+        },
     }
     try stdout.flush();
+}
+
+fn shouldLaunchNexusSidecar(report: search.SearchReport) bool {
+    return report.stats.trigram_acceleration.pruned_files == 0;
+}
+
+fn launchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, argv0: []const u8, request: cli.SearchRequest) void {
+    if (request.nexus_build) return;
+    if (request.case_insensitive) return;
+    if (request.path_count > 1) return;
+    if (!std.process.can_spawn) return;
+
+    var argv = std.ArrayList([]const u8).empty;
+    argv.append(allocator, argv0) catch return;
+    argv.append(allocator, "__ix_nexus") catch return;
+    argv.append(allocator, request.expression) catch return;
+    var path_index: usize = 0;
+    while (path_index < request.path_count) : (path_index += 1) argv.append(allocator, request.paths[path_index]) catch return;
+    if (request.hidden) argv.append(allocator, "--hidden") catch return;
+    if (request.follow_symlinks) argv.append(allocator, "--follow-symlinks") catch return;
+    if (request.threads) |threads| {
+        argv.append(allocator, "--threads") catch return;
+        argv.append(allocator, std.fmt.allocPrint(allocator, "{}", .{threads}) catch return) catch return;
+    }
+
+    if (comptime builtin.os.tag == .windows) {
+        launchNexusSidecarWindows(allocator, argv.items) catch return;
+        return;
+    }
+
+    const child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+        .create_no_window = true,
+    }) catch return;
+    _ = child;
+}
+
+fn launchNexusSidecarWindows(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    const windows = std.os.windows;
+    const app_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, argv[0]);
+    var command_line = std.ArrayList(u8).empty;
+    for (argv, 0..) |arg, index| {
+        if (index != 0) try command_line.append(allocator, ' ');
+        try appendWindowsCommandArg(allocator, &command_line, arg);
+    }
+    const command_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, command_line.items);
+
+    var startup = std.mem.zeroes(windows.STARTUPINFOW);
+    startup.cb = @sizeOf(windows.STARTUPINFOW);
+    var info: windows.PROCESS.INFORMATION = undefined;
+    const ok = windows.kernel32.CreateProcessW(
+        app_w.ptr,
+        command_w.ptr,
+        null,
+        null,
+        .FALSE,
+        .{
+            .detached_process = true,
+            .create_new_process_group = true,
+            .create_no_window = true,
+        },
+        null,
+        null,
+        &startup,
+        &info,
+    );
+    if (ok == .FALSE) return error.NexusSpawnFailed;
+    windows.CloseHandle(info.hThread);
+    windows.CloseHandle(info.hProcess);
+}
+
+fn appendWindowsCommandArg(allocator: std.mem.Allocator, list: *std.ArrayList(u8), arg: []const u8) !void {
+    try list.append(allocator, '"');
+    var backslashes: usize = 0;
+    for (arg) |byte| {
+        if (byte == '\\') {
+            backslashes += 1;
+            continue;
+        }
+        if (byte == '"') {
+            try appendRepeated(allocator, list, '\\', backslashes * 2 + 1);
+            try list.append(allocator, '"');
+        } else {
+            try appendRepeated(allocator, list, '\\', backslashes);
+            try list.append(allocator, byte);
+        }
+        backslashes = 0;
+    }
+    try appendRepeated(allocator, list, '\\', backslashes * 2);
+    try list.append(allocator, '"');
+}
+
+fn appendRepeated(allocator: std.mem.Allocator, list: *std.ArrayList(u8), byte: u8, count: usize) !void {
+    var index: usize = 0;
+    while (index < count) : (index += 1) try list.append(allocator, byte);
+}
+
+test "nexus sidecar launch is gated after evidence-pruned foreground reuse" {
+    try std.testing.expect(shouldLaunchNexusSidecar(testSearchReportForSidecar(0)));
+    try std.testing.expect(!shouldLaunchNexusSidecar(testSearchReportForSidecar(1)));
+    try std.testing.expect(!shouldLaunchNexusSidecar(testSearchReportForSidecar(79041)));
+}
+
+test "windows command argument quoting preserves spaces quotes and trailing slashes" {
+    const allocator = std.testing.allocator;
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(allocator);
+
+    try appendWindowsCommandArg(allocator, &list, "plain");
+    try std.testing.expectEqualStrings("\"plain\"", list.items);
+    list.clearRetainingCapacity();
+
+    try appendWindowsCommandArg(allocator, &list, "has space");
+    try std.testing.expectEqualStrings("\"has space\"", list.items);
+    list.clearRetainingCapacity();
+
+    try appendWindowsCommandArg(allocator, &list, "a\"b");
+    try std.testing.expectEqualStrings("\"a\\\"b\"", list.items);
+    list.clearRetainingCapacity();
+
+    try appendWindowsCommandArg(allocator, &list, "tail\\");
+    try std.testing.expectEqualStrings("\"tail\\\\\"", list.items);
+}
+
+fn testSearchReportForSidecar(pruned_files: usize) search.SearchReport {
+    var report = search.SearchReport{
+        .expression = "lit:needle",
+        .input_roots = 1,
+        .effective_roots = 1,
+        .pruned_roots = 0,
+        .overlap_pruned_roots = 0,
+        .discovered_duplicate_paths = 0,
+        .collect_hits = true,
+        .stats = .{},
+        .bytes_scanned = 0,
+        .files_discovered = 0,
+        .files_scanned = 0,
+        .files_skipped = 0,
+        .matches_found = 0,
+        .truncated = false,
+        .slowest_path = "",
+        .slowest_bytes = 0,
+        .slowest_ms = 0,
+        .discover_ms = 0,
+        .scan_ms = 0,
+        .aggregate_ms = 0,
+        .total_ms = 0,
+        .scan_work_ms_total = 0,
+        .matcher_strategy_supported = false,
+        .outer_parallel_shard_safe = false,
+        .uses_single_literal_counter = false,
+        .fast_count_range_overlap = null,
+        .available_threads = 1,
+        .outer_scan_threads = 0,
+        .hits = undefined,
+        .hit_count = 0,
+    };
+    report.stats.trigram_acceleration.pruned_files = pruned_files;
+    return report;
 }
 
 test {

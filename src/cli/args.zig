@@ -8,6 +8,7 @@ pub const CommandTag = enum {
     matches,
     inspect,
     explain,
+    nexus,
 };
 
 pub const HelpTopic = enum {
@@ -32,6 +33,7 @@ pub const SearchRequest = struct {
     max_hits: ?usize,
     threads: ?usize,
     emit_report: ?[]const u8,
+    nexus_build: bool,
 };
 
 pub const InspectRequest = struct {
@@ -72,6 +74,7 @@ pub const Command = union(CommandTag) {
     matches: SearchRequest,
     inspect: InspectRequest,
     explain: ExplainRequest,
+    nexus: SearchRequest,
 };
 
 pub const Invocation = struct {
@@ -112,6 +115,13 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .explain } };
         if (argv.len < 3) return ParseError.MissingExpression;
         return .{ .command = .{ .explain = .{ .expression = argv[2] } } };
+    }
+    if (std.mem.eql(u8, first, "__ix_nexus")) {
+        var request = try parseSearch(argv[2..]);
+        request.stats_only = true;
+        request.json = true;
+        request.nexus_build = true;
+        return .{ .command = .{ .nexus = request } };
     }
 
     return .{ .command = .{ .search = try parseCompatSearch(allocator, argv[1..]) } };
@@ -177,6 +187,7 @@ fn emptySearchRequest(expression: []const u8) SearchRequest {
         .max_hits = null,
         .threads = null,
         .emit_report = null,
+        .nexus_build = false,
     };
 }
 
@@ -422,4 +433,29 @@ test "canonical commands parse before compat lowering" {
     const argv = [_][]const u8{ "ix-zig", "explain", "lit:needle" };
     const invocation = try parseInvocation(std.testing.allocator, &argv);
     try std.testing.expect(invocation.command == .explain);
+}
+
+test "hidden nexus command forces silent stats json build mode" {
+    const argv = [_][]const u8{
+        "ix-zig",
+        "__ix_nexus",
+        "re:\\bPM_RESUME\\b",
+        "src",
+        "--hidden",
+        "--follow-symlinks",
+        "--threads",
+        "7",
+    };
+    const invocation = try parseInvocation(std.testing.allocator, &argv);
+    try std.testing.expect(invocation.command == .nexus);
+    const request = invocation.command.nexus;
+    try std.testing.expectEqualStrings("re:\\bPM_RESUME\\b", request.expression);
+    try std.testing.expectEqual(@as(usize, 1), request.path_count);
+    try std.testing.expectEqualStrings("src", request.paths[0]);
+    try std.testing.expect(request.stats_only);
+    try std.testing.expect(request.json);
+    try std.testing.expect(request.nexus_build);
+    try std.testing.expect(request.hidden);
+    try std.testing.expect(request.follow_symlinks);
+    try std.testing.expectEqual(@as(?usize, 7), request.threads);
 }

@@ -106,6 +106,9 @@ threadlocal var cache: CachedRegex = .{};
 /// Returns error.CompileFailed if PCRE2 cannot compile the pattern.
 pub fn column(line: []const u8, pattern: []const u8, case_insensitive: bool) error{CompileFailed}!?usize {
     if (!cache.ensureCompiled(pattern, case_insensitive)) return error.CompileFailed;
+    // PCRE2 crashes on empty subjects: pcre2_match dereferences start_match - 1
+    // to check the previous byte for \b / lookbehind. Guard here.
+    if (line.len == 0) return null;
 
     const rc: c_int = c.pcre2_match_8(
         cache.code.?,
@@ -127,6 +130,7 @@ pub fn column(line: []const u8, pattern: []const u8, case_insensitive: bool) err
 /// Returns error.CompileFailed if PCRE2 cannot compile the pattern.
 pub fn count(line: []const u8, pattern: []const u8, case_insensitive: bool) error{CompileFailed}!usize {
     if (!cache.ensureCompiled(pattern, case_insensitive)) return error.CompileFailed;
+    if (line.len == 0) return 0;
 
     var total: usize = 0;
     var offset: usize = 0;

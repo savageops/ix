@@ -29,6 +29,17 @@
 // the C compiler must emit them as real symbols first.
 extern fn ix_sz_find(haystack: [*]const u8, h_len: usize, needle: [*]const u8, n_len: usize) ?[*]const u8;
 extern fn ix_sz_find_byte(haystack: [*]const u8, h_len: usize, needle: [*]const u8) ?[*]const u8;
+extern fn ix_sz_find_byteset(haystack: [*]const u8, h_len: usize, set: *const ByteSet) ?[*]const u8;
+
+/// 256-bit byte membership bitmap, ABI-compatible with `sz_byteset_t`.
+/// 4 × u64 = 32 bytes. Bit `c` is set iff byte value `c` is in the set.
+pub const ByteSet = extern struct {
+    _u64s: [4]u64 = .{ 0, 0, 0, 0 },
+
+    pub fn add(self: *ByteSet, byte: u8) void {
+        self._u64s[byte >> 6] |= @as(u64, 1) << @as(u6, @intCast(byte & 63));
+    }
+};
 
 /// SIMD-accelerated substring search (memmem equivalent).
 ///
@@ -64,5 +75,18 @@ pub fn indexOfByte(haystack: []const u8, byte: u8) ?usize {
     // the multi-byte find function signature.
     const needle_buf = [1]u8{byte};
     const result = ix_sz_find_byte(haystack.ptr, haystack.len, &needle_buf) orelse return null;
+    return @intFromPtr(result) - @intFromPtr(haystack.ptr);
+}
+
+/// SIMD-accelerated byte-set search (find first byte in set).
+///
+/// On Haswell uses VPSHUFB nibble-mask to classify 32 bytes per cycle.
+/// The `ByteSet` is a 256-bit bitmap where bit `c` indicates byte value
+/// `c` is in the target set.
+///
+/// Returns the index of the first byte in `haystack` that belongs to `set`, or null.
+pub fn indexOfByteSet(haystack: []const u8, set: *const ByteSet) ?usize {
+    if (haystack.len == 0) return null;
+    const result = ix_sz_find_byteset(haystack.ptr, haystack.len, set) orelse return null;
     return @intFromPtr(result) - @intFromPtr(haystack.ptr);
 }

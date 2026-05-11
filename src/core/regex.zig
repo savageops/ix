@@ -1,4 +1,5 @@
 const std = @import("std");
+const sz = @import("sz.zig");
 
 /// Zig-native regex engine — a recursive backtracking matcher.
 ///
@@ -78,21 +79,153 @@ fn earliestMatch(line: []const u8, pattern: []const u8, start: usize, case_insen
     return best;
 }
 
+/// Extracts the set of byte values that can start a match for a pattern.
+/// Returns null if the first token matches any byte (`.`, `[^...]` covering
+/// all values, etc.) — in that case SIMD skip provides no benefit.
+fn extractStartSet(pattern: []const u8, case_insensitive: bool) ?sz.ByteSet {
+    const token = parseToken(pattern, 0) orelse return null;
+    var set = sz.ByteSet{};
+    switch (token.kind) {
+        .literal => {
+            set.add(token.literal);
+            if (case_insensitive) {
+                set.add(std.ascii.toUpper(token.literal));
+                set.add(std.ascii.toLower(token.literal));
+            }
+        },
+        .word => {
+            for (0..256) |i| {
+                if (CLASS_TABLE[i].word != 0) set.add(@intCast(i));
+            }
+        },
+        .digit => {
+            for ('0'..('9' + 1)) |i| set.add(@intCast(i));
+        },
+        .whitespace => {
+            set.add(' ');
+            set.add('\t');
+            set.add('\r');
+            set.add('\n');
+        },
+        .class => {
+            populateClassSet(&set, token.class, case_insensitive);
+        },
+        // These match too broadly or are zero-width — skip SIMD prefilter.
+        .any, .negated_class, .group, .word_boundary, .line_start, .line_end => return null,
+    }
+    return set;
+}
+
+/// Populates a ByteSet from a character class body (e.g., the `a-zA-Z` in `[a-zA-Z]`).
+fn populateClassSet(set: *sz.ByteSet, class: []const u8, case_insensitive: bool) void {
+    var index: usize = 0;
+    while (index < class.len) : (index += 1) {
+        const first = if (class[index] == '\\' and index + 1 < class.len) blk: {
+            index += 1;
+            break :blk escapedClassByte(class[index]);
+        } else class[index];
+        if (index + 2 < class.len and class[index + 1] == '-') {
+            const last = class[index + 2];
+            var c: u16 = first;
+            while (c <= last) : (c += 1) {
+                set.add(@intCast(c));
+                if (case_insensitive) {
+                    set.add(std.ascii.toUpper(@intCast(c)));
+                    set.add(std.ascii.toLower(@intCast(c)));
+                }
+            }
+            index += 2;
+            continue;
+        }
+        set.add(first);
+        if (case_insensitive) {
+            set.add(std.ascii.toUpper(first));
+            set.add(std.ascii.toLower(first));
+        }
+    }
+}
+
 fn branchMatch(line: []const u8, pattern: []const u8, start: usize, case_insensitive: bool) ?MatchSpan {
+    // Visited set shared across starting cursors: matchPatternEnd is a pure
+    // function of (pattern, pattern_index, line, cursor, case_insensitive),
+    // so a memoized failure at (pat_pos, cursor) is valid regardless of
+    // which outer starting position triggered the exploration.
+    var visited = VisitedSet.init(pattern, line);
+    const start_set = extractStartSet(pattern, case_insensitive);
     var cursor: usize = start;
-    while (cursor <= line.len) : (cursor += 1) {
-        if (matchPatternEnd(pattern, 0, line, cursor, case_insensitive)) |end| return .{ .start = cursor, .end = end };
+    while (cursor <= line.len) {
+        if (matchPatternEnd(pattern, 0, line, cursor, case_insensitive, &visited)) |end| return .{ .start = cursor, .end = end };
+        // SIMD skip: jump to the next byte that could start a match.
+        if (start_set) |*ss| {
+            if (cursor + 1 < line.len) {
+                cursor = if (sz.indexOfByteSet(line[cursor + 1 ..], ss)) |offset| cursor + 1 + offset else return null;
+            } else {
+                cursor += 1;
+            }
+        } else {
+            cursor += 1;
+        }
     }
     return null;
 }
 
 fn branchColumn(line: []const u8, pattern: []const u8, case_insensitive: bool) ?usize {
+    var visited = VisitedSet.init(pattern, line);
+    const start_set = extractStartSet(pattern, case_insensitive);
     var start: usize = 0;
-    while (start <= line.len) : (start += 1) {
-        if (matchPatternEnd(pattern, 0, line, start, case_insensitive) != null) return start + 1;
+    while (start <= line.len) {
+        if (matchPatternEnd(pattern, 0, line, start, case_insensitive, &visited) != null) return start + 1;
+        if (start_set) |*ss| {
+            if (start + 1 < line.len) {
+                start = if (sz.indexOfByteSet(line[start + 1 ..], ss)) |offset| start + 1 + offset else return null;
+            } else {
+                start += 1;
+            }
+        } else {
+            start += 1;
+        }
     }
     return null;
 }
+
+/// Visited-state bitset for bounded backtracking. Prevents exponential
+/// blow-up on pathological patterns (e.g., `a*a*a*a*b` vs `aaaa`) by
+/// memoizing failed (pattern_offset, cursor) pairs. If the key space
+/// exceeds the stack budget, the check degrades to a no-op — correctness
+/// is preserved, only the exponential bound is lost.
+const VisitedSet = struct {
+    const MAX_BITS = 64 * 1024; // 8 KiB bitset
+    const WORDS = MAX_BITS / 64;
+
+    bits: [WORDS]u64,
+    pattern_base: [*]const u8,
+    stride: usize, // line.len + 1
+    active: bool,
+
+    fn init(pattern: []const u8, line: []const u8) VisitedSet {
+        const stride = line.len + 1;
+        const total = pattern.len * stride;
+        if (total > MAX_BITS) {
+            return .{ .bits = undefined, .pattern_base = pattern.ptr, .stride = stride, .active = false };
+        }
+        return .{ .bits = @splat(0), .pattern_base = pattern.ptr, .stride = stride, .active = true };
+    }
+
+    /// Returns true if this (pattern_pos, cursor) was already visited (=> known failure).
+    /// Sets the bit and returns false on first visit.
+    fn checkAndSet(self: *VisitedSet, pattern_ptr: [*]const u8, pattern_index: usize, cursor: usize) bool {
+        if (!self.active) return false;
+        const pat_offset = @intFromPtr(pattern_ptr) -% @intFromPtr(self.pattern_base);
+        const key = (pat_offset + pattern_index) * self.stride + cursor;
+        if (key >= MAX_BITS) return false; // out of budget — skip
+        const word = key / 64;
+        const bit: u6 = @intCast(key % 64);
+        const mask: u64 = @as(u64, 1) << bit;
+        if (self.bits[word] & mask != 0) return true;
+        self.bits[word] |= mask;
+        return false;
+    }
+};
 
 /// Recursive pattern matcher — attempts to match the pattern starting at
 /// pattern_index against the line starting at cursor. Returns the end
@@ -108,34 +241,38 @@ fn branchColumn(line: []const u8, pattern: []const u8, case_insensitive: bool) ?
 /// tokens). Recursive backtracking is fast enough for these and avoids
 /// the complexity of NFA state management. Pathological exponential
 /// patterns (e.g., (a*)* ) are not in the IX expression grammar.
-fn matchPatternEnd(pattern: []const u8, pattern_index: usize, line: []const u8, cursor: usize, case_insensitive: bool) ?usize {
+fn matchPatternEnd(pattern: []const u8, pattern_index: usize, line: []const u8, cursor: usize, case_insensitive: bool, visited: *VisitedSet) ?usize {
     if (pattern_index >= pattern.len) return cursor;
     if (cursor > line.len) return null;
+
+    // Visited-bitset pruning: if we already explored this (pattern_pos, cursor)
+    // and it failed, skip immediately. This bounds worst-case to O(P × L).
+    if (visited.checkAndSet(pattern.ptr, pattern_index, cursor)) return null;
 
     const token = parseToken(pattern, pattern_index) orelse return null;
     if (token.kind == .group) {
         const close = matchingGroupEnd(pattern, pattern_index) orelse return null;
-        return matchGroupThenRest(pattern[pattern_index + 1 .. close], pattern[close + 1 ..], line, cursor, case_insensitive);
+        return matchGroupThenRest(pattern[pattern_index + 1 .. close], pattern[close + 1 ..], line, cursor, case_insensitive, visited);
     }
     if (token.kind == .word_boundary) {
         if (!isWordBoundary(line, cursor)) return null;
-        return matchPatternEnd(pattern, token.next_index, line, cursor, case_insensitive);
+        return matchPatternEnd(pattern, token.next_index, line, cursor, case_insensitive, visited);
     }
     if (token.kind == .line_start) {
         if (cursor != 0) return null;
-        return matchPatternEnd(pattern, token.next_index, line, cursor, case_insensitive);
+        return matchPatternEnd(pattern, token.next_index, line, cursor, case_insensitive, visited);
     }
     if (token.kind == .line_end) {
         if (cursor != line.len) return null;
-        return matchPatternEnd(pattern, token.next_index, line, cursor, case_insensitive);
+        return matchPatternEnd(pattern, token.next_index, line, cursor, case_insensitive, visited);
     }
     // OPTIONAL (?) — match 0 or 1 times. Tries consuming one character
     // first (greedy), falls back to matching zero characters.
     if (token.next_index < pattern.len and pattern[token.next_index] == '?') {
         if (cursor < line.len and tokenMatches(token, line[cursor], case_insensitive)) {
-            if (matchPatternEnd(pattern, token.next_index + 1, line, cursor + 1, case_insensitive)) |end| return end;
+            if (matchPatternEnd(pattern, token.next_index + 1, line, cursor + 1, case_insensitive, visited)) |end| return end;
         }
-        return matchPatternEnd(pattern, token.next_index + 1, line, cursor, case_insensitive);
+        return matchPatternEnd(pattern, token.next_index + 1, line, cursor, case_insensitive, visited);
     }
     // STAR (*) — match 0 or more times, greedy with backtracking.
     // First consumes as many matching bytes as possible (greedy), then
@@ -146,7 +283,7 @@ fn matchPatternEnd(pattern: []const u8, pattern_index: usize, line: []const u8, 
         while (next_cursor < line.len and tokenMatches(token, line[next_cursor], case_insensitive)) : (next_cursor += 1) {}
         // Backtrack from the greedy maximum toward the minimum (cursor).
         while (next_cursor >= cursor) : (next_cursor -= 1) {
-            if (matchPatternEnd(pattern, token.next_index + 1, line, next_cursor, case_insensitive)) |end| return end;
+            if (matchPatternEnd(pattern, token.next_index + 1, line, next_cursor, case_insensitive, visited)) |end| return end;
             if (next_cursor == 0) break;
         }
         return null;
@@ -158,7 +295,7 @@ fn matchPatternEnd(pattern: []const u8, pattern_index: usize, line: []const u8, 
         if (cursor >= line.len or !tokenMatches(token, line[cursor], case_insensitive)) return null;
         var next_cursor = cursor + 1;
         while (true) {
-            if (matchPatternEnd(pattern, token.next_index + 1, line, next_cursor, case_insensitive)) |end| return end;
+            if (matchPatternEnd(pattern, token.next_index + 1, line, next_cursor, case_insensitive, visited)) |end| return end;
             if (next_cursor >= line.len or !tokenMatches(token, line[next_cursor], case_insensitive)) break;
             next_cursor += 1;
         }
@@ -175,7 +312,7 @@ fn matchPatternEnd(pattern: []const u8, pattern_index: usize, line: []const u8, 
         if (next_cursor >= line.len or !tokenMatches(token, line[next_cursor], case_insensitive)) return null;
         next_cursor += 1;
     }
-    return matchPatternEnd(pattern, repeat_end, line, next_cursor, case_insensitive);
+    return matchPatternEnd(pattern, repeat_end, line, next_cursor, case_insensitive, visited);
 }
 
 /// Matches a parenthesized group with alternation, then the rest of the pattern.
@@ -186,13 +323,13 @@ fn matchPatternEnd(pattern: []const u8, pattern_index: usize, line: []const u8, 
 /// group's end position feeds into the rest pattern's start — this is what makes
 /// `(session|handshake)\b` work correctly: the word boundary check happens at
 /// the exact byte after "session" or "handshake" ends.
-fn matchGroupThenRest(group: []const u8, rest: []const u8, line: []const u8, cursor: usize, case_insensitive: bool) ?usize {
+fn matchGroupThenRest(group: []const u8, rest: []const u8, line: []const u8, cursor: usize, case_insensitive: bool, visited: *VisitedSet) ?usize {
     var branch_start: usize = 0;
     while (branch_start <= group.len) {
         const branch_end = findTopLevelAlternation(group, branch_start) orelse group.len;
         const branch = group[branch_start..branch_end];
-        if (matchPatternEnd(branch, 0, line, cursor, case_insensitive)) |group_end| {
-            if (matchPatternEnd(rest, 0, line, group_end, case_insensitive)) |end| return end;
+        if (matchPatternEnd(branch, 0, line, cursor, case_insensitive, visited)) |group_end| {
+            if (matchPatternEnd(rest, 0, line, group_end, case_insensitive, visited)) |end| return end;
         }
         if (branch_end == group.len) break;
         branch_start = branch_end + 1;
@@ -260,13 +397,44 @@ fn parseHexByte(pattern: []const u8, index: usize) ?Token {
     return .{ .kind = .literal, .literal = value, .next_index = index + 4 };
 }
 
+/// Comptime-generated 256-byte classification table. Single indexed load
+/// replaces branch cascade in the hot path. Bit layout:
+///   bit 0: word      [a-zA-Z0-9_]
+///   bit 1: digit     [0-9]
+///   bit 2: whitespace [ \t\r\n]
+const CharClass = packed struct {
+    word: u1 = 0,
+    digit: u1 = 0,
+    whitespace: u1 = 0,
+    _pad: u5 = 0,
+};
+
+const CLASS_TABLE: [256]CharClass = blk: {
+    var table: [256]CharClass = @splat(CharClass{});
+    for (0..256) |i| {
+        const c: u8 = @intCast(i);
+        if ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '_')
+        {
+            table[i].word = 1;
+        }
+        if (c >= '0' and c <= '9') {
+            table[i].digit = 1;
+        }
+        if (c == ' ' or c == '\t' or c == '\r' or c == '\n') {
+            table[i].whitespace = 1;
+        }
+    }
+    break :blk table;
+};
+
 fn tokenMatches(token: Token, byte: u8, case_insensitive: bool) bool {
     return switch (token.kind) {
         .literal => byteEquals(byte, token.literal, case_insensitive),
         .any => true,
-        .word => isWordByte(byte),
-        .digit => std.ascii.isDigit(byte),
-        .whitespace => byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n',
+        .word => CLASS_TABLE[byte].word != 0,
+        .digit => CLASS_TABLE[byte].digit != 0,
+        .whitespace => CLASS_TABLE[byte].whitespace != 0,
         .class => classMatches(token.class, byte, case_insensitive),
         .negated_class => !classMatches(token.class, byte, case_insensitive),
         else => false,
@@ -378,7 +546,7 @@ fn isWordBoundary(line: []const u8, cursor: usize) bool {
 }
 
 fn isWordByte(byte: u8) bool {
-    return std.ascii.isAlphanumeric(byte) or byte == '_';
+    return CLASS_TABLE[byte].word != 0;
 }
 
 fn byteEquals(left: u8, right: u8, case_insensitive: bool) bool {

@@ -18,7 +18,7 @@ pub const LogicMode = enum {
 };
 
 /// The four IX predicate types, each with distinct matching semantics:
-///   literal  → substring match anywhere in the line (uses StringZilla SIMD)
+///   literal  → substring match anywhere in the line (AVX2 SIMD)
 ///   regex    → Zig-native regex engine (recursive backtracking)
 ///   prefix   → line must start with the value
 ///   suffix   → line must end with the value

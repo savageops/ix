@@ -1,14 +1,91 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const cli = @import("../cli/args.zig");
 const expr = @import("expr.zig");
 const regex = @import("regex.zig");
 const pcre_regex = @import("pcre_regex.zig");
 const core_stats = @import("stats.zig");
 const trigram = @import("trigram.zig");
-// SIMD-accelerated byte/substring search via StringZilla (see sz.zig).
-// Replaces std.mem.indexOf (~1 byte/cycle) with AVX2 search (~32 bytes/cycle)
-// on the three hottest paths: newline scanning, binary sniffing, and literal matching.
-const sz = @import("sz.zig");
+// Pure Zig SIMD search kernels — same VPCMPEQB/VPMOVMSKB/TZCNT instructions
+// as StringZilla but inlineable (no FFI call overhead). Eliminates ~5 ns/call
+// FFI overhead across ~600K calls per search (~3 ms total). Used on the hottest
+// paths: newline scanning, binary sniffing, and literal matching.
+const simd = @import("simd.zig");
+
+// ---------------------------------------------------------------------------
+// NT Object Path Bypass (Windows)
+//
+// Standard file open on Windows routes through RtlGetFullPathName_U which
+// acquires the process-global PEB lock (RTL_CRITICAL_SECTION) to canonicalize
+// paths. At 32 threads × 79K files, this single mutex serializes all file
+// opens: per-file overhead inflates 13.6× from 66 μs (1 thread) to 897 μs
+// (32 threads), collapsing parallelism from 32× theoretical to 1.6× measured.
+//
+// Fix: construct NT object paths (\??\E:\path\to\file) before calling openFile.
+// The stdlib's wToPrefixedFileW checks hasCommonNtPrefix first — if the \??\
+// prefix is present, it memcpys the path directly. No RtlGetFullPathName_U,
+// no PEB lock, no contention. NtCreateFile receives the absolute NT path with
+// RootDirectory=null and resolves it independently per thread.
+// ---------------------------------------------------------------------------
+
+/// NT CWD prefix: \??\E:\path\to\cwd\ (backslash-terminated UTF-8).
+/// Resolved once on the main thread in run(), read-only during parallel scan.
+var g_nt_cwd_prefix: [1024]u8 = undefined;
+var g_nt_cwd_prefix_len: usize = 0;
+
+/// Resolves CWD into NT object path prefix. Single-threaded, called once.
+fn initNtCwdPrefix(io: std.Io) void {
+    if (comptime builtin.os.tag != .windows) return;
+    const nt_hdr = "\\??\\";
+    @memcpy(g_nt_cwd_prefix[0..nt_hdr.len], nt_hdr);
+    const cwd_len = std.process.currentPath(io, g_nt_cwd_prefix[nt_hdr.len .. g_nt_cwd_prefix.len - 1]) catch return;
+    var total = nt_hdr.len + cwd_len;
+    // CWD from RtlGetCurrentDirectory_U uses backslashes; normalize any stray forward slashes.
+    for (g_nt_cwd_prefix[nt_hdr.len..total]) |*b| {
+        if (b.* == '/') b.* = '\\';
+    }
+    if (total == 0 or g_nt_cwd_prefix[total - 1] != '\\') {
+        g_nt_cwd_prefix[total] = '\\';
+        total += 1;
+    }
+    g_nt_cwd_prefix_len = total;
+}
+
+/// Opens a file using NT object path to bypass RtlGetFullPathName_U PEB lock.
+/// Constructs \??\{CWD}\{path} on the stack with / → \ conversion.
+/// Falls back to standard openFile for non-Windows, unresolved CWD, or overflow.
+fn openFileNt(io: std.Io, display_path: []const u8) !std.Io.File {
+    if (comptime builtin.os.tag != .windows)
+        return std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false });
+    if (g_nt_cwd_prefix_len == 0)
+        return std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false });
+
+    // Absolute paths (drive letter) get \??\ prefix; relative paths get \??\{CWD}\.
+    const nt_hdr: []const u8 = "\\??\\";
+    const is_abs = display_path.len >= 2 and display_path[1] == ':' and
+        ((display_path[0] >= 'A' and display_path[0] <= 'Z') or
+            (display_path[0] >= 'a' and display_path[0] <= 'z'));
+    const prefix = if (is_abs) nt_hdr else g_nt_cwd_prefix[0..g_nt_cwd_prefix_len];
+    const total_len = prefix.len + display_path.len;
+
+    var nt_buf: [1280]u8 = undefined;
+    if (total_len > nt_buf.len)
+        return std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false });
+
+    @memcpy(nt_buf[0..prefix.len], prefix);
+    @memcpy(nt_buf[prefix.len..][0..display_path.len], display_path);
+    // NT namespace requires backslash separators. Collapse consecutive separators
+    // in one pass — NT Object Manager rejects adjacent backslashes (STATUS_OBJECT_NAME_INVALID).
+    // This handles root paths with trailing slash producing "dir//file" via joinPathForward.
+    var write_pos: usize = 0;
+    for (nt_buf[0..total_len]) |b| {
+        const c = if (b == '/') @as(u8, '\\') else b;
+        if (write_pos > 0 and c == '\\' and nt_buf[write_pos - 1] == '\\') continue;
+        nt_buf[write_pos] = c;
+        write_pos += 1;
+    }
+    return std.Io.Dir.cwd().openFile(io, nt_buf[0..write_pos], .{ .allow_directory = false });
+}
 
 /// Maximum hit records retained in the report. Beyond this count, matches
 /// are still counted for stats but individual hit records are not stored.
@@ -16,6 +93,9 @@ const sz = @import("sz.zig");
 pub const MAX_RETAINED_HITS = 4096;
 
 const TRIGRAM_MIN_PRUNE_BYTES: usize = 64 * 1024;
+const EVIDENCE_FRONTIER_CACHE_MAGIC = "IXEVIDENCE2";
+const EVIDENCE_FRONTIER_CACHE_READ_LIMIT = 64 * 1024 * 1024;
+const EVIDENCE_FRONTIER_CACHE_CANDIDATE_LIMIT = 262144;
 
 /// Comptime predicate specialization for single-predicate plans. When passed to
 /// scanOpenFileIntoShardImpl / recordLineIntoShardImpl, the per-line match
@@ -124,23 +204,37 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     }
     report.discover_ms = elapsedMs(io, discover_started);
 
+    // Resolve CWD → NT object path prefix once, before spawning scan threads.
+    // All workers read g_nt_cwd_prefix without contention (immutable after init).
+    initNtCwdPrefix(io);
+
     // Phase 2: Scan files — thread count adapts to corpus size after discovery.
     const scan_started = std.Io.Timestamp.now(io, .awake);
-    const discovered = file_list.items(allocator);
     const trigram_admission = trigram.admit(plan);
+    const trigram_program = TrigramAdmissionProgram.compile(trigram_admission);
     initTrigramStats(&report.stats.trigram_acceleration, trigram_admission, request.case_insensitive);
-    const thread_count = effectiveThreadCount(request, discovered.len);
+    const discovered_mut = file_list.mutableItems();
+    const evidence_prepared = prepareEvidenceFrontier(io, allocator, request, plan, trigram_admission, discovered_mut, &report);
+    const active_files = evidence_prepared.active_files orelse discovered_mut;
+    const thread_count = effectiveThreadCount(request, active_files.len);
     report.outer_scan_threads = thread_count;
+
+    // Shuffle file list to distribute NTFS directory lock contention across threads.
+    // Without shuffle, depth-first ordering causes all threads to contend on the same
+    // directory's FCB lock in NtCreateFile — overhead inflates 13.6× at 32 threads.
+    // Only for parallel mode: single-threaded benefits from sequential FS locality.
+    if (thread_count > 1) shuffleFiles(active_files);
+    const discovered: []const DiscoveredFile = active_files;
     if (discovered.len == 0) {
         // No files discovered — nothing to scan.
     } else if (thread_count <= 1 or discovered.len < 4) {
         // Serial path: single thread or too few files to justify workers.
         for (discovered) |entry| {
-            try scanDiscoveredFile(io, allocator, entry.path, request, plan, trigram_admission, &report);
+            try scanDiscoveredFile(io, allocator, entry.path, request, plan, trigram_admission, &trigram_program, &report);
             if (report.truncated) break;
         }
     } else {
-        try parallelScanFiles(io, allocator, discovered, request, plan, trigram_admission, thread_count, &report);
+        try parallelScanFiles(io, allocator, discovered, request, plan, trigram_admission, &trigram_program, thread_count, evidence_prepared.runtime, &report);
     }
     report.scan_ms = elapsedMs(io, scan_started);
 
@@ -151,26 +245,24 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     return report;
 }
 
-/// Determine effective thread count for parallel scanning.
-/// Uses the --threads flag if provided, otherwise scales adaptively with corpus size.
+/// Adaptive thread count scaling based on file count.
 ///
-/// ADAPTIVE SCALING RATIONALE:
-/// On Windows, spawning one OS thread (CreateThread) costs ~210μs. For small
-/// corpora, over-threading means spawn_cost dwarfs actual scan work.
+/// Each thread spawn costs ~100 μs on Windows (CreateThread + stack alloc).
+/// Spawning 32 threads for 100 files adds ~3 ms to a 12 ms search — 25%
+/// overhead with no throughput gain since one large file dominates.
 ///
-/// Optimal thread count N minimises: spawn_cost*N + total_work/N
-/// Setting d/dN = 0: N* = sqrt(total_work / spawn_cost)
-/// Empirically, the retained upstream candidate benefits from a more conservative
-/// Windows split point: avoid extra worker fanout until discovery material is
-/// large enough to amortize thread spawn and shard reduction.
+/// sqrt(file_count) grows sub-linearly, clamped to [4, cpu_count]:
+///   100 files → 10 threads
+///   600 files → 24 threads
+///  1000 files → 31 threads
+///  5000 files → capped at cpu count
 fn effectiveThreadCount(request: cli.SearchRequest, file_count: usize) usize {
     if (request.threads) |threads| return @max(threads, 1);
     const cpus = availableThreads();
-    const hard_cap: usize = @min(cpus, 16);
-    // ceil(sqrt(file_count / 8)): loop finds smallest n where n² * 8 >= file_count.
-    var adaptive: usize = 1;
-    while (adaptive * adaptive * 8 < file_count) : (adaptive += 1) {}
-    return @min(hard_cap, adaptive);
+    if (file_count <= 4) return @min(cpus, @max(file_count, 1));
+    const sqrt_files = std.math.sqrt(@as(f64, @floatFromInt(file_count)));
+    const scaled: usize = @intFromFloat(@min(sqrt_files, @as(f64, @floatFromInt(cpus))));
+    return @max(scaled, 4);
 }
 
 /// A discovered file entry — path is arena-allocated and lives for the
@@ -210,7 +302,262 @@ const FileList = struct {
         if (self.buffer) |buf| return buf[0..self.len];
         return &[_]DiscoveredFile{};
     }
+
+    fn mutableItems(self: *FileList) []DiscoveredFile {
+        if (self.buffer) |buf| return buf[0..self.len];
+        return &[_]DiscoveredFile{};
+    }
 };
+
+/// Shuffle file list to distribute kernel-level NTFS directory lock contention.
+///
+/// Discovery walks depth-first, so adjacent files share the same parent directory.
+/// With dynamic work claiming, all 32 threads contend on the same directory's FCB
+/// lock in NtCreateFile. Shuffling interleaves files from different directories,
+/// spreading concurrent opens across independent kernel locks.
+///
+/// Uses XorShift64 with fixed seed — deterministic, no allocation, O(n).
+fn shuffleFiles(files: []DiscoveredFile) void {
+    if (files.len <= 1) return;
+    var rng: u64 = 0x12345678_9ABCDEF0;
+    var i = files.len - 1;
+    while (i > 0) : (i -= 1) {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        const j = rng % (i + 1);
+        const tmp = files[i];
+        files[i] = files[j];
+        files[j] = tmp;
+    }
+}
+
+const EvidenceFrontierCache = struct {
+    pruned_files: usize,
+    pruned_bytes: usize,
+    skipped_files: usize,
+    content_signature: u64,
+    candidates: []const []const u8,
+
+    fn contains(self: EvidenceFrontierCache, path: []const u8) bool {
+        for (self.candidates) |candidate| {
+            if (std.mem.eql(u8, candidate, path)) return true;
+        }
+        return false;
+    }
+};
+
+const EvidenceFrontierBuild = struct {
+    pruned_files: usize = 0,
+    pruned_bytes: usize = 0,
+    skipped_files: usize = 0,
+    candidates: []DiscoveredFile,
+};
+
+const EvidenceFrontierRuntime = struct {
+    enabled: bool = false,
+    cache_path: []const u8 = "",
+    key: u64 = 0,
+    signature: u64 = 0,
+    file_count: usize = 0,
+    files: []const DiscoveredFile = &.{},
+};
+
+const EvidenceFrontierPrepared = struct {
+    active_files: ?[]DiscoveredFile = null,
+    runtime: EvidenceFrontierRuntime = .{},
+};
+
+fn prepareEvidenceFrontier(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    admission: trigram.Admission,
+    files: []DiscoveredFile,
+    report: *SearchReport,
+) EvidenceFrontierPrepared {
+    if (!evidenceFrontierEligible(request, plan, admission)) return .{};
+    const signature = computeDiscoveredSignature(io, files) catch return .{};
+    const key = evidenceFrontierKey(request, plan);
+    const cache_path = std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key}) catch return .{};
+
+    if (loadEvidenceFrontierCache(io, allocator, cache_path, key, signature, files)) |cache| {
+        var evidence_files: std.ArrayList(DiscoveredFile) = .empty;
+        for (files) |entry| {
+            if (cache.contains(entry.path)) evidence_files.append(allocator, entry) catch return .{};
+        }
+        report.files_scanned += cache.pruned_files;
+        report.bytes_scanned += cache.pruned_bytes;
+        report.files_skipped += cache.skipped_files;
+        report.stats.trigram_acceleration.pruned_files += cache.pruned_files;
+        return .{ .active_files = evidence_files.toOwnedSlice(allocator) catch return .{} };
+    }
+
+    return .{ .runtime = .{
+        .enabled = request.nexus_build,
+        .cache_path = cache_path,
+        .key = key,
+        .signature = signature,
+        .file_count = files.len,
+        .files = files,
+    } };
+}
+
+fn evidenceFrontierEligible(request: cli.SearchRequest, plan: expr.ExpressionPlan, admission: trigram.Admission) bool {
+    if (request.case_insensitive) return false;
+    if (!admission.eligible and !(plan.predicate_count == 1 and fileAdmissionNeedleRuntime(plan.predicates[0]) != null)) return false;
+    if (request.path_count > 1) return false;
+    return true;
+}
+
+fn evidenceFrontierKey(request: cli.SearchRequest, plan: expr.ExpressionPlan) u64 {
+    var hasher = std.hash.Wyhash.init(0x4958_4556_4944_4e43);
+    hasher.update(plan.source);
+    hashU64(&hasher, if (request.path_count == 0) 0 else request.path_count);
+    var index: usize = 0;
+    while (index < request.path_count) : (index += 1) hasher.update(request.paths[index]);
+    hashU64(&hasher, if (request.hidden) 1 else 0);
+    hashU64(&hasher, if (request.follow_symlinks) 1 else 0);
+    return hasher.final();
+}
+
+fn computeDiscoveredSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
+    _ = io;
+    var hasher = std.hash.Wyhash.init(0x4556_4944_5349_474e);
+    hashU64(&hasher, files.len);
+    for (files) |entry| {
+        hasher.update(entry.path);
+    }
+    return hasher.final();
+}
+
+fn computeContentSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
+    var hasher = std.hash.Wyhash.init(0x4556_4944_434f_4e54);
+    hashU64(&hasher, files.len);
+    for (files) |entry| {
+        var file = try openFileNt(io, entry.path);
+        defer file.close(io);
+        const stat = try file.stat(io);
+        hasher.update(entry.path);
+        hashU64(&hasher, stat.size);
+        hashU64(&hasher, @bitCast(stat.inode));
+        hashTimestamp(&hasher, stat.mtime);
+    }
+    return hasher.final();
+}
+
+fn writeEvidenceFrontierCacheFromShards(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    runtime: EvidenceFrontierRuntime,
+    shards: []const ShardReport,
+) void {
+    if (!runtime.enabled) return;
+    var candidates: std.ArrayList(DiscoveredFile) = .empty;
+    var built = EvidenceFrontierBuild{ .candidates = &.{} };
+    for (shards) |shard| {
+        if (shard.evidence_had_error) return;
+        built.pruned_files += shard.evidence_pruned_files;
+        built.pruned_bytes += shard.evidence_pruned_bytes;
+        built.skipped_files += shard.evidence_skipped_files;
+        for (shard.evidence_candidates.items) |candidate| {
+            candidates.append(allocator, candidate) catch return;
+            if (candidates.items.len > EVIDENCE_FRONTIER_CACHE_CANDIDATE_LIMIT) return;
+        }
+    }
+    built.candidates = candidates.toOwnedSlice(allocator) catch return;
+    const content_signature = computeContentSignature(io, runtime.files) catch return;
+    writeEvidenceFrontierCache(io, runtime.cache_path, runtime.key, runtime.signature, content_signature, runtime.file_count, built);
+}
+
+fn loadEvidenceFrontierCache(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    key: u64,
+    signature: u64,
+    files: []const DiscoveredFile,
+) ?EvidenceFrontierCache {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(EVIDENCE_FRONTIER_CACHE_READ_LIMIT)) catch return null;
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return null, "\r"), EVIDENCE_FRONTIER_CACHE_MAGIC)) return null;
+    if (parseCacheU64(lines.next() orelse return null, "key=") != key) return null;
+    if (parseCacheU64(lines.next() orelse return null, "signature=") != signature) return null;
+    const content_signature = parseCacheU64(lines.next() orelse return null, "content_signature=");
+    if (parseCacheUsize(lines.next() orelse return null, "file_count=") != files.len) return null;
+    const pruned_files = parseCacheUsize(lines.next() orelse return null, "pruned_files=");
+    const pruned_bytes = parseCacheUsize(lines.next() orelse return null, "pruned_bytes=");
+    const skipped_files = parseCacheUsize(lines.next() orelse return null, "skipped_files=");
+    const candidate_count = parseCacheUsize(lines.next() orelse return null, "candidates=");
+    if (candidate_count > EVIDENCE_FRONTIER_CACHE_CANDIDATE_LIMIT) return null;
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return null, "\r"), "--")) return null;
+
+    var candidates: std.ArrayList([]const u8) = .empty;
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (line.len == 0) continue;
+        candidates.append(allocator, line) catch return null;
+    }
+    if (candidates.items.len != candidate_count) return null;
+    return .{
+        .pruned_files = pruned_files,
+        .pruned_bytes = pruned_bytes,
+        .skipped_files = skipped_files,
+        .content_signature = content_signature,
+        .candidates = candidates.toOwnedSlice(allocator) catch return null,
+    };
+}
+
+fn writeEvidenceFrontierCache(
+    io: std.Io,
+    path: []const u8,
+    key: u64,
+    signature: u64,
+    content_signature: u64,
+    file_count: usize,
+    built: EvidenceFrontierBuild,
+) void {
+    var file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return;
+    defer file.close(io);
+    var buffer: [8192]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    writer.interface.print("{s}\nkey={x}\nsignature={x}\ncontent_signature={x}\nfile_count={}\npruned_files={}\npruned_bytes={}\nskipped_files={}\ncandidates={}\n--\n", .{
+        EVIDENCE_FRONTIER_CACHE_MAGIC,
+        key,
+        signature,
+        content_signature,
+        file_count,
+        built.pruned_files,
+        built.pruned_bytes,
+        built.skipped_files,
+        built.candidates.len,
+    }) catch return;
+    for (built.candidates) |candidate| writer.interface.print("{s}\n", .{candidate.path}) catch return;
+    writer.interface.flush() catch return;
+}
+
+fn parseCacheU64(line: []const u8, prefix: []const u8) u64 {
+    const trimmed = std.mem.trimEnd(u8, line, "\r");
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return 0;
+    return std.fmt.parseUnsigned(u64, trimmed[prefix.len..], 16) catch 0;
+}
+
+fn parseCacheUsize(line: []const u8, prefix: []const u8) usize {
+    const trimmed = std.mem.trimEnd(u8, line, "\r");
+    if (!std.mem.startsWith(u8, trimmed, prefix)) return 0;
+    return std.fmt.parseUnsigned(usize, trimmed[prefix.len..], 10) catch 0;
+}
+
+fn hashU64(hasher: *std.hash.Wyhash, value: u64) void {
+    var mutable = value;
+    hasher.update(std.mem.asBytes(&mutable));
+}
+
+fn hashTimestamp(hasher: *std.hash.Wyhash, timestamp: std.Io.Timestamp) void {
+    var nanos = timestamp.nanoseconds;
+    hasher.update(std.mem.asBytes(&nanos));
+}
 
 /// Phase 1: Recursively walk a root path and collect all scannable file paths.
 /// This is fast — only readdir syscalls, no file content reads. Hidden files
@@ -283,6 +630,13 @@ const ShardReport = struct {
     hit_count: usize,
     truncated: bool,
     had_error: bool,
+    evidence_capture: bool,
+    evidence_allocator: ?std.mem.Allocator,
+    evidence_candidates: std.ArrayList(DiscoveredFile),
+    evidence_pruned_files: usize,
+    evidence_pruned_bytes: usize,
+    evidence_skipped_files: usize,
+    evidence_had_error: bool,
 
     const empty: ShardReport = .{
         .bytes_scanned = 0,
@@ -298,8 +652,37 @@ const ShardReport = struct {
         .hit_count = 0,
         .truncated = false,
         .had_error = false,
+        .evidence_capture = false,
+        .evidence_allocator = null,
+        .evidence_candidates = .empty,
+        .evidence_pruned_files = 0,
+        .evidence_pruned_bytes = 0,
+        .evidence_skipped_files = 0,
+        .evidence_had_error = false,
     };
 };
+
+fn recordEvidenceCandidate(shard: *ShardReport, display_path: []const u8) void {
+    if (!shard.evidence_capture) return;
+    const allocator = shard.evidence_allocator orelse {
+        shard.evidence_had_error = true;
+        return;
+    };
+    shard.evidence_candidates.append(allocator, .{ .path = display_path }) catch {
+        shard.evidence_had_error = true;
+    };
+}
+
+fn recordEvidencePruned(shard: *ShardReport, bytes: usize) void {
+    if (!shard.evidence_capture) return;
+    shard.evidence_pruned_files += 1;
+    shard.evidence_pruned_bytes += bytes;
+}
+
+fn recordEvidenceSkipped(shard: *ShardReport) void {
+    if (!shard.evidence_capture) return;
+    shard.evidence_skipped_files += 1;
+}
 
 /// Scan a single discovered file — used in the serial path and by
 /// parallel workers. Opens the file, checks for binary content, and
@@ -311,17 +694,16 @@ fn scanDiscoveredFile(
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     trigram_admission: trigram.Admission,
+    trigram_program: *const TrigramAdmissionProgram,
     report: *SearchReport,
 ) anyerror!void {
-    // display_path is already normalized; open via the original-ish path.
-    // We re-derive a filesystem path by using display_path directly since
-    // we stored normalized forward-slash paths during discovery.
-    const file = std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false }) catch |err| switch (err) {
+    // Open via NT object path to bypass RtlGetFullPathName_U PEB lock contention.
+    const file = openFileNt(io, display_path) catch |err| switch (err) {
         error.IsDir, error.AccessDenied => return,
         else => return err,
     };
     defer file.close(io);
-    try scanOpenFile(io, allocator, file, display_path, request, plan, trigram_admission, report);
+    try scanOpenFile(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, report);
 }
 
 /// Scan a single file into a ShardReport (thread-local, no sync needed).
@@ -332,16 +714,152 @@ fn scanFileIntoShard(
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     trigram_admission: trigram.Admission,
+    trigram_program: *const TrigramAdmissionProgram,
     shard: *ShardReport,
 ) void {
-    const file = std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false }) catch {
+    const file = openFileNt(io, display_path) catch {
         shard.files_skipped += 1;
+        recordEvidenceSkipped(shard);
         return;
     };
     defer file.close(io);
-    scanOpenFileIntoShard(io, allocator, file, display_path, request, plan, trigram_admission, shard) catch {
+    scanOpenFileIntoShard(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch {
         shard.had_error = true;
     };
+}
+
+/// Memory-mapped file scan — zero-copy, no stack buffer, no carry buffer.
+/// Maps the entire file via NtCreateSection/NtMapViewOfSection (Windows) or
+/// mmap (POSIX). The OS page cache provides the data directly; no read()
+/// syscalls, no memcpy, no multi-chunk loop.
+///
+/// Returns error on mmap failure (resource limits, non-regular file), allowing
+/// the caller to fall back to chunked reads.
+fn scanFileMmap(
+    comptime mono: ?MonoSpec,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: std.Io.File,
+    display_path: []const u8,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    trigram_admission: trigram.Admission,
+    trigram_program: *const TrigramAdmissionProgram,
+    shard: *ShardReport,
+    file_started: std.Io.Timestamp,
+) !void {
+    const raw_len = try file.length(io);
+    const file_bytes: usize = @intCast(raw_len);
+
+    if (file_bytes == 0) {
+        shard.files_scanned += 1;
+        recordLineIntoShardImpl(mono, allocator, display_path, "", 1, request, plan, shard, false);
+        recordEvidenceCandidate(shard, display_path);
+        const file_ms = elapsedMs(io, file_started);
+        shard.scan_work_ms_total += file_ms;
+        if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+        return;
+    }
+
+    var mm = try std.Io.File.MemoryMap.create(io, file, .{
+        .len = file_bytes,
+        .protection = .{ .read = true },
+        .offset = 0,
+    });
+    defer mm.destroy(io);
+
+    const data = mm.memory[0..file_bytes];
+
+    // Binary sniff: first 1024 bytes for null bytes.
+    if (simd.indexOfByte(data[0..@min(1024, data.len)], 0) != null) {
+        shard.files_skipped += 1;
+        recordEvidenceSkipped(shard);
+        return;
+    }
+
+    shard.files_scanned += 1;
+    shard.bytes_scanned += file_bytes;
+    if (file_bytes >= shard.slowest_bytes) {
+        shard.slowest_path = display_path;
+        shard.slowest_bytes = file_bytes;
+    }
+
+    if (mono) |m| {
+        if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
+            if (!request.case_insensitive and simd.indexOf(data, needle) == null) {
+                recordEvidencePruned(shard, file_bytes);
+                const file_ms = elapsedMs(io, file_started);
+                shard.scan_work_ms_total += file_ms;
+                if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+                return;
+            }
+        }
+    }
+
+    // Trigram prune — entire file available as one contiguous buffer.
+    if (shouldAttemptTrigramPrune(file_bytes, true, trigram_admission, request.case_insensitive) and
+        tryTrigramPruneFile(data, trigram_program, &shard.trigram_stats))
+    {
+        recordEvidencePruned(shard, file_bytes);
+        const file_ms = elapsedMs(io, file_started);
+        shard.scan_work_ms_total += file_ms;
+        if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+        return;
+    }
+
+    // Whole-buffer fast count — always applicable (entire file is one buffer).
+    // For casefold-literal patterns in stats_only mode, this handles the
+    // case-insensitive counting without buffer modification.
+    if (request.stats_only) {
+        if (wholeBufferFastCount(data, plan, request.case_insensitive, false)) |count| {
+            shard.matches_found += count;
+            recordEvidenceCandidate(shard, display_path);
+            const file_ms = elapsedMs(io, file_started);
+            shard.scan_work_ms_total += file_ms;
+            if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            return;
+        }
+    }
+
+    // Whole-file literal precheck: if a mandatory literal is absent from
+    // the entire file, skip per-line processing.
+    if (mono) |m| {
+        if (chunkPrefilterNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
+            if (!request.case_insensitive and simd.indexOf(data, needle) == null) {
+                recordEvidencePruned(shard, file_bytes);
+                const file_ms = elapsedMs(io, file_started);
+                shard.scan_work_ms_total += file_ms;
+                if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+                return;
+            }
+        }
+    }
+
+    // Per-line processing on mapped memory — no carry buffer, no chunk boundaries.
+    var line_number: usize = 1;
+    var pos: usize = 0;
+    while (pos < data.len) {
+        if (simd.indexOfByte(data[pos..], '\n')) |nl| {
+            const line_end = pos + nl;
+            recordLineIntoShardImpl(mono, allocator, display_path, data[pos..line_end], line_number, request, plan, shard, false);
+            if (shard.truncated) break;
+            line_number += 1;
+            pos = line_end + 1;
+        } else {
+            // Last line without trailing newline.
+            recordLineIntoShardImpl(mono, allocator, display_path, data[pos..], line_number, request, plan, shard, false);
+            break;
+        }
+    }
+    // Trailing newline produces an empty final line.
+    if (!shard.truncated and data.len > 0 and data[data.len - 1] == '\n') {
+        recordLineIntoShardImpl(mono, allocator, display_path, "", line_number, request, plan, shard, false);
+    }
+
+    recordEvidenceCandidate(shard, display_path);
+    const file_ms = elapsedMs(io, file_started);
+    shard.scan_work_ms_total += file_ms;
+    if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
 }
 
 /// Comptime-generic per-file scan. When mono is non-null, the per-line match
@@ -356,9 +874,11 @@ fn scanOpenFileIntoShardImpl(
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     trigram_admission: trigram.Admission,
+    trigram_program: *const TrigramAdmissionProgram,
     shard: *ShardReport,
 ) anyerror!void {
     const file_started = std.Io.Timestamp.now(io, .awake);
+
     var read_buffer: [1024 * 1024]u8 = undefined;
 
     // Read first chunk before length lookup. Single-shot positional read avoids
@@ -367,16 +887,27 @@ fn scanOpenFileIntoShardImpl(
     if (first_read == 0) {
         shard.files_scanned += 1;
         recordLineIntoShardImpl(mono, allocator, display_path, "", 1, request, plan, shard, false);
+        recordEvidenceCandidate(shard, display_path);
         const file_ms = elapsedMs(io, file_started);
         shard.scan_work_ms_total += file_ms;
         if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
         return;
     }
-    if (sz.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
+    if (simd.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
         shard.files_skipped += 1;
+        recordEvidenceSkipped(shard);
         return;
     }
     const single_chunk = first_read < read_buffer.len;
+
+    // Multi-chunk files (> 1 MiB): switch to mmap for zero-copy access.
+    // Eliminates the carry buffer, multi-read loop, and per-chunk syscalls.
+    // Single-chunk files stay on the readPositional path (one syscall, warm cache).
+    if (!single_chunk) mmap: {
+        scanFileMmap(mono, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard, file_started) catch break :mmap;
+        return;
+    }
+
     const file_bytes: usize = if (single_chunk) first_read else @intCast(try file.length(io));
 
     shard.files_scanned += 1;
@@ -385,9 +916,21 @@ fn scanOpenFileIntoShardImpl(
         shard.slowest_path = display_path;
         shard.slowest_bytes = file_bytes;
     }
+    if (mono) |m| {
+        if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
+            if (!request.case_insensitive and simd.indexOf(read_buffer[0..first_read], needle) == null) {
+                recordEvidencePruned(shard, file_bytes);
+                const file_ms = elapsedMs(io, file_started);
+                shard.scan_work_ms_total += file_ms;
+                if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+                return;
+            }
+        }
+    }
     if (shouldAttemptTrigramPrune(file_bytes, single_chunk, trigram_admission, request.case_insensitive) and
-        tryTrigramPruneFile(read_buffer[0..first_read], trigram_admission, &shard.trigram_stats))
+        tryTrigramPruneFile(read_buffer[0..first_read], trigram_program, &shard.trigram_stats))
     {
+        recordEvidencePruned(shard, file_bytes);
         const file_ms = elapsedMs(io, file_started);
         shard.scan_work_ms_total += file_ms;
         if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
@@ -411,12 +954,21 @@ fn scanOpenFileIntoShardImpl(
         const ci = if (chunk_casefold) false else request.case_insensitive;
         if (wholeBufferFastCount(read_buffer[0..first_read], plan, ci, chunk_casefold)) |count| {
             shard.matches_found += count;
+            recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
             shard.scan_work_ms_total += file_ms;
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
             return;
         }
     }
+
+    // CHUNK-LEVEL PREFILTER: extract the mandatory literal from the plan
+    // (if any) to reject entire chunks that cannot contain a match.
+    // One simd.indexOf over the 1 MiB chunk at 32 B/cycle (AVX2) replaces
+    // ~10K per-line newline scans + ~10K per-line literal scans on
+    // non-matching chunks. Only safe for case-sensitive single-predicate
+    // literal/regex plans where the needle is a direct substring test.
+    const chunk_prefilter_needle: ?[]const u8 = if (mono) |m| chunkPrefilterNeedle(m.kind, m.strategy, plan.predicates[0]) else null;
 
     var carry: std.ArrayList(u8) = .empty;
     defer carry.deinit(allocator);
@@ -428,9 +980,44 @@ fn scanOpenFileIntoShardImpl(
     var offset: u64 = first_read;
     while (true) {
         ended_with_newline = chunk[chunk.len - 1] == '\n';
+
+        // Chunk-level prefilter: if the mandatory literal is absent from the
+        // entire chunk AND no carry data spans from the previous chunk, skip
+        // the per-line loop. Count newlines with SIMD to maintain line_number,
+        // then set up the carry buffer for the trailing partial line.
+        if (chunk_prefilter_needle) |needle| {
+            if (carry.items.len == 0 and !request.case_insensitive and
+                simd.indexOf(chunk, needle) == null)
+            {
+                // Fast newline count: count newlines in bulk via SIMD.
+                const newlines = std.mem.count(u8, chunk, "\n");
+                line_number += newlines;
+                // If chunk doesn't end with newline, the trailing bytes
+                // become carry for the next chunk.
+                if (!ended_with_newline) {
+                    // Find last newline to extract the trailing partial line.
+                    if (std.mem.lastIndexOfScalar(u8, chunk, '\n')) |last_nl| {
+                        try carry.appendSlice(allocator, chunk[last_nl + 1 ..]);
+                    } else {
+                        // No newlines in chunk — entire chunk is carry.
+                        try carry.appendSlice(allocator, chunk);
+                    }
+                }
+                if (offset >= file_bytes) break;
+                const remaining = file_bytes - @as(usize, @intCast(offset));
+                const target_len: usize = @intCast(@min(read_buffer.len, remaining));
+                const read_len = try file.readPositionalAll(io, read_buffer[0..target_len], offset);
+                if (read_len == 0) break;
+                offset += read_len;
+                chunk = read_buffer[0..read_len];
+                if (chunk_casefold) asciiLowerBuf(read_buffer[0..read_len], read_buffer[0..read_len]);
+                continue;
+            }
+        }
+
         var chunk_index: usize = 0;
         while (chunk_index < chunk.len) {
-            if (sz.indexOfByte(chunk[chunk_index..], '\n')) |relative_newline| {
+            if (simd.indexOfByte(chunk[chunk_index..], '\n')) |relative_newline| {
                 const line_part = chunk[chunk_index .. chunk_index + relative_newline];
                 if (carry.items.len == 0) {
                     recordLineIntoShardImpl(mono, allocator, display_path, line_part, line_number, request, plan, shard, chunk_casefold);
@@ -462,6 +1049,7 @@ fn scanOpenFileIntoShardImpl(
     if (!shard.truncated and (carry.items.len > 0 or ended_with_newline)) {
         recordLineIntoShardImpl(mono, allocator, display_path, carry.items, line_number, request, plan, shard, chunk_casefold);
     }
+    recordEvidenceCandidate(shard, display_path);
     const file_ms = elapsedMs(io, file_started);
     shard.scan_work_ms_total += file_ms;
     if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
@@ -476,9 +1064,10 @@ fn scanOpenFileIntoShard(
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     trigram_admission: trigram.Admission,
+    trigram_program: *const TrigramAdmissionProgram,
     shard: *ShardReport,
 ) anyerror!void {
-    return scanOpenFileIntoShardImpl(null, io, allocator, file, display_path, request, plan, trigram_admission, shard);
+    return scanOpenFileIntoShardImpl(null, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard);
 }
 
 /// Comptime-generic per-line processor. When mono is non-null (single-predicate
@@ -539,92 +1128,92 @@ fn recordLineIntoShard(
 
 /// Worker thread entry point. For single-predicate plans, dispatches to a
 /// comptime-monomorphized file loop where per-line match overhead is zero.
-fn shardWorker(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+fn shardWorker(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     if (plan.predicate_count == 1) {
-        dispatchMonoShardLoop(io, allocator, files, request, plan, trigram_admission, shard);
+        dispatchMonoShardLoop(io, allocator, files, request, plan, trigram_admission, trigram_program, shard);
     } else {
         for (files) |entry| {
             if (shard.truncated) break;
-            scanFileIntoShard(io, allocator, entry.path, request, plan, trigram_admission, shard);
+            scanFileIntoShard(io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
         }
     }
 }
 
-fn dynamicShardWorker(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+fn dynamicShardWorker(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     if (plan.predicate_count == 1) {
-        dispatchMonoDynamicLoop(io, allocator, next_file, files, request, plan, trigram_admission, shard);
+        dispatchMonoDynamicLoop(io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
     } else {
         while (!shard.truncated) {
             const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
             if (index >= files.len) break;
-            scanFileIntoShard(io, allocator, files[index].path, request, plan, trigram_admission, shard);
+            scanFileIntoShard(io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
         }
     }
 }
 
 /// Resolve single-predicate plan to comptime-known kind+strategy, then enter
 /// monomorphized file loop. Dispatch happens once per worker thread.
-fn dispatchMonoShardLoop(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+fn dispatchMonoShardLoop(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     const pred = plan.predicates[0];
     switch (pred.kind) {
-        .literal => monoShardLoop(.{ .kind = .literal, .strategy = .literal }, io, allocator, files, request, plan, trigram_admission, shard),
-        .prefix => monoShardLoop(.{ .kind = .prefix, .strategy = .prefix }, io, allocator, files, request, plan, trigram_admission, shard),
-        .suffix => monoShardLoop(.{ .kind = .suffix, .strategy = .suffix }, io, allocator, files, request, plan, trigram_admission, shard),
+        .literal => monoShardLoop(.{ .kind = .literal, .strategy = .literal }, io, allocator, files, request, plan, trigram_admission, trigram_program, shard),
+        .prefix => monoShardLoop(.{ .kind = .prefix, .strategy = .prefix }, io, allocator, files, request, plan, trigram_admission, trigram_program, shard),
+        .suffix => monoShardLoop(.{ .kind = .suffix, .strategy = .suffix }, io, allocator, files, request, plan, trigram_admission, trigram_program, shard),
         .regex => switch (pred.strategy) {
-            inline else => |strategy| monoShardLoop(.{ .kind = .regex, .strategy = strategy }, io, allocator, files, request, plan, trigram_admission, shard),
+            inline else => |strategy| monoShardLoop(.{ .kind = .regex, .strategy = strategy }, io, allocator, files, request, plan, trigram_admission, trigram_program, shard),
         },
     }
 }
 
-fn monoShardLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+fn monoShardLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     for (files) |entry| {
         if (shard.truncated) break;
-        scanFileIntoShardMono(mono, io, allocator, entry.path, request, plan, trigram_admission, shard);
+        scanFileIntoShardMono(mono, io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
     }
 }
 
-fn dispatchMonoDynamicLoop(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+fn dispatchMonoDynamicLoop(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     const pred = plan.predicates[0];
     switch (pred.kind) {
-        .literal => monoDynamicLoop(.{ .kind = .literal, .strategy = .literal }, io, allocator, next_file, files, request, plan, trigram_admission, shard),
-        .prefix => monoDynamicLoop(.{ .kind = .prefix, .strategy = .prefix }, io, allocator, next_file, files, request, plan, trigram_admission, shard),
-        .suffix => monoDynamicLoop(.{ .kind = .suffix, .strategy = .suffix }, io, allocator, next_file, files, request, plan, trigram_admission, shard),
+        .literal => monoDynamicLoop(.{ .kind = .literal, .strategy = .literal }, io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard),
+        .prefix => monoDynamicLoop(.{ .kind = .prefix, .strategy = .prefix }, io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard),
+        .suffix => monoDynamicLoop(.{ .kind = .suffix, .strategy = .suffix }, io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard),
         .regex => switch (pred.strategy) {
-            inline else => |strategy| monoDynamicLoop(.{ .kind = .regex, .strategy = strategy }, io, allocator, next_file, files, request, plan, trigram_admission, shard),
+            inline else => |strategy| monoDynamicLoop(.{ .kind = .regex, .strategy = strategy }, io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard),
         },
     }
 }
 
-fn monoDynamicLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
+fn monoDynamicLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     while (!shard.truncated) {
         const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
         if (index >= files.len) break;
-        scanFileIntoShardMono(mono, io, allocator, files[index].path, request, plan, trigram_admission, shard);
+        scanFileIntoShardMono(mono, io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
     }
 }
 
 /// Monomorphized file opener — calls scanOpenFileIntoShardImpl with comptime mono.
-fn scanFileIntoShardMono(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, display_path: []const u8, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, shard: *ShardReport) void {
-    const file = std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false }) catch {
+fn scanFileIntoShardMono(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, display_path: []const u8, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    const file = openFileNt(io, display_path) catch {
         shard.files_skipped += 1;
         return;
     };
     defer file.close(io);
-    scanOpenFileIntoShardImpl(mono, io, allocator, file, display_path, request, plan, trigram_admission, shard) catch {
+    scanOpenFileIntoShardImpl(mono, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch {
         shard.had_error = true;
     };
 }
 
 fn shouldUseDynamicWorkClaim(plan: expr.ExpressionPlan, file_count: usize) bool {
-    if (file_count > 128) return false;
+    _ = file_count; // Dynamic claiming benefits all file counts — atomic counter contention is negligible.
     return canUseDynamicWorkClaimForPlan(plan);
 }
 
 fn canUseDynamicWorkClaimForPlan(plan: expr.ExpressionPlan) bool {
-    if (plan.predicate_count != 1) return false;
-    const predicate = plan.predicates[0];
-    if (predicate.kind == .literal) return true;
-    return predicate.kind == .regex and predicate.strategy == .regex_literal_alternates;
+    // All single-predicate plans benefit from dynamic load balancing.
+    // The monomorphized dispatch in dispatchMonoDynamicLoop handles every
+    // PredicateKind × MatcherStrategy variant.
+    return plan.predicate_count == 1;
 }
 
 /// Phase 2: Distribute files across N threads and scan in parallel.
@@ -638,7 +1227,9 @@ fn parallelScanFiles(
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     trigram_admission: trigram.Admission,
+    trigram_program: *const TrigramAdmissionProgram,
     thread_count: usize,
+    evidence_runtime: EvidenceFrontierRuntime,
     report: *SearchReport,
 ) !void {
     const actual_threads = @min(thread_count, files.len);
@@ -647,18 +1238,25 @@ fn parallelScanFiles(
 
     // Allocate shard reports — one per thread (including main).
     const shards = try allocator.alloc(ShardReport, actual_threads);
-    for (shards) |*s| s.* = ShardReport.empty;
+    for (shards) |*s| {
+        s.* = ShardReport.empty;
+        if (evidence_runtime.enabled) {
+            s.evidence_capture = true;
+            s.evidence_allocator = allocator;
+        }
+    }
 
     if (shouldUseDynamicWorkClaim(plan, files.len)) {
         var next_file: usize = 0;
         const threads = try allocator.alloc(std.Thread, worker_count);
         for (0..worker_count) |i| {
             const shard_index = i + 1;
-            threads[i] = try std.Thread.spawn(.{}, dynamicShardWorker, .{ io, allocator, &next_file, files, request, plan, trigram_admission, &shards[shard_index] });
+            threads[i] = try std.Thread.spawn(.{}, dynamicShardWorker, .{ io, allocator, &next_file, files, request, plan, trigram_admission, trigram_program, &shards[shard_index] });
         }
-        dynamicShardWorker(io, allocator, &next_file, files, request, plan, trigram_admission, &shards[0]);
+        dynamicShardWorker(io, allocator, &next_file, files, request, plan, trigram_admission, trigram_program, &shards[0]);
         for (threads) |thread| thread.join();
         mergeShardsIntoReport(shards, report);
+        writeEvidenceFrontierCacheFromShards(io, allocator, evidence_runtime, shards);
         return;
     }
 
@@ -679,17 +1277,18 @@ fn parallelScanFiles(
     for (0..worker_count) |i| {
         const shard_index = i + 1;
         const shard_files = files[boundaries[shard_index]..boundaries[shard_index + 1]];
-        threads[i] = try std.Thread.spawn(.{}, shardWorker, .{ io, allocator, shard_files, request, plan, trigram_admission, &shards[shard_index] });
+        threads[i] = try std.Thread.spawn(.{}, shardWorker, .{ io, allocator, shard_files, request, plan, trigram_admission, trigram_program, &shards[shard_index] });
     }
 
     // Main thread processes shard 0.
     const main_files = files[boundaries[0]..boundaries[1]];
-    shardWorker(io, allocator, main_files, request, plan, trigram_admission, &shards[0]);
+    shardWorker(io, allocator, main_files, request, plan, trigram_admission, trigram_program, &shards[0]);
 
     // Join all worker threads.
     for (threads) |t| t.join();
 
     mergeShardsIntoReport(shards, report);
+    writeEvidenceFrontierCacheFromShards(io, allocator, evidence_runtime, shards);
 }
 
 fn mergeShardsIntoReport(shards: []const ShardReport, report: *SearchReport) void {
@@ -896,13 +1495,119 @@ fn mergeTrigramStats(target: *core_stats.TrigramAccelerationStats, source: core_
     target.ineligible_files += source.ineligible_files;
 }
 
+const TRIGRAM_ADMISSION_CAPACITY = 4096;
+const TRIGRAM_ADMISSION_HASH_MASK: usize = TRIGRAM_ADMISSION_CAPACITY - 1;
+
+const TrigramAdmissionProgram = struct {
+    eligible: bool = false,
+    mode: trigram.AdmissionMode = .all,
+    group_count: usize = 0,
+    group_complete_mask: u64 = 0,
+    required_counts: [trigram.MAX_GROUPS]u8 = [_]u8{0} ** trigram.MAX_GROUPS,
+    keys: [TRIGRAM_ADMISSION_CAPACITY]trigram.Trigram = [_]trigram.Trigram{0} ** TRIGRAM_ADMISSION_CAPACITY,
+    group_masks: [TRIGRAM_ADMISSION_CAPACITY]u64 = [_]u64{0} ** TRIGRAM_ADMISSION_CAPACITY,
+    occupied: [TRIGRAM_ADMISSION_CAPACITY]bool = [_]bool{false} ** TRIGRAM_ADMISSION_CAPACITY,
+
+    fn compile(admission: trigram.Admission) TrigramAdmissionProgram {
+        var program = TrigramAdmissionProgram{
+            .eligible = admission.eligible,
+            .mode = admission.mode,
+            .group_count = admission.group_count,
+        };
+        if (!admission.eligible) return program;
+
+        for (admission.groups[0..admission.group_count], 0..) |group, group_index| {
+            program.required_counts[group_index] = @intCast(group.trigram_count);
+            program.group_complete_mask |= groupBit(group_index);
+            for (group.trigrams[0..group.trigram_count]) |needle| {
+                program.insert(needle, group_index);
+            }
+        }
+        return program;
+    }
+
+    fn mayMatch(self: *const TrigramAdmissionProgram, bytes: []const u8) bool {
+        if (!self.eligible) return true;
+        if (bytes.len < 3) return false;
+
+        var seen_slots = [_]bool{false} ** TRIGRAM_ADMISSION_CAPACITY;
+        var group_seen_counts = [_]u8{0} ** trigram.MAX_GROUPS;
+        var satisfied_groups: u64 = 0;
+        var rolling: trigram.Trigram = trigram.key(bytes[0..3]);
+        if (self.recordTrigram(rolling, &seen_slots, &group_seen_counts, &satisfied_groups)) return true;
+
+        var index: usize = 3;
+        while (index < bytes.len) : (index += 1) {
+            rolling = ((rolling & 0xffff) << 8) | bytes[index];
+            if (self.recordTrigram(rolling, &seen_slots, &group_seen_counts, &satisfied_groups)) return true;
+        }
+        return false;
+    }
+
+    fn insert(self: *TrigramAdmissionProgram, needle: trigram.Trigram, group_index: usize) void {
+        var slot = hashTrigram(needle);
+        while (self.occupied[slot]) : (slot = (slot + 1) & TRIGRAM_ADMISSION_HASH_MASK) {
+            if (self.keys[slot] == needle) {
+                self.group_masks[slot] |= groupBit(group_index);
+                return;
+            }
+        }
+        self.occupied[slot] = true;
+        self.keys[slot] = needle;
+        self.group_masks[slot] = groupBit(group_index);
+    }
+
+    fn findSlot(self: *const TrigramAdmissionProgram, needle: trigram.Trigram) ?usize {
+        var slot = hashTrigram(needle);
+        while (self.occupied[slot]) : (slot = (slot + 1) & TRIGRAM_ADMISSION_HASH_MASK) {
+            if (self.keys[slot] == needle) return slot;
+        }
+        return null;
+    }
+
+    fn recordTrigram(
+        self: *const TrigramAdmissionProgram,
+        needle: trigram.Trigram,
+        seen_slots: *[TRIGRAM_ADMISSION_CAPACITY]bool,
+        group_seen_counts: *[trigram.MAX_GROUPS]u8,
+        satisfied_groups: *u64,
+    ) bool {
+        const slot = self.findSlot(needle) orelse return false;
+        if (seen_slots[slot]) return false;
+        seen_slots[slot] = true;
+
+        var mask = self.group_masks[slot];
+        while (mask != 0) {
+            const group_index: usize = @intCast(@ctz(mask));
+            group_seen_counts[group_index] += 1;
+            if (group_seen_counts[group_index] == self.required_counts[group_index]) {
+                satisfied_groups.* |= groupBit(group_index);
+                if (self.mode == .any) return true;
+                if ((satisfied_groups.* & self.group_complete_mask) == self.group_complete_mask) return true;
+            }
+            mask &= mask - 1;
+        }
+        return false;
+    }
+};
+
+fn groupBit(group_index: usize) u64 {
+    return @as(u64, 1) << @as(u6, @intCast(group_index));
+}
+
+fn hashTrigram(needle: trigram.Trigram) usize {
+    var value = needle *% 0x9E3779B1;
+    value ^= value >> 16;
+    return @as(usize, value) & TRIGRAM_ADMISSION_HASH_MASK;
+}
+
 fn tryTrigramPruneFile(
     bytes: []const u8,
-    admission: trigram.Admission,
+    program: *const TrigramAdmissionProgram,
     stats: *core_stats.TrigramAccelerationStats,
 ) bool {
     stats.candidate_files_checked += 1;
-    if (trigramAdmissionMayMatch(bytes, admission)) {
+    if (program.mayMatch(bytes)) {
         stats.verified_files += 1;
         return false;
     }
@@ -914,36 +1619,6 @@ fn shouldAttemptTrigramPrune(file_bytes: usize, single_chunk: bool, admission: t
     return admission.eligible and !case_insensitive and single_chunk and file_bytes >= TRIGRAM_MIN_PRUNE_BYTES;
 }
 
-fn trigramAdmissionMayMatch(bytes: []const u8, admission: trigram.Admission) bool {
-    if (admission.mode == .any) {
-        for (admission.groups[0..admission.group_count]) |group| {
-            if (trigramGroupMayMatch(bytes, group)) return true;
-        }
-        return false;
-    }
-    for (admission.groups[0..admission.group_count]) |group| {
-        if (!trigramGroupMayMatch(bytes, group)) return false;
-    }
-    return true;
-}
-
-fn trigramGroupMayMatch(bytes: []const u8, group: trigram.PredicateEvidence) bool {
-    for (group.trigrams[0..group.trigram_count]) |needle| {
-        if (!bytesContainTrigram(bytes, needle)) return false;
-    }
-    return true;
-}
-
-fn bytesContainTrigram(bytes: []const u8, needle: trigram.Trigram) bool {
-    if (bytes.len < 3) return false;
-    const key_bytes = [_]u8{
-        @intCast((needle >> 16) & 0xff),
-        @intCast((needle >> 8) & 0xff),
-        @intCast(needle & 0xff),
-    };
-    return sz.indexOf(bytes, key_bytes[0..]) != null;
-}
-
 fn availableThreads() usize {
     return std.Thread.getCpuCount() catch 1;
 }
@@ -951,24 +1626,17 @@ fn availableThreads() usize {
 /// Core per-file scan loop. Reads the file in 1 MiB chunks, splits into
 /// lines, and runs predicate matching on each line.
 ///
-/// WHY CHUNKED READS INSTEAD OF MMAP:
-/// Zig's std library doesn't expose mmap on Windows in a way that matches
-/// Rust's `memmap2` ergonomics. Rust's search engine memory-maps large files
-/// for zero-copy access, which avoids the read() syscall overhead and lets
-/// the OS page in data on demand. This chunked approach copies data into a
-/// stack buffer, adding syscall + memcpy overhead per chunk. This is one of
-/// the remaining performance gaps vs Rust on large files.
+/// Serial-path per-file scan (non-parallel reports, e.g. inspect mode).
 ///
-/// WHY 1 MiB CHUNKS:
-/// 1 MiB fits comfortably in L2/L3 cache on modern CPUs, so the StringZilla
-/// SIMD newline scan operates on warm cache lines. Larger buffers risk
-/// cache thrashing; smaller ones increase syscall frequency.
+/// Single-chunk files (≤1 MiB) use a stack-allocated read buffer — one
+/// ReadFile syscall, warm L2/L3 cache for the SIMD scan. Multi-chunk
+/// files dispatch to scanFileMmap for zero-copy access via
+/// NtCreateSection/NtMapViewOfSection.
 ///
-/// THE CARRY BUFFER:
-/// Lines can span chunk boundaries (a line starts in chunk N and ends in
-/// chunk N+1). The `carry` ArrayList accumulates partial line bytes across
-/// chunks. When a newline is found, carry + current chunk segment form the
-/// complete line. This is the standard streaming line-split pattern.
+/// THE CARRY BUFFER (multi-chunk fallback):
+/// Lines can span chunk boundaries. The `carry` ArrayList accumulates
+/// partial line bytes across chunks. When a newline is found,
+/// carry + current chunk segment form the complete line.
 fn scanOpenFile(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -977,6 +1645,7 @@ fn scanOpenFile(
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     trigram_admission: trigram.Admission,
+    trigram_program: *const TrigramAdmissionProgram,
     report: *SearchReport,
 ) anyerror!void {
     const file_started = std.Io.Timestamp.now(io, .awake);
@@ -993,7 +1662,7 @@ fn scanOpenFile(
         if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
         return;
     }
-    if (sz.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
+    if (simd.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
         report.files_skipped += 1;
         return;
     }
@@ -1007,7 +1676,7 @@ fn scanOpenFile(
         report.slowest_bytes = file_bytes;
     }
     if (shouldAttemptTrigramPrune(file_bytes, single_chunk, trigram_admission, request.case_insensitive) and
-        tryTrigramPruneFile(read_buffer[0..first_read], trigram_admission, &report.stats.trigram_acceleration))
+        tryTrigramPruneFile(read_buffer[0..first_read], trigram_program, &report.stats.trigram_acceleration))
     {
         const file_ms = elapsedMs(io, file_started);
         report.scan_work_ms_total += file_ms;
@@ -1044,14 +1713,14 @@ fn scanOpenFile(
     var ended_with_newline = false;
 
     // Process first chunk then any remaining chunks (most files fit in one chunk).
-    // HOT PATH: sz.indexOfByte uses AVX2 VPCMPEQB — 32 bytes/cycle vs 1 byte/cycle scalar.
+    // HOT PATH: simd.indexOfByte uses AVX2 VPCMPEQB — 32 bytes/cycle vs 1 byte/cycle scalar.
     var chunk: []const u8 = read_buffer[0..first_read];
     var offset: u64 = first_read;
     while (true) {
         ended_with_newline = chunk[chunk.len - 1] == '\n';
         var chunk_index: usize = 0;
         while (chunk_index < chunk.len) {
-            if (sz.indexOfByte(chunk[chunk_index..], '\n')) |relative_newline| {
+            if (simd.indexOfByte(chunk[chunk_index..], '\n')) |relative_newline| {
                 const line_part = chunk[chunk_index .. chunk_index + relative_newline];
                 if (carry.items.len == 0) {
                     try recordLine(allocator, display_path, line_part, line_number, request, plan, report, chunk_casefold);
@@ -1117,6 +1786,84 @@ fn recordLine(
             };
             report.hit_count += 1;
         }
+    }
+}
+
+/// Extracts only contract-safe whole-file admission needles.
+/// These needles are mandatory substrings for the predicate shape, so absence
+/// from the file proves absence of a match without invoking the line verifier.
+fn fileAdmissionNeedle(comptime kind: expr.PredicateKind, comptime strategy: expr.MatcherStrategy, predicate: expr.Predicate) ?[]const u8 {
+    switch (kind) {
+        .literal, .prefix, .suffix => return if (predicate.value.len >= 2) predicate.value else null,
+        .regex => switch (strategy) {
+            .regex_plain_literal => {
+                if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null and predicate.value.len >= 2)
+                    return predicate.value;
+                return null;
+            },
+            .regex_word_boundary_literal => {
+                const body = stripWordBoundaryAnchors(predicate.value);
+                return if (body.len >= 2) body else null;
+            },
+            else => return null,
+        },
+    }
+}
+
+fn fileAdmissionNeedleRuntimeForPlan(plan: expr.ExpressionPlan) ?[]const u8 {
+    if (plan.predicate_count != 1) return null;
+    return fileAdmissionNeedleRuntime(plan.predicates[0]);
+}
+
+fn fileAdmissionNeedleRuntime(predicate: expr.Predicate) ?[]const u8 {
+    switch (predicate.kind) {
+        .literal, .prefix, .suffix => return if (predicate.value.len >= 2) predicate.value else null,
+        .regex => switch (predicate.strategy) {
+            .regex_plain_literal => {
+                if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null and predicate.value.len >= 2)
+                    return predicate.value;
+                return null;
+            },
+            .regex_word_boundary_literal => {
+                const body = stripWordBoundaryAnchors(predicate.value);
+                return if (body.len >= 2) body else null;
+            },
+            else => return null,
+        },
+    }
+}
+
+/// Extracts a mandatory literal needle suitable for chunk-level prefiltering.
+/// Returns null when the predicate cannot be reduced to a simple substring
+/// test (case-insensitive, character classes, alternation, etc.).
+///
+/// For literals: the literal value itself.
+/// For regex_plain_literal: the literal value (no metachar escapes).
+/// For regex_full: the longest literal fragment extracted at runtime.
+/// For regex_word_boundary_literal: the word body (stripped of \b anchors).
+fn chunkPrefilterNeedle(comptime kind: expr.PredicateKind, comptime strategy: expr.MatcherStrategy, predicate: expr.Predicate) ?[]const u8 {
+    switch (kind) {
+        .literal => return if (predicate.value.len >= 2) predicate.value else null,
+        .regex => {
+            switch (strategy) {
+                .regex_plain_literal => {
+                    if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null and predicate.value.len >= 2)
+                        return predicate.value;
+                    return null;
+                },
+                .regex_word_boundary_literal => {
+                    const body = stripWordBoundaryAnchors(predicate.value);
+                    return if (body.len >= 2) body else null;
+                },
+                .regex_full, .regex_fixed_width_bytes, .regex_decomposition_candidate_lines => {
+                    const effective = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+                    const fragment = extractLongestLiteralFragment(effective);
+                    return if (fragment.len >= 2) fragment else null;
+                },
+                else => return null,
+            }
+        },
+        else => return null,
     }
 }
 
@@ -1249,10 +1996,9 @@ fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, ca
 }
 
 fn countRegexWithPrefilter(line: []const u8, pattern: []const u8, case_insensitive: bool) usize {
-    const effective_pattern = if (std.mem.startsWith(u8, pattern, "(?i)")) pattern[4..] else pattern;
-    const prefix = extractLiteralPrefix(effective_pattern);
-    if (prefix.len >= 2) {
-        if (indexOfLiteral(line, prefix, case_insensitive) == null) return 0;
+    const cached = cachedLiteralFragment(pattern);
+    if (cached.len >= 2) {
+        if (indexOfLiteral(line, cached, case_insensitive) == null) return 0;
     }
     return countRegexStatsOnly(line, pattern, case_insensitive);
 }
@@ -1401,46 +2147,161 @@ fn regexColumnByStrategy(line: []const u8, predicate: expr.Predicate, case_insen
     };
 }
 
-/// For regex_full patterns, extract the literal prefix (if any) and use
-/// StringZilla to reject lines that can't match before running the regex.
-/// E.g. `process_\d+_\d+` has literal prefix `process_` — lines without
-/// it are skipped entirely. This avoids the recursive backtracking cost
-/// on the ~90% of lines that don't contain the prefix.
+/// For regex_full patterns, extract the longest literal fragment from
+/// anywhere in the pattern and use SIMD indexOf to reject lines that
+/// can't match before running the regex engine.
+///
+/// E.g. `\w+Column` → fragment `Column` (suffix, not prefix).
+///      `process_\d+_\d+` → fragment `process_` (prefix).
+///      `[A-Z]+error_log` → fragment `error_log` (suffix).
+///
+/// SIMD indexOf rejects non-matching lines at ~32 bytes/cycle (AVX2),
+/// eliminating the per-line PCRE2 JIT dispatch on ~99% of lines for
+/// patterns with a mandatory literal of ≥2 bytes.
 fn regexWithLiteralPrefilter(line: []const u8, pattern: []const u8, case_insensitive: bool) ?usize {
-    const effective_pattern = if (std.mem.startsWith(u8, pattern, "(?i)")) pattern[4..] else pattern;
-    const prefix = extractLiteralPrefix(effective_pattern);
-    if (prefix.len >= 2) {
-        if (indexOfLiteral(line, prefix, case_insensitive) == null) return null;
+    // Use threadlocal cache to avoid re-extracting the same fragment per line.
+    // The search loop uses the same pattern for every line in a file.
+    const cached = cachedLiteralFragment(pattern);
+    if (cached.len >= 2) {
+        if (indexOfLiteral(line, cached, case_insensitive) == null) return null;
     }
     return pcre_regex.column(line, pattern, case_insensitive) catch
         regex.column(line, pattern, case_insensitive);
 }
 
-/// Extract the leading literal bytes from a regex pattern, stopping at
-/// the first metacharacter or escape sequence. Returns an empty slice
-/// if the pattern starts with a metacharacter.
-fn extractLiteralPrefix(pattern: []const u8) []const u8 {
-    var end: usize = 0;
-    while (end < pattern.len) {
-        const byte = pattern[end];
-        const token_end = regexPrefixTokenEnd(pattern, end) orelse break;
-        if (token_end < pattern.len and (pattern[token_end] == '?' or pattern[token_end] == '*')) break;
-        if (byte == '\\') break; // escape sequence — not a plain literal
-        if (isRegexMetaChar(byte)) break;
-        end = token_end;
+/// Single-entry threadlocal cache for literal fragment extraction.
+/// Avoids recomputing extractLongestLiteralFragment on every line
+/// when the pattern is the same (which it always is within a file scan).
+fn cachedLiteralFragment(pattern: []const u8) []const u8 {
+    const Cache = struct {
+        threadlocal var ptr: [*]const u8 = undefined;
+        threadlocal var len: usize = 0;
+        threadlocal var result_ptr: [*]const u8 = undefined;
+        threadlocal var result_len: usize = 0;
+        threadlocal var initialized: bool = false;
+    };
+    if (Cache.initialized and Cache.len == pattern.len and Cache.ptr == pattern.ptr) {
+        return Cache.result_ptr[0..Cache.result_len];
     }
-    return pattern[0..end];
+    const effective = if (std.mem.startsWith(u8, pattern, "(?i)")) pattern[4..] else pattern;
+    const fragment = extractLongestLiteralFragment(effective);
+    Cache.ptr = pattern.ptr;
+    Cache.len = pattern.len;
+    Cache.result_ptr = fragment.ptr;
+    Cache.result_len = fragment.len;
+    Cache.initialized = true;
+    return fragment;
 }
 
-fn regexPrefixTokenEnd(pattern: []const u8, index: usize) ?usize {
-    if (index >= pattern.len) return null;
-    if (pattern[index] == '\\') {
-        if (index + 1 >= pattern.len) return null;
-        if (pattern[index + 1] == 'x') return if (index + 3 < pattern.len) index + 4 else null;
-        return index + 2;
+/// Extract the longest contiguous literal substring from anywhere in a regex
+/// pattern. Walks the entire pattern, tracking runs of plain literal bytes
+/// (not preceded by `?` or `*` quantifiers which make them optional).
+/// Returns the longest such run as a slice into the original pattern.
+///
+/// Examples:
+///   `\w+Column`      → `Column`
+///   `process_\d+_\d+`→ `process_`
+///   `[A-Z]+error_log` → `error_log`
+///   `\d{4}-\d{2}`    → `-`  (short — caller applies ≥2 byte threshold)
+///   `.*`             → ``   (empty — no literals)
+fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
+    var best_start: usize = 0;
+    var best_len: usize = 0;
+    var run_start: usize = 0;
+    var run_len: usize = 0;
+    var i: usize = 0;
+
+    while (i < pattern.len) {
+        const byte = pattern[i];
+
+        // Skip escape sequences — they are metachar classes (\w, \d, etc.)
+        // or escaped literals (\., \\). Escaped literals could theoretically
+        // be included but would complicate the fragment (it wouldn't be a
+        // simple substring match anymore). Break the run.
+        if (byte == '\\') {
+            if (run_len > best_len) {
+                best_start = run_start;
+                best_len = run_len;
+            }
+            run_len = 0;
+            // Skip the escaped pair
+            i += if (i + 1 < pattern.len and pattern[i + 1] == 'x') @as(usize, 4) else @as(usize, 2);
+            run_start = i;
+            continue;
+        }
+
+        // Metacharacters break a literal run.
+        if (isRegexMetaChar(byte)) {
+            if (run_len > best_len) {
+                best_start = run_start;
+                best_len = run_len;
+            }
+            run_len = 0;
+            // For character classes [...], skip to closing bracket.
+            if (byte == '[') {
+                i += 1;
+                while (i < pattern.len and pattern[i] != ']') : (i += 1) {
+                    if (pattern[i] == '\\' and i + 1 < pattern.len) i += 1;
+                }
+                if (i < pattern.len) i += 1; // skip ']'
+            } else if (byte == '(') {
+                // Groups contain alternation — cannot guarantee any single
+                // branch's literal is mandatory. Skip to matching ')'.
+                var depth: usize = 1;
+                i += 1;
+                while (i < pattern.len and depth > 0) : (i += 1) {
+                    if (pattern[i] == '\\' and i + 1 < pattern.len) {
+                        i += 1;
+                        continue;
+                    }
+                    if (pattern[i] == '(') depth += 1;
+                    if (pattern[i] == ')') depth -= 1;
+                }
+            } else {
+                i += 1;
+            }
+            run_start = i;
+            continue;
+        }
+
+        // Check if this literal is followed by a quantifier that makes it
+        // optional (? or *). If so, it's not mandatory — break the run.
+        if (i + 1 < pattern.len and (pattern[i + 1] == '?' or pattern[i + 1] == '*')) {
+            if (run_len > best_len) {
+                best_start = run_start;
+                best_len = run_len;
+            }
+            run_len = 0;
+            i += 2; // skip the literal + quantifier
+            run_start = i;
+            continue;
+        }
+
+        // Plain mandatory literal byte — extend the current run.
+        // If a `+` quantifier follows, the literal is still mandatory (≥1 match),
+        // so include the byte but skip the `+`.
+        run_len += 1;
+        i += 1;
+        if (i < pattern.len and pattern[i] == '+') {
+            // `x+` means ≥1 x. The single `x` is mandatory. But the run
+            // must break here because the next byte is a separate token.
+            if (run_len > best_len) {
+                best_start = run_start;
+                best_len = run_len;
+            }
+            run_len = 0;
+            i += 1; // skip '+'
+            run_start = i;
+        }
     }
-    if (isRegexMetaChar(pattern[index])) return null;
-    return index + 1;
+
+    // Final run.
+    if (run_len > best_len) {
+        best_start = run_start;
+        best_len = run_len;
+    }
+
+    return pattern[best_start .. best_start + best_len];
 }
 
 fn isRegexMetaChar(byte: u8) bool {
@@ -1462,7 +2323,7 @@ fn isHiddenPath(path: []const u8) bool {
 //
 // ASCII case differs by exactly bit 5 (0x20). To search case-insensitively
 // at SIMD speed, we lowercase both the line and needle into scratch buffers,
-// then run StringZilla's AVX2 memmem on the lowered copies.
+// then run the pure Zig SIMD memmem on the lowered copies.
 //
 // The vector loop processes 32 bytes per iteration:
 //   1. Load 32 bytes
@@ -1510,32 +2371,32 @@ fn asciiLowerBuf(dst: []u8, src: []const u8) void {
 
 /// HOT PATH 3: Literal substring matching — the core search operation.
 ///
-/// Case-sensitive path uses sz.indexOf (StringZilla AVX2 memmem), which
+/// Case-sensitive path uses simd.indexOf (AVX2 first+last byte fingerprint), which
 /// fingerprints by first+last byte across 32 positions per SIMD pass.
 ///
 /// Case-insensitive path dispatches to indexOfLiteralCasefold (separate
 /// function) to keep this hot path's stack frame under 4 KiB. On Windows,
 /// frames > 4 KiB trigger __chkstk page probes on every call — including
-/// case-sensitive calls that take the early return. Isolating the 32 KiB
-/// casefold buffer into its own function eliminates that overhead.
+/// case-sensitive calls that take the early return. Isolating the 2 KiB
+/// casefold buffers into their own function eliminates that overhead.
 fn indexOfLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) ?usize {
-    if (!case_insensitive) return sz.indexOf(line, needle);
+    if (!case_insensitive) return simd.indexOf(line, needle);
     if (needle.len == 0) return 0;
     if (needle.len > line.len) return null;
     return indexOfLiteralCasefold(line, needle);
 }
 
 /// SIMD casefold search — isolated from indexOfLiteral to quarantine the
-/// 32 KiB stack buffer away from the case-sensitive hot path.
+/// 2 KiB + 256 B stack buffers away from the case-sensitive hot path.
 /// Lowercase both line and needle into stack buffers via AVX2 vector ops,
-/// then search with sz.indexOf. O(n) casefold + O(n) SIMD search.
+/// then search with simd.indexOf. O(n) casefold + O(n) SIMD search.
 fn indexOfLiteralCasefold(line: []const u8, needle: []const u8) ?usize {
     if (line.len <= CASEFOLD_LINE_MAX and needle.len <= CASEFOLD_NEEDLE_MAX) {
         var lower_line: [CASEFOLD_LINE_MAX]u8 = undefined;
         var lower_needle: [CASEFOLD_NEEDLE_MAX]u8 = undefined;
         asciiLowerBuf(lower_line[0..line.len], line);
         asciiLowerBuf(lower_needle[0..needle.len], needle);
-        return sz.indexOf(lower_line[0..line.len], lower_needle[0..needle.len]);
+        return simd.indexOf(lower_line[0..line.len], lower_needle[0..needle.len]);
     }
     return indexOfLiteralScalar(line, needle);
 }
@@ -1553,17 +2414,17 @@ fn indexOfLiteralScalar(line: []const u8, needle: []const u8) ?usize {
 }
 
 /// Counts non-overlapping occurrences of a literal needle in a line.
-/// Case-sensitive path calls sz.indexOf directly in a tight loop.
+/// Case-sensitive path calls simd.indexOf directly in a tight loop.
 /// Case-insensitive path dispatches to countLiteralCasefold (separate
-/// function) to quarantine the 32 KiB casefold buffer.
+/// function) to quarantine the casefold stack buffers.
 fn countLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) usize {
     if (needle.len == 0) return 0;
     if (case_insensitive) return countLiteralCasefold(line, needle);
-    // Case-sensitive: sz.indexOf directly, no indirection.
+    // Case-sensitive: simd.indexOf directly, no indirection.
     var total: usize = 0;
     var start: usize = 0;
     while (start + needle.len <= line.len) {
-        const index = sz.indexOf(line[start..], needle) orelse break;
+        const index = simd.indexOf(line[start..], needle) orelse break;
         total += 1;
         start += index + needle.len;
     }
@@ -1571,7 +2432,7 @@ fn countLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) us
 }
 
 /// Casefold-once counting — isolated from countLiteral to quarantine the
-/// 32 KiB stack buffer. Lowercase the line once, then loop sz.indexOf
+/// casefold stack buffers. Lowercase the line once, then loop simd.indexOf
 /// on the lowered copy to avoid redundant casefold per match position.
 fn countLiteralCasefold(line: []const u8, needle: []const u8) usize {
     if (line.len <= CASEFOLD_LINE_MAX and needle.len <= CASEFOLD_NEEDLE_MAX) {
@@ -1584,7 +2445,7 @@ fn countLiteralCasefold(line: []const u8, needle: []const u8) usize {
         var total: usize = 0;
         var start: usize = 0;
         while (start + needle.len <= ll.len) {
-            const index = sz.indexOf(ll[start..], ln) orelse break;
+            const index = simd.indexOf(ll[start..], ln) orelse break;
             total += 1;
             start += index + needle.len;
         }
@@ -1723,13 +2584,14 @@ fn literalAlternatesColumn(line: []const u8, pattern: []const u8, case_insensiti
 test "trigram gate rejects impossible complete file without verifier authority" {
     const plan = try expr.parse("lit:needle");
     const admission = trigram.admit(plan);
+    const program = TrigramAdmissionProgram.compile(admission);
     var stats = core_stats.TrigramAccelerationStats{};
     initTrigramStats(&stats, admission, false);
     var bytes: [TRIGRAM_MIN_PRUNE_BYTES]u8 = undefined;
     @memset(bytes[0..], 'a');
 
     try std.testing.expect(shouldAttemptTrigramPrune(bytes.len, true, admission, false));
-    try std.testing.expect(tryTrigramPruneFile(bytes[0..], admission, &stats));
+    try std.testing.expect(tryTrigramPruneFile(bytes[0..], &program, &stats));
     try std.testing.expect(stats.eligible);
     try std.testing.expectEqual(@as(usize, 1), stats.candidate_files_checked);
     try std.testing.expectEqual(@as(usize, 1), stats.pruned_files);
@@ -1739,6 +2601,7 @@ test "trigram gate rejects impossible complete file without verifier authority" 
 test "trigram gate admits possible file for exact verifier" {
     const plan = try expr.parse("lit:needle");
     const admission = trigram.admit(plan);
+    const program = TrigramAdmissionProgram.compile(admission);
     var stats = core_stats.TrigramAccelerationStats{};
     initTrigramStats(&stats, admission, false);
     var bytes: [TRIGRAM_MIN_PRUNE_BYTES]u8 = undefined;
@@ -1746,10 +2609,49 @@ test "trigram gate admits possible file for exact verifier" {
     @memcpy(bytes[128..134], "needle");
 
     try std.testing.expect(shouldAttemptTrigramPrune(bytes.len, true, admission, false));
-    try std.testing.expect(!tryTrigramPruneFile(bytes[0..], admission, &stats));
+    try std.testing.expect(!tryTrigramPruneFile(bytes[0..], &program, &stats));
     try std.testing.expectEqual(@as(usize, 1), stats.candidate_files_checked);
     try std.testing.expectEqual(@as(usize, 0), stats.pruned_files);
     try std.testing.expectEqual(@as(usize, 1), stats.verified_files);
+}
+
+test "trigram program requires every all-mode evidence group" {
+    const plan = try expr.parse("lit:alpha && lit:omega");
+    const admission = trigram.admit(plan);
+    const program = TrigramAdmissionProgram.compile(admission);
+    var stats = core_stats.TrigramAccelerationStats{};
+    initTrigramStats(&stats, admission, false);
+    var bytes: [TRIGRAM_MIN_PRUNE_BYTES]u8 = undefined;
+    @memset(bytes[0..], 'z');
+    @memcpy(bytes[64..69], "alpha");
+
+    try std.testing.expect(tryTrigramPruneFile(bytes[0..], &program, &stats));
+    @memcpy(bytes[128..133], "omega");
+    try std.testing.expect(!tryTrigramPruneFile(bytes[0..], &program, &stats));
+}
+
+test "trigram program admits any-mode satisfied branch" {
+    const plan = try expr.parse("lit:alpha || lit:omega");
+    const admission = trigram.admit(plan);
+    const program = TrigramAdmissionProgram.compile(admission);
+    var stats = core_stats.TrigramAccelerationStats{};
+    initTrigramStats(&stats, admission, false);
+    var bytes: [TRIGRAM_MIN_PRUNE_BYTES]u8 = undefined;
+    @memset(bytes[0..], 'z');
+    @memcpy(bytes[96..101], "omega");
+
+    try std.testing.expect(!tryTrigramPruneFile(bytes[0..], &program, &stats));
+}
+
+test "file admission needle lowers only contract-safe predicate shapes" {
+    const word_plan = try expr.parse("re:\\bPM_RESUME\\b");
+    try std.testing.expectEqualStrings(
+        "PM_RESUME",
+        fileAdmissionNeedle(.regex, .regex_word_boundary_literal, word_plan.predicates[0]).?,
+    );
+
+    const full_plan = try expr.parse("re:PM_.*RESUME");
+    try std.testing.expect(fileAdmissionNeedle(.regex, .regex_full, full_plan.predicates[0]) == null);
 }
 
 test "trigram gate disables case-insensitive byte semantics" {
@@ -1762,4 +2664,223 @@ test "trigram gate disables case-insensitive byte semantics" {
     try std.testing.expect(!shouldAttemptTrigramPrune("needle\n".len, true, admission, true));
     try std.testing.expectEqual(@as(usize, 0), stats.candidate_files_checked);
     try std.testing.expectEqual(@as(usize, 0), stats.pruned_files);
+}
+
+test "evidence frontier cache round trips IXEVIDENCE2 identity and candidates" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = ".ix-evidence-test-roundtrip.cache";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const files = [_]DiscoveredFile{
+        .{ .path = "src/main.zig" },
+        .{ .path = "src/core/search.zig" },
+    };
+    var candidates = [_]DiscoveredFile{files[1]};
+    const signature = try computeDiscoveredSignature(io, &files);
+    const content_signature: u64 = 0xfeed_cafe_0123_4567;
+    writeEvidenceFrontierCache(io, path, 0xabc, signature, content_signature, files.len, .{
+        .pruned_files = 1,
+        .pruned_bytes = 4096,
+        .skipped_files = 2,
+        .candidates = &candidates,
+    });
+
+    const cache = loadEvidenceFrontierCache(io, allocator, path, 0xabc, signature, &files) orelse return error.TestExpectedCacheHit;
+    try std.testing.expectEqual(@as(usize, 1), cache.pruned_files);
+    try std.testing.expectEqual(@as(usize, 4096), cache.pruned_bytes);
+    try std.testing.expectEqual(@as(usize, 2), cache.skipped_files);
+    try std.testing.expectEqual(content_signature, cache.content_signature);
+    try std.testing.expect(cache.contains("src/core/search.zig"));
+    try std.testing.expect(!cache.contains("src/main.zig"));
+}
+
+test "evidence frontier cache rejects stale or malformed artifact headers" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const path = ".ix-evidence-test-reject.cache";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    const files = [_]DiscoveredFile{.{ .path = "src/main.zig" }};
+    const signature = try computeDiscoveredSignature(io, &files);
+    const key: u64 = 0x1234;
+
+    try writeCacheText(io, path, "IXEVIDENCE1\nkey=1234\nsignature=0\ncontent_signature=0\nfile_count=1\npruned_files=0\npruned_bytes=0\nskipped_files=0\ncandidates=0\n--\n");
+    try std.testing.expect(loadEvidenceFrontierCache(io, allocator, path, key, signature, &files) == null);
+
+    try writeCacheText(io, path, try std.fmt.allocPrint(allocator, "IXEVIDENCE2\nkey={x}\nsignature={x}\ncontent_signature=1\nfile_count=2\npruned_files=0\npruned_bytes=0\nskipped_files=0\ncandidates=0\n--\n", .{ key, signature }));
+    try std.testing.expect(loadEvidenceFrontierCache(io, allocator, path, key, signature, &files) == null);
+
+    try writeCacheText(io, path, try std.fmt.allocPrint(allocator, "IXEVIDENCE2\nkey={x}\nsignature={x}\ncontent_signature=1\nfile_count=1\npruned_files=0\npruned_bytes=0\nskipped_files=0\ncandidates=2\n--\nsrc/main.zig\n", .{ key, signature }));
+    try std.testing.expect(loadEvidenceFrontierCache(io, allocator, path, key, signature, &files) == null);
+
+    try writeCacheText(io, path, try std.fmt.allocPrint(allocator, "IXEVIDENCE2\nkey={x}\nsignature={x}\ncontent_signature=1\nfile_count=1\npruned_files=0\npruned_bytes=0\nskipped_files=0\ncandidates={}\n--\n", .{ key, signature, EVIDENCE_FRONTIER_CACHE_CANDIDATE_LIMIT + 1 }));
+    try std.testing.expect(loadEvidenceFrontierCache(io, allocator, path, key, signature, &files) == null);
+}
+
+test "evidence frontier prepare narrows active files and accounts cached prunes" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const request = testSearchRequest("lit:needle", "fixture-root");
+    const plan = try expr.parse(request.expression);
+    const admission = trigram.admit(plan);
+    const files = [_]DiscoveredFile{
+        .{ .path = "src/main.zig" },
+        .{ .path = "src/core/search.zig" },
+    };
+    var candidates = [_]DiscoveredFile{files[1]};
+    const signature = try computeDiscoveredSignature(io, &files);
+    const key = evidenceFrontierKey(request, plan);
+    const cache_path = try std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key});
+    defer std.Io.Dir.cwd().deleteFile(io, cache_path) catch {};
+    writeEvidenceFrontierCache(io, cache_path, key, signature, 0x9876, files.len, .{
+        .pruned_files = 1,
+        .pruned_bytes = 123,
+        .skipped_files = 4,
+        .candidates = &candidates,
+    });
+
+    var mutable_files = files;
+    var report = testSearchReport(request.expression, plan);
+    const prepared = prepareEvidenceFrontier(io, allocator, request, plan, admission, &mutable_files, &report);
+    const active = prepared.active_files orelse return error.TestExpectedCacheHit;
+
+    try std.testing.expect(!prepared.runtime.enabled);
+    try std.testing.expectEqual(@as(usize, 1), active.len);
+    try std.testing.expectEqualStrings("src/core/search.zig", active[0].path);
+    try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
+    try std.testing.expectEqual(@as(usize, 123), report.bytes_scanned);
+    try std.testing.expectEqual(@as(usize, 4), report.files_skipped);
+    try std.testing.expectEqual(@as(usize, 1), report.stats.trigram_acceleration.pruned_files);
+}
+
+test "content signature changes when file size mutates but stays off foreground admission" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "epoch.txt", .data = "needle\n" });
+    const file_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/epoch.txt", .{&tmp.sub_path});
+    const files = [_]DiscoveredFile{.{ .path = file_path }};
+    const before = try computeContentSignature(io, &files);
+    try tmp.dir.writeFile(io, .{ .sub_path = "epoch.txt", .data = "needle plus more bytes\n" });
+    const after = try computeContentSignature(io, &files);
+    try std.testing.expect(before != after);
+}
+
+test "search run consumes evidence frontier and scans only retained candidates" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const request = testSearchRequest("lit:needle", root_path);
+    const plan = try expr.parse(request.expression);
+    const key = evidenceFrontierKey(request, plan);
+    const cache_path = try std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key});
+    defer std.Io.Dir.cwd().deleteFile(io, cache_path) catch {};
+
+    var discovery_report = testSearchReport(request.expression, plan);
+    var discovered = try FileList.initWithCapacity(allocator, 4);
+    try discoverFiles(io, allocator, root_path, request, &discovered, &discovery_report);
+    const files = discovered.mutableItems();
+    try std.testing.expectEqual(@as(usize, 2), files.len);
+    const signature = try computeDiscoveredSignature(io, files);
+
+    var retained = [_]DiscoveredFile{candidateFromDiscovered(files) orelse return error.TestExpectedCacheHit};
+    writeEvidenceFrontierCache(io, cache_path, key, signature, 0xace, files.len, .{
+        .pruned_files = 1,
+        .pruned_bytes = 64,
+        .skipped_files = 0,
+        .candidates = &retained,
+    });
+
+    const report = try run(io, allocator, request, plan);
+    try std.testing.expectEqual(@as(usize, 1), report.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), report.hit_count);
+    try std.testing.expectEqualStrings(retained[0].path, report.hits[0].path);
+    try std.testing.expectEqual(@as(usize, 1), report.stats.trigram_acceleration.pruned_files);
+    try std.testing.expectEqual(@as(usize, 2), report.files_scanned);
+}
+
+fn candidateFromDiscovered(files: []const DiscoveredFile) ?DiscoveredFile {
+    for (files) |file| {
+        if (std.mem.endsWith(u8, file.path, "candidate.txt")) return file;
+    }
+    return null;
+}
+
+fn writeCacheText(io: std.Io, path: []const u8, data: []const u8) !void {
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = data });
+}
+
+fn testSearchRequest(expression: []const u8, path: []const u8) cli.SearchRequest {
+    var request = cli.SearchRequest{
+        .expression = expression,
+        .paths = undefined,
+        .path_count = 1,
+        .json = false,
+        .stats_only = false,
+        .hidden = false,
+        .line_numbers = false,
+        .fixed_strings = false,
+        .case_insensitive = false,
+        .follow_symlinks = false,
+        .max_hits = null,
+        .threads = null,
+        .emit_report = null,
+        .nexus_build = false,
+    };
+    request.paths[0] = path;
+    return request;
+}
+
+fn testSearchReport(expression_source: []const u8, plan: expr.ExpressionPlan) SearchReport {
+    return .{
+        .expression = expression_source,
+        .input_roots = 1,
+        .effective_roots = 1,
+        .pruned_roots = 0,
+        .overlap_pruned_roots = 0,
+        .discovered_duplicate_paths = 0,
+        .collect_hits = true,
+        .stats = .{},
+        .bytes_scanned = 0,
+        .files_discovered = 0,
+        .files_scanned = 0,
+        .files_skipped = 0,
+        .matches_found = 0,
+        .truncated = false,
+        .slowest_path = "",
+        .slowest_bytes = 0,
+        .slowest_ms = 0,
+        .discover_ms = 0,
+        .scan_ms = 0,
+        .aggregate_ms = 0,
+        .total_ms = 0,
+        .scan_work_ms_total = 0,
+        .matcher_strategy_supported = plan.supportsLargeDirectoryStreamingSelector(),
+        .outer_parallel_shard_safe = plan.supportsOuterParallelShardFastCount(),
+        .uses_single_literal_counter = plan.usesSingleLiteralCounter(),
+        .fast_count_range_overlap = plan.fastMatchCountRangeOverlap(),
+        .available_threads = 1,
+        .outer_scan_threads = 0,
+        .hits = undefined,
+        .hit_count = 0,
+    };
 }
