@@ -9,6 +9,7 @@ const search = @import("core/search.zig");
 test {
     _ = @import("core/trigram.zig");
     _ = @import("core/corpus.zig");
+    _ = @import("core/catalog.zig");
 }
 
 /// IX Zig binary entry point.

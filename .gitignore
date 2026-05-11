@@ -7,6 +7,7 @@
 /tools/reports/
 /tools/scripts/competitors.json
 /.ix-evidence-*.cache
+/.ix-evidence-*.cache.live
 /.ix-trigram-warm-*.cache
 Created*
 node_modules/
