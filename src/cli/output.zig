@@ -282,6 +282,8 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
     try writer.writeAll("\"fast_count_density\":{\"literal_reject_fast_calls\":0,\"literal_reject_fast_bytes\":0,\"literal_range_calls\":0,\"literal_range_bytes\":0,\"literal_matches\":0,\"alternate_reject_fast_calls\":0,\"alternate_reject_fast_bytes\":0,\"alternate_full_scan_calls\":0,\"alternate_full_scan_bytes\":0,\"alternate_full_scan_matches\":0,\"alternate_range_calls\":0,\"alternate_range_bytes\":0,\"alternate_matches\":0,\"shard_merge_calls\":0,\"shard_merge_ranges\":0,\"shard_merge_matches\":0},");
     try writer.print("\"byte_shard_kernel\":{{\"enabled\":{s},\"strategy\":\"{s}\",\"files_profiled\":{},\"range_calls\":{},\"line_aligned_ranges\":{},\"logical_range_bytes\":{},\"widened_range_bytes\":{},\"overlap_bytes\":{},\"boundary_verified_candidates\":{},\"boundary_rejected_candidates\":{},\"range_elapsed_ns_total\":{},\"max_range_elapsed_ns\":{},\"reduce_elapsed_ns_total\":{},\"max_reduce_elapsed_ns\":{},\"matches\":{}}},", .{ boolText(report.stats.byte_shard_kernel.enabled), report.stats.byte_shard_kernel.strategy, report.stats.byte_shard_kernel.files_profiled, report.stats.byte_shard_kernel.range_calls, report.stats.byte_shard_kernel.line_aligned_ranges, report.stats.byte_shard_kernel.logical_range_bytes, report.stats.byte_shard_kernel.widened_range_bytes, report.stats.byte_shard_kernel.overlap_bytes, report.stats.byte_shard_kernel.boundary_verified_candidates, report.stats.byte_shard_kernel.boundary_rejected_candidates, report.stats.byte_shard_kernel.range_elapsed_ns_total, report.stats.byte_shard_kernel.max_range_elapsed_ns, report.stats.byte_shard_kernel.reduce_elapsed_ns_total, report.stats.byte_shard_kernel.max_reduce_elapsed_ns, report.stats.byte_shard_kernel.matches });
     try writer.print("\"trigram_acceleration\":{{\"eligible\":{s},\"mode\":\"{s}\",\"mandatory_groups\":{},\"mandatory_trigrams\":{},\"candidate_files_checked\":{},\"pruned_files\":{},\"verified_files\":{},\"ineligible_files\":{}}},", .{ boolText(report.stats.trigram_acceleration.eligible), report.stats.trigram_acceleration.mode, report.stats.trigram_acceleration.mandatory_groups, report.stats.trigram_acceleration.mandatory_trigrams, report.stats.trigram_acceleration.candidate_files_checked, report.stats.trigram_acceleration.pruned_files, report.stats.trigram_acceleration.verified_files, report.stats.trigram_acceleration.ineligible_files });
+    try writeCatalogIndexJson(writer, report.stats.catalog_index);
+    try writer.writeAll(",");
     try writeAccessErrorsJson(writer, report.stats.access_errors);
     try writer.writeAll(",");
     try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ report.stats.timings.discover_ms, report.stats.timings.scan_ms, report.stats.timings.aggregate_ms, report.stats.timings.total_ms, report.stats.timings.scan_work_ms_total, report.stats.timings.aggregate_merge_ms, report.stats.timings.aggregate_finalize_ms });
@@ -324,6 +326,24 @@ fn writeAccessErrorsJson(writer: anytype, access_errors: core_stats.AccessErrorS
         try writer.writeAll("}");
     }
     try writer.writeAll("]}");
+}
+
+fn writeCatalogIndexJson(writer: anytype, catalog_index: core_stats.CatalogIndexStats) !void {
+    try writer.print("\"catalog_index\":{{\"enabled\":{s},\"available\":{s},\"generation\":", .{
+        boolText(catalog_index.enabled),
+        boolText(catalog_index.available),
+    });
+    if (catalog_index.generation) |generation| {
+        try writer.print("{}", .{generation});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.print(",\"path_count\":{},\"meta_count\":{},\"fallback_reason\":", .{
+        catalog_index.path_count,
+        catalog_index.meta_count,
+    });
+    try writeJsonString(writer, catalog_index.fallback_reason);
+    try writer.writeAll("}");
 }
 
 pub fn writeSearchHits(writer: anytype, report: search.SearchReport) !void {
@@ -499,4 +519,17 @@ test "access error json exposes partial-search diagnostics" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"access_denied\":1") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"operation\":\"open_dir\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"error\":\"AccessDenied\"") != null);
+}
+
+test "catalog index json exposes inactive default state" {
+    var buffer: [256]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeCatalogIndexJson(&writer, .{});
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"catalog_index\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"available\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"generation\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"fallback_reason\":\"not_wired\"") != null);
 }

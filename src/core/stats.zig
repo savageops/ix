@@ -126,6 +126,15 @@ pub const TrigramAccelerationStats = struct {
     ineligible_files: usize = 0,
 };
 
+pub const CatalogIndexStats = struct {
+    enabled: bool = false,
+    available: bool = false,
+    generation: ?u64 = null,
+    path_count: usize = 0,
+    meta_count: usize = 0,
+    fallback_reason: []const u8 = "not_wired",
+};
+
 pub const AccessErrorSample = struct {
     phase: []const u8 = "",
     operation: []const u8 = "",
@@ -230,6 +239,7 @@ pub const SearchStats = struct {
     fast_count_density: FastCountDensityStats = .{},
     byte_shard_kernel: ByteShardKernelStats = .{},
     trigram_acceleration: TrigramAccelerationStats = .{},
+    catalog_index: CatalogIndexStats = .{},
     access_errors: AccessErrorStats = .{},
     fallback_line_scan: ?FallbackLineScanStats = null,
     timings: PhaseTimings = .{},
@@ -258,6 +268,8 @@ test "search stats owns rust-compatible top-level schema defaults" {
     try std.testing.expectEqual(@as(usize, 1), snapshot.concurrency.available_threads);
     try std.testing.expectEqualStrings("materialized", snapshot.concurrency.execution_mode);
     try std.testing.expectEqualStrings("linux_amd_asic_reg_giant_header", snapshot.linux_dominant_file.target_class);
+    try std.testing.expect(!snapshot.catalog_index.enabled);
+    try std.testing.expectEqualStrings("not_wired", snapshot.catalog_index.fallback_reason);
     try std.testing.expectEqual(@as(usize, 1), snapshot.slowest_file_count);
 }
 
