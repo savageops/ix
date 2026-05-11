@@ -13,6 +13,7 @@ test {
     _ = @import("core/catalog.zig");
     _ = @import("core/postings.zig");
     _ = @import("core/indexd.zig");
+    _ = @import("core/generation.zig");
 }
 
 /// IX Zig binary entry point.

@@ -286,6 +286,8 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
     try writer.writeAll(",");
     try writePostingsIndexJson(writer, report.stats.postings_index);
     try writer.writeAll(",");
+    try writeGenerationRefreshJson(writer, report.stats.generation_refresh);
+    try writer.writeAll(",");
     try writeAccessErrorsJson(writer, report.stats.access_errors);
     try writer.writeAll(",");
     try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ report.stats.timings.discover_ms, report.stats.timings.scan_ms, report.stats.timings.aggregate_ms, report.stats.timings.total_ms, report.stats.timings.scan_work_ms_total, report.stats.timings.aggregate_merge_ms, report.stats.timings.aggregate_finalize_ms });
@@ -367,6 +369,23 @@ fn writePostingsIndexJson(writer: anytype, postings_index: core_stats.PostingsIn
         postings_index.verified_files,
     });
     try writeJsonString(writer, postings_index.fallback_reason);
+    try writer.writeAll("}");
+}
+
+fn writeGenerationRefreshJson(writer: anytype, generation_refresh: core_stats.GenerationRefreshStats) !void {
+    try writer.print("\"generation_refresh\":{{\"enabled\":{s},\"available\":{s},\"epoch\":", .{
+        boolText(generation_refresh.enabled),
+        boolText(generation_refresh.available),
+    });
+    if (generation_refresh.epoch) |epoch| {
+        try writer.print("{}", .{epoch});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"refresh_status\":");
+    try writeJsonString(writer, generation_refresh.refresh_status);
+    try writer.writeAll(",\"fallback_reason\":");
+    try writeJsonString(writer, generation_refresh.fallback_reason);
     try writer.writeAll("}");
 }
 
@@ -581,4 +600,24 @@ test "postings index json exposes candidate pruning counters" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"candidate_files\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"pruned_files\":9") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"verified_files\":2") != null);
+}
+
+test "generation refresh json exposes epoch status and fallback" {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeGenerationRefreshJson(&writer, .{
+        .enabled = true,
+        .available = true,
+        .epoch = 42,
+        .refresh_status = "pinned",
+        .fallback_reason = "",
+    });
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"generation_refresh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"available\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"epoch\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"refresh_status\":\"pinned\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"fallback_reason\":\"\"") != null);
 }
