@@ -9,6 +9,7 @@ pub const CommandTag = enum {
     inspect,
     explain,
     nexus,
+    indexd,
 };
 
 pub const HelpTopic = enum {
@@ -69,6 +70,12 @@ pub const ExplainRequest = struct {
     expression: []const u8,
 };
 
+pub const IndexdRequest = struct {
+    root: []const u8,
+    foreground: bool,
+    once: bool,
+};
+
 pub const Command = union(CommandTag) {
     help: HelpTopic,
     search: SearchRequest,
@@ -76,6 +83,7 @@ pub const Command = union(CommandTag) {
     inspect: InspectRequest,
     explain: ExplainRequest,
     nexus: SearchRequest,
+    indexd: IndexdRequest,
 };
 
 pub const Invocation = struct {
@@ -124,6 +132,9 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
         request.nexus_build = true;
         return .{ .command = .{ .nexus = request } };
     }
+    if (std.mem.eql(u8, first, "__ix_indexd")) {
+        return .{ .command = .{ .indexd = try parseIndexd(argv[2..]) } };
+    }
 
     return .{ .command = .{ .search = try parseCompatSearch(allocator, argv[1..]) } };
 }
@@ -170,6 +181,29 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
         } else return ParseError.UnsupportedFlag;
     }
     request.expression = expression orelse return ParseError.MissingExpression;
+    return request;
+}
+
+fn parseIndexd(args: []const []const u8) ParseError!IndexdRequest {
+    var request = IndexdRequest{
+        .root = ".",
+        .foreground = false,
+        .once = false,
+    };
+    var root_seen = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--foreground")) {
+            request.foreground = true;
+        } else if (std.mem.eql(u8, arg, "--once")) {
+            request.once = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return ParseError.UnsupportedFlag;
+        } else {
+            if (root_seen) return ParseError.MissingValue;
+            request.root = arg;
+            root_seen = true;
+        }
+    }
     return request;
 }
 
@@ -460,4 +494,38 @@ test "hidden nexus command forces silent stats json build mode" {
     try std.testing.expect(request.hidden);
     try std.testing.expect(request.follow_symlinks);
     try std.testing.expectEqual(@as(?usize, 7), request.threads);
+}
+
+test "hidden indexd command parses without public command exposure" {
+    const argv = [_][]const u8{
+        "ix-zig",
+        "__ix_indexd",
+        "E:\\Workspaces\\01_Projects\\01_Github\\ix-zig",
+        "--foreground",
+        "--once",
+    };
+    const invocation = try parseInvocation(std.testing.allocator, &argv);
+    try std.testing.expect(invocation.command == .indexd);
+    const request = invocation.command.indexd;
+    try std.testing.expectEqualStrings("E:\\Workspaces\\01_Projects\\01_Github\\ix-zig", request.root);
+    try std.testing.expect(request.foreground);
+    try std.testing.expect(request.once);
+}
+
+test "hidden indexd command rejects unsupported lifecycle flags and duplicate roots" {
+    const bad_flag = [_][]const u8{
+        "ix-zig",
+        "__ix_indexd",
+        ".",
+        "--verbose",
+    };
+    try std.testing.expectError(ParseError.UnsupportedFlag, parseInvocation(std.testing.allocator, &bad_flag));
+
+    const duplicate_root = [_][]const u8{
+        "ix-zig",
+        "__ix_indexd",
+        ".",
+        "src",
+    };
+    try std.testing.expectError(ParseError.MissingValue, parseInvocation(std.testing.allocator, &duplicate_root));
 }

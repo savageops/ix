@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const cli = @import("cli/args.zig");
 const output = @import("cli/output.zig");
 const expr = @import("core/expr.zig");
+const indexd = @import("core/indexd.zig");
 const inspect = @import("core/inspect.zig");
 const search = @import("core/search.zig");
 
@@ -11,6 +12,7 @@ test {
     _ = @import("core/corpus.zig");
     _ = @import("core/catalog.zig");
     _ = @import("core/postings.zig");
+    _ = @import("core/indexd.zig");
 }
 
 /// IX Zig binary entry point.
@@ -84,6 +86,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             if (shouldLaunchNexusSidecar(effective_request, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
+            if (shouldLaunchIndexdSidecar(indexdEnabled(init), effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
             if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
             } else {
@@ -110,6 +113,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             if (shouldLaunchNexusSidecar(effective_request, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
+            if (shouldLaunchIndexdSidecar(indexdEnabled(init), effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
             if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
             } else if (!effective_request.stats_only) {
@@ -176,6 +180,13 @@ pub fn main(init: std.process.Init) !void {
             _ = search.run(init.io, allocator, request, plan) catch std.process.exit(0);
             search.holdEvidenceFrontierLive(init.io, allocator, request, plan);
         },
+        .indexd => |request| {
+            _ = indexd.run(init.io, allocator, .{
+                .root = request.root,
+                .foreground = request.foreground,
+                .once = request.once,
+            }) catch std.process.exit(0);
+        },
     }
     try stdout.flush();
 }
@@ -185,9 +196,26 @@ fn nexusDisabled(init: std.process.Init) bool {
     return std.mem.eql(u8, value.*, "0") or std.ascii.eqlIgnoreCase(value.*, "false") or std.ascii.eqlIgnoreCase(value.*, "off");
 }
 
+fn indexdEnabled(init: std.process.Init) bool {
+    const value = init.environ_map.getPtr("IX_INDEX") orelse return false;
+    return indexdEnvValueEnabled(value.*);
+}
+
+fn indexdEnvValueEnabled(value: []const u8) bool {
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
+}
+
 fn shouldLaunchNexusSidecar(request: cli.SearchRequest, report: search.SearchReport) bool {
     if (request.nexus_disabled) return false;
     return report.stats.trigram_acceleration.pruned_files == 0;
+}
+
+fn shouldLaunchIndexdSidecar(enabled: bool, request: cli.SearchRequest, report: search.SearchReport) bool {
+    if (!enabled) return false;
+    if (request.nexus_build) return false;
+    if (request.case_insensitive) return false;
+    if (request.path_count != 1) return false;
+    return report.files_discovered > 0;
 }
 
 fn launchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, argv0: []const u8, request: cli.SearchRequest) void {
@@ -208,14 +236,28 @@ fn launchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, argv0: []const u
         argv.append(allocator, "--threads") catch return;
         argv.append(allocator, std.fmt.allocPrint(allocator, "{}", .{threads}) catch return) catch return;
     }
+    launchDetachedProcess(io, allocator, argv.items) catch return;
+}
 
+fn launchIndexdSidecar(io: std.Io, allocator: std.mem.Allocator, argv0: []const u8, root: []const u8) void {
+    if (!std.process.can_spawn) return;
+
+    var argv = std.ArrayList([]const u8).empty;
+    argv.append(allocator, argv0) catch return;
+    argv.append(allocator, "__ix_indexd") catch return;
+    argv.append(allocator, root) catch return;
+
+    launchDetachedProcess(io, allocator, argv.items) catch return;
+}
+
+fn launchDetachedProcess(io: std.Io, allocator: std.mem.Allocator, argv: []const []const u8) !void {
     if (comptime builtin.os.tag == .windows) {
-        launchNexusSidecarWindows(allocator, argv.items) catch return;
+        try launchDetachedProcessWindows(allocator, argv);
         return;
     }
 
     const child = std.process.spawn(io, .{
-        .argv = argv.items,
+        .argv = argv,
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .ignore,
@@ -224,7 +266,7 @@ fn launchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, argv0: []const u
     _ = child;
 }
 
-fn launchNexusSidecarWindows(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+fn launchDetachedProcessWindows(allocator: std.mem.Allocator, argv: []const []const u8) !void {
     const windows = std.os.windows;
     const app_w = try std.unicode.wtf8ToWtf16LeAllocZ(allocator, argv[0]);
     var command_line = std.ArrayList(u8).empty;
@@ -253,7 +295,7 @@ fn launchNexusSidecarWindows(allocator: std.mem.Allocator, argv: []const []const
         &startup,
         &info,
     );
-    if (ok == .FALSE) return error.NexusSpawnFailed;
+    if (ok == .FALSE) return error.DetachedSpawnFailed;
     windows.CloseHandle(info.hThread);
     windows.CloseHandle(info.hProcess);
 }
@@ -293,6 +335,37 @@ test "nexus sidecar launch is gated after evidence-pruned foreground reuse" {
     try std.testing.expect(!shouldLaunchNexusSidecar(disabled, testSearchReportForSidecar(0)));
 }
 
+test "indexd sidecar launch is opt in single root and workload gated" {
+    var request = testSearchRequestForSidecar(false);
+    var report = testSearchReportForSidecar(0);
+    report.files_discovered = 12;
+
+    try std.testing.expect(!shouldLaunchIndexdSidecar(false, request, report));
+    try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
+
+    request.path_count = 2;
+    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
+    request.path_count = 1;
+
+    request.case_insensitive = true;
+    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
+    request.case_insensitive = false;
+
+    report.files_discovered = 0;
+    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
+}
+
+test "indexd environment gate only accepts explicit opt in values" {
+    try std.testing.expect(indexdEnvValueEnabled("1"));
+    try std.testing.expect(indexdEnvValueEnabled("true"));
+    try std.testing.expect(indexdEnvValueEnabled("TRUE"));
+    try std.testing.expect(indexdEnvValueEnabled("on"));
+    try std.testing.expect(!indexdEnvValueEnabled("0"));
+    try std.testing.expect(!indexdEnvValueEnabled("false"));
+    try std.testing.expect(!indexdEnvValueEnabled("off"));
+    try std.testing.expect(!indexdEnvValueEnabled(""));
+}
+
 test "windows command argument quoting preserves spaces quotes and trailing slashes" {
     const allocator = std.testing.allocator;
     var list = std.ArrayList(u8).empty;
@@ -312,6 +385,19 @@ test "windows command argument quoting preserves spaces quotes and trailing slas
 
     try appendWindowsCommandArg(allocator, &list, "tail\\");
     try std.testing.expectEqualStrings("\"tail\\\\\"", list.items);
+}
+
+test "indexd sidecar launch keeps hidden argv shape" {
+    const allocator = std.testing.allocator;
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+
+    try argv.append(allocator, "ix-zig");
+    try argv.append(allocator, "__ix_indexd");
+    try argv.append(allocator, "E:\\Workspaces\\ix-zig");
+
+    try std.testing.expectEqualStrings("__ix_indexd", argv.items[1]);
+    try std.testing.expectEqualStrings("E:\\Workspaces\\ix-zig", argv.items[2]);
 }
 
 fn testSearchReportForSidecar(pruned_files: usize) search.SearchReport {
