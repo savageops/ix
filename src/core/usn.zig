@@ -117,6 +117,31 @@ pub const JournalAvailability = struct {
     }
 };
 
+pub const ReadBatchOptions = struct {
+    max_records: usize = 1024,
+    max_bytes: usize = 64 * 1024,
+    cancelled: bool = false,
+};
+
+pub const UsnRecordSummary = struct {
+    major_version: u16,
+    minor_version: u16,
+    record_length: windows.DWORD,
+    reason: windows.DWORD,
+    file_name_offset: u16,
+    file_name_length: u16,
+};
+
+pub const ReadBatchResult = struct {
+    next_start_usn: USN,
+    records: []UsnRecordSummary,
+    truncated_by_limit: bool = false,
+
+    pub fn deinit(self: ReadBatchResult, allocator: std.mem.Allocator) void {
+        allocator.free(self.records);
+    }
+};
+
 pub const JournalPaths = struct {
     journals_dir: []const u8,
     cursor_path: []const u8,
@@ -189,6 +214,13 @@ pub fn readRequest(start_usn: USN, journal_id: DWORDLONG) ReadUsnJournalDataV1 {
     };
 }
 
+pub fn readBatchRequest(cursor: JournalCursor, timeout_ms: DWORDLONG, bytes_to_wait_for: DWORDLONG) ReadUsnJournalDataV1 {
+    var request = readRequest(cursor.next_usn, cursor.usn_journal_id);
+    request.timeout = timeout_ms;
+    request.bytes_to_wait_for = bytes_to_wait_for;
+    return request;
+}
+
 pub fn buildJournalPaths(allocator: std.mem.Allocator, root: []const u8) !JournalPaths {
     const journals_dir = try std.fs.path.join(allocator, &.{ root, ".ix", "index", "journals" });
     errdefer allocator.free(journals_dir);
@@ -247,6 +279,37 @@ pub fn classifyJournalAvailability(volume: VolumeIdentity, input: JournalProbeIn
             .kind = .unsupported_filesystem,
             .fallback_reason = "unsupported_filesystem",
         },
+    };
+}
+
+pub fn parseReadBatch(allocator: std.mem.Allocator, bytes: []const u8, options: ReadBatchOptions) !ReadBatchResult {
+    if (options.cancelled) return error.OperationCancelled;
+    if (options.max_records == 0) return error.EmptyUsnBatchCapacity;
+    if (bytes.len > options.max_bytes) return error.UsnBatchTooLarge;
+
+    var cursor = ByteCursor{ .bytes = bytes };
+    const next_start_usn = try cursor.readI64();
+    var records = std.ArrayList(UsnRecordSummary).empty;
+    errdefer records.deinit(allocator);
+
+    var truncated_by_limit = false;
+    while (cursor.remaining() > 0) {
+        if (options.cancelled) return error.OperationCancelled;
+        if (records.items.len >= options.max_records) {
+            truncated_by_limit = true;
+            break;
+        }
+
+        const remaining = cursor.bytes[cursor.index..];
+        const summary = try parseRecordSummary(remaining);
+        try records.append(allocator, summary);
+        _ = try cursor.take(summary.record_length);
+    }
+
+    return .{
+        .next_start_usn = next_start_usn,
+        .records = try records.toOwnedSlice(allocator),
+        .truncated_by_limit = truncated_by_limit,
     };
 }
 
@@ -338,6 +401,48 @@ fn validateJournalCursor(cursor: JournalCursor) !void {
     if (cursor.next_usn < cursor.first_usn) return error.InvalidUsnRange;
     if (cursor.lowest_valid_usn < cursor.first_usn) return error.InvalidUsnRange;
     if (cursor.lowest_valid_usn > cursor.next_usn) return error.InvalidUsnRange;
+}
+
+fn parseRecordSummary(bytes: []const u8) !UsnRecordSummary {
+    if (bytes.len < @sizeOf(UsnRecordHeader)) return error.TruncatedUsnRecord;
+    var cursor = ByteCursor{ .bytes = bytes };
+    const record_length = try cursor.readU32();
+    const major_version = try cursor.readU16();
+    const minor_version = try cursor.readU16();
+    if (record_length < @sizeOf(UsnRecordHeader)) return error.InvalidUsnRecordLength;
+    if (record_length > bytes.len) return error.TruncatedUsnRecord;
+
+    const reason_offset: usize, const file_name_length_offset: usize, const file_name_offset_offset: usize = switch (major_version) {
+        2 => .{ 40, 56, 58 },
+        3 => .{ 56, 72, 74 },
+        else => return error.UnsupportedUsnRecordVersion,
+    };
+    if (record_length < file_name_offset_offset + @sizeOf(u16)) return error.TruncatedUsnRecord;
+
+    const reason = readU32At(bytes, reason_offset);
+    const file_name_length = readU16At(bytes, file_name_length_offset);
+    const file_name_offset = readU16At(bytes, file_name_offset_offset);
+    if (@as(usize, file_name_offset) + file_name_length > record_length) return error.InvalidUsnRecordNameBounds;
+
+    return .{
+        .major_version = major_version,
+        .minor_version = minor_version,
+        .record_length = record_length,
+        .reason = reason,
+        .file_name_offset = file_name_offset,
+        .file_name_length = file_name_length,
+    };
+}
+
+fn readU16At(bytes: []const u8, offset: usize) u16 {
+    return @as(u16, bytes[offset]) | (@as(u16, bytes[offset + 1]) << 8);
+}
+
+fn readU32At(bytes: []const u8, offset: usize) u32 {
+    return @as(u32, bytes[offset]) |
+        (@as(u32, bytes[offset + 1]) << 8) |
+        (@as(u32, bytes[offset + 2]) << 16) |
+        (@as(u32, bytes[offset + 3]) << 24);
 }
 
 fn fileSystemKindFromByte(byte: u8) ?FileSystemKind {
@@ -597,4 +702,75 @@ test "journal availability rejects malformed journal data as invalid" {
     try std.testing.expect(!invalid.canUseUsn());
     try std.testing.expectEqual(JournalAvailabilityKind.invalid_journal, invalid.kind);
     try std.testing.expectEqualStrings("invalid_journal", invalid.fallback_reason);
+}
+
+test "usn read batch request carries cursor timeout and byte wait" {
+    const volume = VolumeIdentity{
+        .root_fingerprint = 0x1111,
+        .volume_serial_number = 0x2222,
+        .filesystem = .ntfs,
+    };
+    const cursor = try cursorFromJournalData(volume, .{
+        .usn_journal_id = 44,
+        .first_usn = 1,
+        .next_usn = 100,
+        .lowest_valid_usn = 1,
+    });
+    const request = readBatchRequest(cursor, 250, 4096);
+    try std.testing.expectEqual(@as(USN, 100), request.start_usn);
+    try std.testing.expectEqual(@as(DWORDLONG, 44), request.usn_journal_id);
+    try std.testing.expectEqual(@as(DWORDLONG, 250), request.timeout);
+    try std.testing.expectEqual(@as(DWORDLONG, 4096), request.bytes_to_wait_for);
+}
+
+test "usn read batch parser reads bounded records" {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(std.testing.allocator);
+    try appendI64(&bytes, std.testing.allocator, 200);
+    try appendFakeUsnRecordV2(&bytes, std.testing.allocator, USN_REASON_FILE_CREATE, "alpha.zig");
+    try appendFakeUsnRecordV2(&bytes, std.testing.allocator, USN_REASON_DATA_EXTEND, "beta.zig");
+
+    const parsed = try parseReadBatch(std.testing.allocator, bytes.items, .{ .max_records = 1 });
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(USN, 200), parsed.next_start_usn);
+    try std.testing.expectEqual(@as(usize, 1), parsed.records.len);
+    try std.testing.expect(parsed.truncated_by_limit);
+    try std.testing.expectEqual(USN_REASON_FILE_CREATE, parsed.records[0].reason);
+}
+
+test "usn read batch parser rejects hostile buffers and cancellation" {
+    var bytes = std.ArrayList(u8).empty;
+    defer bytes.deinit(std.testing.allocator);
+    try appendI64(&bytes, std.testing.allocator, 200);
+    try appendFakeUsnRecordV2(&bytes, std.testing.allocator, USN_REASON_FILE_DELETE, "gamma.zig");
+
+    try std.testing.expectError(error.OperationCancelled, parseReadBatch(std.testing.allocator, bytes.items, .{ .cancelled = true }));
+    try std.testing.expectError(error.UsnBatchTooLarge, parseReadBatch(std.testing.allocator, bytes.items, .{ .max_bytes = 4 }));
+    try std.testing.expectError(error.TruncatedUsnRecord, parseReadBatch(std.testing.allocator, bytes.items[0 .. bytes.items.len - 1], .{}));
+}
+
+fn appendFakeUsnRecordV2(bytes: *std.ArrayList(u8), allocator: std.mem.Allocator, reason: windows.DWORD, name: []const u8) !void {
+    const record_start = bytes.items.len;
+    const file_name_offset: u16 = 60;
+    const file_name_length: u16 = @intCast(name.len * 2);
+    const record_length: u32 = file_name_offset + file_name_length;
+
+    try appendU32(bytes, allocator, record_length);
+    try appendU16(bytes, allocator, 2);
+    try appendU16(bytes, allocator, 0);
+    try appendU64(bytes, allocator, 1);
+    try appendU64(bytes, allocator, 1);
+    try appendI64(bytes, allocator, 101);
+    try appendI64(bytes, allocator, 0);
+    try appendU32(bytes, allocator, reason);
+    try appendU32(bytes, allocator, 0);
+    try appendU32(bytes, allocator, 0);
+    try appendU32(bytes, allocator, 0);
+    try appendU16(bytes, allocator, file_name_length);
+    try appendU16(bytes, allocator, file_name_offset);
+    while (bytes.items.len < record_start + file_name_offset) try bytes.append(allocator, 0);
+    for (name) |byte| {
+        try bytes.append(allocator, byte);
+        try bytes.append(allocator, 0);
+    }
 }

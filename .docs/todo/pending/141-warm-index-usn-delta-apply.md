@@ -99,7 +99,7 @@ The research identifies USN as the serious Windows-native delta feed. Directory 
 | `/todo/changelog/141c-warm-index-usn-delta-apply.md` | c | Volume identity | archived |
 | `/todo/changelog/141d-warm-index-usn-delta-apply.md` | d | Cursor persistence | archived |
 | `/todo/changelog/141e-warm-index-usn-delta-apply.md` | e | Journal availability probe | archived |
-| `/todo/pending/141f-warm-index-usn-delta-apply.md` | f | Read batch loop | pending |
+| `/todo/changelog/141f-warm-index-usn-delta-apply.md` | f | Read batch loop | archived |
 | `/todo/pending/141g-warm-index-usn-delta-apply.md` | g | Record path resolution | pending |
 | `/todo/pending/141h-warm-index-usn-delta-apply.md` | h | Delta task mapping | pending |
 | `/todo/pending/141i-warm-index-usn-delta-apply.md` | i | Batch coalescing | pending |
