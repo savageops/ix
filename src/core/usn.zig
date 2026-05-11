@@ -1344,6 +1344,67 @@ test "usn continuity decision permits continuous bounded delta" {
     try std.testing.expectEqual(@as(?DeltaTask, null), continuityReconcileTask(.apply_delta));
 }
 
+test "usn adversarial branch switch forces root reconcile" {
+    const previous_volume = VolumeIdentity{
+        .root_fingerprint = 0xaaaa,
+        .volume_serial_number = 0x77,
+        .filesystem = .ntfs,
+    };
+    const current_volume = VolumeIdentity{
+        .root_fingerprint = 0xbbbb,
+        .volume_serial_number = 0x77,
+        .filesystem = .ntfs,
+    };
+    const previous = try cursorFromJournalData(previous_volume, .{
+        .usn_journal_id = 1,
+        .first_usn = 1,
+        .next_usn = 50,
+        .lowest_valid_usn = 1,
+    });
+    const current = try cursorFromJournalData(current_volume, .{
+        .usn_journal_id = 1,
+        .first_usn = 1,
+        .next_usn = 80,
+        .lowest_valid_usn = 40,
+    });
+    const batch = ReadBatchResult{
+        .next_start_usn = 80,
+        .records = &.{},
+    };
+
+    try std.testing.expectEqual(ContinuityFailureKind.journal_wrapped, evaluateDeltaContinuity(previous, current, batch).reconcile_root);
+}
+
+test "usn adversarial rename storm and delete recreate never expose stale path state" {
+    const same_file = RecordPathResolution{ .catalog_file_id = 12 };
+    const rename_storm = [_]DeltaTask{
+        .{ .kind = .delete_file, .reason = USN_REASON_RENAME_OLD_NAME, .resolution = same_file },
+        .{ .kind = .upsert_file, .reason = USN_REASON_RENAME_NEW_NAME, .resolution = same_file },
+        .{ .kind = .delete_file, .reason = USN_REASON_RENAME_OLD_NAME, .resolution = same_file },
+        .{ .kind = .upsert_file, .reason = USN_REASON_RENAME_NEW_NAME, .resolution = same_file },
+    };
+
+    const coalesced = try coalesceDeltaTasks(std.testing.allocator, &rename_storm);
+    defer std.testing.allocator.free(coalesced);
+    try std.testing.expectEqual(@as(usize, 1), coalesced.len);
+    try std.testing.expectEqual(DeltaTaskKind.upsert_file, coalesced[0].kind);
+    try std.testing.expectEqual(
+        USN_REASON_RENAME_OLD_NAME | USN_REASON_RENAME_NEW_NAME,
+        coalesced[0].reason,
+    );
+
+    const delete_recreate = DeltaTask{
+        .kind = .reconcile_root,
+        .reason = USN_REASON_FILE_DELETE | USN_REASON_FILE_CREATE,
+        .resolution = same_file,
+    };
+    const reconcile = try coalesceDeltaTasks(std.testing.allocator, &.{delete_recreate});
+    defer std.testing.allocator.free(reconcile);
+    try std.testing.expectEqual(@as(usize, 1), reconcile.len);
+    try std.testing.expectEqual(DeltaTaskKind.reconcile_root, reconcile[0].kind);
+    try std.testing.expect(planDeltaApply(reconcile).publishesFullGeneration());
+}
+
 test "usn delta apply planning distinguishes surgical and reconcile batches" {
     const surgical = [_]DeltaTask{
         .{

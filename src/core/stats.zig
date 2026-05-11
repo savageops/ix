@@ -156,6 +156,58 @@ pub const GenerationRefreshStats = struct {
     fallback_reason: []const u8 = "not_wired",
 };
 
+pub const WarmBenchmarkMode = enum {
+    cold,
+    index_hot,
+    mutation_hot,
+    fallback,
+};
+
+pub const WarmBenchmarkSample = struct {
+    mode: WarmBenchmarkMode,
+    elapsed_ns: u64,
+    files_scanned: usize = 0,
+    matches_found: usize = 0,
+};
+
+pub const WarmPerformanceGate = struct {
+    max_index_hot_to_cold_per_mille: u16 = 800,
+    max_mutation_hot_to_cold_per_mille: u16 = 1000,
+    min_fallback_to_index_hot_per_mille: u16 = 1000,
+};
+
+pub const WarmPerformanceResult = struct {
+    cold_ns: u64,
+    index_hot_ns: u64,
+    mutation_hot_ns: u64,
+    fallback_ns: u64,
+    index_hot_to_cold_per_mille: u64,
+    mutation_hot_to_cold_per_mille: u64,
+    fallback_to_index_hot_per_mille: u64,
+};
+
+pub fn evaluateWarmPerformanceGates(samples: []const WarmBenchmarkSample, gate: WarmPerformanceGate) !WarmPerformanceResult {
+    const cold = findWarmBenchmarkSample(samples, .cold) orelse return error.MissingColdBenchmark;
+    const index_hot = findWarmBenchmarkSample(samples, .index_hot) orelse return error.MissingIndexHotBenchmark;
+    const mutation_hot = findWarmBenchmarkSample(samples, .mutation_hot) orelse return error.MissingMutationHotBenchmark;
+    const fallback = findWarmBenchmarkSample(samples, .fallback) orelse return error.MissingFallbackBenchmark;
+    if (cold.elapsed_ns == 0 or index_hot.elapsed_ns == 0 or mutation_hot.elapsed_ns == 0 or fallback.elapsed_ns == 0) return error.InvalidBenchmarkDuration;
+
+    const result = WarmPerformanceResult{
+        .cold_ns = cold.elapsed_ns,
+        .index_hot_ns = index_hot.elapsed_ns,
+        .mutation_hot_ns = mutation_hot.elapsed_ns,
+        .fallback_ns = fallback.elapsed_ns,
+        .index_hot_to_cold_per_mille = ratioPerMille(index_hot.elapsed_ns, cold.elapsed_ns),
+        .mutation_hot_to_cold_per_mille = ratioPerMille(mutation_hot.elapsed_ns, cold.elapsed_ns),
+        .fallback_to_index_hot_per_mille = ratioPerMille(fallback.elapsed_ns, index_hot.elapsed_ns),
+    };
+    if (result.index_hot_to_cold_per_mille > gate.max_index_hot_to_cold_per_mille) return error.IndexHotBenchmarkRegression;
+    if (result.mutation_hot_to_cold_per_mille > gate.max_mutation_hot_to_cold_per_mille) return error.MutationHotBenchmarkRegression;
+    if (result.fallback_to_index_hot_per_mille < gate.min_fallback_to_index_hot_per_mille) return error.FallbackBenchmarkInversion;
+    return result;
+}
+
 pub const AccessErrorSample = struct {
     phase: []const u8 = "",
     operation: []const u8 = "",
@@ -284,6 +336,48 @@ pub const SearchStats = struct {
         }
     }
 };
+
+fn findWarmBenchmarkSample(samples: []const WarmBenchmarkSample, mode: WarmBenchmarkMode) ?WarmBenchmarkSample {
+    for (samples) |sample| {
+        if (sample.mode == mode) return sample;
+    }
+    return null;
+}
+
+fn ratioPerMille(numerator: u64, denominator: u64) u64 {
+    return numerator * 1000 / denominator;
+}
+
+test "warm performance gates accept cold hot mutation and fallback samples" {
+    const samples = [_]WarmBenchmarkSample{
+        .{ .mode = .cold, .elapsed_ns = 1_000_000, .files_scanned = 100 },
+        .{ .mode = .index_hot, .elapsed_ns = 250_000, .files_scanned = 100 },
+        .{ .mode = .mutation_hot, .elapsed_ns = 700_000, .files_scanned = 4 },
+        .{ .mode = .fallback, .elapsed_ns = 1_050_000, .files_scanned = 100 },
+    };
+
+    const result = try evaluateWarmPerformanceGates(&samples, .{});
+    try std.testing.expectEqual(@as(u64, 250), result.index_hot_to_cold_per_mille);
+    try std.testing.expectEqual(@as(u64, 700), result.mutation_hot_to_cold_per_mille);
+    try std.testing.expectEqual(@as(u64, 4200), result.fallback_to_index_hot_per_mille);
+}
+
+test "warm performance gates reject regressions and incomplete benchmark matrices" {
+    const regressed = [_]WarmBenchmarkSample{
+        .{ .mode = .cold, .elapsed_ns = 1_000_000 },
+        .{ .mode = .index_hot, .elapsed_ns = 900_000 },
+        .{ .mode = .mutation_hot, .elapsed_ns = 700_000 },
+        .{ .mode = .fallback, .elapsed_ns = 1_050_000 },
+    };
+    try std.testing.expectError(error.IndexHotBenchmarkRegression, evaluateWarmPerformanceGates(&regressed, .{}));
+
+    const incomplete = [_]WarmBenchmarkSample{
+        .{ .mode = .cold, .elapsed_ns = 1_000_000 },
+        .{ .mode = .index_hot, .elapsed_ns = 250_000 },
+        .{ .mode = .fallback, .elapsed_ns = 1_050_000 },
+    };
+    try std.testing.expectError(error.MissingMutationHotBenchmark, evaluateWarmPerformanceGates(&incomplete, .{}));
+}
 
 test "search stats owns rust-compatible top-level schema defaults" {
     var snapshot = SearchStats{};

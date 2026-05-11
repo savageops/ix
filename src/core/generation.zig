@@ -121,9 +121,110 @@ pub const ReaderPin = struct {
     }
 };
 
+pub const CompactionPolicy = struct {
+    min_segment_count: usize = 4,
+    small_segment_bytes: u64 = 64 * 1024,
+    dense_segment_bytes: u64 = 16 * 1024 * 1024,
+    deleted_ratio_per_mille: u16 = 250,
+};
+
+pub const CompactionReasonFlags = packed struct(u8) {
+    small_segment: bool = false,
+    dense_segment: bool = false,
+    deleted_entries: bool = false,
+    reserved: u5 = 0,
+
+    pub fn any(self: CompactionReasonFlags) bool {
+        return self.small_segment or self.dense_segment or self.deleted_entries;
+    }
+};
+
+pub const CompactionSegmentState = struct {
+    segment: GenerationSegment,
+    total_entries: u64 = 0,
+    deleted_entries: u64 = 0,
+    reader_pinned: bool = false,
+};
+
+pub const CompactionCandidate = struct {
+    segment: GenerationSegment,
+    reasons: CompactionReasonFlags,
+};
+
+pub const CompactedGenerationInput = struct {
+    root_fingerprint: RootFingerprint,
+    epoch: Epoch,
+    parent_epoch: ?Epoch = null,
+    catalog_bytes: []const u8,
+    postings_bytes: []const u8,
+};
+
+pub const GenerationGcPolicy = struct {
+    retain_newest: usize = 2,
+};
+
 pub fn readerPinRetainedAfterPublish(pin: ReaderPin, published_epoch: Epoch) bool {
     if (pin.epoch == INVALID_EPOCH) return false;
     return pin.epoch <= published_epoch;
+}
+
+pub fn planGenerationGc(
+    allocator: std.mem.Allocator,
+    epochs: []const Epoch,
+    reader_pins: []const ReaderPin,
+    current_epoch: Epoch,
+    policy: GenerationGcPolicy,
+) ![]Epoch {
+    if (current_epoch == INVALID_EPOCH) return error.InvalidGenerationEpoch;
+
+    const sorted_epochs = try allocator.dupe(Epoch, epochs);
+    defer allocator.free(sorted_epochs);
+    std.mem.sort(Epoch, sorted_epochs, {}, lessThanEpoch);
+
+    var delete_epochs = std.ArrayList(Epoch).empty;
+    errdefer delete_epochs.deinit(allocator);
+    for (sorted_epochs) |epoch| {
+        if (epoch == INVALID_EPOCH) continue;
+        if (containsEpoch(delete_epochs.items, epoch)) continue;
+        if (epoch >= current_epoch) continue;
+        if (isReaderPinnedEpoch(epoch, reader_pins)) continue;
+        if (isNewestRetainedEpoch(epoch, sorted_epochs, policy.retain_newest)) continue;
+        try delete_epochs.append(allocator, epoch);
+    }
+
+    return delete_epochs.toOwnedSlice(allocator);
+}
+
+pub fn planCompaction(
+    allocator: std.mem.Allocator,
+    states: []const CompactionSegmentState,
+    policy: CompactionPolicy,
+) ![]CompactionCandidate {
+    var candidates = std.ArrayList(CompactionCandidate).empty;
+    errdefer candidates.deinit(allocator);
+    const segment_pressure = states.len >= policy.min_segment_count;
+
+    for (states) |state| {
+        if (state.reader_pinned) continue;
+        var reasons = CompactionReasonFlags{};
+        if (segment_pressure and state.segment.byte_len <= policy.small_segment_bytes) {
+            reasons.small_segment = true;
+        }
+        if (state.segment.byte_len >= policy.dense_segment_bytes) {
+            reasons.dense_segment = true;
+        }
+        if (deletedRatioExceeded(state.deleted_entries, state.total_entries, policy.deleted_ratio_per_mille)) {
+            reasons.deleted_entries = true;
+        }
+        if (reasons.any()) {
+            try candidates.append(allocator, .{
+                .segment = state.segment,
+                .reasons = reasons,
+            });
+        }
+    }
+
+    return candidates.toOwnedSlice(allocator);
 }
 
 pub fn makeManifest(root_fingerprint: RootFingerprint, epoch: Epoch, parent_epoch: ?Epoch, segments: []const GenerationSegment) GenerationManifest {
@@ -222,6 +323,22 @@ pub fn publishGenerationPayloads(
     try publishManifestBytes(io, paths, manifest_bytes);
     try publishCurrentManifestBytes(io, paths, manifest_bytes);
     return try pinManifestBytesForRoot(manifest_bytes, root_fingerprint);
+}
+
+pub fn publishCompactedGeneration(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    paths: GenerationPaths,
+    input: CompactedGenerationInput,
+) !ReaderPin {
+    if (input.catalog_bytes.len == 0) return error.EmptyGenerationSegment;
+    if (input.postings_bytes.len == 0) return error.EmptyGenerationSegment;
+
+    const payloads = [_]SegmentPayload{
+        .{ .kind = .catalog, .relative_path = "catalog.ixcat", .bytes = input.catalog_bytes },
+        .{ .kind = .postings, .relative_path = "postings.ixpost", .bytes = input.postings_bytes },
+    };
+    return publishGenerationPayloads(io, allocator, paths, input.root_fingerprint, input.epoch, input.parent_epoch, &payloads);
 }
 
 pub fn publishCurrentManifestBytes(io: std.Io, paths: GenerationPaths, bytes: []const u8) !void {
@@ -361,6 +478,40 @@ fn readSegmentRecord(cursor: *Cursor, expected_epoch: Epoch) !GenerationSegment 
         .byte_len = byte_len,
         .checksum = checksum,
     };
+}
+
+fn deletedRatioExceeded(deleted_entries: u64, total_entries: u64, threshold_per_mille: u16) bool {
+    if (total_entries == 0 or deleted_entries == 0) return false;
+    return deleted_entries * 1000 >= total_entries * @as(u64, threshold_per_mille);
+}
+
+fn lessThanEpoch(_: void, lhs: Epoch, rhs: Epoch) bool {
+    return lhs < rhs;
+}
+
+fn containsEpoch(epochs: []const Epoch, target: Epoch) bool {
+    for (epochs) |epoch| {
+        if (epoch == target) return true;
+    }
+    return false;
+}
+
+fn isReaderPinnedEpoch(epoch: Epoch, pins: []const ReaderPin) bool {
+    for (pins) |pin| {
+        if (pin.epoch == epoch) return true;
+        if (pin.parent_epoch != null and pin.parent_epoch.? == epoch) return true;
+    }
+    return false;
+}
+
+fn isNewestRetainedEpoch(epoch: Epoch, sorted_epochs: []const Epoch, retain_newest: usize) bool {
+    if (retain_newest == 0) return false;
+
+    var newer_count: usize = 0;
+    for (sorted_epochs) |candidate| {
+        if (candidate != INVALID_EPOCH and candidate > epoch) newer_count += 1;
+    }
+    return newer_count < retain_newest;
 }
 
 fn segmentKindFromByte(byte: u8) !SegmentKind {
@@ -566,6 +717,60 @@ test "generation reader pin selects only validated complete epoch" {
     try std.testing.expectError(error.WrongGenerationRoot, pinManifestBytesForRoot(bytes, 0x9999));
 }
 
+test "generation compaction planner selects small dense and tombstoned segments without pinned readers" {
+    const states = [_]CompactionSegmentState{
+        .{ .segment = .{ .kind = .catalog, .relative_path = "catalog-a.ixcat", .generation = 10, .byte_len = 1024 }, .total_entries = 10 },
+        .{ .segment = .{ .kind = .postings, .relative_path = "postings-a.ixpost", .generation = 10, .byte_len = 32 * 1024 * 1024 }, .total_entries = 10 },
+        .{ .segment = .{ .kind = .catalog, .relative_path = "catalog-b.ixcat", .generation = 10, .byte_len = 512 * 1024 }, .total_entries = 100, .deleted_entries = 40 },
+        .{ .segment = .{ .kind = .postings, .relative_path = "postings-pinned.ixpost", .generation = 10, .byte_len = 512 }, .total_entries = 100, .deleted_entries = 90, .reader_pinned = true },
+    };
+
+    const candidates = try planCompaction(std.testing.allocator, &states, .{});
+    defer std.testing.allocator.free(candidates);
+    try std.testing.expectEqual(@as(usize, 3), candidates.len);
+    try std.testing.expect(candidates[0].reasons.small_segment);
+    try std.testing.expect(candidates[1].reasons.dense_segment);
+    try std.testing.expect(candidates[2].reasons.deleted_entries);
+}
+
+test "generation compaction planner requires segment pressure before small segment merging" {
+    const states = [_]CompactionSegmentState{
+        .{ .segment = .{ .kind = .catalog, .relative_path = "catalog-a.ixcat", .generation = 10, .byte_len = 1024 }, .total_entries = 10 },
+        .{ .segment = .{ .kind = .postings, .relative_path = "postings-a.ixpost", .generation = 10, .byte_len = 1024 }, .total_entries = 10 },
+    };
+
+    const candidates = try planCompaction(std.testing.allocator, &states, .{ .min_segment_count = 3 });
+    defer std.testing.allocator.free(candidates);
+    try std.testing.expectEqual(@as(usize, 0), candidates.len);
+}
+
+test "generation gc planner protects current newest and reader pinned epochs" {
+    const epochs = [_]Epoch{ 10, 11, 12, 13, 14, 15 };
+    const pins = [_]ReaderPin{
+        .{ .root_fingerprint = 0xaaaa, .epoch = 11, .parent_epoch = null, .segment_count = 2 },
+        .{ .root_fingerprint = 0xaaaa, .epoch = 14, .parent_epoch = 13, .segment_count = 2 },
+    };
+
+    const delete_epochs = try planGenerationGc(std.testing.allocator, &epochs, &pins, 15, .{ .retain_newest = 2 });
+    defer std.testing.allocator.free(delete_epochs);
+
+    try std.testing.expectEqual(@as(usize, 2), delete_epochs.len);
+    try std.testing.expectEqual(@as(Epoch, 10), delete_epochs[0]);
+    try std.testing.expectEqual(@as(Epoch, 12), delete_epochs[1]);
+}
+
+test "generation gc planner deduplicates and refuses invalid current epoch" {
+    const epochs = [_]Epoch{ 1, 1, 2, 3, 4 };
+    const delete_epochs = try planGenerationGc(std.testing.allocator, &epochs, &.{}, 4, .{ .retain_newest = 1 });
+    defer std.testing.allocator.free(delete_epochs);
+
+    try std.testing.expectEqual(@as(usize, 3), delete_epochs.len);
+    try std.testing.expectEqual(@as(Epoch, 1), delete_epochs[0]);
+    try std.testing.expectEqual(@as(Epoch, 2), delete_epochs[1]);
+    try std.testing.expectEqual(@as(Epoch, 3), delete_epochs[2]);
+    try std.testing.expectError(error.InvalidGenerationEpoch, planGenerationGc(std.testing.allocator, &epochs, &.{}, INVALID_EPOCH, .{}));
+}
+
 test "generation payload publish writes catalog postings and manifest through epoch directory" {
     const root = ".zig-cache\\ix-generation-payload-publish-test";
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
@@ -594,6 +799,41 @@ test "generation payload publish writes catalog postings and manifest through ep
     defer std.testing.allocator.free(catalog_path);
     const catalog_bytes = try std.Io.Dir.cwd().readFile(std.testing.io, catalog_path, &buffer);
     try std.testing.expectEqualStrings("CATALOG", catalog_bytes);
+}
+
+test "generation compacted publish writes canonical catalog and postings payloads" {
+    const root = ".zig-cache\\ix-generation-compacted-publish-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    const paths = try buildGenerationPaths(std.testing.allocator, root, 14);
+    defer paths.deinit(std.testing.allocator);
+    const pin = try publishCompactedGeneration(std.testing.io, std.testing.allocator, paths, .{
+        .root_fingerprint = 0xface,
+        .epoch = 14,
+        .parent_epoch = 13,
+        .catalog_bytes = "COMPACTED-CATALOG",
+        .postings_bytes = "COMPACTED-POSTINGS",
+    });
+    try std.testing.expectEqual(@as(Epoch, 14), pin.epoch);
+    try std.testing.expectEqual(@as(?Epoch, 13), pin.parent_epoch);
+    try std.testing.expectEqual(@as(usize, 2), pin.segment_count);
+
+    var buffer: [512]u8 = undefined;
+    const current_manifest_bytes = try std.Io.Dir.cwd().readFile(std.testing.io, paths.current_manifest_path, &buffer);
+    const current_pin = try pinManifestBytesForRoot(current_manifest_bytes, 0xface);
+    try std.testing.expectEqual(@as(Epoch, 14), current_pin.epoch);
+}
+
+test "generation compacted publish rejects missing segment payloads" {
+    const paths = try buildGenerationPaths(std.testing.allocator, ".zig-cache\\unused-generation-compacted-empty-test", 15);
+    defer paths.deinit(std.testing.allocator);
+    try std.testing.expectError(error.EmptyGenerationSegment, publishCompactedGeneration(std.testing.io, std.testing.allocator, paths, .{
+        .root_fingerprint = 0xbeef,
+        .epoch = 15,
+        .catalog_bytes = "",
+        .postings_bytes = "POSTINGS",
+    }));
 }
 
 test "generation publish retains prior reader pinned epoch" {

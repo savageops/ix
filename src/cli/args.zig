@@ -74,6 +74,7 @@ pub const IndexdRequest = struct {
     root: []const u8,
     foreground: bool,
     once: bool,
+    repair: bool,
 };
 
 pub const Command = union(CommandTag) {
@@ -189,6 +190,7 @@ fn parseIndexd(args: []const []const u8) ParseError!IndexdRequest {
         .root = ".",
         .foreground = false,
         .once = false,
+        .repair = false,
     };
     var root_seen = false;
     for (args) |arg| {
@@ -196,6 +198,8 @@ fn parseIndexd(args: []const []const u8) ParseError!IndexdRequest {
             request.foreground = true;
         } else if (std.mem.eql(u8, arg, "--once")) {
             request.once = true;
+        } else if (std.mem.eql(u8, arg, "--repair")) {
+            request.repair = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return ParseError.UnsupportedFlag;
         } else {
@@ -503,6 +507,7 @@ test "hidden indexd command parses without public command exposure" {
         "E:\\Workspaces\\01_Projects\\01_Github\\ix-zig",
         "--foreground",
         "--once",
+        "--repair",
     };
     const invocation = try parseInvocation(std.testing.allocator, &argv);
     try std.testing.expect(invocation.command == .indexd);
@@ -510,6 +515,7 @@ test "hidden indexd command parses without public command exposure" {
     try std.testing.expectEqualStrings("E:\\Workspaces\\01_Projects\\01_Github\\ix-zig", request.root);
     try std.testing.expect(request.foreground);
     try std.testing.expect(request.once);
+    try std.testing.expect(request.repair);
 }
 
 test "hidden indexd command rejects unsupported lifecycle flags and duplicate roots" {

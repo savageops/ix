@@ -42,9 +42,9 @@ What it cannot do:
 
 The current design is therefore a **frontier replay lane**, not a **maintained retrieval substrate**.
 
-## Implementation Status: Warm Postings + Hidden Indexd Lifecycle + Generation Refresh
+## Implementation Status: Warm Postings + Hidden Indexd Lifecycle + Generation Refresh + Compaction Ops
 
-As of 2026-05-11, the first corpus-global warm-index primitives, hidden maintenance-process lifecycle, and generation publication substrate are implemented as verified internal substrate. Foreground search adoption is still intentionally disabled until candidate pruning can open the current manifest and prove verifier-equivalent results.
+As of 2026-05-11, the first corpus-global warm-index primitives, hidden maintenance-process lifecycle, generation publication substrate, USN delta substrate, and compaction operations hardening are implemented as verified internal substrate. Foreground search adoption is still intentionally disabled until candidate pruning can open the current manifest and prove verifier-equivalent results.
 
 Implemented:
 
@@ -58,14 +58,19 @@ Implemented:
 - `GenerationManifest`: versioned `IXGEN001` manifest bytes, epoch/root validation, parent epoch, segment list, atomic per-epoch manifest publication, stable `.ix/index/current.ixgen` refresh, and `ReaderPin` semantics for foreground adoption.
 - Refresh telemetry: public JSON stats expose inactive/fail-closed `generation_refresh` with `epoch`, `refresh_status`, and `fallback_reason`, preserving the no-pretend contract while adoption remains disabled.
 - Parity proof: disabled/enabled public `matches` output was hash-identical on a throwaway corpus while the enabled run created the internal sidecar index directory.
+- Windows freshness substrate: `core/usn.zig` models NTFS/ReFS journal identity, validates serialized journal cursors, parses bounded USN batches, maps delta records to upsert/delete/reconcile tasks, escalates lost cursor / journal wrap / batch overflow to root reconcile, and publishes delta generations through the same manifest path.
+- Compaction operations substrate: `core/generation.zig` selects compaction candidates by small/dense/tombstoned pressure, publishes compacted catalog/postings generations, and plans reader-safe generation GC without deleting current, newest-retained, or pinned parent epochs.
+- Tombstone folding: `core/catalog.zig` folds deleted file IDs and stale paths into a compacted catalog table while preserving sorted path order and entry/meta alignment.
+- Operator controls: hidden `__ix_indexd --repair` writes `.ix/index/repair.state` as an explicit reconcile request under the existing single-writer root lock; diagnostics render manifest epoch, parent epoch, segment count, generation count, journal cursor floor/next, and lock state.
+- Gates: adversarial tests cover branch-switch discontinuity, rename storm coalescing, delete/recreate reconcile escalation, partial publish failure, and typed cold/index-hot/mutation-hot/fallback performance ratio acceptance.
 
 Not yet implemented:
 
-- USN-backed delta ingestion and root-settle batching.
+- OS-backed live USN ingestion loop and root-settle batching.
 - Foreground search adoption of existing postings segments.
-- Compaction, tombstones, and generation garbage collection.
+- Physical filesystem deletion for GC plans after durable pin accounting is integrated into a long-running indexd loop.
 
-Operationally, this means IX now has the internal data model, opt-in silent process boundary, and atomic current-generation pointer needed for cross-query reuse, but it still does not claim foreground acceleration from resident index state. The next milestone is adoption: foreground search must verify root/generation compatibility from `.ix/index/current.ixgen`, open catalog/postings segments, and only then prune candidates before the verifier.
+Operationally, this means IX now has the internal data model, opt-in silent process boundary, atomic current-generation pointer, Windows freshness model, and compaction/repair/diagnostic contracts needed for a durable warm layer, but it still does not claim foreground acceleration from resident index state. The next milestone is adoption: foreground search must verify root/generation compatibility from `.ix/index/current.ixgen`, open catalog/postings segments, and only then prune candidates before the verifier.
 
 ## Why Query-Keyed Frontiers Plateau
 

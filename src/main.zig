@@ -187,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
                 .root = request.root,
                 .foreground = request.foreground,
                 .once = request.once,
+                .repair = request.repair,
             }) catch std.process.exit(0);
         },
     }

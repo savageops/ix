@@ -102,6 +102,48 @@ pub const CatalogSnapshot = struct {
     }
 };
 
+pub const TombstoneSet = struct {
+    file_ids: []const FileId = &.{},
+    paths: []const []const u8 = &.{},
+
+    pub fn contains(self: TombstoneSet, file_id: FileId, path: []const u8) bool {
+        return self.containsFileId(file_id) or self.containsPath(path);
+    }
+
+    pub fn containsFileId(self: TombstoneSet, file_id: FileId) bool {
+        for (self.file_ids) |candidate| {
+            if (candidate == file_id) return true;
+        }
+        return false;
+    }
+
+    pub fn containsPath(self: TombstoneSet, path: []const u8) bool {
+        for (self.paths) |candidate| {
+            if (std.mem.eql(u8, candidate, path)) return true;
+        }
+        return false;
+    }
+};
+
+pub const FoldedCatalog = struct {
+    entries: []PathEntry,
+    metas: []FileMeta,
+    path_bytes: []u8,
+    removed_count: usize,
+
+    pub fn deinit(self: FoldedCatalog, allocator: std.mem.Allocator) void {
+        allocator.free(self.entries);
+        allocator.free(self.metas);
+        allocator.free(self.path_bytes);
+    }
+
+    pub fn path(self: FoldedCatalog, entry: PathEntry) []const u8 {
+        const start: usize = @intCast(entry.path_offset);
+        const end = start + entry.path_len;
+        return self.path_bytes[start..end];
+    }
+};
+
 pub const PathFlags = packed struct(u32) {
     hidden: bool = false,
     generated: bool = false,
@@ -331,6 +373,49 @@ pub fn parseCatalogForRoot(allocator: std.mem.Allocator, bytes: []const u8, expe
     errdefer snapshot.deinit(allocator);
     if (snapshot.header.rootFingerprint() != expected_root) return error.WrongCatalogRoot;
     return snapshot;
+}
+
+pub fn foldTombstonedCatalogEntries(
+    allocator: std.mem.Allocator,
+    snapshot: CatalogSnapshot,
+    tombstones: TombstoneSet,
+) !FoldedCatalog {
+    var entries = std.ArrayList(PathEntry).empty;
+    errdefer entries.deinit(allocator);
+    var metas = std.ArrayList(FileMeta).empty;
+    errdefer metas.deinit(allocator);
+    var path_bytes = std.ArrayList(u8).empty;
+    errdefer path_bytes.deinit(allocator);
+
+    var removed_count: usize = 0;
+    for (snapshot.entries, 0..) |entry, index| {
+        const existing_path = snapshot.path(entry);
+        if (tombstones.contains(entry.file_id, existing_path)) {
+            removed_count += 1;
+            continue;
+        }
+
+        var folded_entry = entry;
+        folded_entry.path_offset = @intCast(path_bytes.items.len);
+        try path_bytes.appendSlice(allocator, existing_path);
+        try entries.append(allocator, folded_entry);
+        try metas.append(allocator, snapshot.metas[index]);
+    }
+
+    const owned_entries = try entries.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_entries);
+    const owned_metas = try metas.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_metas);
+    const owned_path_bytes = try path_bytes.toOwnedSlice(allocator);
+    errdefer allocator.free(owned_path_bytes);
+
+    try validateCatalogShape(owned_entries, owned_metas, owned_path_bytes);
+    return .{
+        .entries = owned_entries,
+        .metas = owned_metas,
+        .path_bytes = owned_path_bytes,
+        .removed_count = removed_count,
+    };
 }
 
 pub fn publishCatalogBytes(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, data: []const u8) !void {
@@ -788,6 +873,78 @@ test "catalog build entrypoint creates sorted parseable catalog bytes" {
     try std.testing.expectEqualStrings("src/main.zig", parsed.path(parsed.entries[1]));
     try std.testing.expectEqual(@as(u64, 10), parsed.metas[0].size);
     try std.testing.expectEqual(@as(u64, 30), parsed.metas[1].size);
+}
+
+test "catalog tombstone folding removes deleted file ids and stale paths" {
+    const files = [_]CatalogFileInput{
+        .{
+            .path = "src/a.zig",
+            .size = 10,
+            .mtime_ns = 100,
+            .sample = "const a = 1;",
+        },
+        .{
+            .path = "src/b.zig",
+            .size = 20,
+            .mtime_ns = 200,
+            .sample = "const b = 2;",
+        },
+        .{
+            .path = "src/c.zig",
+            .size = 30,
+            .mtime_ns = 300,
+            .sample = "const c = 3;",
+        },
+    };
+
+    const encoded = try buildCatalogBytes(std.testing.allocator, "E:\\Workspaces\\ix-zig\\", 12, &files);
+    defer std.testing.allocator.free(encoded);
+    const snapshot = try parseCatalog(std.testing.allocator, encoded);
+    defer snapshot.deinit(std.testing.allocator);
+
+    const folded = try foldTombstonedCatalogEntries(std.testing.allocator, snapshot, .{
+        .file_ids = &.{makeFileId(1)},
+        .paths = &.{"src/c.zig"},
+    });
+    defer folded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), folded.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), folded.metas.len);
+    try std.testing.expectEqual(@as(usize, 2), folded.removed_count);
+    try std.testing.expectEqual(makeFileId(0), folded.entries[0].file_id);
+    try std.testing.expectEqual(makeFileId(0), folded.metas[0].file_id);
+    try std.testing.expectEqualStrings("src/a.zig", folded.path(folded.entries[0]));
+}
+
+test "catalog tombstone folding preserves sorted shape when nothing is removed" {
+    const files = [_]CatalogFileInput{
+        .{
+            .path = "README.md",
+            .size = 10,
+            .mtime_ns = 100,
+            .sample = "# ix",
+        },
+        .{
+            .path = "src/main.zig",
+            .size = 20,
+            .mtime_ns = 200,
+            .sample = "pub fn main() void {}",
+        },
+    };
+
+    const encoded = try buildCatalogBytes(std.testing.allocator, "E:\\Workspaces\\ix-zig\\", 13, &files);
+    defer std.testing.allocator.free(encoded);
+    const snapshot = try parseCatalog(std.testing.allocator, encoded);
+    defer snapshot.deinit(std.testing.allocator);
+
+    const folded = try foldTombstonedCatalogEntries(std.testing.allocator, snapshot, .{});
+    defer folded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), folded.entries.len);
+    try std.testing.expectEqual(@as(usize, 0), folded.removed_count);
+    try std.testing.expectEqualStrings("README.md", folded.path(folded.entries[0]));
+    try std.testing.expectEqualStrings("src/main.zig", folded.path(folded.entries[1]));
+    try std.testing.expectEqual(@as(u64, 20), folded.metas[1].size);
 }
 
 test "catalog build entrypoint is deterministic across input order" {
