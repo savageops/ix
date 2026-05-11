@@ -10,6 +10,7 @@ test {
     _ = @import("core/trigram.zig");
     _ = @import("core/corpus.zig");
     _ = @import("core/catalog.zig");
+    _ = @import("core/postings.zig");
 }
 
 /// IX Zig binary entry point.

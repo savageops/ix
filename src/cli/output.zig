@@ -284,6 +284,8 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
     try writer.print("\"trigram_acceleration\":{{\"eligible\":{s},\"mode\":\"{s}\",\"mandatory_groups\":{},\"mandatory_trigrams\":{},\"candidate_files_checked\":{},\"pruned_files\":{},\"verified_files\":{},\"ineligible_files\":{}}},", .{ boolText(report.stats.trigram_acceleration.eligible), report.stats.trigram_acceleration.mode, report.stats.trigram_acceleration.mandatory_groups, report.stats.trigram_acceleration.mandatory_trigrams, report.stats.trigram_acceleration.candidate_files_checked, report.stats.trigram_acceleration.pruned_files, report.stats.trigram_acceleration.verified_files, report.stats.trigram_acceleration.ineligible_files });
     try writeCatalogIndexJson(writer, report.stats.catalog_index);
     try writer.writeAll(",");
+    try writePostingsIndexJson(writer, report.stats.postings_index);
+    try writer.writeAll(",");
     try writeAccessErrorsJson(writer, report.stats.access_errors);
     try writer.writeAll(",");
     try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ report.stats.timings.discover_ms, report.stats.timings.scan_ms, report.stats.timings.aggregate_ms, report.stats.timings.total_ms, report.stats.timings.scan_work_ms_total, report.stats.timings.aggregate_merge_ms, report.stats.timings.aggregate_finalize_ms });
@@ -343,6 +345,28 @@ fn writeCatalogIndexJson(writer: anytype, catalog_index: core_stats.CatalogIndex
         catalog_index.meta_count,
     });
     try writeJsonString(writer, catalog_index.fallback_reason);
+    try writer.writeAll("}");
+}
+
+fn writePostingsIndexJson(writer: anytype, postings_index: core_stats.PostingsIndexStats) !void {
+    try writer.print("\"postings_index\":{{\"enabled\":{s},\"available\":{s},\"generation\":", .{
+        boolText(postings_index.enabled),
+        boolText(postings_index.available),
+    });
+    if (postings_index.generation) |generation| {
+        try writer.print("{}", .{generation});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.print(",\"trigram_count\":{},\"postings_count\":{},\"file_count\":{},\"candidate_files\":{},\"pruned_files\":{},\"verified_files\":{},\"fallback_reason\":", .{
+        postings_index.trigram_count,
+        postings_index.postings_count,
+        postings_index.file_count,
+        postings_index.candidate_files,
+        postings_index.pruned_files,
+        postings_index.verified_files,
+    });
+    try writeJsonString(writer, postings_index.fallback_reason);
     try writer.writeAll("}");
 }
 
@@ -532,4 +556,29 @@ test "catalog index json exposes inactive default state" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"available\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"generation\":null") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"fallback_reason\":\"not_wired\"") != null);
+}
+
+test "postings index json exposes candidate pruning counters" {
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writePostingsIndexJson(&writer, .{
+        .enabled = true,
+        .available = true,
+        .generation = 7,
+        .trigram_count = 3,
+        .postings_count = 5,
+        .file_count = 11,
+        .candidate_files = 2,
+        .pruned_files = 9,
+        .verified_files = 2,
+        .fallback_reason = "",
+    });
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"postings_index\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"generation\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"candidate_files\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"pruned_files\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"verified_files\":2") != null);
 }
