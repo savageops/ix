@@ -30,7 +30,7 @@ pub const ConcurrencyStats = struct {
 
 pub const LinuxDominantFileStats = struct {
     target_class: []const u8 = "linux_amd_asic_reg_giant_header",
-    min_bytes: usize = 8 * 1024 * 1024,
+    min_bytes: usize = 1024 * 1024,
     targeted_files_scanned: usize = 0,
     targeted_bytes_scanned: usize = 0,
     targeted_slowest_files: usize = 0,

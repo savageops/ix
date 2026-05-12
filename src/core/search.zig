@@ -1502,6 +1502,7 @@ const ShardReport = struct {
     regex_decomposition_stats: core_stats.RegexDecompositionStats,
     trigram_stats: core_stats.TrigramAccelerationStats,
     byte_shard_stats: core_stats.ByteShardKernelStats,
+    linux_dominant_file_stats: core_stats.LinuxDominantFileStats,
     slowest_path: []const u8,
     slowest_bytes: usize,
     slowest_ms: f64,
@@ -1528,6 +1529,7 @@ const ShardReport = struct {
         .regex_decomposition_stats = .{},
         .trigram_stats = .{},
         .byte_shard_stats = .{},
+        .linux_dominant_file_stats = .{},
         .slowest_path = "",
         .slowest_bytes = 0,
         .slowest_ms = 0,
@@ -1570,6 +1572,48 @@ fn recordEvidencePruned(shard: *ShardReport, bytes: usize) void {
 fn recordEvidenceSkipped(shard: *ShardReport) void {
     if (!shard.evidence_capture) return;
     shard.evidence_skipped_files += 1;
+}
+
+fn recordLinuxDominantFileScan(shard: *ShardReport, display_path: []const u8, file_bytes: usize) bool {
+    const min_bytes = shard.linux_dominant_file_stats.min_bytes;
+    if (file_bytes < min_bytes) return false;
+    if (!isLinuxDominantFilePath(display_path)) return false;
+    shard.linux_dominant_file_stats.targeted_files_scanned += 1;
+    shard.linux_dominant_file_stats.targeted_bytes_scanned += file_bytes;
+    shard.linux_dominant_file_stats.eligible_files += 1;
+    return true;
+}
+
+fn recordLinuxDominantFileActivation(shard: *ShardReport) void {
+    shard.linux_dominant_file_stats.activated_files += 1;
+    const files_profiled = shard.byte_shard_stats.files_profiled;
+    if (files_profiled > 0) {
+        const ranges = shard.byte_shard_stats.range_calls / files_profiled;
+        shard.linux_dominant_file_stats.max_shard_threads = @max(shard.linux_dominant_file_stats.max_shard_threads, ranges);
+        shard.linux_dominant_file_stats.max_range_count = @max(shard.linux_dominant_file_stats.max_range_count, ranges);
+        if (shard.byte_shard_stats.range_calls > 0) {
+            const chunk = shard.byte_shard_stats.logical_range_bytes / shard.byte_shard_stats.range_calls;
+            shard.linux_dominant_file_stats.max_chunk_bytes = @max(shard.linux_dominant_file_stats.max_chunk_bytes, chunk);
+        }
+    }
+}
+
+fn isLinuxDominantFilePath(path: []const u8) bool {
+    var has_amd = false;
+    var has_asic_reg = false;
+    var start: usize = 0;
+    for (path, 0..) |byte, index| {
+        if (byte == '/' or byte == '\\') {
+            const segment = path[start..index];
+            if (std.ascii.eqlIgnoreCase(segment, "amd")) has_amd = true;
+            if (std.ascii.eqlIgnoreCase(segment, "asic_reg")) has_asic_reg = true;
+            start = index + 1;
+        }
+    }
+    const tail = path[start..];
+    if (std.ascii.eqlIgnoreCase(tail, "amd")) has_amd = true;
+    if (std.ascii.eqlIgnoreCase(tail, "asic_reg")) has_asic_reg = true;
+    return has_amd and has_asic_reg;
 }
 
 /// Scan a single discovered file — used in the serial path and by
@@ -1738,6 +1782,7 @@ fn scanFileMmap(
 
     shard.files_scanned += 1;
     shard.bytes_scanned += file_bytes;
+    const linux_dominant_target = recordLinuxDominantFileScan(shard, display_path, file_bytes);
     if (file_bytes >= shard.slowest_bytes) {
         shard.slowest_path = display_path;
         shard.slowest_bytes = file_bytes;
@@ -1745,6 +1790,7 @@ fn scanFileMmap(
 
     if (request.stats_only and shouldRunByteShardBeforeAdmission(plan)) {
         if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
+            if (linux_dominant_target) recordLinuxDominantFileActivation(shard);
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
@@ -1782,6 +1828,7 @@ fn scanFileMmap(
     // case-insensitive counting without buffer modification.
     if (request.stats_only) {
         if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
+            if (linux_dominant_target) recordLinuxDominantFileActivation(shard);
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
@@ -2280,6 +2327,7 @@ fn scanOpenFileIntoShardImpl(
 
     shard.files_scanned += 1;
     shard.bytes_scanned += file_bytes;
+    const linux_dominant_target = recordLinuxDominantFileScan(shard, display_path, file_bytes);
     if (file_bytes >= shard.slowest_bytes) {
         shard.slowest_path = display_path;
         shard.slowest_bytes = file_bytes;
@@ -2295,6 +2343,7 @@ fn scanOpenFileIntoShardImpl(
             }
         }
     }
+    _ = linux_dominant_target;
     if (shouldAttemptTrigramPrune(file_bytes, single_chunk, trigram_admission, request.case_insensitive) and
         tryTrigramPruneFile(read_buffer[0..first_read], trigram_program, &shard.trigram_stats))
     {
@@ -2707,6 +2756,7 @@ fn mergeShardsIntoReport(shards: []const ShardReport, report: *SearchReport) voi
         mergeRegexDecompositionStats(&report.stats.regex_decomposition, shard.regex_decomposition_stats);
         mergeTrigramStats(&report.stats.trigram_acceleration, shard.trigram_stats);
         mergeByteShardStats(&report.stats.byte_shard_kernel, shard.byte_shard_stats);
+        mergeLinuxDominantFileStats(&report.stats.linux_dominant_file, shard.linux_dominant_file_stats);
         if (shard.slowest_ms >= report.slowest_ms) {
             report.slowest_ms = shard.slowest_ms;
             report.slowest_path = shard.slowest_path;
@@ -2891,7 +2941,7 @@ fn refreshStats(report: *SearchReport) void {
         .max_shard_ranges = byte_shard_ranges,
         .max_shard_chunk_bytes = byte_shard_chunk,
     };
-    report.stats.recordSlowFile(report.slowest_path, report.slowest_ms, report.slowest_bytes, false);
+    report.stats.recordSlowFile(report.slowest_path, report.slowest_ms, report.slowest_bytes, isLinuxDominantFilePath(report.slowest_path) and report.slowest_bytes >= report.stats.linux_dominant_file.min_bytes);
 }
 
 fn initTrigramStats(stats: *core_stats.TrigramAccelerationStats, admission: trigram.Admission, case_insensitive: bool) void {
@@ -2937,6 +2987,19 @@ fn mergeByteShardStats(target: *core_stats.ByteShardKernelStats, source: core_st
     target.reduce_elapsed_ns_total += source.reduce_elapsed_ns_total;
     target.max_reduce_elapsed_ns = @max(target.max_reduce_elapsed_ns, source.max_reduce_elapsed_ns);
     target.matches += source.matches;
+}
+
+fn mergeLinuxDominantFileStats(target: *core_stats.LinuxDominantFileStats, source: core_stats.LinuxDominantFileStats) void {
+    target.targeted_files_scanned += source.targeted_files_scanned;
+    target.targeted_bytes_scanned += source.targeted_bytes_scanned;
+    target.targeted_slowest_files += source.targeted_slowest_files;
+    target.targeted_slowest_bytes += source.targeted_slowest_bytes;
+    target.eligible_files += source.eligible_files;
+    target.activated_files += source.activated_files;
+    target.bailout_files += source.bailout_files;
+    target.max_shard_threads = @max(target.max_shard_threads, source.max_shard_threads);
+    target.max_range_count = @max(target.max_range_count, source.max_range_count);
+    target.max_chunk_bytes = @max(target.max_chunk_bytes, source.max_chunk_bytes);
 }
 
 const TRIGRAM_ADMISSION_CAPACITY = 4096;
