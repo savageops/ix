@@ -36,6 +36,7 @@ pub const SearchRequest = struct {
     emit_report: ?[]const u8,
     nexus_build: bool,
     nexus_disabled: bool,
+    index_enabled: bool,
 };
 
 pub const InspectRequest = struct {
@@ -228,6 +229,7 @@ fn emptySearchRequest(expression: []const u8) SearchRequest {
         .emit_report = null,
         .nexus_build = false,
         .nexus_disabled = false,
+        .index_enabled = false,
     };
 }
 

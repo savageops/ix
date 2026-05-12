@@ -143,7 +143,8 @@ pub fn extractFileTrigrams(allocator: std.mem.Allocator, bytes: []const u8) ![]T
 
     var index: usize = 0;
     while (index + 3 <= bytes.len) : (index += 1) {
-        try keys.append(allocator, makeTrigramKey(bytes[index..][0..3]));
+        const key = makeTrigramKey(bytes[index..][0..3]);
+        if (isValidTrigramKey(key)) try keys.append(allocator, key);
     }
     std.sort.heap(TrigramKey, keys.items, {}, lessThanTrigramKey);
 
@@ -710,6 +711,17 @@ test "postings extraction is binary safe" {
     try std.testing.expectEqual(makeTrigramKey(&.{ 0, 'a', 'b' }), keys[0]);
     try std.testing.expectEqual(makeTrigramKey(&.{ 'a', 'b', 0 }), keys[1]);
     try std.testing.expectEqual(makeTrigramKey(&.{ 'b', 0, 'a' }), keys[2]);
+}
+
+test "postings extraction drops reserved zero trigram sentinel" {
+    const keys = try extractFileTrigrams(std.testing.allocator, "\x00\x00\x00abc");
+    defer std.testing.allocator.free(keys);
+
+    for (keys) |key| try std.testing.expect(isValidTrigramKey(key));
+    try std.testing.expectEqual(@as(usize, 3), keys.len);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 0, 0, 'a' }), keys[0]);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 0, 'a', 'b' }), keys[1]);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'a', 'b', 'c' }), keys[2]);
 }
 
 test "postings extraction handles files shorter than one trigram" {

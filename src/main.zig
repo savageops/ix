@@ -72,6 +72,7 @@ pub fn main(init: std.process.Init) !void {
         .search => |request| {
             var effective_request = request;
             effective_request.nexus_disabled = nexusDisabled(init);
+            effective_request.index_enabled = indexdEnabled(init);
             const plan = expr.parse(request.expression) catch |err| {
                 try output.writeError(stderr, "invalid_expression", @errorName(err));
                 try stderr.flush();
@@ -88,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             if (shouldLaunchNexusSidecar(effective_request, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
-            if (shouldLaunchIndexdSidecar(indexdEnabled(init), effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
+            if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
             if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
             } else {
@@ -99,6 +100,7 @@ pub fn main(init: std.process.Init) !void {
         .matches => |request| {
             var effective_request = request;
             effective_request.nexus_disabled = nexusDisabled(init);
+            effective_request.index_enabled = indexdEnabled(init);
             const plan = expr.parse(request.expression) catch |err| {
                 try output.writeError(stderr, "invalid_expression", @errorName(err));
                 try stderr.flush();
@@ -115,7 +117,7 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             if (shouldLaunchNexusSidecar(effective_request, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
-            if (shouldLaunchIndexdSidecar(indexdEnabled(init), effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
+            if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
             if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
             } else if (!effective_request.stats_only) {
@@ -217,6 +219,7 @@ fn shouldLaunchIndexdSidecar(enabled: bool, request: cli.SearchRequest, report: 
     if (!enabled) return false;
     if (request.nexus_build) return false;
     if (request.case_insensitive) return false;
+    if (request.hidden) return false;
     if (request.path_count != 1) return false;
     return report.files_discovered > 0;
 }
@@ -457,6 +460,7 @@ fn testSearchRequestForSidecar(nexus_disabled: bool) cli.SearchRequest {
         .emit_report = null,
         .nexus_build = false,
         .nexus_disabled = nexus_disabled,
+        .index_enabled = false,
     };
 }
 

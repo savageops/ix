@@ -1,8 +1,24 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const windows = std.os.windows;
+const catalog = @import("catalog.zig");
 const generation = @import("generation.zig");
+const postings = @import("postings.zig");
 const usn = @import("usn.zig");
+
+extern "kernel32" fn ReadDirectoryChangesW(
+    hDirectory: windows.HANDLE,
+    lpBuffer: ?*anyopaque,
+    nBufferLength: windows.DWORD,
+    bWatchSubtree: windows.BOOL,
+    dwNotifyFilter: windows.DWORD,
+    lpBytesReturned: ?*windows.DWORD,
+    lpOverlapped: ?*anyopaque,
+    lpCompletionRoutine: ?*anyopaque,
+) callconv(.winapi) windows.BOOL;
+
+pub const LIVE_MARKER_NAME = "index.live";
+const INDEX_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
 
 pub const Request = struct {
     root: []const u8,
@@ -52,6 +68,15 @@ pub const Heartbeat = struct {
     }
 };
 
+pub const LiveMarker = struct {
+    path: []const u8,
+
+    pub fn remove(self: LiveMarker, io: std.Io, allocator: std.mem.Allocator) void {
+        std.Io.Dir.cwd().deleteFile(io, self.path) catch {};
+        allocator.free(self.path);
+    }
+};
+
 pub const RunResult = struct {
     config: Config,
 
@@ -87,12 +112,21 @@ pub const IndexDiagnostics = struct {
 
 pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResult {
     const config = try buildConfig(allocator, request);
+    try std.Io.Dir.cwd().createDirPath(io, config.root);
     var lock = try acquireRootLock(io, allocator, config);
     defer lock.release(io, allocator);
     const heartbeat = try writeHeartbeat(io, allocator, config, currentProcessId());
     defer heartbeat.remove(io, allocator);
     if (config.repair) try writeRepairState(io, allocator, config, "operator_requested_reconcile");
     if (config.mode == .foreground_once) try writeBootstrapState(io, allocator, config);
+    if (!config.repair) {
+        _ = try publishRootGeneration(io, allocator, config.root);
+        if (config.mode != .foreground_once) {
+            const live = try writeLiveMarker(io, allocator, config);
+            defer live.remove(io, allocator);
+            holdLiveUntilRootMutation(io, config.root);
+        }
+    }
     return .{
         .config = config,
     };
@@ -218,6 +252,72 @@ pub fn writeRepairState(io: std.Io, allocator: std.mem.Allocator, config: Config
     try writer.interface.flush();
 }
 
+pub fn writeLiveMarker(io: std.Io, allocator: std.mem.Allocator, config: Config) !LiveMarker {
+    try std.Io.Dir.cwd().createDirPath(io, config.index_dir);
+    const live_path = try std.fs.path.join(allocator, &.{ config.index_dir, LIVE_MARKER_NAME });
+    errdefer allocator.free(live_path);
+
+    var file = try std.Io.Dir.cwd().createFile(io, live_path, .{ .truncate = true });
+    defer file.close(io);
+
+    var buffer: [256]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    try writer.interface.print("IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), config.root });
+    try writer.interface.flush();
+    return .{ .path = live_path };
+}
+
+pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !generation.ReaderPin {
+    var files = std.ArrayList(IndexedFile).empty;
+    defer {
+        for (files.items) |file| file.deinit(allocator);
+        files.deinit(allocator);
+    }
+
+    try collectIndexFiles(io, allocator, root, &files);
+    std.mem.sort(IndexedFile, files.items, {}, lessThanIndexedFilePath);
+
+    const epoch = currentEpoch(io);
+    const root_identity = try catalog.identifyRoot(allocator, root);
+    defer root_identity.deinit(allocator);
+
+    const catalog_inputs = try allocator.alloc(catalog.CatalogFileInput, files.items.len);
+    defer allocator.free(catalog_inputs);
+    const postings_inputs = try allocator.alloc(postings.PostingsFileInput, files.items.len);
+    defer allocator.free(postings_inputs);
+
+    for (files.items, 0..) |file, index| {
+        const file_id = catalog.makeFileId(@intCast(index));
+        catalog_inputs[index] = .{
+            .path = file.path,
+            .size = file.size,
+            .mtime_ns = file.mtime_ns,
+            .file_index_or_inode = file.file_index_or_inode,
+            .kind = .regular,
+            .sample = file.bytes[0..@min(file.bytes.len, 4096)],
+        };
+        postings_inputs[index] = .{
+            .file_id = file_id,
+            .bytes = file.bytes,
+        };
+    }
+
+    const catalog_bytes = try catalog.buildCatalogBytes(allocator, root, epoch, catalog_inputs);
+    defer allocator.free(catalog_bytes);
+    const segment = try postings.buildPostingsSegment(allocator, root_identity.fingerprint, epoch, postings_inputs);
+    defer segment.deinit(allocator);
+    const postings_bytes = try postings.serializePostingsSegment(allocator, segment);
+    defer allocator.free(postings_bytes);
+
+    const paths = try generation.buildGenerationPaths(allocator, root, epoch);
+    defer paths.deinit(allocator);
+    const payloads = [_]generation.SegmentPayload{
+        .{ .kind = .catalog, .relative_path = "catalog.ixcat", .bytes = catalog_bytes },
+        .{ .kind = .postings, .relative_path = "postings.ixpost", .bytes = postings_bytes },
+    };
+    return generation.publishGenerationPayloads(io, allocator, paths, root_identity.fingerprint, epoch, null, &payloads);
+}
+
 fn modeFor(request: Request) Mode {
     if (request.repair) return .foreground_repair;
     if (request.foreground and request.once) return .foreground_once;
@@ -262,6 +362,175 @@ fn appendFormat(text: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime
     const rendered = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(rendered);
     try text.appendSlice(allocator, rendered);
+}
+
+const IndexedFile = struct {
+    path: []const u8,
+    bytes: []u8,
+    size: u64,
+    mtime_ns: i128,
+    file_index_or_inode: u128 = 0,
+
+    fn deinit(self: IndexedFile, allocator: std.mem.Allocator) void {
+        allocator.free(self.path);
+        allocator.free(self.bytes);
+    }
+};
+
+fn collectIndexFiles(io: std.Io, allocator: std.mem.Allocator, root: []const u8, files: *std.ArrayList(IndexedFile)) !void {
+    const dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        error.AccessDenied => return,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var iterator = dir.iterate();
+    while (true) {
+        const maybe_entry = iterator.next(io) catch |err| switch (err) {
+            error.AccessDenied => return,
+            else => return err,
+        };
+        const entry = maybe_entry orelse break;
+        if (std.mem.eql(u8, entry.name, ".ix")) continue;
+        if (isDefaultHiddenEntry(entry.name)) continue;
+        const child_path = try joinPathForward(allocator, root, entry.name);
+        switch (entry.kind) {
+            .file => try appendIndexedFile(io, allocator, child_path, files),
+            .directory => {
+                try collectIndexFiles(io, allocator, child_path, files);
+                allocator.free(child_path);
+            },
+            else => allocator.free(child_path),
+        }
+    }
+}
+
+fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, files: *std.ArrayList(IndexedFile)) !void {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
+        error.AccessDenied, error.FileNotFound => {
+            allocator.free(path);
+            return;
+        },
+        else => return err,
+    };
+    defer file.close(io);
+    const stat = file.stat(io) catch |err| switch (err) {
+        error.AccessDenied => {
+            allocator.free(path);
+            return;
+        },
+        else => return err,
+    };
+    if (stat.size > INDEX_FILE_READ_LIMIT) {
+        allocator.free(path);
+        return error.IndexFileTooLarge;
+    }
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(INDEX_FILE_READ_LIMIT)) catch |err| switch (err) {
+        error.AccessDenied, error.FileNotFound => {
+            allocator.free(path);
+            return;
+        },
+        else => return err,
+    };
+    try files.append(allocator, .{
+        .path = path,
+        .bytes = bytes,
+        .size = stat.size,
+        .mtime_ns = stat.mtime.nanoseconds,
+    });
+}
+
+fn lessThanIndexedFilePath(_: void, lhs: IndexedFile, rhs: IndexedFile) bool {
+    return std.mem.lessThan(u8, lhs.path, rhs.path);
+}
+
+fn isDefaultHiddenEntry(name: []const u8) bool {
+    return name.len > 1 and name[0] == '.' and !std.mem.eql(u8, name, "..");
+}
+
+fn joinPathForward(allocator: std.mem.Allocator, parent: []const u8, name: []const u8) ![]u8 {
+    if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return allocator.dupe(u8, name);
+    const sep: []const u8 = if (std.mem.endsWith(u8, parent, "/") or std.mem.endsWith(u8, parent, "\\")) "" else "/";
+    return std.fmt.allocPrint(allocator, "{s}{s}{s}", .{ parent, sep, name });
+}
+
+fn currentEpoch(io: std.Io) generation.Epoch {
+    const now = std.Io.Timestamp.now(io, .real).nanoseconds;
+    if (now <= 0) return 1;
+    return @intCast(now);
+}
+
+fn holdLiveUntilRootMutation(io: std.Io, root_path: []const u8) void {
+    if (builtin.os.tag == .windows) {
+        holdLiveUntilRootMutationWindows(io, root_path);
+    } else {
+        std.Thread.sleep(@as(u64, 120) * std.time.ns_per_s);
+    }
+}
+
+fn holdLiveUntilRootMutationWindows(io: std.Io, root_path: []const u8) void {
+    const dir = std.Io.Dir.cwd().openDir(io, root_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+    var buffer: [64 * 1024]u8 align(4) = undefined;
+    var bytes_returned: windows.DWORD = 0;
+    const filter: windows.DWORD =
+        0x0000_0001 |
+        0x0000_0002 |
+        0x0000_0008 |
+        0x0000_0010 |
+        0x0000_0040;
+    while (true) {
+        bytes_returned = 0;
+        _ = ReadDirectoryChangesW(
+            dir.handle,
+            &buffer,
+            @intCast(buffer.len),
+            windows.BOOL.TRUE,
+            filter,
+            &bytes_returned,
+            null,
+            null,
+        );
+        if (bytes_returned == 0) return;
+        if (bufferHasExternalRootMutation(buffer[0..@intCast(bytes_returned)])) return;
+    }
+}
+
+fn bufferHasExternalRootMutation(bytes: []const u8) bool {
+    var offset: usize = 0;
+    while (offset + 12 <= bytes.len) {
+        const next = readLeU32(bytes[offset..][0..4]);
+        const name_len = readLeU32(bytes[offset + 8 ..][0..4]);
+        if (offset + 12 + name_len > bytes.len) return true;
+        const name_bytes = bytes[offset + 12 .. offset + 12 + name_len];
+        if (!isIndexMaintenancePath(name_bytes)) return true;
+        if (next == 0) break;
+        offset += next;
+    }
+    return false;
+}
+
+fn isIndexMaintenancePath(name_bytes: []const u8) bool {
+    if (name_bytes.len < 6) return false;
+    const dot = readLeU16(name_bytes[0..2]);
+    const i = readLeU16(name_bytes[2..4]);
+    const x = readLeU16(name_bytes[4..6]);
+    if (dot != '.' or std.ascii.toLower(@intCast(i)) != 'i' or std.ascii.toLower(@intCast(x)) != 'x') return false;
+    if (name_bytes.len == 6) return true;
+    const sep = readLeU16(name_bytes[6..8]);
+    return sep == '\\' or sep == '/';
+}
+
+fn readLeU16(bytes: *const [2]u8) u16 {
+    return @as(u16, bytes[0]) | (@as(u16, bytes[1]) << 8);
+}
+
+fn readLeU32(bytes: *const [4]u8) u32 {
+    return @as(u32, bytes[0]) |
+        (@as(u32, bytes[1]) << 8) |
+        (@as(u32, bytes[2]) << 16) |
+        (@as(u32, bytes[3]) << 24);
 }
 
 fn currentProcessId() u32 {
@@ -425,6 +694,40 @@ test "indexd foreground once writes bootstrap state" {
     try std.testing.expect(std.mem.indexOf(u8, contents, "IXINDEXD_BOOTSTRAP1") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "state=ready") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "mode=foreground_once") != null);
+}
+
+test "indexd foreground once publishes catalog postings generation" {
+    const root = ".zig-cache\\ix-indexd-generation-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const sample_path = try std.fs.path.join(std.testing.allocator, &.{ root, "sample.txt" });
+    defer std.testing.allocator.free(sample_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sample_path, .data = "needle\n" });
+
+    const result = try run(std.testing.io, std.testing.allocator, .{
+        .root = root,
+        .foreground = true,
+        .once = true,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    const root_identity = try catalog.identifyRoot(std.testing.allocator, root);
+    defer root_identity.deinit(std.testing.allocator);
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ result.config.index_dir, "current.ixgen" });
+    defer std.testing.allocator.free(current_path);
+    const pin = (try generation.tryPinCurrentGeneration(std.testing.io, std.testing.allocator, current_path, root_identity.fingerprint)) orelse return error.TestExpectedCurrentGeneration;
+    const paths = try generation.buildGenerationPaths(std.testing.allocator, root, pin.epoch);
+    defer paths.deinit(std.testing.allocator);
+
+    var buffer: [32]u8 = undefined;
+    _ = try std.Io.Dir.cwd().readFile(std.testing.io, paths.manifest_path, &buffer);
+    const catalog_path = try std.fs.path.join(std.testing.allocator, &.{ paths.generation_dir, "catalog.ixcat" });
+    defer std.testing.allocator.free(catalog_path);
+    _ = try std.Io.Dir.cwd().readFile(std.testing.io, catalog_path, &buffer);
+    const postings_path = try std.fs.path.join(std.testing.allocator, &.{ paths.generation_dir, "postings.ixpost" });
+    defer std.testing.allocator.free(postings_path);
+    _ = try std.Io.Dir.cwd().readFile(std.testing.io, postings_path, &buffer);
 }
 
 test "indexd repair command writes reconcile request marker" {
