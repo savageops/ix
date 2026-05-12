@@ -1,3 +1,5 @@
+const std = @import("std");
+
 /// Thin Zig wrapper over StringZilla SIMD search kernels.
 ///
 /// StringZilla (v4.6.0, Ash Vardanian) provides hardware-accelerated string
@@ -60,6 +62,39 @@ pub fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
     return @intFromPtr(result) - @intFromPtr(haystack.ptr);
 }
 
+/// Existence probe for long mandatory needles.
+///
+/// StringZilla's fingerprint kernel is the canonical substring engine. For
+/// cold-path admission, however, long absent needles profit from Horspool's
+/// skip distance because the caller only needs null/not-null. Keep the selector
+/// conservative so short literals and match counting remain on StringZilla.
+pub fn indexOfAdmission(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len >= 16 and haystack.len >= 4096) {
+        return indexOfBoyerMooreHorspool(haystack, needle);
+    }
+    return indexOf(haystack, needle);
+}
+
+fn indexOfBoyerMooreHorspool(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+
+    var skip_table: [256]usize = undefined;
+    @memset(&skip_table, needle.len);
+    for (needle[0 .. needle.len - 1], 0..) |byte, index| {
+        skip_table[byte] = needle.len - 1 - index;
+    }
+
+    var cursor: usize = 0;
+    const last = needle.len - 1;
+    const limit = haystack.len - needle.len;
+    while (cursor <= limit) {
+        if (std.mem.eql(u8, haystack[cursor .. cursor + needle.len], needle)) return cursor;
+        cursor += skip_table[haystack[cursor + last]];
+    }
+    return null;
+}
+
 /// SIMD-accelerated single-byte search (memchr equivalent).
 ///
 /// Uses VPCMPEQB to compare 32 bytes against the target byte in one
@@ -89,4 +124,14 @@ pub fn indexOfByteSet(haystack: []const u8, set: *const ByteSet) ?usize {
     if (haystack.len == 0) return null;
     const result = ix_sz_find_byteset(haystack.ptr, haystack.len, set) orelse return null;
     return @intFromPtr(result) - @intFromPtr(haystack.ptr);
+}
+
+test "admission index matches stringzilla semantics" {
+    try std.testing.expectEqual(@as(?usize, 0), indexOfAdmission("abcdef", ""));
+    try std.testing.expectEqual(@as(?usize, null), indexOfAdmission("abc", "abcd"));
+    try std.testing.expectEqual(@as(?usize, 6), indexOfAdmission("prefix0123456789abcdefsuffix", "0123456789abcdef"));
+    try std.testing.expectEqual(@as(?usize, null), indexOfAdmission("prefix0123456789abcxefsuffix", "0123456789abcdef"));
+
+    const haystack = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0123456789abcdef";
+    try std.testing.expectEqual(indexOf(haystack, "0123456789abcdef"), indexOfAdmission(haystack, "0123456789abcdef"));
 }

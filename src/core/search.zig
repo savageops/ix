@@ -1802,7 +1802,7 @@ fn scanFileMmap(
 
     if (mono) |m| {
         if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
-            if (!request.case_insensitive and sz.indexOf(data, needle) == null) {
+            if (!request.case_insensitive and sz.indexOfAdmission(data, needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
                 shard.scan_work_ms_total += file_ms;
@@ -1858,7 +1858,7 @@ fn scanFileMmap(
     // the entire file, skip per-line processing.
     if (mono) |m| {
         if (chunkPrefilterNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
-            if (!request.case_insensitive and sz.indexOf(data, needle) == null) {
+            if (!request.case_insensitive and sz.indexOfAdmission(data, needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
                 shard.scan_work_ms_total += file_ms;
@@ -2334,7 +2334,7 @@ fn scanOpenFileIntoShardImpl(
     }
     if (mono) |m| {
         if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
-            if (!request.case_insensitive and sz.indexOf(read_buffer[0..first_read], needle) == null) {
+            if (!request.case_insensitive and sz.indexOfAdmission(read_buffer[0..first_read], needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
                 shard.scan_work_ms_total += file_ms;
@@ -2412,7 +2412,7 @@ fn scanOpenFileIntoShardImpl(
         // then set up the carry buffer for the trailing partial line.
         if (chunk_prefilter_needle) |needle| {
             if (carry.items.len == 0 and !request.case_insensitive and
-                sz.indexOf(chunk, needle) == null)
+                sz.indexOfAdmission(chunk, needle) == null)
             {
                 // Fast newline count: count newlines in bulk via SIMD.
                 const newlines = std.mem.count(u8, chunk, "\n");
