@@ -2043,7 +2043,7 @@ fn tryByteShardFastCount(
     var spawned: usize = 0;
     while (spawned < worker_count) : (spawned += 1) {
         const job_index = spawned + 1;
-        threads[spawned] = std.Thread.spawn(.{}, byteShardWorker, .{&jobs[job_index]}) catch {
+        threads[spawned] = std.Thread.spawn(.{ .stack_size = 64 * 1024 }, byteShardWorker, .{&jobs[job_index]}) catch {
             for (threads[0..spawned]) |thread| thread.join();
             return null;
         };
