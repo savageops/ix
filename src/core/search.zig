@@ -129,6 +129,7 @@ pub const MAX_RETAINED_HITS = 4096;
 const TRIGRAM_MIN_PRUNE_BYTES: usize = 64 * 1024;
 const BYTE_SHARD_MIN_FILE_BYTES: usize = 8 * 1024 * 1024;
 const BYTE_SHARD_MIN_RANGE_BYTES: usize = 4 * 1024 * 1024;
+const BYTE_SHARD_DEFAULT_MAX_RANGES: usize = 18;
 const BYTE_SHARD_LINE_BOUNDARY_SEARCH_LIMIT: usize = 1024 * 1024;
 const EVIDENCE_FRONTIER_CACHE_MAGIC = "IXEVIDENCE2";
 const EVIDENCE_FRONTIER_LIVE_MAGIC = "IXEVIDENCELIVE1";
@@ -1877,7 +1878,7 @@ fn tryByteShardFastCount(
     if (shard_plan.case_insensitive) return null;
     if (shard_plan.needle.len < 2 or shard_plan.needle.len > data.len) return null;
 
-    const requested_threads = request.threads orelse availableThreads();
+    const requested_threads = request.threads orelse defaultByteShardThreadBudget(availableThreads());
     const max_threads = @max(@as(usize, 1), requested_threads);
     const ranges_by_size = (data.len + BYTE_SHARD_MIN_RANGE_BYTES - 1) / BYTE_SHARD_MIN_RANGE_BYTES;
     const range_count = @min(max_threads, ranges_by_size);
@@ -1972,6 +1973,10 @@ fn tryByteShardFastCount(
         stats.boundary_rejected_candidates += regex_duplicate_candidate_hits_skipped;
     }
     return total;
+}
+
+fn defaultByteShardThreadBudget(available: usize) usize {
+    return @min(available, BYTE_SHARD_DEFAULT_MAX_RANGES);
 }
 
 fn byteShardWorker(job: *ByteShardJob) void {
@@ -4275,6 +4280,11 @@ test "byte shard plan admits word-boundary line kernels" {
 
     const regex_casefold_word = try expr.parse("re:(?i)\\bSherlock Holmes\\b");
     try std.testing.expect(byteShardPlan(regex_casefold_word) == null);
+}
+
+test "byte shard default fanout caps implicit hardware thread count" {
+    try std.testing.expectEqual(@as(usize, BYTE_SHARD_DEFAULT_MAX_RANGES), defaultByteShardThreadBudget(BYTE_SHARD_DEFAULT_MAX_RANGES + 14));
+    try std.testing.expectEqual(@as(usize, 8), defaultByteShardThreadBudget(8));
 }
 
 test "regex decomposition fast count verifies mandatory literal candidate lines" {
