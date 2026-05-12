@@ -88,7 +88,7 @@ pub fn main(init: std.process.Init) !void {
                 try stderr.flush();
                 std.process.exit(1);
             };
-            if (shouldLaunchNexusSidecar(effective_request, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
+            if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
             if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
             if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
                 try stderr.flush();
                 std.process.exit(1);
             };
-            if (shouldLaunchNexusSidecar(effective_request, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
+            if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
             if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
             if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
@@ -210,9 +210,15 @@ fn indexdEnvValueEnabled(value: []const u8) bool {
     return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
 }
 
-fn shouldLaunchNexusSidecar(request: cli.SearchRequest, report: search.SearchReport) bool {
+fn shouldLaunchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest, plan: expr.ExpressionPlan, report: search.SearchReport) bool {
+    if (!shouldConsiderNexusSidecar(request, report)) return false;
+    return search.tryClaimEvidenceFrontierBuild(io, allocator, request, plan);
+}
+
+fn shouldConsiderNexusSidecar(request: cli.SearchRequest, report: search.SearchReport) bool {
     if (request.nexus_disabled) return false;
-    return report.stats.trigram_acceleration.pruned_files == 0;
+    if (report.stats.trigram_acceleration.pruned_files != 0) return false;
+    return true;
 }
 
 fn shouldLaunchIndexdSidecar(enabled: bool, request: cli.SearchRequest, report: search.SearchReport) bool {
@@ -335,10 +341,10 @@ fn appendRepeated(allocator: std.mem.Allocator, list: *std.ArrayList(u8), byte: 
 test "nexus sidecar launch is gated after evidence-pruned foreground reuse" {
     const enabled = testSearchRequestForSidecar(false);
     const disabled = testSearchRequestForSidecar(true);
-    try std.testing.expect(shouldLaunchNexusSidecar(enabled, testSearchReportForSidecar(0)));
-    try std.testing.expect(!shouldLaunchNexusSidecar(enabled, testSearchReportForSidecar(1)));
-    try std.testing.expect(!shouldLaunchNexusSidecar(enabled, testSearchReportForSidecar(79041)));
-    try std.testing.expect(!shouldLaunchNexusSidecar(disabled, testSearchReportForSidecar(0)));
+    try std.testing.expect(shouldConsiderNexusSidecar(enabled, testSearchReportForSidecar(0)));
+    try std.testing.expect(!shouldConsiderNexusSidecar(enabled, testSearchReportForSidecar(1)));
+    try std.testing.expect(!shouldConsiderNexusSidecar(enabled, testSearchReportForSidecar(79041)));
+    try std.testing.expect(!shouldConsiderNexusSidecar(disabled, testSearchReportForSidecar(0)));
 }
 
 test "indexd sidecar launch is opt in single root and workload gated" {

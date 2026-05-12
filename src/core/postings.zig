@@ -502,7 +502,7 @@ fn unionFileIds(allocator: std.mem.Allocator, lhs: []const FileId, rhs: []const 
     return out.toOwnedSlice(allocator);
 }
 
-fn containsFileId(sorted_file_ids: []const FileId, file_id: FileId) bool {
+pub fn containsFileId(sorted_file_ids: []const FileId, file_id: FileId) bool {
     var low: usize = 0;
     var high: usize = sorted_file_ids.len;
     while (low < high) {

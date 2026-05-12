@@ -137,6 +137,7 @@ const EVIDENCE_FRONTIER_CACHE_READ_LIMIT = 64 * 1024 * 1024;
 const EVIDENCE_FRONTIER_LIVE_READ_LIMIT = 4096;
 const EVIDENCE_FRONTIER_CACHE_CANDIDATE_LIMIT = 262144;
 const EVIDENCE_FRONTIER_LIVE_TTL_NS: i96 = 120 * std.time.ns_per_s;
+const EVIDENCE_FRONTIER_BUILD_TTL_NS: i128 = 120 * std.time.ns_per_s;
 
 /// Comptime predicate specialization for single-predicate plans. When passed to
 /// scanOpenFileIntoShardImpl / recordLineIntoShardImpl, the per-line match
@@ -431,6 +432,8 @@ fn prepareWarmIndexFrontier(
         if (!request.hidden and isHiddenPath(warmIndexRelativePath(root, path))) continue;
         active.append(allocator, .{ .path = allocator.dupe(u8, path) catch return warmIndexFallback(report, "candidate_path_alloc_failed") }) catch return warmIndexFallback(report, "candidate_append_failed");
     }
+    var verify_required_count: usize = 0;
+    appendWarmVerificationFrontier(allocator, root, request, snapshot, candidate_ids, &active, &verify_required_count) catch return warmIndexFallback(report, "verify_required_append_failed");
 
     report.discover_ms = 0;
     report.files_discovered = snapshot.entries.len;
@@ -455,6 +458,26 @@ fn prepareWarmIndexFrontier(
     const owned = active.toOwnedSlice(allocator) catch return warmIndexFallback(report, "candidate_finalize_failed");
     writeWarmQueryFrontier(io, allocator, root, root_identity.fingerprint, pin.epoch, request, snapshot.entries.len, owned);
     return owned;
+}
+
+fn appendWarmVerificationFrontier(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    request: cli.SearchRequest,
+    snapshot: catalog.CatalogSnapshot,
+    candidate_ids: []const catalog.FileId,
+    active: *std.ArrayList(DiscoveredFile),
+    verify_required_count: *usize,
+) !void {
+    const count = @min(snapshot.entries.len, snapshot.metas.len);
+    for (snapshot.entries[0..count], snapshot.metas[0..count]) |entry, meta| {
+        if (!catalog.metaRequiresVerification(meta)) continue;
+        verify_required_count.* += 1;
+        if (postings.containsFileId(candidate_ids, entry.file_id)) continue;
+        const path = snapshot.path(entry);
+        if (!request.hidden and isHiddenPath(warmIndexRelativePath(root, path))) continue;
+        try active.append(allocator, .{ .path = try allocator.dupe(u8, path) });
+    }
 }
 
 fn warmIndexFallback(report: *SearchReport, reason: []const u8) ?[]DiscoveredFile {
@@ -719,6 +742,37 @@ fn prepareLiveEvidenceFrontier(
     return .{ .active_files = evidence_files.toOwnedSlice(allocator) catch return null };
 }
 
+pub fn tryClaimEvidenceFrontierBuild(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+) bool {
+    if (request.nexus_disabled) return false;
+    const admission = trigram.admit(plan);
+    if (!evidenceFrontierEligible(request, plan, admission)) return false;
+    const key = evidenceFrontierKey(request, plan);
+    const cache_path = std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key}) catch return false;
+    defer allocator.free(cache_path);
+    const live_path = evidenceFrontierLivePath(allocator, cache_path) catch return false;
+    defer allocator.free(live_path);
+    if (loadEvidenceFrontierLive(io, allocator, live_path, key)) return false;
+    const build_path = evidenceFrontierBuildPath(allocator, cache_path) catch return false;
+    defer allocator.free(build_path);
+    if (evidenceFrontierBuildClaimFresh(io, build_path)) return false;
+    var file = std.Io.Dir.cwd().createFile(io, build_path, .{ .truncate = false, .exclusive = true }) catch return false;
+    defer file.close(io);
+    var buffer: [256]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    writer.interface.print("IXEVIDENCEBUILD1\nkey={x}\ncreated_ns={}\npid={}\n", .{
+        key,
+        std.Io.Timestamp.now(io, .real).nanoseconds,
+        currentProcessId(),
+    }) catch return false;
+    writer.interface.flush() catch return false;
+    return true;
+}
+
 fn prepareEvidenceFrontier(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -920,6 +974,18 @@ fn evidenceFrontierLivePath(allocator: std.mem.Allocator, cache_path: []const u8
     return std.fmt.allocPrint(allocator, "{s}.live", .{cache_path});
 }
 
+fn evidenceFrontierBuildPath(allocator: std.mem.Allocator, cache_path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(allocator, "{s}.build", .{cache_path});
+}
+
+fn evidenceFrontierBuildClaimFresh(io: std.Io, path: []const u8) bool {
+    var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    defer file.close(io);
+    const stat = file.stat(io) catch return true;
+    const age_ns = std.Io.Timestamp.now(io, .real).nanoseconds - stat.mtime.nanoseconds;
+    return age_ns >= 0 and age_ns < EVIDENCE_FRONTIER_BUILD_TTL_NS;
+}
+
 fn loadEvidenceFrontierLive(io: std.Io, allocator: std.mem.Allocator, path: []const u8, key: u64) bool {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(EVIDENCE_FRONTIER_LIVE_READ_LIMIT)) catch return false;
     var lines = std.mem.splitScalar(u8, bytes, '\n');
@@ -1035,6 +1101,11 @@ fn writeEvidenceFrontierCache(
     }) catch return;
     for (built.candidates) |candidate| writer.interface.print("{s}\n", .{candidate.path}) catch return;
     writer.interface.flush() catch return;
+    const build_path = evidenceFrontierBuildPath(std.heap.page_allocator, path) catch "";
+    if (build_path.len != 0) {
+        defer std.heap.page_allocator.free(build_path);
+        std.Io.Dir.cwd().deleteFile(io, build_path) catch {};
+    }
     writeEvidenceFrontierLive(io, path, key);
 }
 

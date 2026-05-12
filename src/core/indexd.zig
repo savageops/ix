@@ -283,8 +283,8 @@ pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []c
 
     const catalog_inputs = try allocator.alloc(catalog.CatalogFileInput, files.items.len);
     defer allocator.free(catalog_inputs);
-    const postings_inputs = try allocator.alloc(postings.PostingsFileInput, files.items.len);
-    defer allocator.free(postings_inputs);
+    var postings_inputs = std.ArrayList(postings.PostingsFileInput).empty;
+    defer postings_inputs.deinit(allocator);
 
     for (files.items, 0..) |file, index| {
         const file_id = catalog.makeFileId(@intCast(index));
@@ -295,16 +295,19 @@ pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []c
             .file_index_or_inode = file.file_index_or_inode,
             .kind = .regular,
             .sample = file.bytes[0..@min(file.bytes.len, 4096)],
+            .verify_required = file.verify_required,
         };
-        postings_inputs[index] = .{
-            .file_id = file_id,
-            .bytes = file.bytes,
-        };
+        if (!file.verify_required) {
+            try postings_inputs.append(allocator, .{
+                .file_id = file_id,
+                .bytes = file.bytes,
+            });
+        }
     }
 
     const catalog_bytes = try catalog.buildCatalogBytes(allocator, root, epoch, catalog_inputs);
     defer allocator.free(catalog_bytes);
-    const segment = try postings.buildPostingsSegment(allocator, root_identity.fingerprint, epoch, postings_inputs);
+    const segment = try postings.buildPostingsSegment(allocator, root_identity.fingerprint, epoch, postings_inputs.items);
     defer segment.deinit(allocator);
     const postings_bytes = try postings.serializePostingsSegment(allocator, segment);
     defer allocator.free(postings_bytes);
@@ -370,6 +373,7 @@ const IndexedFile = struct {
     size: u64,
     mtime_ns: i128,
     file_index_or_inode: u128 = 0,
+    verify_required: bool = false,
 
     fn deinit(self: IndexedFile, allocator: std.mem.Allocator) void {
         allocator.free(self.path);
@@ -423,8 +427,15 @@ fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
         else => return err,
     };
     if (stat.size > INDEX_FILE_READ_LIMIT) {
-        allocator.free(path);
-        return error.IndexFileTooLarge;
+        const bytes = try allocator.alloc(u8, 0);
+        try files.append(allocator, .{
+            .path = path,
+            .bytes = bytes,
+            .size = stat.size,
+            .mtime_ns = stat.mtime.nanoseconds,
+            .verify_required = true,
+        });
+        return;
     }
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(INDEX_FILE_READ_LIMIT)) catch |err| switch (err) {
         error.AccessDenied, error.FileNotFound => {

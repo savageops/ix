@@ -161,6 +161,8 @@ pub const FileMeta = extern struct {
     reserved: u16 = 0,
 };
 
+pub const FILE_META_VERIFY_REQUIRED: u16 = 1;
+
 pub const FileMetaInput = struct {
     file_id: FileId,
     size: u64,
@@ -168,6 +170,7 @@ pub const FileMetaInput = struct {
     file_index_or_inode: u128 = 0,
     kind: FileKind = .regular,
     sample: []const u8 = "",
+    verify_required: bool = false,
 };
 
 pub const CatalogFileInput = struct {
@@ -177,6 +180,7 @@ pub const CatalogFileInput = struct {
     file_index_or_inode: u128 = 0,
     kind: FileKind = .regular,
     sample: []const u8 = "",
+    verify_required: bool = false,
 };
 
 pub fn isValidFileId(value: FileId) bool {
@@ -263,8 +267,12 @@ pub fn makeFileMeta(input: FileMetaInput) FileMeta {
         .file_index_or_inode = input.file_index_or_inode,
         .kind = input.kind,
         .text = classifySample(input.sample),
-        .reserved = 0,
+        .reserved = if (input.verify_required) FILE_META_VERIFY_REQUIRED else 0,
     };
+}
+
+pub fn metaRequiresVerification(meta: FileMeta) bool {
+    return (meta.reserved & FILE_META_VERIFY_REQUIRED) != 0;
 }
 
 pub fn classifySample(sample: []const u8) TextKind {
@@ -305,6 +313,7 @@ pub fn buildCatalogBytes(
             .file_index_or_inode = file.file_index_or_inode,
             .kind = file.kind,
             .sample = file.sample,
+            .verify_required = file.verify_required,
         });
     }
 
