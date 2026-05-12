@@ -270,7 +270,53 @@ fn classifyRegex(pattern: []const u8) MatcherStrategy {
 
 fn classifyRegexDecomposition(pattern: []const u8) bool {
     const body = if (std.mem.startsWith(u8, pattern, "(?i)")) pattern[4..] else pattern;
-    return std.mem.indexOf(u8, body, "\\w+\\s+") != null and std.mem.indexOf(u8, body, "\\s+\\w+") != null;
+    return regexDecompositionLiteralCandidate(body) != null;
+}
+
+pub fn regexDecompositionLiteralCandidate(pattern: []const u8) ?[]const u8 {
+    if (pattern.len == 0) return null;
+    var best_start: usize = 0;
+    var best_len: usize = 0;
+    var run_start: usize = 0;
+    var run_len: usize = 0;
+    var saw_required_class = false;
+    var index: usize = 0;
+
+    while (index < pattern.len) {
+        const byte = pattern[index];
+        if (byte == '\\') {
+            if (run_len > best_len) {
+                best_start = run_start;
+                best_len = run_len;
+            }
+            run_len = 0;
+            if (index + 1 >= pattern.len) return null;
+            const escaped = pattern[index + 1];
+            switch (escaped) {
+                's', 'w', 'd' => {
+                    saw_required_class = true;
+                    index += 2;
+                    if (index < pattern.len and pattern[index] == '+') index += 1;
+                    run_start = index;
+                    continue;
+                },
+                else => return null,
+            }
+        }
+        if (isRegexMeta(byte)) {
+            return null;
+        }
+        if (run_len == 0) run_start = index;
+        run_len += 1;
+        index += 1;
+    }
+
+    if (run_len > best_len) {
+        best_start = run_start;
+        best_len = run_len;
+    }
+    if (!saw_required_class or best_len < 3) return null;
+    return pattern[best_start .. best_start + best_len];
 }
 
 fn isWordBoundaryLiteral(pattern: []const u8) bool {
@@ -412,4 +458,11 @@ test "plan exposes rust capability predicates" {
     try std.testing.expect(word.supportsOuterParallelShardFastCount());
     try std.testing.expect(word.usesSingleLiteralCounter());
     try std.testing.expectEqual(@as(?usize, 13), word.fastMatchCountRangeOverlap());
+}
+
+test "regex decomposition classifies mandatory literal whitespace regex" {
+    const plan = try parse("re:Sherlock\\s+Holmes");
+    try std.testing.expectEqual(PredicateKind.regex, plan.predicates[0].kind);
+    try std.testing.expectEqual(MatcherStrategy.regex_decomposition_candidate_lines, plan.predicates[0].strategy);
+    try std.testing.expect(plan.predicates[0].decomposition);
 }

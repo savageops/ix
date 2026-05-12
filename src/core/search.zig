@@ -22,6 +22,8 @@ const WARM_INDEX_SEGMENT_READ_LIMIT: usize = 128 * 1024 * 1024;
 const WARM_QUERY_CACHE_MAGIC = "IXQUERY_FRONTIER1";
 const WARM_QUERY_CACHE_READ_LIMIT: usize = 4 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: usize = 4 * 1024;
+const REGEX_DECOMPOSITION_MIN_LITERAL_LEN: usize = 3;
+const REGEX_DECOMPOSITION_MAX_CANDIDATE_LINES: usize = 4096;
 
 extern "kernel32" fn ReadDirectoryChangesW(
     hDirectory: windows.HANDLE,
@@ -1394,6 +1396,8 @@ const ShardReport = struct {
     files_skipped: usize,
     matches_found: usize,
     scan_work_ms_total: f64,
+    acceleration_bailouts: usize,
+    regex_decomposition_stats: core_stats.RegexDecompositionStats,
     trigram_stats: core_stats.TrigramAccelerationStats,
     byte_shard_stats: core_stats.ByteShardKernelStats,
     slowest_path: []const u8,
@@ -1418,6 +1422,8 @@ const ShardReport = struct {
         .files_skipped = 0,
         .matches_found = 0,
         .scan_work_ms_total = 0,
+        .acceleration_bailouts = 0,
+        .regex_decomposition_stats = .{},
         .trigram_stats = .{},
         .byte_shard_stats = .{},
         .slowest_path = "",
@@ -1681,6 +1687,14 @@ fn scanFileMmap(
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
             return;
         }
+        if (regexDecompositionFastCount(data, plan, request.case_insensitive, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
+            shard.matches_found += count;
+            recordEvidenceCandidate(shard, display_path);
+            const file_ms = elapsedMs(io, file_started);
+            shard.scan_work_ms_total += file_ms;
+            if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            return;
+        }
         if (wholeBufferFastCount(data, plan, request.case_insensitive, false)) |count| {
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
@@ -1744,13 +1758,20 @@ fn trySerialMmapFastPath(
     report: *SearchReport,
     file_started: std.Io.Timestamp,
 ) bool {
-    if (!request.stats_only or !plan.usesSingleLiteralCounter()) return false;
+    if (!request.stats_only) return false;
+    if (!plan.usesSingleLiteralCounter() and !planUsesRegexDecompositionFastCount(plan, request.case_insensitive)) return false;
 
     var shard = ShardReport.empty;
     scanFileMmap(null, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, &shard, file_started) catch return false;
     var shards = [_]ShardReport{shard};
     mergeShardsIntoReport(shards[0..], report);
     return true;
+}
+
+fn planUsesRegexDecompositionFastCount(plan: expr.ExpressionPlan, case_insensitive: bool) bool {
+    if (case_insensitive or plan.predicate_count != 1) return false;
+    const predicate = plan.predicates[0];
+    return predicate.kind == .regex and regexDecompositionNeedle(predicate.value) != null;
 }
 
 const ByteShardStrategy = enum {
@@ -2095,6 +2116,14 @@ fn scanOpenFileIntoShardImpl(
     if (request.stats_only and single_chunk) {
         const ci = if (chunk_casefold) false else request.case_insensitive;
         if (wholeBufferFastCount(read_buffer[0..first_read], plan, ci, chunk_casefold)) |count| {
+            shard.matches_found += count;
+            recordEvidenceCandidate(shard, display_path);
+            const file_ms = elapsedMs(io, file_started);
+            shard.scan_work_ms_total += file_ms;
+            if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            return;
+        }
+        if (regexDecompositionFastCount(read_buffer[0..first_read], plan, ci, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
@@ -2468,7 +2497,9 @@ fn mergeShardsIntoReport(shards: []const ShardReport, report: *SearchReport) voi
         report.files_skipped += shard.files_skipped;
         report.matches_found += shard.matches_found;
         report.scan_work_ms_total += shard.scan_work_ms_total;
+        report.stats.acceleration_bailouts += shard.acceleration_bailouts;
         report.stats.access_errors.merge(shard.access_errors);
+        mergeRegexDecompositionStats(&report.stats.regex_decomposition, shard.regex_decomposition_stats);
         mergeTrigramStats(&report.stats.trigram_acceleration, shard.trigram_stats);
         mergeByteShardStats(&report.stats.byte_shard_kernel, shard.byte_shard_stats);
         if (shard.slowest_ms >= report.slowest_ms) {
@@ -2674,6 +2705,15 @@ fn mergeTrigramStats(target: *core_stats.TrigramAccelerationStats, source: core_
     target.pruned_files += source.pruned_files;
     target.verified_files += source.verified_files;
     target.ineligible_files += source.ineligible_files;
+}
+
+fn mergeRegexDecompositionStats(target: *core_stats.RegexDecompositionStats, source: core_stats.RegexDecompositionStats) void {
+    target.eligible_files += source.eligible_files;
+    target.counted_files += source.counted_files;
+    target.bailout_files += source.bailout_files;
+    target.candidate_lines_checked += source.candidate_lines_checked;
+    target.duplicate_candidate_hits_skipped += source.duplicate_candidate_hits_skipped;
+    target.candidate_lines_matched += source.candidate_lines_matched;
 }
 
 fn mergeByteShardStats(target: *core_stats.ByteShardKernelStats, source: core_stats.ByteShardKernelStats) void {
@@ -3126,6 +3166,80 @@ fn wholeBufferRegexCount(buffer: []const u8, predicate: expr.Predicate, case_ins
         },
         else => null,
     };
+}
+
+fn regexDecompositionFastCount(
+    buffer: []const u8,
+    plan: expr.ExpressionPlan,
+    case_insensitive: bool,
+    stats: *core_stats.RegexDecompositionStats,
+    acceleration_bailouts: *usize,
+) ?usize {
+    if (case_insensitive or plan.predicate_count != 1) return null;
+    const predicate = plan.predicates[0];
+    if (predicate.kind != .regex) return null;
+    const needle = regexDecompositionNeedle(predicate.value) orelse return null;
+
+    stats.eligible_files += 1;
+    var count: usize = 0;
+    var search_pos: usize = 0;
+    var checked_this_file: usize = 0;
+    var last_line_start: ?usize = null;
+    while (search_pos < buffer.len) {
+        const relative = simd.indexOf(buffer[search_pos..], needle) orelse break;
+        const candidate_start = search_pos + relative;
+        const line_start = lineStartForOffset(buffer, candidate_start);
+        search_pos = @min(candidate_start + needle.len, buffer.len);
+
+        if (last_line_start != null and last_line_start.? == line_start) {
+            stats.duplicate_candidate_hits_skipped += 1;
+            continue;
+        }
+        if (checked_this_file == REGEX_DECOMPOSITION_MAX_CANDIDATE_LINES) {
+            stats.bailout_files += 1;
+            acceleration_bailouts.* += 1;
+            return null;
+        }
+
+        checked_this_file += 1;
+        stats.candidate_lines_checked += 1;
+        const line_end = lineEndForOffset(buffer, candidate_start);
+        const raw_line = buffer[line_start..line_end];
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (regexLineMatches(line, predicate.value)) {
+            count += 1;
+            stats.candidate_lines_matched += 1;
+        }
+        last_line_start = line_start;
+    }
+
+    stats.counted_files += 1;
+    return count;
+}
+
+fn regexDecompositionNeedle(pattern: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, pattern, "(?i)")) return null;
+    const fragment = expr.regexDecompositionLiteralCandidate(pattern) orelse return null;
+    if (fragment.len < REGEX_DECOMPOSITION_MIN_LITERAL_LEN) return null;
+    return fragment;
+}
+
+fn lineStartForOffset(buffer: []const u8, offset: usize) usize {
+    var index = @min(offset, buffer.len);
+    while (index > 0 and buffer[index - 1] != '\n') : (index -= 1) {}
+    return index;
+}
+
+fn lineEndForOffset(buffer: []const u8, offset: usize) usize {
+    var index = @min(offset, buffer.len);
+    while (index < buffer.len and buffer[index] != '\n') : (index += 1) {}
+    return index;
+}
+
+fn regexLineMatches(line: []const u8, pattern: []const u8) bool {
+    const column = pcre_regex.column(line, pattern, false) catch
+        regex.column(line, pattern, false);
+    return column != null;
 }
 
 /// Stats-only mode counts matches without retaining hit records.
@@ -3971,6 +4085,67 @@ test "byte shard plan admits word-boundary line kernels" {
 
     const regex_casefold_word = try expr.parse("re:(?i)\\bSherlock Holmes\\b");
     try std.testing.expect(byteShardPlan(regex_casefold_word) == null);
+}
+
+test "regex decomposition fast count verifies mandatory literal candidate lines" {
+    const plan = try expr.parse("re:Sherlock\\s+Holmes");
+    try std.testing.expect(planUsesRegexDecompositionFastCount(plan, false));
+    try std.testing.expectEqualStrings("Sherlock", regexDecompositionNeedle(plan.predicates[0].value).?);
+
+    const buffer =
+        "Sherlock Holmes\n" ++
+        "Sherlock\n" ++
+        "Sherlock    Holmes\n" ++
+        "Holmes Sherlock\n";
+    var stats: core_stats.RegexDecompositionStats = .{};
+    var bailouts: usize = 0;
+    const count = regexDecompositionFastCount(buffer, plan, false, &stats, &bailouts).?;
+    try std.testing.expectEqual(@as(usize, 2), count);
+    try std.testing.expectEqual(@as(usize, 1), stats.eligible_files);
+    try std.testing.expectEqual(@as(usize, 1), stats.counted_files);
+    try std.testing.expectEqual(@as(usize, 4), stats.candidate_lines_checked);
+    try std.testing.expectEqual(@as(usize, 2), stats.candidate_lines_matched);
+    try std.testing.expectEqual(@as(usize, 0), bailouts);
+}
+
+test "search run uses regex decomposition mmap fast count for large stats-only file" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var data = try allocator.alloc(u8, 1024 * 1024 + 128);
+    @memset(data, 'x');
+    data[0] = 'S';
+    data[1] = 'h';
+    data[2] = 'e';
+    data[3] = 'r';
+    data[4] = 'l';
+    data[5] = 'o';
+    data[6] = 'c';
+    data[7] = 'k';
+    data[8] = ' ';
+    data[9] = 'H';
+    data[10] = 'o';
+    data[11] = 'l';
+    data[12] = 'm';
+    data[13] = 'e';
+    data[14] = 's';
+    data[15] = '\n';
+    try tmp.dir.writeFile(io, .{ .sub_path = "large.txt", .data = data });
+
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    var request = testSearchRequest("re:Sherlock\\s+Holmes", root_path);
+    request.stats_only = true;
+    request.threads = 8;
+    const plan = try expr.parse(request.expression);
+    const report = try run(io, allocator, request, plan);
+    try std.testing.expectEqual(@as(usize, 1), report.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), report.stats.regex_decomposition.eligible_files);
+    try std.testing.expectEqual(@as(usize, 1), report.stats.regex_decomposition.counted_files);
+    try std.testing.expectEqual(@as(usize, 1), report.stats.regex_decomposition.candidate_lines_matched);
 }
 
 test "word-boundary byte range counts exact line-owned semantics" {
