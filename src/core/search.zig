@@ -129,6 +129,8 @@ pub const MAX_RETAINED_HITS = 4096;
 const TRIGRAM_MIN_PRUNE_BYTES: usize = 64 * 1024;
 const BYTE_SHARD_MIN_FILE_BYTES: usize = 8 * 1024 * 1024;
 const BYTE_SHARD_MIN_RANGE_BYTES: usize = 4 * 1024 * 1024;
+const BYTE_SHARD_WORD_BOUNDARY_MIN_FILE_BYTES: usize = 1 * 1024 * 1024;
+const BYTE_SHARD_WORD_BOUNDARY_MIN_RANGE_BYTES: usize = 2 * 1024 * 1024;
 const BYTE_SHARD_DEFAULT_MAX_RANGES: usize = 18;
 const BYTE_SHARD_LINE_BOUNDARY_SEARCH_LIMIT: usize = 1024 * 1024;
 const EVIDENCE_FRONTIER_CACHE_MAGIC = "IXEVIDENCE2";
@@ -1996,14 +1998,22 @@ fn tryByteShardFastCount(
     acceleration_bailouts: *usize,
 ) ?usize {
     if (!request.stats_only or request.case_insensitive) return null;
-    if (data.len < BYTE_SHARD_MIN_FILE_BYTES) return null;
     const shard_plan = byteShardPlan(plan) orelse return null;
     if (shard_plan.case_insensitive) return null;
     if (shard_plan.needle.len < 2 or shard_plan.needle.len > data.len) return null;
+    const min_file_bytes: usize = switch (shard_plan.strategy) {
+        .word_boundary_line => BYTE_SHARD_WORD_BOUNDARY_MIN_FILE_BYTES,
+        else => BYTE_SHARD_MIN_FILE_BYTES,
+    };
+    if (data.len < min_file_bytes) return null;
 
     const requested_threads = request.threads orelse defaultByteShardThreadBudget(availableThreads());
     const max_threads = @max(@as(usize, 1), requested_threads);
-    const ranges_by_size = (data.len + BYTE_SHARD_MIN_RANGE_BYTES - 1) / BYTE_SHARD_MIN_RANGE_BYTES;
+    const min_range_bytes: usize = switch (shard_plan.strategy) {
+        .word_boundary_line => BYTE_SHARD_WORD_BOUNDARY_MIN_RANGE_BYTES,
+        else => BYTE_SHARD_MIN_RANGE_BYTES,
+    };
+    const ranges_by_size = (data.len + min_range_bytes - 1) / min_range_bytes;
     const range_count = @min(max_threads, ranges_by_size);
     if (range_count < 2) return null;
 
