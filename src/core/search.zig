@@ -1232,13 +1232,18 @@ const DiscoveryShardReport = struct {
 };
 
 fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) bool {
-    const requested_threads = request.threads orelse return false;
+    const requested_threads = request.threads orelse defaultParallelDiscoveryThreadBudget(request);
     if (requested_threads <= 1) return false;
     if (roots.count == 0) return false;
     for (roots.items[0..roots.count]) |root| {
         if (!root.is_directory) return false;
     }
     return true;
+}
+
+fn defaultParallelDiscoveryThreadBudget(request: cli.SearchRequest) usize {
+    if (!request.stats_only) return 1;
+    return @min(availableThreads(), 8);
 }
 
 fn discoverRootsParallelTopLevel(
@@ -1259,7 +1264,7 @@ fn discoverRootsParallelTopLevel(
     const top_dir_items = top_dirs.mutableItems();
     if (top_dir_items.len == 0) return true;
 
-    const requested_threads = request.threads orelse 1;
+    const requested_threads = request.threads orelse defaultParallelDiscoveryThreadBudget(request);
     const actual_threads = @min(@max(requested_threads, 1), top_dir_items.len);
     if (actual_threads <= 1 or top_dir_items.len < 2) {
         for (top_dir_items) |entry| {
@@ -1751,7 +1756,7 @@ fn scanFileMmap(
 
     if (mono) |m| {
         if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
-            if (!request.case_insensitive and simd.indexOf(data, needle) == null) {
+            if (!request.case_insensitive and sz.indexOf(data, needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
                 shard.scan_work_ms_total += file_ms;
@@ -1806,7 +1811,7 @@ fn scanFileMmap(
     // the entire file, skip per-line processing.
     if (mono) |m| {
         if (chunkPrefilterNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
-            if (!request.case_insensitive and simd.indexOf(data, needle) == null) {
+            if (!request.case_insensitive and sz.indexOf(data, needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
                 shard.scan_work_ms_total += file_ms;
@@ -2281,7 +2286,7 @@ fn scanOpenFileIntoShardImpl(
     }
     if (mono) |m| {
         if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
-            if (!request.case_insensitive and simd.indexOf(read_buffer[0..first_read], needle) == null) {
+            if (!request.case_insensitive and sz.indexOf(read_buffer[0..first_read], needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
                 shard.scan_work_ms_total += file_ms;
@@ -2358,7 +2363,7 @@ fn scanOpenFileIntoShardImpl(
         // then set up the carry buffer for the trailing partial line.
         if (chunk_prefilter_needle) |needle| {
             if (carry.items.len == 0 and !request.case_insensitive and
-                simd.indexOf(chunk, needle) == null)
+                sz.indexOf(chunk, needle) == null)
             {
                 // Fast newline count: count newlines in bulk via SIMD.
                 const newlines = std.mem.count(u8, chunk, "\n");
