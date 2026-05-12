@@ -2,9 +2,9 @@
 
 # IX
 
-**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Admission-bytecode lane. Thread-sharded execution. Exact-verified output.**
+**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Admission-bytecode lane. Warm query-frontier reuse. Thread-sharded execution. Exact-verified output.**
 
-*AVX2 SIMD literal scan · Boolean predicate algebra · Arena-allocated pipeline · Vendored C kernels compiled into one binary*
+*AVX2 SIMD literal scan · Boolean predicate algebra · Generation-pinned warm index · Arena-allocated pipeline · Vendored C kernels compiled into one binary*
 
 ---
 
@@ -41,6 +41,8 @@ IX is a search engine built around one constraint: the fastest path to an exact 
 Literal queries land on the SIMD byte-search path — 32 bytes per cycle through 256-bit vector lanes. Regex patterns with extractable literals bypass the regex engine and hit the SIMD path directly. Full regex patterns compile through PCRE2 10.44 with JIT — the pattern is compiled to native machine code once per thread and reused for every line. AND/OR queries extract mandatory trigram evidence and reject ineligible files before a single line is scanned. File scans shard across threads with thread-local accumulation — zero mutex contention on the hot path.
 
 The first executable admission slice now compiles trigram evidence once per query into a compact rolling membership program and threads that immutable program through the serial, mmap, and worker scan paths. The larger retained architecture lane is still `PathAdmission -> FileAdmissionBytecode -> ByteKernel -> LineVerifier`: reject work before line splitting and before PCRE2, using path predicates, file metadata, PCRE2-proven byte facts, and one-pass trigram evidence.
+
+The second architecture lane is the warm index: a corpus-global `FileCatalog`, generation-pinned trigram postings, live `__ix_indexd` ownership, USN/delta freshness substrate, and query-frontier reuse. When the live marker and current generation are valid, IX can skip discovery, skip full-corpus trigram scans, load the retained candidate frontier, and invoke the canonical verifier only on the surviving files. The verifier still owns correctness; the index only removes impossible work.
 
 > [!NOTE]
 > Acceleration rejects candidates. It never creates matches.
@@ -179,11 +181,14 @@ Each query is classified by shape and routed to the narrowest execution path:
 | Trigram gate | Exact-byte mandatory-trigram rejection; predicate evidence admission — conjunctions (AND) require all evidence groups, disjunctions (OR) fail if any branch is unindexed; candidate files execute a single rolling trigram stream over compiled query membership |
 | Word-boundary byte shard | Stats-only `re:\bLITERAL\b` plans lower to `ByteShardPlan.strategy = word_boundary_literal` for large mmap-backed files. Each shard owns complete newline-aligned logical lines, scans candidates with `simd.indexOf`, verifies exact `\b` boundaries, counts at most one match per owned line, and falls back before risking double counts on long unbounded lines. |
 | Nexus evidence frontier | Public `search` / `matches` launch a hidden `__ix_nexus` sidecar after the foreground report is computed. The sidecar is stats-only, stdout/stderr-silent, no-window on Windows, and writes `.ix-evidence-{key}.cache` only from the background path. Foreground searches never synchronously build the artifact; they consume a validated expression/root/path-set frontier if it already exists and skip redundant sidecar rebuilds after a successful evidence-pruned reuse. |
-| Warm FileCatalog | Internal corpus-global substrate for the next cache generation. It assigns one root fingerprint and deterministic file IDs to path metadata, serializes the catalog as a versioned little-endian binary object, publishes through atomic replacement, and rejects wrong-root, malformed, truncated, or unsorted state before search can observe it. This is not a user-visible mode yet: public search remains cold-path compatible, the verifier still owns correctness, and JSON reports expose `stats.catalog_index` as inactive/fail-closed telemetry until adoption slices wire candidate selection. |
-| Warm trigram postings | First cross-query warm-index primitive. `core/postings.zig` builds a root/generation-pinned trigram-to-FileId segment from catalog file IDs, serializes it as a versioned little-endian object, validates magic/version/root/generation/counts/sortedness/density, lowers expression mandatory evidence into lookup keys, intersects/unions candidate FileIds, and hands selected catalog entries back to the verifier. Unsafe lowering returns `RequiresFullScan`; malformed or wrong-root state is rejected before it can prune candidates. Public search remains cold-path compatible while JSON reports expose inactive `stats.postings_index` counters for candidate/pruned/verified files. |
-| Warm indexd lifecycle | Hidden `__ix_indexd` is the opt-in maintenance-process boundary for the warm layer. Public `search` / `matches` only detach it when `IX_INDEX=1`, `IX_INDEX=true`, or `IX_INDEX=on`, and only for single-root case-sensitive workloads with discovered files. Detached stdio is ignored; foreground bootstrap mode writes `.ix/index/bootstrap.state`, heartbeat state is process-owned and cleaned on return, and a root lock prevents overlapping mutation owners. This is a lifecycle substrate, not yet foreground acceleration: USN deltas and postings adoption remain future slices. |
-| Warm generation refresh | `core/generation.zig` owns search-visible warm-index publication. Segment payloads publish into `.ix/index/generations/<epoch>/`, then atomically refresh `.ix/index/current.ixgen`; foreground readers can pin a complete epoch and malformed, wrong-root, incomplete, or missing current manifests fail closed. `refresh_epoch` means the latest search-visible generation. |
-| Warm compaction ops | Internal compaction and operations hardening are implemented as substrate, not a public acceleration promise. The planner selects small, dense, and tombstoned segments without touching reader-pinned state; compacted generations publish canonical catalog/postings payloads; catalog tombstone folding removes stale file IDs and paths while preserving sorted metadata alignment; generation GC only selects obsolete epochs after current, newest-retained, and reader-pinned epochs are protected. Hidden `__ix_indexd --repair` writes an explicit reconcile marker under `.ix/index/repair.state`, diagnostics render manifest/generation/journal/lock state, and benchmark gates encode cold/index-hot/mutation-hot/fallback acceptance ratios. Foreground search still fails closed to the existing verifier-owned cold path until adoption opens a compatible manifest and proves candidate pruning equivalence. |
+| Warm FileCatalog | Corpus-global warm substrate. It assigns one root fingerprint and deterministic file IDs to path metadata, serializes the catalog as `IXCAT001`, publishes by generation, and rejects wrong-root, malformed, truncated, or unsorted state before search can observe it. The catalog is now a foreground-adoption dependency: warm searches map retained FileIds back through this snapshot, while the canonical verifier still owns match correctness. |
+| Warm trigram postings | Cross-query warm-index primitive. `core/postings.zig` builds a root/generation-pinned trigram-to-FileId segment (`IXPOST01`), validates magic/version/root/generation/counts/sortedness/density, lowers expression mandatory evidence into lookup keys, intersects/unions candidate FileIds, and hands selected catalog entries back to the verifier. Unsafe lowering returns `RequiresFullScan`; malformed or wrong-root state is rejected before it can prune candidates. |
+| Warm indexd lifecycle | Hidden `__ix_indexd` is the maintenance-process boundary for the warm layer. Public `search` / `matches` detach it only when `IX_INDEX=1`, `IX_INDEX=true`, or `IX_INDEX=on`, and only for compatible single-root workloads. Detached stdio is ignored, heartbeat state is process-owned, a root lock prevents overlapping mutation owners, and watch mode writes `index.live` only while the generation owner remains alive. |
+| Warm generation refresh | `core/generation.zig` owns search-visible warm-index publication. Catalog/postings payloads publish into `.ix/index/generations/<epoch>/`, then atomically refresh `.ix/index/current.ixgen`; foreground readers pin a complete epoch and malformed, wrong-root, incomplete, or missing current manifests fail closed. `refresh_status` reports `live_pinned`, `live_query_cache`, or `fallback` in JSON telemetry. |
+| Warm query frontier | Repeated identical warm searches store an epoch-pinned `.ix/index/query/<hash>.ixq` candidate frontier. The first live-index hit pays postings parse/evaluation; the next identical query loads the retained file list directly, reports `generation_refresh.refresh_status="live_query_cache"`, sets `discover_ms=0`, and verifies only cached candidates. |
+| Warm compaction ops | Compaction and operations hardening are implemented under generation ownership. The planner selects small, dense, and tombstoned segments without touching reader-pinned state; compacted generations publish canonical catalog/postings payloads; catalog tombstone folding removes stale file IDs and paths while preserving sorted metadata alignment; generation GC only selects obsolete epochs after current, newest-retained, and reader-pinned epochs are protected. Hidden `__ix_indexd --repair` writes an explicit reconcile marker under `.ix/index/repair.state`, and diagnostics render manifest/generation/journal/lock state. |
+| USN delta substrate | `core/usn.zig` models NTFS/ReFS journal identity, cursor continuity, bounded read batches, record parsing, catalog-reference resolution, delta task mapping, duplicate/rename-storm coalescing, and reconcile escalation on lost cursor, journal wrap, or batch overflow. It is the Windows-first freshness substrate for keeping warm generations current without foreground full-tree stat walks. |
+| Protected cold path | Protected Windows roots now reject volatile stores and non-text protected-root extensions before open, route recoverable open/read failures through structured `access_errors`, and account open latency in `scan_work_ms_total` plus slow-file telemetry. This protects cold searches from blocking on system database/log handles while still returning structured partial status when the OS refuses a file. |
 | Byte kernels | Current hot kernels are Zig `@Vector(32, u8)` and StringZilla AVX2. Planned narrow C shim additions are limited to primitives Zig cannot emit cleanly: `ix_count_byte_avx2`, `ix_ascii_ci_memmem_avx2`, and `ix_trigram_admit_scalar_or_avx2`. |
 | Inspect | Bounded read-only windows, match-context mode, `ix.inspect.*` sentinels, `ix.next.v1` continuation hints for agent pagination |
 | Explain | Structured plan JSON, strategy annotation, proof-program lowering — queries classified as `conjunctive_literal_evidence`, `conjunctive_regex_with_mandatory_evidence`, `disjunctive_byte_evidence`, or `verifier_only` with trigram terms and verifier type |
@@ -200,14 +205,17 @@ Each query is classified by shape and routed to the narrowest execution path:
 - **Dynamic work claiming** — for corpora < 128 files with eligible plans, workers claim files via `@atomicRmw(.Add)` instead of static partitioning. Eliminates tail imbalance when file sizes vary.
 - **`__chkstk` avoidance** — casefold buffers (2 KiB line + 256 B needle) are isolated into separate functions. Keeps hot-path stack frames under 4 KiB, avoiding Windows page-probe overhead on every function entry across 100k+ lines.
 - **Single-shot positional read** — first chunk uses `readPositional` (one syscall) instead of `readPositionalAll` (retry loop). Most source files are < 1 MiB and fit in a single read. File length lookup deferred until the first chunk proves the file exceeds the buffer.
+- **4 KiB prefix probe** — cold protected-tree scans inspect the prefix before escalating to full small-file reads. The already-opened handle is reused for the rest of the stream, avoiding reopen churn while rejecting binary/irrelevant files early.
 - **1 MiB chunk sizing** — chosen to fit in L2/L3 cache so StringZilla SIMD newline scan operates on warm cache lines. Larger buffers risk cache thrashing; smaller ones increase syscall frequency.
 - **Binary sniff** — first 1024 bytes checked for null byte via `sz.indexOfByte`. Binary files skipped before any line processing.
+- **Protected-root admission** — Windows system roots skip volatile database/log stores and non-text protected extensions before open. Recoverable `FileBusy` / access failures become bounded `access_errors` samples and partial status instead of aborting the scan.
 
 ### Design Properties
 
 - The CLI surface is stable. The engine routes dynamically by query shape.
 - Most regex queries are reduced to literal evidence before the verifier runs. The verifier only confirms.
 - Trigram admission gates use boolean predicate algebra to reject files before scan.
+- Warm-index query reuse can collapse repeated searches to a generation-pinned candidate frontier with `discover_ms=0`.
 - `inspect` is agent-native: bounded, read-only, structured, continuable via `ix.next.v1`.
 - Thread-local shard reports eliminate mutex contention. Each thread accumulates its own counters and hit buffers; results merge after join.
 
@@ -414,7 +422,70 @@ Foreground cold search:
     median total: 632.7093 ms
 ```
 
-The evidence frontier is the first invisible sidecar slice, not the final persistent corpus index. It validates the discovered path set and a write-side content epoch before foreground reuse, so stale retained frontiers fail closed instead of producing false negatives after content edits. The current freshness owner uses portable file metadata (`path`, size, inode/file-index, and mtime); the planned NTFS USN journal invalidator remains the next Windows-specific step because it can prove the same epoch boundary without charging a full foreground metadata walk on very large trees.
+The evidence frontier was the first invisible sidecar slice. The stronger current lane is the warm index: catalog + postings + generation manifests + live index owner + query-frontier reuse. The older `.ix-evidence-*` frontier is query-keyed evidence replay; the warm index is corpus-global retained structure that can answer new compatible queries from postings and answer repeated compatible queries from `.ix/index/query/*.ixq`.
+
+Warm indexed query reuse:
+
+```text
+First compatible warm query:
+  IX_INDEX=1 ix-zig search "re:\bPM_RESUME\b" <linux bench corpus> --json --stats-only
+  └─ require .ix/index/index.live
+  └─ pin .ix/index/current.ixgen
+  └─ load IXCAT001 catalog snapshot
+  └─ load IXPOST01 trigram postings
+  └─ lower ExpressionPlan evidence to postings lookup
+  └─ map candidate FileIds back to catalog paths
+  └─ verify only retained files
+  └─ write .ix/index/query/<hash>.ixq
+
+Second identical warm query:
+  └─ load epoch-pinned query frontier
+  └─ discover_ms: 0
+  └─ generation_refresh.refresh_status: live_query_cache
+  └─ catalog_index.fallback_reason: query_cache
+  └─ postings_index.fallback_reason: query_cache
+  └─ verify only cached candidates
+```
+
+2026-05-12 external check on the Linux `re:\bPM_RESUME\b` lane:
+
+```text
+Rust median wall: 736.305 ms
+Zig warm final-hot:
+  wall: 31.7333 ms
+  total: 19.5706 ms
+  discover: 0 ms
+  scan: 19.1637 ms
+  matches: 9
+  pruned: 79031
+  verified: 1
+
+warm indexed speedup:
+  engine time: 37.6x faster than Rust median
+  wall time: 23.8x faster than Rust median
+```
+
+2026-05-12 protected cold-path retention grid from commit `8f32a12`:
+
+```text
+src literal:
+  Zig engine: 3.3019 ms
+  Rust engine: 3.3635 ms
+
+Linux re:\bPM_RESUME\b:
+  Zig wall / engine: 574.291 ms / 566.5181 ms
+  Rust wall / engine: 625.999 ms / 607.3528 ms
+
+en.sample.txt lit:Sherlock Holmes:
+  Zig wall / engine: 32.361 ms / 26.5703 ms
+  Rust wall / engine: 36.277 ms / 29.9065 ms
+
+C:\Windows\System32 rare no-hit:
+  Zig wall / engine: 53.338 ms / 46.0139 ms
+  Rust wall / engine: 259.412 ms / 233.5003 ms
+```
+
+The USN work is now present as a delta-apply substrate, not merely a roadmap item. It models journal identity, cursor continuity, bounded reads, relevant reason masks, record resolution, delta task coalescing, and reconcile escalation. That gives the warm layer a Windows-native path toward freshness without making the foreground search pay a full metadata walk.
 
 Planned full opcode surface:
 
@@ -462,8 +533,12 @@ src/
     args.zig        argv parsing and compatibility lowering
     output.zig      text, JSON, sentinels, help
   core/
+    catalog.zig     warm FileCatalog — root fingerprint, file IDs, metadata, tombstone folding
+    generation.zig  IXGEN001 generation manifests, reader pins, atomic current refresh, compaction/GC planning
+    indexd.zig      hidden warm-index daemon boundary, root lock, heartbeat, live marker, repair diagnostics
     expr.zig        IX expression grammar and strategy classification
     pcre_regex.zig  PCRE2 JIT regex engine (compile-once, match-many)
+    postings.zig    IXPOST01 trigram postings, lookup lowering, FileId candidate selection
     regex.zig       Zig-native backtracking regex (fallback)
     search.zig      scan pipeline — discover, admission, shard, scan, merge, aggregate
     simd.zig        Zig @Vector byte-search kernels
@@ -472,6 +547,7 @@ src/
     stats.zig       telemetry model
     sz.zig          StringZilla Zig wrapper
     corpus.zig      proof-program compilation for explain
+    usn.zig         Windows USN cursor, read-batch parser, delta task mapping, reconcile escalation
 ```
 
 ---

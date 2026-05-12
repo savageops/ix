@@ -74,7 +74,7 @@ pub const ReadUsnJournalDataV1 = extern struct {
 };
 
 pub const FileId128 = extern struct {
-    identifier: [16]u8 = [_]u8{0} ** 16,
+    identifier: [16]u8 = @splat(0),
 };
 
 pub const FileSystemKind = enum(u8) {

@@ -128,7 +128,7 @@ test "indexOfByte — exact 32 bytes" {
 }
 
 test "indexOfByte — longer than 32" {
-    const data = "A" ** 64 ++ "B";
+    const data = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB";
     try std.testing.expectEqual(@as(?usize, 64), indexOfByte(data, 'B'));
 }
 
@@ -164,7 +164,7 @@ test "indexOf — repeated pattern" {
 
 test "indexOf — cross-vector boundary" {
     // Needle starts in the tail region after the last full 32-byte chunk.
-    const data = "X" ** 50 ++ "NEEDLE" ++ "Y" ** 10;
+    const data = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXNEEDLEYYYYYYYYYY";
     try std.testing.expectEqual(@as(?usize, 50), indexOf(data, "NEEDLE"));
 }
 

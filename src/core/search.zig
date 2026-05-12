@@ -18,6 +18,8 @@ const sz = @import("sz.zig");
 
 const windows = std.os.windows;
 const WARM_INDEX_LIVE_MARKER_NAME = "index.live";
+const WARM_INDEX_LIVE_MARKER_MAGIC = "IXINDEX_LIVE1";
+const WARM_INDEX_LIVE_READ_LIMIT = 4096;
 const WARM_INDEX_SEGMENT_READ_LIMIT: usize = 128 * 1024 * 1024;
 const WARM_QUERY_CACHE_MAGIC = "IXQUERY_FRONTIER1";
 const WARM_QUERY_CACHE_READ_LIMIT: usize = 4 * 1024 * 1024;
@@ -383,7 +385,9 @@ fn prepareWarmIndexFrontier(
 
     const marker_path = std.fs.path.join(allocator, &.{ root, ".ix", "index", WARM_INDEX_LIVE_MARKER_NAME }) catch return warmIndexFallback(report, "marker_path_failed");
     defer allocator.free(marker_path);
-    std.Io.Dir.cwd().access(io, marker_path, .{}) catch return warmIndexFallback(report, "no_live_owner");
+    const marker_bytes = std.Io.Dir.cwd().readFileAlloc(io, marker_path, allocator, .limited(WARM_INDEX_LIVE_READ_LIMIT)) catch return warmIndexFallback(report, "no_live_owner");
+    defer allocator.free(marker_bytes);
+    if (!validateWarmIndexLiveMarker(marker_bytes, root)) return warmIndexFallback(report, "invalid_live_owner");
 
     const current_paths = generation.buildGenerationPaths(allocator, root, 1) catch return warmIndexFallback(report, "paths_failed");
     defer current_paths.deinit(allocator);
@@ -461,6 +465,27 @@ fn warmIndexFallback(report: *SearchReport, reason: []const u8) ?[]DiscoveredFil
     report.stats.generation_refresh.fallback_reason = reason;
     report.stats.generation_refresh.refresh_status = "fallback";
     return null;
+}
+
+fn validateWarmIndexLiveMarker(bytes: []const u8, expected_root: []const u8) bool {
+    return validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, true);
+}
+
+fn validateWarmIndexLiveMarkerWithOwnerCheck(bytes: []const u8, expected_root: []const u8, check_owner: bool) bool {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return false, "\r"), WARM_INDEX_LIVE_MARKER_MAGIC)) return false;
+    const pid_line = std.mem.trimEnd(u8, lines.next() orelse return false, "\r");
+    const root_line = std.mem.trimEnd(u8, lines.next() orelse return false, "\r");
+    if (!std.mem.startsWith(u8, pid_line, "pid=")) return false;
+    if (!std.mem.startsWith(u8, root_line, "root=")) return false;
+    const owner_pid = std.fmt.parseInt(usize, pid_line["pid=".len..], 10) catch return false;
+    if (owner_pid == 0) return false;
+    const marker_root = root_line["root=".len..];
+    if (!std.mem.eql(u8, marker_root, expected_root)) return false;
+    if (check_owner and builtin.os.tag == .windows) {
+        if (!processIsAlive(@intCast(owner_pid))) return false;
+    }
+    return true;
 }
 
 fn warmIndexRelativePath(root: []const u8, path: []const u8) []const u8 {
@@ -1642,7 +1667,7 @@ fn scanFileMmap(
     }
 
     if (request.stats_only and shouldRunByteShardBeforeAdmission(plan)) {
-        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats)) |count| {
+        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
@@ -1679,7 +1704,7 @@ fn scanFileMmap(
     // For casefold-literal patterns in stats_only mode, this handles the
     // case-insensitive counting without buffer modification.
     if (request.stats_only) {
-        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats)) |count| {
+        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
@@ -1777,11 +1802,13 @@ fn planUsesRegexDecompositionFastCount(plan: expr.ExpressionPlan, case_insensiti
 const ByteShardStrategy = enum {
     literal_occurrence,
     word_boundary_line,
+    regex_decomposition_line,
 
     fn text(self: ByteShardStrategy) []const u8 {
         return switch (self) {
             .literal_occurrence => "literal",
             .word_boundary_line => "word_boundary_literal",
+            .regex_decomposition_line => "regex_decomposition",
         };
     }
 };
@@ -1789,6 +1816,7 @@ const ByteShardStrategy = enum {
 const ByteShardPlan = struct {
     strategy: ByteShardStrategy,
     needle: []const u8,
+    pattern: []const u8 = "",
     case_insensitive: bool = false,
 };
 
@@ -1806,6 +1834,14 @@ const WordBoundaryRangeCount = struct {
     rejected_candidates: usize = 0,
 };
 
+const RegexDecompositionRangeCount = struct {
+    matches: usize = 0,
+    candidate_lines_checked: usize = 0,
+    duplicate_candidate_hits_skipped: usize = 0,
+    candidate_lines_matched: usize = 0,
+    bailed_out: bool = false,
+};
+
 const ByteShardJob = struct {
     io: std.Io,
     data: []const u8,
@@ -1818,6 +1854,10 @@ const ByteShardJob = struct {
     matches: usize = 0,
     boundary_verified_candidates: usize = 0,
     boundary_rejected_candidates: usize = 0,
+    regex_candidate_lines_checked: usize = 0,
+    regex_duplicate_candidate_hits_skipped: usize = 0,
+    regex_candidate_lines_matched: usize = 0,
+    regex_bailed_out: bool = false,
     elapsed_ns: u64 = 0,
 };
 
@@ -1828,6 +1868,8 @@ fn tryByteShardFastCount(
     plan: expr.ExpressionPlan,
     data: []const u8,
     stats: *core_stats.ByteShardKernelStats,
+    regex_stats: *core_stats.RegexDecompositionStats,
+    acceleration_bailouts: *usize,
 ) ?usize {
     if (!request.stats_only or request.case_insensitive) return null;
     if (data.len < BYTE_SHARD_MIN_FILE_BYTES) return null;
@@ -1882,15 +1924,28 @@ fn tryByteShardFastCount(
     var line_aligned_ranges: usize = 0;
     var boundary_verified_candidates: usize = 0;
     var boundary_rejected_candidates: usize = 0;
+    var regex_candidate_lines_checked: usize = 0;
+    var regex_duplicate_candidate_hits_skipped: usize = 0;
+    var regex_candidate_lines_matched: usize = 0;
     var range_elapsed_total: u64 = 0;
     var max_range_elapsed: u64 = 0;
     for (jobs) |job| {
+        if (job.regex_bailed_out) {
+            if (shard_plan.strategy == .regex_decomposition_line) {
+                regex_stats.bailout_files += 1;
+                acceleration_bailouts.* += 1;
+            }
+            return null;
+        }
         total += job.matches;
         logical_bytes += job.logical_end - job.logical_start;
         widened_bytes += job.widened_end - job.widened_start;
         if (job.line_aligned) line_aligned_ranges += 1;
         boundary_verified_candidates += job.boundary_verified_candidates;
         boundary_rejected_candidates += job.boundary_rejected_candidates;
+        regex_candidate_lines_checked += job.regex_candidate_lines_checked;
+        regex_duplicate_candidate_hits_skipped += job.regex_duplicate_candidate_hits_skipped;
+        regex_candidate_lines_matched += job.regex_candidate_lines_matched;
         range_elapsed_total += job.elapsed_ns;
         max_range_elapsed = @max(max_range_elapsed, job.elapsed_ns);
     }
@@ -1907,6 +1962,15 @@ fn tryByteShardFastCount(
     stats.range_elapsed_ns_total += range_elapsed_total;
     stats.max_range_elapsed_ns = @max(stats.max_range_elapsed_ns, max_range_elapsed);
     stats.matches += total;
+    if (shard_plan.strategy == .regex_decomposition_line) {
+        regex_stats.eligible_files += 1;
+        regex_stats.counted_files += 1;
+        regex_stats.candidate_lines_checked += regex_candidate_lines_checked;
+        regex_stats.duplicate_candidate_hits_skipped += regex_duplicate_candidate_hits_skipped;
+        regex_stats.candidate_lines_matched += regex_candidate_lines_matched;
+        stats.boundary_verified_candidates += regex_candidate_lines_checked;
+        stats.boundary_rejected_candidates += regex_duplicate_candidate_hits_skipped;
+    }
     return total;
 }
 
@@ -1921,6 +1985,14 @@ fn byteShardWorker(job: *ByteShardJob) void {
             job.matches = counted.matches;
             job.boundary_verified_candidates = counted.verified_candidates;
             job.boundary_rejected_candidates = counted.rejected_candidates;
+        },
+        .regex_decomposition_line => {
+            const counted = countRegexDecompositionLogicalLinesRange(job.data, job.plan.needle, job.plan.pattern, job.logical_start, job.logical_end);
+            job.matches = counted.matches;
+            job.regex_candidate_lines_checked = counted.candidate_lines_checked;
+            job.regex_duplicate_candidate_hits_skipped = counted.duplicate_candidate_hits_skipped;
+            job.regex_candidate_lines_matched = counted.candidate_lines_matched;
+            job.regex_bailed_out = counted.bailed_out;
         },
     }
     job.elapsed_ns = @intFromFloat(elapsedMs(job.io, started) * 1_000_000.0);
@@ -1941,9 +2013,52 @@ fn countLiteralLogicalRange(data: []const u8, needle: []const u8, logical_start:
     return total;
 }
 
+fn countRegexDecompositionLogicalLinesRange(
+    data: []const u8,
+    needle: []const u8,
+    pattern: []const u8,
+    logical_start: usize,
+    logical_end: usize,
+) RegexDecompositionRangeCount {
+    if (needle.len == 0 or pattern.len == 0 or logical_start >= logical_end) return .{};
+    const end = @min(logical_end, data.len);
+    var result: RegexDecompositionRangeCount = .{};
+    var search_pos = @min(logical_start, end);
+    var last_line_start: ?usize = null;
+
+    while (search_pos < end) {
+        const relative = simd.indexOf(data[search_pos..end], needle) orelse break;
+        const candidate_start = search_pos + relative;
+        const line_start = lineStartForOffset(data, candidate_start);
+        search_pos = @min(candidate_start + needle.len, end);
+
+        if (line_start < logical_start) continue;
+        if (last_line_start != null and last_line_start.? == line_start) {
+            result.duplicate_candidate_hits_skipped += 1;
+            continue;
+        }
+        if (result.candidate_lines_checked == REGEX_DECOMPOSITION_MAX_CANDIDATE_LINES) {
+            result.bailed_out = true;
+            return result;
+        }
+
+        const line_end = lineEndForOffset(data, candidate_start);
+        result.candidate_lines_checked += 1;
+        const raw_line = data[line_start..line_end];
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        if (regexLineMatches(line, pattern)) {
+            result.matches += 1;
+            result.candidate_lines_matched += 1;
+        }
+        last_line_start = line_start;
+    }
+
+    return result;
+}
+
 fn shouldRunByteShardBeforeAdmission(plan: expr.ExpressionPlan) bool {
     const shard_plan = byteShardPlan(plan) orelse return false;
-    return shard_plan.strategy == .word_boundary_line;
+    return shard_plan.strategy == .word_boundary_line or shard_plan.strategy == .regex_decomposition_line;
 }
 
 fn byteShardPlan(plan: expr.ExpressionPlan) ?ByteShardPlan {
@@ -1966,6 +2081,14 @@ fn byteShardPlan(plan: expr.ExpressionPlan) ?ByteShardPlan {
                     .needle = body,
                 } else null;
             },
+            .regex_decomposition_candidate_lines => blk: {
+                const needle = regexDecompositionNeedle(predicate.value) orelse break :blk null;
+                break :blk .{
+                    .strategy = .regex_decomposition_line,
+                    .needle = needle,
+                    .pattern = predicate.value,
+                };
+            },
             else => null,
         },
         else => null,
@@ -1984,6 +2107,7 @@ fn byteShardRangeFor(data: []const u8, plan: ByteShardPlan, logical_start: usize
             };
         },
         .word_boundary_line => byteShardLineOwnedRange(data, logical_start, logical_end, index, range_count),
+        .regex_decomposition_line => byteShardLineOwnedRange(data, logical_start, logical_end, index, range_count),
     };
 }
 
@@ -2742,10 +2866,10 @@ const TrigramAdmissionProgram = struct {
     mode: trigram.AdmissionMode = .all,
     group_count: usize = 0,
     group_complete_mask: u64 = 0,
-    required_counts: [trigram.MAX_GROUPS]u8 = [_]u8{0} ** trigram.MAX_GROUPS,
-    keys: [TRIGRAM_ADMISSION_CAPACITY]trigram.Trigram = [_]trigram.Trigram{0} ** TRIGRAM_ADMISSION_CAPACITY,
-    group_masks: [TRIGRAM_ADMISSION_CAPACITY]u64 = [_]u64{0} ** TRIGRAM_ADMISSION_CAPACITY,
-    occupied: [TRIGRAM_ADMISSION_CAPACITY]bool = [_]bool{false} ** TRIGRAM_ADMISSION_CAPACITY,
+    required_counts: [trigram.MAX_GROUPS]u8 = @splat(0),
+    keys: [TRIGRAM_ADMISSION_CAPACITY]trigram.Trigram = @splat(0),
+    group_masks: [TRIGRAM_ADMISSION_CAPACITY]u64 = @splat(0),
+    occupied: [TRIGRAM_ADMISSION_CAPACITY]bool = @splat(false),
 
     fn compile(admission: trigram.Admission) TrigramAdmissionProgram {
         var program = TrigramAdmissionProgram{
@@ -2769,8 +2893,8 @@ const TrigramAdmissionProgram = struct {
         if (!self.eligible) return true;
         if (bytes.len < 3) return false;
 
-        var seen_slots = [_]bool{false} ** TRIGRAM_ADMISSION_CAPACITY;
-        var group_seen_counts = [_]u8{0} ** trigram.MAX_GROUPS;
+        var seen_slots: [TRIGRAM_ADMISSION_CAPACITY]bool = @splat(false);
+        var group_seen_counts: [trigram.MAX_GROUPS]u8 = @splat(0);
         var satisfied_groups: u64 = 0;
         var rolling: trigram.Trigram = trigram.key(bytes[0..3]);
         if (self.recordTrigram(rolling, &seen_slots, &group_seen_counts, &satisfied_groups)) return true;
@@ -3531,6 +3655,8 @@ fn cachedLiteralFragment(pattern: []const u8) []const u8 {
 ///   `\d{4}-\d{2}`    → `-`  (short — caller applies ≥2 byte threshold)
 ///   `.*`             → ``   (empty — no literals)
 fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
+    if (hasTopLevelRegexAlternation(pattern)) return "";
+
     var best_start: usize = 0;
     var best_len: usize = 0;
     var run_start: usize = 0;
@@ -3628,6 +3754,33 @@ fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
     }
 
     return pattern[best_start .. best_start + best_len];
+}
+
+fn hasTopLevelRegexAlternation(pattern: []const u8) bool {
+    var class_depth = false;
+    var group_depth: usize = 0;
+    var i: usize = 0;
+    while (i < pattern.len) : (i += 1) {
+        const byte = pattern[i];
+        if (byte == '\\') {
+            if (i + 1 < pattern.len) i += 1;
+            continue;
+        }
+        if (class_depth) {
+            if (byte == ']') class_depth = false;
+            continue;
+        }
+        switch (byte) {
+            '[' => class_depth = true,
+            '(' => group_depth += 1,
+            ')' => {
+                if (group_depth > 0) group_depth -= 1;
+            },
+            '|' => if (group_depth == 0) return true,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn isRegexMetaChar(byte: u8) bool {
@@ -4038,6 +4191,37 @@ test "file admission needle lowers only contract-safe predicate shapes" {
     try std.testing.expect(fileAdmissionNeedle(.regex, .regex_full, full_plan.predicates[0]) == null);
 }
 
+test "warm index live marker validates magic pid and root" {
+    const marker = "IXINDEX_LIVE1\npid=1234\nroot=C:/repo\n";
+    try std.testing.expect(validateWarmIndexLiveMarkerWithOwnerCheck(marker, "C:/repo", false));
+    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck("BROKEN\npid=1234\nroot=C:/repo\n", "C:/repo", false));
+    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck("IXINDEX_LIVE1\npid=0\nroot=C:/repo\n", "C:/repo", false));
+    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck("IXINDEX_LIVE1\npid=abc\nroot=C:/repo\n", "C:/repo", false));
+    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck(marker, "D:/repo", false));
+}
+
+test "warm index live marker rejects dead Windows owner" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const marker = "IXINDEX_LIVE1\npid=999999\nroot=C:/repo\n";
+    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck(marker, "C:/repo", true));
+}
+
+test "regex prefilter does not reject top-level alternation branch literals" {
+    try std.testing.expectEqualStrings("", cachedLiteralFragment("[A-Z]+error_log|WARN"));
+    try std.testing.expectEqual(@as(?usize, 1), regexWithLiteralPrefilter("WARN", "[A-Z]+error_log|WARN", false));
+    try std.testing.expectEqual(@as(?usize, 1), regexWithLiteralPrefilter("XXerror_log", "[A-Z]+error_log|WARN", false));
+}
+
+test "regex prefilter still extracts mandatory non-alternation literal" {
+    try std.testing.expectEqualStrings("error_log", cachedLiteralFragment("[A-Z]+error_log"));
+    try std.testing.expect(regexWithLiteralPrefilter("WARN", "[A-Z]+error_log", false) == null);
+}
+
+test "empty line regex preserves zero-width anchor semantics" {
+    try std.testing.expectEqual(@as(?usize, 1), regexWithLiteralPrefilter("", "^$", false));
+    try std.testing.expectEqual(@as(usize, 1), countRegexWithPrefilter("", "^$", false));
+}
+
 test "whole buffer word-boundary literal counts matching lines" {
     const buffer =
         "PM_RESUME once PM_RESUME twice\n" ++
@@ -4083,6 +4267,12 @@ test "byte shard plan admits word-boundary line kernels" {
     try std.testing.expectEqual(ByteShardStrategy.word_boundary_line, word.strategy);
     try std.testing.expectEqualStrings("Sherlock Holmes", word.needle);
 
+    const regex_decomposed = try expr.parse("re:Sherlock\\s+Holmes");
+    const decomposed = byteShardPlan(regex_decomposed).?;
+    try std.testing.expectEqual(ByteShardStrategy.regex_decomposition_line, decomposed.strategy);
+    try std.testing.expectEqualStrings("Sherlock", decomposed.needle);
+    try std.testing.expectEqualStrings("Sherlock\\s+Holmes", decomposed.pattern);
+
     const regex_casefold_word = try expr.parse("re:(?i)\\bSherlock Holmes\\b");
     try std.testing.expect(byteShardPlan(regex_casefold_word) == null);
 }
@@ -4108,6 +4298,27 @@ test "regex decomposition fast count verifies mandatory literal candidate lines"
     try std.testing.expectEqual(@as(usize, 0), bailouts);
 }
 
+test "regex decomposition byte ranges preserve line-owned candidate counts" {
+    const pattern = "Sherlock\\s+Holmes";
+    const needle = regexDecompositionNeedle(pattern).?;
+    const buffer =
+        "Sherlock Holmes\n" ++
+        "Sherlock\n" ++
+        "Sherlock    Holmes\n" ++
+        "Holmes Sherlock\n" ++
+        "Sherlock Holmes again";
+    const expected = countRegexDecompositionLogicalLinesRange(buffer, needle, pattern, 0, buffer.len);
+    const seams = [_]usize{ 1, 9, 17, 31, 44, buffer.len - 1 };
+    for (seams) |seam| {
+        const left_end = findOwnedLineBoundaryAfter(buffer, seam) orelse buffer.len;
+        const left = countRegexDecompositionLogicalLinesRange(buffer, needle, pattern, 0, left_end);
+        const right = countRegexDecompositionLogicalLinesRange(buffer, needle, pattern, left_end, buffer.len);
+        try std.testing.expectEqual(expected.matches, left.matches + right.matches);
+        try std.testing.expectEqual(expected.candidate_lines_checked, left.candidate_lines_checked + right.candidate_lines_checked);
+        try std.testing.expectEqual(expected.candidate_lines_matched, left.candidate_lines_matched + right.candidate_lines_matched);
+    }
+}
+
 test "search run uses regex decomposition mmap fast count for large stats-only file" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -4116,8 +4327,12 @@ test "search run uses regex decomposition mmap fast count for large stats-only f
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var data = try allocator.alloc(u8, 1024 * 1024 + 128);
+    var data = try allocator.alloc(u8, 9 * 1024 * 1024);
     @memset(data, 'x');
+    var newline_pos: usize = 79;
+    while (newline_pos < data.len) : (newline_pos += 80) {
+        data[newline_pos] = '\n';
+    }
     data[0] = 'S';
     data[1] = 'h';
     data[2] = 'e';
@@ -4146,6 +4361,8 @@ test "search run uses regex decomposition mmap fast count for large stats-only f
     try std.testing.expectEqual(@as(usize, 1), report.stats.regex_decomposition.eligible_files);
     try std.testing.expectEqual(@as(usize, 1), report.stats.regex_decomposition.counted_files);
     try std.testing.expectEqual(@as(usize, 1), report.stats.regex_decomposition.candidate_lines_matched);
+    try std.testing.expect(report.stats.byte_shard_kernel.enabled);
+    try std.testing.expectEqualStrings("regex_decomposition", report.stats.byte_shard_kernel.strategy);
 }
 
 test "word-boundary byte range counts exact line-owned semantics" {
@@ -4418,7 +4635,8 @@ test "search run consumes live warm postings and scans only candidate files" {
     const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = "IXINDEX_LIVE1\n" });
+    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
     var request = testSearchRequest("lit:needle", root_path);
     request.index_enabled = true;

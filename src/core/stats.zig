@@ -225,7 +225,7 @@ pub const AccessErrorStats = struct {
     file_open: usize = 0,
     file_read: usize = 0,
     sample_count: usize = 0,
-    samples: [8]AccessErrorSample = [_]AccessErrorSample{.{}} ** 8,
+    samples: [8]AccessErrorSample = @splat(.{}),
 
     pub fn record(self: *AccessErrorStats, phase: []const u8, operation: []const u8, path: []const u8, err: anyerror) void {
         self.total += 1;
@@ -319,7 +319,7 @@ pub const SearchStats = struct {
     fallback_line_scan: ?FallbackLineScanStats = null,
     timings: PhaseTimings = .{},
     concurrency: ConcurrencyStats = .{},
-    slowest_files: [5]SlowFileStat = [_]SlowFileStat{.{}} ** 5,
+    slowest_files: [5]SlowFileStat = @splat(.{}),
     slowest_file_count: usize = 0,
 
     pub fn recordSlowFile(self: *SearchStats, path: []const u8, duration_ms: f64, bytes: usize, linux_dominant_target: bool) void {
