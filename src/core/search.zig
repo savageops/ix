@@ -21,6 +21,7 @@ const WARM_INDEX_LIVE_MARKER_NAME = "index.live";
 const WARM_INDEX_SEGMENT_READ_LIMIT: usize = 128 * 1024 * 1024;
 const WARM_QUERY_CACHE_MAGIC = "IXQUERY_FRONTIER1";
 const WARM_QUERY_CACHE_READ_LIMIT: usize = 4 * 1024 * 1024;
+const BINARY_SNIFF_BYTES: usize = 4 * 1024;
 
 extern "kernel32" fn ReadDirectoryChangesW(
     hDirectory: windows.HANDLE,
@@ -1319,6 +1320,71 @@ fn isRecoverableScanAccessError(err: anyerror) bool {
     };
 }
 
+fn shouldSkipProtectedBinaryContainer(request: cli.SearchRequest, path: []const u8) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    if (!request.stats_only) return false;
+    if (!isProtectedWindowsPath(path)) return false;
+    if (isProtectedVolatileSystemStore(path)) return true;
+    const ext = pathExtension(path) orelse return false;
+    return !hasProtectedTextExtension(ext);
+}
+
+fn isProtectedWindowsPath(path: []const u8) bool {
+    if (path.len < "C:\\Windows".len) return false;
+    if (path[1] != ':') return false;
+    const slash = path[2];
+    if (slash != '\\' and slash != '/') return false;
+    if (!std.ascii.eqlIgnoreCase(path[3..10], "Windows")) return false;
+    if (path.len == 10) return true;
+    return path[10] == '\\' or path[10] == '/';
+}
+
+fn pathExtension(path: []const u8) ?[]const u8 {
+    var base_start = path.len;
+    while (base_start > 0) {
+        base_start -= 1;
+        if (path[base_start] == '\\' or path[base_start] == '/') {
+            base_start += 1;
+            break;
+        }
+    }
+    const name = path[base_start..];
+    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
+    return name[dot_index..];
+}
+
+fn hasProtectedTextExtension(ext: []const u8) bool {
+    const text_extensions = [_][]const u8{
+        ".inf", ".inf_loc", ".mof", ".man", ".cdxml", ".ps1xml", ".log",
+        ".ini", ".psd1", ".xml", ".psm1", ".yaml", ".yml", ".xsd", ".msc",
+        ".gpd", ".strings", ".forms", ".rtf", ".dis", ".txt", ".json",
+        ".xsl", ".rs", ".gdl", ".vbs", ".table", ".hlp", ".cfg", ".dic",
+        ".1", ".ppd",
+    };
+    for (text_extensions) |candidate| {
+        if (std.ascii.eqlIgnoreCase(ext, candidate)) return true;
+    }
+    return false;
+}
+
+fn isProtectedVolatileSystemStore(path: []const u8) bool {
+    return containsPathSegmentPairIgnoreCase(path, "System32", "catroot2");
+}
+
+fn containsPathSegmentPairIgnoreCase(path: []const u8, first: []const u8, second: []const u8) bool {
+    var segments = std.mem.tokenizeAny(u8, path, "\\/");
+    var saw_first = false;
+    while (segments.next()) |segment| {
+        if (!saw_first) {
+            saw_first = std.ascii.eqlIgnoreCase(segment, first);
+            continue;
+        }
+        if (std.ascii.eqlIgnoreCase(segment, second)) return true;
+        saw_first = std.ascii.eqlIgnoreCase(segment, first);
+    }
+    return false;
+}
+
 /// Thread-local shard report. Each worker thread accumulates results here
 /// without any synchronization. Merged into the main SearchReport after
 /// all threads join.
@@ -1411,15 +1477,34 @@ fn scanDiscoveredFile(
     trigram_program: *const TrigramAdmissionProgram,
     report: *SearchReport,
 ) anyerror!void {
+    if (shouldSkipProtectedBinaryContainer(request, display_path)) {
+        report.files_skipped += 1;
+        return;
+    }
+    const open_started = std.Io.Timestamp.now(io, .awake);
     // Open via NT object path to bypass RtlGetFullPathName_U PEB lock contention.
     const file = openFileNt(io, display_path) catch |err| switch (err) {
         error.IsDir => {
+            const open_ms = elapsedMs(io, open_started);
+            report.scan_work_ms_total += open_ms;
+            if (open_ms >= report.slowest_ms) {
+                report.slowest_ms = open_ms;
+                report.slowest_path = display_path;
+                report.slowest_bytes = 0;
+            }
             report.files_skipped += 1;
             recordReportAccessError(report, "scan", "open_file", display_path, err);
             return;
         },
         else => {
             if (isRecoverableScanAccessError(err)) {
+                const open_ms = elapsedMs(io, open_started);
+                report.scan_work_ms_total += open_ms;
+                if (open_ms >= report.slowest_ms) {
+                    report.slowest_ms = open_ms;
+                    report.slowest_path = display_path;
+                    report.slowest_bytes = 0;
+                }
                 report.files_skipped += 1;
                 recordReportAccessError(report, "scan", "open_file", display_path, err);
                 return;
@@ -1427,6 +1512,13 @@ fn scanDiscoveredFile(
             return err;
         },
     };
+    const open_ms = elapsedMs(io, open_started);
+    report.scan_work_ms_total += open_ms;
+    if (open_ms >= report.slowest_ms) {
+        report.slowest_ms = open_ms;
+        report.slowest_path = display_path;
+        report.slowest_bytes = 0;
+    }
     defer file.close(io);
     scanOpenFile(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, report) catch |err| switch (err) {
         else => {
@@ -1449,12 +1541,32 @@ fn scanFileIntoShard(
     trigram_program: *const TrigramAdmissionProgram,
     shard: *ShardReport,
 ) void {
+    if (shouldSkipProtectedBinaryContainer(request, display_path)) {
+        shard.files_skipped += 1;
+        recordEvidenceSkipped(shard);
+        return;
+    }
+    const open_started = std.Io.Timestamp.now(io, .awake);
     const file = openFileNt(io, display_path) catch |err| {
+        const open_ms = elapsedMs(io, open_started);
+        shard.scan_work_ms_total += open_ms;
+        if (open_ms >= shard.slowest_ms) {
+            shard.slowest_ms = open_ms;
+            shard.slowest_path = display_path;
+            shard.slowest_bytes = 0;
+        }
         shard.files_skipped += 1;
         recordShardAccessError(shard, "scan", "open_file", display_path, err);
         recordEvidenceSkipped(shard);
         return;
     };
+    const open_ms = elapsedMs(io, open_started);
+    shard.scan_work_ms_total += open_ms;
+    if (open_ms >= shard.slowest_ms) {
+        shard.slowest_ms = open_ms;
+        shard.slowest_path = display_path;
+        shard.slowest_bytes = 0;
+    }
     defer file.close(io);
     scanOpenFileIntoShard(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch |err| {
         if (isRecoverableScanAccessError(err)) {
@@ -1899,9 +2011,12 @@ fn scanOpenFileIntoShardImpl(
 
     var read_buffer: [1024 * 1024]u8 = undefined;
 
-    // Read first chunk before length lookup. Single-shot positional read avoids
-    // the retry syscall that readPositionalAll pays on sub-1MiB files.
-    const first_read = try file.readPositional(io, &.{&read_buffer}, 0);
+    // Binary-heavy protected trees should not pay a 1 MiB read before skip.
+    // Probe a small prefix first; escalate only for text candidates.
+    var first_read = file.readStreaming(io, &.{read_buffer[0..BINARY_SNIFF_BYTES]}) catch |err| switch (err) {
+        error.EndOfStream => 0,
+        else => return err,
+    };
     if (first_read == 0) {
         shard.files_scanned += 1;
         recordLineIntoShardImpl(mono, allocator, display_path, "", 1, request, plan, shard, false);
@@ -1916,7 +2031,18 @@ fn scanOpenFileIntoShardImpl(
         recordEvidenceSkipped(shard);
         return;
     }
-    const single_chunk = first_read < read_buffer.len;
+    const file_bytes: usize = @intCast(try file.length(io));
+    if (file_bytes > first_read and file_bytes <= read_buffer.len) {
+        while (first_read < file_bytes) {
+            const read_len = file.readStreaming(io, &.{read_buffer[first_read..file_bytes]}) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            if (read_len == 0) break;
+            first_read += read_len;
+        }
+    }
+    const single_chunk = file_bytes <= first_read;
 
     // Multi-chunk files (> 1 MiB): switch to mmap for zero-copy access.
     // Eliminates the carry buffer, multi-read loop, and per-chunk syscalls.
@@ -1925,8 +2051,6 @@ fn scanOpenFileIntoShardImpl(
         scanFileMmap(mono, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard, file_started) catch break :mmap;
         return;
     }
-
-    const file_bytes: usize = if (single_chunk) first_read else @intCast(try file.length(io));
 
     shard.files_scanned += 1;
     shard.bytes_scanned += file_bytes;
@@ -2212,12 +2336,32 @@ fn monoDynamicLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Alloc
 
 /// Monomorphized file opener — calls scanOpenFileIntoShardImpl with comptime mono.
 fn scanFileIntoShardMono(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, display_path: []const u8, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    if (shouldSkipProtectedBinaryContainer(request, display_path)) {
+        shard.files_skipped += 1;
+        recordEvidenceSkipped(shard);
+        return;
+    }
+    const open_started = std.Io.Timestamp.now(io, .awake);
     const file = openFileNt(io, display_path) catch |err| {
+        const open_ms = elapsedMs(io, open_started);
+        shard.scan_work_ms_total += open_ms;
+        if (open_ms >= shard.slowest_ms) {
+            shard.slowest_ms = open_ms;
+            shard.slowest_path = display_path;
+            shard.slowest_bytes = 0;
+        }
         shard.files_skipped += 1;
         recordShardAccessError(shard, "scan", "open_file", display_path, err);
         recordEvidenceSkipped(shard);
         return;
     };
+    const open_ms = elapsedMs(io, open_started);
+    shard.scan_work_ms_total += open_ms;
+    if (open_ms >= shard.slowest_ms) {
+        shard.slowest_ms = open_ms;
+        shard.slowest_path = display_path;
+        shard.slowest_bytes = 0;
+    }
     defer file.close(io);
     scanOpenFileIntoShardImpl(mono, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch |err| {
         if (isRecoverableScanAccessError(err)) {
@@ -4120,6 +4264,25 @@ test "search run consumes live warm postings and scans only candidate files" {
     try std.testing.expectEqualStrings("live_query_cache", cached_report.stats.generation_refresh.refresh_status);
     try std.testing.expectEqual(@as(usize, 1), cached_report.files_scanned);
     try std.testing.expectEqual(@as(usize, 1), cached_report.matches_found);
+}
+
+test "protected Windows stats-only binary container skip stays scoped" {
+    var request = testSearchRequest("lit:needle", "C:\\Windows\\System32");
+    request.stats_only = true;
+
+    if (builtin.os.tag == .windows) {
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:/Windows/System32/catroot/example.cat"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\en-US\\shell32.dll.mui"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\catroot2\\edbtmp.log"));
+        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\DriverStore\\sample.inf"));
+        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\drivers\\etc\\hosts"));
+        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "E:\\repo\\fake.dll"));
+        request.stats_only = false;
+        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
+    } else {
+        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
+    }
 }
 
 fn candidateFromDiscovered(files: []const DiscoveredFile) ?DiscoveredFile {
