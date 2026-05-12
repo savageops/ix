@@ -1067,6 +1067,20 @@ fn recordReportAccessError(report: *SearchReport, phase: []const u8, operation: 
     report.stats.access_errors.record(phase, operation, path, err);
 }
 
+fn isRecoverableScanAccessError(err: anyerror) bool {
+    return switch (err) {
+        error.AccessDenied,
+        error.FileBusy,
+        error.FileLocksNotSupported,
+        error.SharingViolation,
+        error.FileNotFound,
+        error.ProcessFdQuotaExceeded,
+        error.SystemFdQuotaExceeded,
+        => true,
+        else => false,
+    };
+}
+
 /// Thread-local shard report. Each worker thread accumulates results here
 /// without any synchronization. Merged into the main SearchReport after
 /// all threads join.
@@ -1161,21 +1175,28 @@ fn scanDiscoveredFile(
 ) anyerror!void {
     // Open via NT object path to bypass RtlGetFullPathName_U PEB lock contention.
     const file = openFileNt(io, display_path) catch |err| switch (err) {
-        error.IsDir, error.AccessDenied => {
+        error.IsDir => {
             report.files_skipped += 1;
             recordReportAccessError(report, "scan", "open_file", display_path, err);
             return;
         },
-        else => return err,
+        else => {
+            if (isRecoverableScanAccessError(err)) {
+                report.files_skipped += 1;
+                recordReportAccessError(report, "scan", "open_file", display_path, err);
+                return;
+            }
+            return err;
+        },
     };
     defer file.close(io);
     scanOpenFile(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, report) catch |err| switch (err) {
-        error.AccessDenied => {
+        else => {
+            if (!isRecoverableScanAccessError(err)) return err;
             report.files_skipped += 1;
             recordReportAccessError(report, "scan", "read_file", display_path, err);
             return;
         },
-        else => return err,
     };
 }
 
@@ -1198,7 +1219,7 @@ fn scanFileIntoShard(
     };
     defer file.close(io);
     scanOpenFileIntoShard(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch |err| {
-        if (err == error.AccessDenied) {
+        if (isRecoverableScanAccessError(err)) {
             shard.files_skipped += 1;
             recordShardAccessError(shard, "scan", "read_file", display_path, err);
             recordEvidenceSkipped(shard);
@@ -1961,7 +1982,7 @@ fn scanFileIntoShardMono(comptime mono: MonoSpec, io: std.Io, allocator: std.mem
     };
     defer file.close(io);
     scanOpenFileIntoShardImpl(mono, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch |err| {
-        if (err == error.AccessDenied) {
+        if (isRecoverableScanAccessError(err)) {
             shard.files_skipped += 1;
             recordShardAccessError(shard, "scan", "read_file", display_path, err);
             recordEvidenceSkipped(shard);

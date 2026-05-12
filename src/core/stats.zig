@@ -399,10 +399,12 @@ test "access errors record bounded partial-search diagnostics" {
     var snapshot = SearchStats{};
     snapshot.access_errors.record("discovery", "open_dir", "C:/locked", error.AccessDenied);
     snapshot.access_errors.record("scan", "open_file", "C:/locked/file.txt", error.AccessDenied);
-    try std.testing.expectEqual(@as(usize, 2), snapshot.access_errors.total);
+    snapshot.access_errors.record("scan", "open_file", "C:/locked/busy.dll", error.FileBusy);
+    try std.testing.expectEqual(@as(usize, 3), snapshot.access_errors.total);
     try std.testing.expectEqual(@as(usize, 2), snapshot.access_errors.access_denied);
     try std.testing.expectEqual(@as(usize, 1), snapshot.access_errors.discovery);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.access_errors.scan);
-    try std.testing.expectEqual(@as(usize, 2), snapshot.access_errors.sample_count);
+    try std.testing.expectEqual(@as(usize, 2), snapshot.access_errors.scan);
+    try std.testing.expectEqual(@as(usize, 3), snapshot.access_errors.sample_count);
     try std.testing.expectEqualStrings("open_dir", snapshot.access_errors.samples[0].operation);
+    try std.testing.expectEqualStrings("FileBusy", snapshot.access_errors.samples[2].error_name);
 }
