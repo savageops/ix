@@ -1245,7 +1245,7 @@ fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) 
 
 fn defaultParallelDiscoveryThreadBudget(request: cli.SearchRequest) usize {
     if (!request.stats_only) return 1;
-    return @min(availableThreads(), 8);
+    return @min(availableThreads(), 16);
 }
 
 fn discoverRootsParallelTopLevel(
@@ -1277,7 +1277,7 @@ fn discoverRootsParallelTopLevel(
 
     const shards = try allocator.alloc(DiscoveryShardReport, actual_threads);
     for (shards) |*shard| {
-        shard.* = .{ .file_list = try FileList.initWithCapacity(allocator, 512) };
+        shard.* = .{ .file_list = try FileList.initWithCapacity(allocator, 8192) };
     }
 
     var next_dir: usize = 0;
