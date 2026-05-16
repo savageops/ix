@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const path_admission = @import("admission.zig");
 const cli = @import("../cli/args.zig");
 const catalog = @import("catalog.zig");
 const expr = @import("expr.zig");
@@ -243,6 +244,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     const trigram_admission = trigram.admit(plan);
     const trigram_program = TrigramAdmissionProgram.compile(trigram_admission);
     initTrigramStats(&report.stats.trigram_acceleration, trigram_admission, request.case_insensitive);
+    report.stats.admission.enabled = !request.no_ignore;
 
     if (prepareWarmIndexFrontier(io, allocator, request, plan, &report)) |active_files| {
         try scanPreparedFiles(io, allocator, active_files, request, plan, trigram_admission, &trigram_program, &report);
@@ -261,9 +263,15 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     // Phase 1: Discover all files via serial directory walk.
     const discover_started = std.Io.Timestamp.now(io, .awake);
     var file_list = try FileList.initWithCapacity(allocator, 512);
+    var admission_engine = path_admission.Engine.init(allocator, !request.no_ignore);
+    for (request.ignore_files[0..request.ignore_file_count]) |ignore_file| {
+        if (try admission_engine.loadExternalIgnoreFile(io, ignore_file)) {
+            report.stats.admission.ignore_files_loaded += 1;
+        }
+    }
     if (!try discoverRootsParallelTopLevel(io, allocator, roots, request, &file_list, &report)) {
         for (roots.items[0..roots.count]) |root| {
-            try discoverFiles(io, allocator, root.original, request, &file_list, &report);
+            try discoverFiles(io, allocator, root.original, request, &admission_engine, &file_list, &report);
         }
     }
     report.discover_ms = elapsedMs(io, discover_started);
@@ -786,6 +794,7 @@ fn prepareEvidenceFrontier(
 ) EvidenceFrontierPrepared {
     if (request.nexus_disabled) return .{};
     if (!evidenceFrontierEligible(request, plan, admission)) return .{};
+    if (!request.nexus_build) return .{};
     const signature = computeDiscoveredSignature(io, files) catch return .{};
     const key = evidenceFrontierKey(request, plan);
     const cache_path = std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key}) catch return .{};
@@ -1154,17 +1163,18 @@ fn discoverFiles(
     allocator: std.mem.Allocator,
     path: []const u8,
     request: cli.SearchRequest,
+    admission_engine: *path_admission.Engine,
     file_list: *FileList,
     report: *SearchReport,
 ) anyerror!void {
     // Try opening as a file first. If it's a directory, recurse.
     const file = std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false }) catch |file_err| switch (file_err) {
         error.IsDir => {
-            try discoverDirectory(io, allocator, path, request, file_list, report);
+            try discoverDirectory(io, allocator, path, request, admission_engine, file_list, report);
             return;
         },
         error.AccessDenied => {
-            discoverDirectory(io, allocator, path, request, file_list, report) catch |dir_err| switch (dir_err) {
+            discoverDirectory(io, allocator, path, request, admission_engine, file_list, report) catch |dir_err| switch (dir_err) {
                 error.AccessDenied, error.NotDir => {
                     recordReportAccessError(report, "discovery", "open_file", path, file_err);
                     report.files_skipped += 1;
@@ -1177,6 +1187,7 @@ fn discoverFiles(
     };
     file.close(io);
     report.files_discovered += 1;
+    report.stats.admission.explicit_files_included += 1;
     const display_path = try normalizeDisplayPath(allocator, path);
     try file_list.append(allocator, .{ .path = display_path });
 }
@@ -1186,17 +1197,14 @@ fn discoverDirectory(
     allocator: std.mem.Allocator,
     path: []const u8,
     request: cli.SearchRequest,
+    admission_engine: *path_admission.Engine,
     file_list: *FileList,
     report: *SearchReport,
 ) anyerror!void {
-    const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
-        error.AccessDenied => {
-            recordReportAccessError(report, "discovery", "open_dir", path, err);
-            report.files_skipped += 1;
-            return;
-        },
-        else => return err,
-    };
+    const mark = admission_engine.checkpoint();
+    defer admission_engine.restore(mark);
+
+    const dir = try openDiscoveryDir(io, path, report) orelse return;
     defer dir.close(io);
     var iterator = dir.iterate();
     while (true) {
@@ -1211,18 +1219,95 @@ fn discoverDirectory(
         const entry = maybe_entry orelse break;
         if (!request.hidden and isHiddenPath(entry.name)) {
             report.files_skipped += 1;
+            recordDiscoveryAdmissionSkip(io, report, path, entry.name, entry.kind == .file, "hidden");
             continue;
         }
         const child_path = try joinPathForward(allocator, path, entry.name);
+        if (admission_engine.decide(child_path, entry.kind == .directory) == .ignore) {
+            report.files_skipped += 1;
+            recordDiscoveryAdmissionSkipPath(io, report, child_path, entry.kind == .file, "ignored");
+            continue;
+        }
         switch (entry.kind) {
             .file => {
                 report.files_discovered += 1;
                 try file_list.append(allocator, .{ .path = child_path });
             },
-            .directory => try discoverDirectory(io, allocator, child_path, request, file_list, report),
+            .directory => try discoverDirectory(io, allocator, child_path, request, admission_engine, file_list, report),
             else => {},
         }
     }
+}
+
+fn openDiscoveryDir(io: std.Io, path: []const u8, report: *SearchReport) anyerror!?std.Io.Dir {
+    return std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.AccessDenied => {
+            recordReportAccessError(report, "discovery", "open_dir", path, err);
+            report.files_skipped += 1;
+            return null;
+        },
+        else => return err,
+    };
+}
+
+fn recordDiscoveryAdmissionSkip(
+    io: std.Io,
+    report: *SearchReport,
+    parent: []const u8,
+    name: []const u8,
+    is_file: bool,
+    reason: []const u8,
+) void {
+    var path_buf: [4096]u8 = undefined;
+    const path = joinPathForwardBounded(parent, name, &path_buf) orelse return recordAdmissionSkip(report, reason, 0);
+    recordDiscoveryAdmissionSkipPath(io, report, path, is_file, reason);
+}
+
+fn recordDiscoveryAdmissionSkipPath(
+    io: std.Io,
+    report: *SearchReport,
+    path: []const u8,
+    is_file: bool,
+    reason: []const u8,
+) void {
+    const bytes = if (is_file) skippedFileBytes(io, path) else 0;
+    recordAdmissionSkip(report, reason, bytes);
+}
+
+fn recordAdmissionSkip(report: *SearchReport, reason: []const u8, bytes: usize) void {
+    if (std.mem.eql(u8, reason, "hidden")) {
+        report.stats.admission.hidden_entries_skipped += 1;
+        report.stats.admission.hidden_file_bytes += bytes;
+    } else if (std.mem.eql(u8, reason, "ignored")) {
+        report.stats.admission.ignored_entries_skipped += 1;
+        report.stats.admission.ignored_file_bytes += bytes;
+    }
+}
+
+fn skippedFileBytes(io: std.Io, path: []const u8) usize {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false }) catch return 0;
+    defer file.close(io);
+    return @intCast(file.length(io) catch return 0);
+}
+
+fn joinPathForwardBounded(left: []const u8, right: []const u8, out: []u8) ?[]const u8 {
+    var n: usize = 0;
+    for (left) |byte| {
+        if (n >= out.len) return null;
+        out[n] = if (byte == '\\') '/' else byte;
+        n += 1;
+    }
+    if (n > 0 and out[n - 1] != '/') {
+        if (n >= out.len) return null;
+        out[n] = '/';
+        n += 1;
+    }
+    for (right) |byte| {
+        if (n >= out.len) return null;
+        out[n] = if (byte == '\\') '/' else byte;
+        n += 1;
+    }
+    return out[0..n];
 }
 
 const DiscoveryShardReport = struct {
@@ -1234,6 +1319,7 @@ const DiscoveryShardReport = struct {
 };
 
 fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) bool {
+    if (!request.no_ignore) return false;
     const requested_threads = request.threads orelse defaultParallelDiscoveryThreadBudget(request);
     if (requested_threads <= 1) return false;
     if (roots.count == 0) return false;
@@ -1269,8 +1355,9 @@ fn discoverRootsParallelTopLevel(
     const requested_threads = request.threads orelse defaultParallelDiscoveryThreadBudget(request);
     const actual_threads = @min(@max(requested_threads, 1), top_dir_items.len);
     if (actual_threads <= 1 or top_dir_items.len < 2) {
+        var disabled_admission = path_admission.Engine.init(allocator, false);
         for (top_dir_items) |entry| {
-            try discoverDirectory(io, allocator, entry.path, request, file_list, report);
+            try discoverDirectory(io, allocator, entry.path, request, &disabled_admission, file_list, report);
         }
         return true;
     }
@@ -1505,6 +1592,7 @@ const ShardReport = struct {
     trigram_stats: core_stats.TrigramAccelerationStats,
     byte_shard_stats: core_stats.ByteShardKernelStats,
     linux_dominant_file_stats: core_stats.LinuxDominantFileStats,
+    admission_stats: core_stats.AdmissionStats,
     slowest_path: []const u8,
     slowest_bytes: usize,
     slowest_ms: f64,
@@ -1532,6 +1620,7 @@ const ShardReport = struct {
         .trigram_stats = .{},
         .byte_shard_stats = .{},
         .linux_dominant_file_stats = .{},
+        .admission_stats = .{},
         .slowest_path = "",
         .slowest_bytes = 0,
         .slowest_ms = 0,
@@ -1633,6 +1722,7 @@ fn scanDiscoveredFile(
 ) anyerror!void {
     if (shouldSkipProtectedBinaryContainer(request, display_path)) {
         report.files_skipped += 1;
+        report.stats.admission.protected_entries_skipped += 1;
         return;
     }
     const open_started = std.Io.Timestamp.now(io, .awake);
@@ -1697,6 +1787,7 @@ fn scanFileIntoShard(
 ) void {
     if (shouldSkipProtectedBinaryContainer(request, display_path)) {
         shard.files_skipped += 1;
+        shard.admission_stats.protected_entries_skipped += 1;
         recordEvidenceSkipped(shard);
         return;
     }
@@ -1778,6 +1869,8 @@ fn scanFileMmap(
     // Binary sniff: first 1024 bytes for null bytes.
     if (simd.indexOfByte(data[0..@min(1024, data.len)], 0) != null) {
         shard.files_skipped += 1;
+        shard.admission_stats.binary_entries_skipped += 1;
+        shard.admission_stats.binary_file_bytes += file_bytes;
         recordEvidenceSkipped(shard);
         return;
     }
@@ -2311,6 +2404,8 @@ fn scanOpenFileIntoShardImpl(
     }
     if (simd.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
         shard.files_skipped += 1;
+        shard.admission_stats.binary_entries_skipped += 1;
+        shard.admission_stats.binary_file_bytes += @intCast(file.length(io) catch first_read);
         recordEvidenceSkipped(shard);
         return;
     }
@@ -2763,6 +2858,7 @@ fn mergeShardsIntoReport(shards: []const ShardReport, report: *SearchReport) voi
         report.scan_work_ms_total += shard.scan_work_ms_total;
         report.stats.acceleration_bailouts += shard.acceleration_bailouts;
         report.stats.access_errors.merge(shard.access_errors);
+        report.stats.admission.merge(shard.admission_stats);
         mergeRegexDecompositionStats(&report.stats.regex_decomposition, shard.regex_decomposition_stats);
         mergeTrigramStats(&report.stats.trigram_acceleration, shard.trigram_stats);
         mergeByteShardStats(&report.stats.byte_shard_kernel, shard.byte_shard_stats);
@@ -3181,6 +3277,8 @@ fn scanOpenFile(
     }
     if (simd.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
         report.files_skipped += 1;
+        report.stats.admission.binary_entries_skipped += 1;
+        report.stats.admission.binary_file_bytes += @intCast(file.length(io) catch first_read);
         return;
     }
     const single_chunk = first_read < read_buffer.len;
@@ -3850,6 +3948,9 @@ fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
                     if (pattern[i] == '\\' and i + 1 < pattern.len) i += 1;
                 }
                 if (i < pattern.len) i += 1; // skip ']'
+                if (i < pattern.len and pattern[i] == '{') {
+                    i = skipRegexQuantifier(pattern, i);
+                }
             } else if (byte == '(') {
                 // Groups contain alternation — cannot guarantee any single
                 // branch's literal is mandatory. Skip to matching ')'.
@@ -3863,6 +3964,8 @@ fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
                     if (pattern[i] == '(') depth += 1;
                     if (pattern[i] == ')') depth -= 1;
                 }
+            } else if (byte == '{') {
+                i = skipRegexQuantifier(pattern, i);
             } else {
                 i += 1;
             }
@@ -3908,6 +4011,12 @@ fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
     }
 
     return pattern[best_start .. best_start + best_len];
+}
+
+fn skipRegexQuantifier(pattern: []const u8, open_index: usize) usize {
+    std.debug.assert(open_index < pattern.len and pattern[open_index] == '{');
+    const close = std.mem.indexOfScalarPos(u8, pattern, open_index + 1, '}') orelse return open_index + 1;
+    return close + 1;
 }
 
 fn hasTopLevelRegexAlternation(pattern: []const u8) bool {
@@ -4371,6 +4480,11 @@ test "regex prefilter still extracts mandatory non-alternation literal" {
     try std.testing.expect(regexWithLiteralPrefilter("WARN", "[A-Z]+error_log", false) == null);
 }
 
+test "regex prefilter ignores counted repeat quantifier bodies" {
+    try std.testing.expectEqualStrings("", cachedLiteralFragment("[A-Za-z_][A-Za-z0-9_]{20,}"));
+    try std.testing.expectEqual(@as(?usize, 1), regexWithLiteralPrefilter("IdentifierNameWithTwentyChars", "[A-Za-z_][A-Za-z0-9_]{20,}", false));
+}
+
 test "empty line regex preserves zero-width anchor semantics" {
     try std.testing.expectEqual(@as(?usize, 1), regexWithLiteralPrefilter("", "^$", false));
     try std.testing.expectEqual(@as(usize, 1), countRegexWithPrefilter("", "^$", false));
@@ -4669,7 +4783,8 @@ test "evidence frontier prepare narrows active files and accounts cached prunes"
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const request = testSearchRequest("lit:needle", "fixture-root");
+    var request = testSearchRequest("lit:needle", "fixture-root");
+    request.nexus_build = true;
     const plan = try expr.parse(request.expression);
     const admission = trigram.admit(plan);
     const files = [_]DiscoveredFile{
@@ -4756,7 +4871,8 @@ test "search run consumes evidence frontier and scans only retained candidates" 
 
     var discovery_report = testSearchReport(request.expression, plan);
     var discovered = try FileList.initWithCapacity(allocator, 4);
-    try discoverFiles(io, allocator, root_path, request, &discovered, &discovery_report);
+    var admission_engine = path_admission.Engine.init(allocator, !request.no_ignore);
+    try discoverFiles(io, allocator, root_path, request, &admission_engine, &discovered, &discovery_report);
     const files = discovered.mutableItems();
     try std.testing.expectEqual(@as(usize, 2), files.len);
     const signature = try computeDiscoveredSignature(io, files);
@@ -4769,6 +4885,7 @@ test "search run consumes evidence frontier and scans only retained candidates" 
         .skipped_files = 0,
         .candidates = &retained,
     });
+    writeEvidenceFrontierLive(io, cache_path, key);
 
     const report = try run(io, allocator, request, plan);
     try std.testing.expectEqual(@as(f64, 0), report.discover_ms);
@@ -4860,6 +4977,9 @@ fn testSearchRequest(expression: []const u8, path: []const u8) cli.SearchRequest
         .fixed_strings = false,
         .case_insensitive = false,
         .follow_symlinks = false,
+        .no_ignore = false,
+        .ignore_files = undefined,
+        .ignore_file_count = 0,
         .max_hits = null,
         .threads = null,
         .emit_report = null,

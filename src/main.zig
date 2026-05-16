@@ -7,6 +7,8 @@ const indexd = @import("core/indexd.zig");
 const inspect = @import("core/inspect.zig");
 const search = @import("core/search.zig");
 
+const NEXUS_MIN_BUILD_FRONTIER_FILES: usize = 4096;
+
 test {
     _ = @import("core/trigram.zig");
     _ = @import("core/corpus.zig");
@@ -180,9 +182,10 @@ pub fn main(init: std.process.Init) !void {
             try output.writeExplain(stdout, plan);
         },
         .nexus => |request| {
-            const plan = expr.parse(request.expression) catch std.process.exit(0);
-            _ = search.run(init.io, allocator, request, plan) catch std.process.exit(0);
-            search.holdEvidenceFrontierLive(init.io, allocator, request, plan);
+            const effective_request = request;
+            const plan = expr.parse(effective_request.expression) catch std.process.exit(0);
+            _ = search.run(init.io, allocator, effective_request, plan) catch std.process.exit(0);
+            search.holdEvidenceFrontierLive(init.io, allocator, effective_request, plan);
         },
         .indexd => |request| {
             _ = indexd.run(init.io, allocator, .{
@@ -217,6 +220,9 @@ fn shouldLaunchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, request: c
 
 fn shouldConsiderNexusSidecar(request: cli.SearchRequest, report: search.SearchReport) bool {
     if (request.nexus_disabled) return false;
+    if (request.stats_only) return false;
+    if (request.path_count != 1) return false;
+    if (report.files_discovered < NEXUS_MIN_BUILD_FRONTIER_FILES) return false;
     if (report.stats.trigram_acceleration.pruned_files != 0) return false;
     return true;
 }
@@ -243,6 +249,11 @@ fn launchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, argv0: []const u
     var path_index: usize = 0;
     while (path_index < request.path_count) : (path_index += 1) argv.append(allocator, request.paths[path_index]) catch return;
     if (request.hidden) argv.append(allocator, "--hidden") catch return;
+    if (request.no_ignore) argv.append(allocator, "--no-ignore") catch return;
+    for (request.ignore_files[0..request.ignore_file_count]) |ignore_file| {
+        argv.append(allocator, "--ignore-file") catch return;
+        argv.append(allocator, ignore_file) catch return;
+    }
     if (request.follow_symlinks) argv.append(allocator, "--follow-symlinks") catch return;
     if (request.threads) |threads| {
         argv.append(allocator, "--threads") catch return;
@@ -339,9 +350,18 @@ fn appendRepeated(allocator: std.mem.Allocator, list: *std.ArrayList(u8), byte: 
 }
 
 test "nexus sidecar launch is gated after evidence-pruned foreground reuse" {
-    const enabled = testSearchRequestForSidecar(false);
+    var enabled = testSearchRequestForSidecar(false);
     const disabled = testSearchRequestForSidecar(true);
-    try std.testing.expect(shouldConsiderNexusSidecar(enabled, testSearchReportForSidecar(0)));
+    enabled.stats_only = false;
+    var cold_report = testSearchReportForSidecar(0);
+    cold_report.files_discovered = NEXUS_MIN_BUILD_FRONTIER_FILES;
+    try std.testing.expect(shouldConsiderNexusSidecar(enabled, cold_report));
+    var small_report = testSearchReportForSidecar(0);
+    small_report.files_discovered = NEXUS_MIN_BUILD_FRONTIER_FILES - 1;
+    try std.testing.expect(!shouldConsiderNexusSidecar(enabled, small_report));
+    var stats_only = enabled;
+    stats_only.stats_only = true;
+    try std.testing.expect(!shouldConsiderNexusSidecar(stats_only, cold_report));
     try std.testing.expect(!shouldConsiderNexusSidecar(enabled, testSearchReportForSidecar(1)));
     try std.testing.expect(!shouldConsiderNexusSidecar(enabled, testSearchReportForSidecar(79041)));
     try std.testing.expect(!shouldConsiderNexusSidecar(disabled, testSearchReportForSidecar(0)));
@@ -461,6 +481,9 @@ fn testSearchRequestForSidecar(nexus_disabled: bool) cli.SearchRequest {
         .fixed_strings = false,
         .case_insensitive = false,
         .follow_symlinks = false,
+        .no_ignore = false,
+        .ignore_files = undefined,
+        .ignore_file_count = 0,
         .max_hits = null,
         .threads = null,
         .emit_report = null,

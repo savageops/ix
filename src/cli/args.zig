@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const MAX_SEARCH_PATHS = 128;
+pub const MAX_IGNORE_FILES = 32;
 
 pub const CommandTag = enum {
     help,
@@ -31,6 +32,9 @@ pub const SearchRequest = struct {
     fixed_strings: bool,
     case_insensitive: bool,
     follow_symlinks: bool,
+    no_ignore: bool,
+    ignore_files: [MAX_IGNORE_FILES][]const u8,
+    ignore_file_count: usize,
     max_hits: ?usize,
     threads: ?usize,
     emit_report: ?[]const u8,
@@ -168,7 +172,15 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
             }
             continue;
         }
-        if (std.mem.eql(u8, arg, "--json") or std.mem.eql(u8, arg, "-j")) request.json = true else if (std.mem.eql(u8, arg, "--stats-only")) request.stats_only = true else if (std.mem.eql(u8, arg, "--hidden")) request.hidden = true else if (std.mem.eql(u8, arg, "--line-number") or std.mem.eql(u8, arg, "-n")) request.line_numbers = true else if (std.mem.eql(u8, arg, "--fixed-strings") or std.mem.eql(u8, arg, "-F")) request.fixed_strings = true else if (std.mem.eql(u8, arg, "--ignore-case") or std.mem.eql(u8, arg, "-i")) request.case_insensitive = true else if (std.mem.eql(u8, arg, "--follow-symlinks")) request.follow_symlinks = true else if (std.mem.eql(u8, arg, "--max-hits")) {
+        if (std.mem.eql(u8, arg, "--json") or std.mem.eql(u8, arg, "-j")) request.json = true else if (std.mem.eql(u8, arg, "--stats-only")) request.stats_only = true else if (std.mem.eql(u8, arg, "--hidden")) request.hidden = true else if (std.mem.eql(u8, arg, "--no-ignore")) request.no_ignore = true else if (std.mem.eql(u8, arg, "--unrestricted") or std.mem.eql(u8, arg, "-u")) {
+            request.hidden = true;
+            request.no_ignore = true;
+        } else if (std.mem.eql(u8, arg, "--ignore-file")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.no_ignore = false;
+            try pushIgnoreFile(&request, args[index]);
+        } else if (std.mem.eql(u8, arg, "--line-number") or std.mem.eql(u8, arg, "-n")) request.line_numbers = true else if (std.mem.eql(u8, arg, "--fixed-strings") or std.mem.eql(u8, arg, "-F")) request.fixed_strings = true else if (std.mem.eql(u8, arg, "--ignore-case") or std.mem.eql(u8, arg, "-i")) request.case_insensitive = true else if (std.mem.eql(u8, arg, "--follow-symlinks")) request.follow_symlinks = true else if (std.mem.eql(u8, arg, "--max-hits")) {
             index += 1;
             if (index >= args.len) return ParseError.MissingValue;
             request.max_hits = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
@@ -224,6 +236,9 @@ fn emptySearchRequest(expression: []const u8) SearchRequest {
         .fixed_strings = false,
         .case_insensitive = false,
         .follow_symlinks = false,
+        .no_ignore = true,
+        .ignore_files = undefined,
+        .ignore_file_count = 0,
         .max_hits = null,
         .threads = null,
         .emit_report = null,
@@ -237,6 +252,12 @@ fn pushPath(request: *SearchRequest, path: []const u8) ParseError!void {
     if (request.path_count >= MAX_SEARCH_PATHS) return ParseError.MissingValue;
     request.paths[request.path_count] = path;
     request.path_count += 1;
+}
+
+fn pushIgnoreFile(request: *SearchRequest, path: []const u8) ParseError!void {
+    if (request.ignore_file_count >= MAX_IGNORE_FILES) return ParseError.MissingValue;
+    request.ignore_files[request.ignore_file_count] = path;
+    request.ignore_file_count += 1;
 }
 
 fn parseInspect(args: []const []const u8) ParseError!InspectRequest {
@@ -388,6 +409,16 @@ fn parseCompatSearch(allocator: std.mem.Allocator, args: []const []const u8) !Se
             request.threads = std.fmt.parseInt(usize, arg["--threads=".len..], 10) catch return ParseError.MissingValue;
         } else if (std.mem.eql(u8, arg, "--hidden")) {
             request.hidden = true;
+        } else if (std.mem.eql(u8, arg, "--no-ignore")) {
+            request.no_ignore = true;
+        } else if (std.mem.eql(u8, arg, "--unrestricted") or std.mem.eql(u8, arg, "-u")) {
+            request.hidden = true;
+            request.no_ignore = true;
+        } else if (std.mem.eql(u8, arg, "--ignore-file")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.no_ignore = false;
+            try pushIgnoreFile(&request, args[index]);
         } else if (std.mem.eql(u8, arg, "--line-number") or std.mem.eql(u8, arg, "-n")) {
             request.line_numbers = true;
         } else if (std.mem.eql(u8, arg, "--fixed-strings") or std.mem.eql(u8, arg, "-F")) {
@@ -500,6 +531,45 @@ test "hidden nexus command forces silent stats json build mode" {
     try std.testing.expect(request.hidden);
     try std.testing.expect(request.follow_symlinks);
     try std.testing.expectEqual(@as(?usize, 7), request.threads);
+}
+
+test "search admission flags parse into one deterministic contract" {
+    const argv = [_][]const u8{
+        "ix-zig",
+        "search",
+        "--ignore-file",
+        "extra.ignore",
+        "--unrestricted",
+        "lit:needle",
+        "src",
+    };
+    const invocation = try parseInvocation(std.testing.allocator, &argv);
+    try std.testing.expect(invocation.command == .search);
+    const request = invocation.command.search;
+    try std.testing.expect(request.hidden);
+    try std.testing.expect(request.no_ignore);
+    try std.testing.expectEqual(@as(usize, 1), request.ignore_file_count);
+    try std.testing.expectEqualStrings("extra.ignore", request.ignore_files[0]);
+    try std.testing.expectEqual(@as(usize, 1), request.path_count);
+    try std.testing.expectEqualStrings("src", request.paths[0]);
+}
+
+test "compat admission flags preserve rg-shaped entrypoint" {
+    const argv = [_][]const u8{
+        "ix-zig",
+        "--ignore-file",
+        "extra.ignore",
+        "--no-ignore",
+        "needle",
+        "src",
+    };
+    const invocation = try parseInvocation(std.testing.allocator, &argv);
+    try std.testing.expect(invocation.command == .search);
+    const request = invocation.command.search;
+    defer std.testing.allocator.free(request.expression);
+    try std.testing.expect(request.no_ignore);
+    try std.testing.expectEqual(@as(usize, 1), request.ignore_file_count);
+    try std.testing.expectEqualStrings("extra.ignore", request.ignore_files[0]);
 }
 
 test "hidden indexd command parses without public command exposure" {

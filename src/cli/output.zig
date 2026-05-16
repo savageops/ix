@@ -39,7 +39,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  expr: lit:text | re:pattern | prefix:x | suffix:x | A && B | A || B
         \\COMPAT TRANSLATOR
         \\  top-level ix PATTERN [PATH]... accepts a narrow rg-shaped subset for agents
-        \\  supported: PATTERN, -e PATTERN, repeated -e, -F, -i, -j, -n, --json, --hidden
+        \\  supported: PATTERN, -e PATTERN, repeated -e, -F, -i, -j, -n, --json, --hidden, --no-ignore, -u, --ignore-file
         \\  accepted input lowers into canonical IX search; unsupported flags fail guided
         \\  raw regex patterns containing && or || are ambiguous and rejected
         \\  use ix search <expr> [PATH]... for native IX boolean expressions
@@ -76,7 +76,10 @@ fn writeSearchHelp(writer: anytype, summary: []const u8, command: []const u8) !v
         \\  [PATH]...  Files or directories to scan [default: .]
         \\
         \\Options:
-        \\      --hidden                     
+        \\      --hidden                     Include hidden files and directories
+        \\      --no-ignore                  Disable explicit ignore-file admission
+        \\  -u, --unrestricted              Include hidden and ignored paths
+        \\      --ignore-file <PATH>         Add an explicit ignore source
         \\      --follow-symlinks            
         \\      --json                       
         \\      --stats-only                 
@@ -201,7 +204,7 @@ pub fn writeError(writer: anytype, code: []const u8, message: []const u8) !void 
 
 pub fn writeCompatUnsupportedFlag(writer: anytype, flag: []const u8) !void {
     try writer.print(
-        "-- ix.error.v1 {{\"cmd\":\"ix\",\"code\":\"command_failed\",\"hint\":null,\"message\":\"rg-shaped compatibility translator does not support `{s}`. Supported subset: `ix PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, and `--hidden`. Use canonical `ix search <expr> [PATH]...` for native IX syntax.\",\"severity\":\"error\",\"status\":\"error\"}} --\n",
+        "-- ix.error.v1 {{\"cmd\":\"ix\",\"code\":\"command_failed\",\"hint\":null,\"message\":\"rg-shaped compatibility translator does not support `{s}`. Supported subset: `ix PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, `--hidden`, `--no-ignore`, `-u/--unrestricted`, and `--ignore-file`. Use canonical `ix search <expr> [PATH]...` for native IX syntax.\",\"severity\":\"error\",\"status\":\"error\"}} --\n",
         .{flag},
     );
 }
@@ -290,6 +293,8 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
     try writer.writeAll(",");
     try writeAccessErrorsJson(writer, report.stats.access_errors);
     try writer.writeAll(",");
+    try writeAdmissionJson(writer, report.stats.admission);
+    try writer.writeAll(",");
     try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ report.stats.timings.discover_ms, report.stats.timings.scan_ms, report.stats.timings.aggregate_ms, report.stats.timings.total_ms, report.stats.timings.scan_work_ms_total, report.stats.timings.aggregate_merge_ms, report.stats.timings.aggregate_finalize_ms });
     try writer.print("\"concurrency\":{{\"available_threads\":{},\"outer_scan_threads\":{},\"execution_mode\":\"{s}\",\"sharding_enabled\":{s},\"sharded_files\":{},\"max_shard_threads\":{},\"max_shard_ranges\":{},\"max_shard_chunk_bytes\":{}}},", .{ report.stats.concurrency.available_threads, report.stats.concurrency.outer_scan_threads, report.stats.concurrency.execution_mode, boolText(report.stats.concurrency.sharding_enabled), report.stats.concurrency.sharded_files, report.stats.concurrency.max_shard_threads, report.stats.concurrency.max_shard_ranges, report.stats.concurrency.max_shard_chunk_bytes });
     try writer.writeAll("\"slowest_files\":[");
@@ -304,6 +309,21 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
 
 fn searchStatus(report: search.SearchReport) []const u8 {
     return if (report.stats.access_errors.total == 0) "ok" else "partial";
+}
+
+fn writeAdmissionJson(writer: anytype, stats: core_stats.AdmissionStats) !void {
+    try writer.print("\"admission\":{{\"enabled\":{s},\"ignore_files_loaded\":{},\"hidden_entries_skipped\":{},\"hidden_file_bytes\":{},\"ignored_entries_skipped\":{},\"ignored_file_bytes\":{},\"explicit_files_included\":{},\"protected_entries_skipped\":{},\"binary_entries_skipped\":{},\"binary_file_bytes\":{}}}", .{
+        boolText(stats.enabled),
+        stats.ignore_files_loaded,
+        stats.hidden_entries_skipped,
+        stats.hidden_file_bytes,
+        stats.ignored_entries_skipped,
+        stats.ignored_file_bytes,
+        stats.explicit_files_included,
+        stats.protected_entries_skipped,
+        stats.binary_entries_skipped,
+        stats.binary_file_bytes,
+    });
 }
 
 fn writeAccessErrorsJson(writer: anytype, access_errors: core_stats.AccessErrorStats) !void {

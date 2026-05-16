@@ -272,6 +272,32 @@ pub const AccessErrorStats = struct {
     }
 };
 
+pub const AdmissionStats = struct {
+    enabled: bool = false,
+    ignore_files_loaded: usize = 0,
+    hidden_entries_skipped: usize = 0,
+    hidden_file_bytes: usize = 0,
+    ignored_entries_skipped: usize = 0,
+    ignored_file_bytes: usize = 0,
+    explicit_files_included: usize = 0,
+    protected_entries_skipped: usize = 0,
+    binary_entries_skipped: usize = 0,
+    binary_file_bytes: usize = 0,
+
+    pub fn merge(self: *AdmissionStats, other: AdmissionStats) void {
+        self.enabled = self.enabled or other.enabled;
+        self.ignore_files_loaded += other.ignore_files_loaded;
+        self.hidden_entries_skipped += other.hidden_entries_skipped;
+        self.hidden_file_bytes += other.hidden_file_bytes;
+        self.ignored_entries_skipped += other.ignored_entries_skipped;
+        self.ignored_file_bytes += other.ignored_file_bytes;
+        self.explicit_files_included += other.explicit_files_included;
+        self.protected_entries_skipped += other.protected_entries_skipped;
+        self.binary_entries_skipped += other.binary_entries_skipped;
+        self.binary_file_bytes += other.binary_file_bytes;
+    }
+};
+
 pub const FallbackLineScanStats = struct {
     enabled: bool = false,
     files_profiled: usize = 0,
@@ -316,6 +342,7 @@ pub const SearchStats = struct {
     postings_index: PostingsIndexStats = .{},
     generation_refresh: GenerationRefreshStats = .{},
     access_errors: AccessErrorStats = .{},
+    admission: AdmissionStats = .{},
     fallback_line_scan: ?FallbackLineScanStats = null,
     timings: PhaseTimings = .{},
     concurrency: ConcurrencyStats = .{},
@@ -393,6 +420,7 @@ test "search stats owns rust-compatible top-level schema defaults" {
     try std.testing.expectEqualStrings("not_wired", snapshot.generation_refresh.refresh_status);
     try std.testing.expectEqualStrings("not_wired", snapshot.generation_refresh.fallback_reason);
     try std.testing.expectEqual(@as(usize, 1), snapshot.slowest_file_count);
+    try std.testing.expect(!snapshot.admission.enabled);
 }
 
 test "access errors record bounded partial-search diagnostics" {
