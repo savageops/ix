@@ -33,15 +33,6 @@ extern fn ix_sz_find(haystack: [*]const u8, h_len: usize, needle: [*]const u8, n
 extern fn ix_sz_find_byte(haystack: [*]const u8, h_len: usize, needle: [*]const u8) ?[*]const u8;
 extern fn ix_sz_find_byteset(haystack: [*]const u8, h_len: usize, set: *const ByteSet) ?[*]const u8;
 
-const AdmissionSkipCache = struct {
-    ptr: usize = 0,
-    len: usize = 0,
-    hash: u64 = 0,
-    table: [256]usize = undefined,
-};
-
-threadlocal var admission_skip_cache: AdmissionSkipCache = .{};
-
 /// 256-bit byte membership bitmap, ABI-compatible with `sz_byteset_t`.
 /// 4 × u64 = 32 bytes. Bit `c` is set iff byte value `c` is in the set.
 pub const ByteSet = extern struct {
@@ -79,33 +70,20 @@ pub fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
 /// conservative so short literals and match counting remain on StringZilla.
 pub fn indexOfAdmission(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len >= 16 and haystack.len >= 4096) {
-        return indexOfBoyerMooreHorspoolCached(haystack, needle);
+        return indexOfBoyerMooreHorspool(haystack, needle);
     }
     return indexOf(haystack, needle);
 }
 
-fn indexOfBoyerMooreHorspoolCached(haystack: []const u8, needle: []const u8) ?usize {
+fn indexOfBoyerMooreHorspool(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return null;
-    const ptr = @intFromPtr(needle.ptr);
-    const hash = if (admission_skip_cache.ptr == ptr and admission_skip_cache.len == needle.len)
-        admission_skip_cache.hash
-    else
-        std.hash.Wyhash.hash(0x4958_4144_4d49_5445, needle);
-
-    if (admission_skip_cache.ptr != ptr or admission_skip_cache.len != needle.len or admission_skip_cache.hash != hash) {
-        admission_skip_cache.ptr = ptr;
-        admission_skip_cache.len = needle.len;
-        admission_skip_cache.hash = hash;
-        @memset(&admission_skip_cache.table, needle.len);
-        for (needle[0 .. needle.len - 1], 0..) |byte, index| {
-            admission_skip_cache.table[byte] = needle.len - 1 - index;
-        }
+    var skip_table: [256]usize = undefined;
+    @memset(&skip_table, needle.len);
+    for (needle[0 .. needle.len - 1], 0..) |byte, index| {
+        skip_table[byte] = needle.len - 1 - index;
     }
-    return indexOfBoyerMooreHorspoolWithTable(haystack, needle, &admission_skip_cache.table);
-}
 
-fn indexOfBoyerMooreHorspoolWithTable(haystack: []const u8, needle: []const u8, skip_table: *const [256]usize) ?usize {
     var cursor: usize = 0;
     const last = needle.len - 1;
     const limit = haystack.len - needle.len;
