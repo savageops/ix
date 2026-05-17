@@ -259,13 +259,18 @@ fn classifyRegex(pattern: []const u8) MatcherStrategy {
     if (isWordBoundaryLiteral(body)) {
         return if (casefold) .regex_ascii_casefold_word_boundary_literal else .regex_word_boundary_literal;
     }
-    if (isTopLevelLiteralAlternates(body)) return .regex_literal_alternates;
+    if (!casefold and isTopLevelLiteralAlternates(literalAlternatesBody(body))) return .regex_literal_alternates;
     if (isPlainLiteralRegex(body)) {
         return if (casefold) .regex_ascii_casefold_literal else .regex_plain_literal;
     }
     if (isFixedWidthBytesRegex(body)) return .regex_fixed_width_bytes;
     if (classifyRegexDecomposition(body)) return .regex_decomposition_candidate_lines;
     return .regex_full;
+}
+
+pub fn literalAlternatesBody(pattern: []const u8) []const u8 {
+    const body = if (std.mem.startsWith(u8, pattern, "(?i)")) pattern[4..] else pattern;
+    return singleLiteralAlternationGroupBody(body) orelse body;
 }
 
 fn classifyRegexDecomposition(pattern: []const u8) bool {
@@ -333,6 +338,42 @@ fn isTopLevelLiteralAlternates(pattern: []const u8) bool {
         start = end + 1;
     }
     return true;
+}
+
+fn singleLiteralAlternationGroupBody(pattern: []const u8) ?[]const u8 {
+    if (pattern.len < 3 or pattern[0] != '(' or pattern[pattern.len - 1] != ')') return null;
+
+    const inner_start: usize = if (pattern.len >= 4 and pattern[1] == '?' and pattern[2] == ':') 3 else 1;
+    var depth: usize = 0;
+    var index: usize = 0;
+    while (index < pattern.len) : (index += 1) {
+        const byte = pattern[index];
+        if (byte == '\\') {
+            index += 1;
+            continue;
+        }
+        if (byte == '[') {
+            index += 1;
+            while (index < pattern.len and pattern[index] != ']') : (index += 1) {
+                if (pattern[index] == '\\') index += 1;
+            }
+            if (index >= pattern.len) return null;
+            continue;
+        }
+        if (byte == '(') {
+            depth += 1;
+            continue;
+        }
+        if (byte == ')') {
+            if (depth == 0) return null;
+            depth -= 1;
+            if (depth == 0 and index != pattern.len - 1) return null;
+        }
+    }
+    if (depth != 0 or inner_start >= pattern.len - 1) return null;
+
+    const inner = pattern[inner_start .. pattern.len - 1];
+    return if (isTopLevelLiteralAlternates(inner)) inner else null;
 }
 
 fn isPlainLiteralRegex(pattern: []const u8) bool {
@@ -429,6 +470,23 @@ test "regex requires explicit prefix" {
     const plan = try parse("re:a|b");
     try std.testing.expectEqual(PredicateKind.regex, plan.predicates[0].kind);
     try std.testing.expectEqual(MatcherStrategy.regex_literal_alternates, plan.predicates[0].strategy);
+}
+
+test "regex literal alternates may be wrapped in one full pattern group" {
+    const captured = try parse("re:(alpha|beta)");
+    try std.testing.expectEqual(PredicateKind.regex, captured.predicates[0].kind);
+    try std.testing.expectEqual(MatcherStrategy.regex_literal_alternates, captured.predicates[0].strategy);
+    try std.testing.expectEqualStrings("alpha|beta", literalAlternatesBody(captured.predicates[0].value));
+
+    const noncapturing = try parse("re:(?:alpha|beta)");
+    try std.testing.expectEqual(MatcherStrategy.regex_literal_alternates, noncapturing.predicates[0].strategy);
+    try std.testing.expectEqualStrings("alpha|beta", literalAlternatesBody(noncapturing.predicates[0].value));
+
+    const partial = try parse("re:(alpha|beta)gamma");
+    try std.testing.expectEqual(MatcherStrategy.regex_full, partial.predicates[0].strategy);
+
+    const casefold = try parse("re:(?i)alpha|beta");
+    try std.testing.expectEqual(MatcherStrategy.regex_full, casefold.predicates[0].strategy);
 }
 
 test "parser trims source and splits rust-style boolean tokens" {

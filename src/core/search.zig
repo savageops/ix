@@ -2003,7 +2003,9 @@ fn trySerialMmapFastPath(
     file_started: std.Io.Timestamp,
 ) bool {
     if (!request.stats_only) return false;
-    if (!plan.usesSingleLiteralCounter() and !planUsesRegexDecompositionFastCount(plan, request.case_insensitive)) return false;
+    if (!plan.usesSingleLiteralCounter() and
+        !planUsesRegexDecompositionFastCount(plan, request.case_insensitive) and
+        !planUsesLiteralAlternatesFastCount(plan, request.case_insensitive)) return false;
 
     var shard = ShardReport.empty;
     scanFileMmap(null, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, &shard, file_started) catch return false;
@@ -2018,14 +2020,24 @@ fn planUsesRegexDecompositionFastCount(plan: expr.ExpressionPlan, case_insensiti
     return predicate.kind == .regex and regexDecompositionNeedle(predicate.value) != null;
 }
 
+fn planUsesLiteralAlternatesFastCount(plan: expr.ExpressionPlan, case_insensitive: bool) bool {
+    if (case_insensitive or plan.predicate_count != 1) return false;
+    const predicate = plan.predicates[0];
+    return predicate.kind == .regex and
+        predicate.strategy == .regex_literal_alternates and
+        parseLiteralAlternates(expr.literalAlternatesBody(predicate.value)) != null;
+}
+
 const ByteShardStrategy = enum {
     literal_occurrence,
+    literal_alternates_line,
     word_boundary_line,
     regex_decomposition_line,
 
     fn text(self: ByteShardStrategy) []const u8 {
         return switch (self) {
             .literal_occurrence => "literal",
+            .literal_alternates_line => "literal_alternates",
             .word_boundary_line => "word_boundary_literal",
             .regex_decomposition_line => "regex_decomposition",
         };
@@ -2059,6 +2071,22 @@ const RegexDecompositionRangeCount = struct {
     duplicate_candidate_hits_skipped: usize = 0,
     candidate_lines_matched: usize = 0,
     bailed_out: bool = false,
+};
+
+const LiteralAlternatesRangeCount = struct {
+    matches: usize = 0,
+    bailed_out: bool = false,
+};
+
+const MAX_LITERAL_ALTERNATE_BRANCHES = 32;
+
+const LiteralAlternates = struct {
+    branches: [MAX_LITERAL_ALTERNATE_BRANCHES][]const u8 = undefined,
+    count: usize = 0,
+
+    fn slice(self: *const LiteralAlternates) []const []const u8 {
+        return self.branches[0..self.count];
+    }
 };
 
 const ByteShardJob = struct {
@@ -2211,6 +2239,11 @@ fn byteShardWorker(job: *ByteShardJob) void {
         .literal_occurrence => {
             job.matches = countLiteralLogicalRange(job.data, job.plan.needle, job.logical_start, job.logical_end, job.widened_start, job.widened_end);
         },
+        .literal_alternates_line => {
+            const counted = countLiteralAlternatesLogicalLinesRange(job.data, job.plan.pattern, job.logical_start, job.logical_end);
+            job.matches = counted.matches;
+            job.regex_bailed_out = counted.bailed_out;
+        },
         .word_boundary_line => {
             const counted = countWordBoundaryLiteralLogicalLinesRange(job.data, job.plan.needle, job.logical_start, job.logical_end);
             job.matches = counted.matches;
@@ -2289,7 +2322,9 @@ fn countRegexDecompositionLogicalLinesRange(
 
 fn shouldRunByteShardBeforeAdmission(plan: expr.ExpressionPlan) bool {
     const shard_plan = byteShardPlan(plan) orelse return false;
-    return shard_plan.strategy == .word_boundary_line or shard_plan.strategy == .regex_decomposition_line;
+    return shard_plan.strategy == .literal_alternates_line or
+        shard_plan.strategy == .word_boundary_line or
+        shard_plan.strategy == .regex_decomposition_line;
 }
 
 fn byteShardPlan(plan: expr.ExpressionPlan) ?ByteShardPlan {
@@ -2311,6 +2346,15 @@ fn byteShardPlan(plan: expr.ExpressionPlan) ?ByteShardPlan {
                     .strategy = .word_boundary_line,
                     .needle = body,
                 } else null;
+            },
+            .regex_literal_alternates => blk: {
+                const pattern = expr.literalAlternatesBody(predicate.value);
+                const branch = firstLiteralAlternateBranchAtLeast(pattern, 2) orelse break :blk null;
+                break :blk .{
+                    .strategy = .literal_alternates_line,
+                    .needle = branch,
+                    .pattern = pattern,
+                };
             },
             .regex_decomposition_candidate_lines => blk: {
                 const needle = regexDecompositionNeedle(predicate.value) orelse break :blk null;
@@ -2337,6 +2381,7 @@ fn byteShardRangeFor(data: []const u8, plan: ByteShardPlan, logical_start: usize
                 .widened_end = @min(logical_end + overlap, data.len),
             };
         },
+        .literal_alternates_line => byteShardLineOwnedRange(data, logical_start, logical_end, index, range_count),
         .word_boundary_line => byteShardLineOwnedRange(data, logical_start, logical_end, index, range_count),
         .regex_decomposition_line => byteShardLineOwnedRange(data, logical_start, logical_end, index, range_count),
     };
@@ -3685,7 +3730,7 @@ fn predicateMatchCountByStrategyMono(comptime strategy: expr.MatcherStrategy, li
             const effective_ci = if (chunk_casefolded) false else true;
             break :blk if (wordBoundaryLiteralColumn(line, stripWordBoundaryAnchors(after_flag), effective_ci) != null) 1 else 0;
         },
-        .regex_literal_alternates => if (literalAlternatesColumn(line, predicate.value, case_insensitive) != null) 1 else 0,
+        .regex_literal_alternates => countLiteralAlternates(line, expr.literalAlternatesBody(predicate.value), case_insensitive),
         else => countRegexWithPrefilter(line, predicate.value, case_insensitive),
     };
 }
@@ -3833,7 +3878,7 @@ fn regexColumnByStrategyMono(comptime strategy: expr.MatcherStrategy, line: []co
             return wordBoundaryLiteralColumn(line, body, true);
         },
         .regex_literal_alternates => {
-            return literalAlternatesColumn(line, predicate.value, case_insensitive);
+            return literalAlternatesColumn(line, expr.literalAlternatesBody(predicate.value), case_insensitive);
         },
         // regex_full, regex_fixed_width_bytes, regex_decomposition_candidate_lines,
         // and non-regex strategies all fall through to prefilter + regex engine.
@@ -4344,6 +4389,29 @@ fn countWordBoundaryLiteralLogicalLinesRange(buffer: []const u8, needle: []const
     return counted;
 }
 
+fn countLiteralAlternatesLogicalLinesRange(buffer: []const u8, pattern: []const u8, logical_start: usize, logical_end: usize) LiteralAlternatesRangeCount {
+    if (pattern.len == 0 or logical_start >= logical_end) return .{};
+    const alternates = parseLiteralAlternates(pattern) orelse return .{ .bailed_out = true };
+    const end = @min(logical_end, buffer.len);
+    var counted = LiteralAlternatesRangeCount{};
+    var cursor = @min(logical_start, end);
+
+    while (cursor < end) {
+        const newline = simd.indexOfByte(buffer[cursor..end], '\n');
+        const line_end = if (newline) |offset| cursor + offset else end;
+        const raw_line = buffer[cursor..line_end];
+        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        counted.matches += countLiteralAlternatesParsed(line, alternates.slice(), false);
+        if (newline) |offset| {
+            cursor += offset + 1;
+        } else {
+            break;
+        }
+    }
+
+    return counted;
+}
+
 fn wordBoundaryLiteralAt(buffer: []const u8, needle: []const u8, abs: usize) bool {
     if (needle.len == 0 or abs + needle.len > buffer.len) return false;
     const left_is_word = abs > 0 and isWordChar(buffer[abs - 1]);
@@ -4364,6 +4432,10 @@ fn isWordChar(byte: u8) bool {
 /// Each branch is a plain literal — search them individually and return
 /// the earliest match column.
 fn literalAlternatesColumn(line: []const u8, pattern: []const u8, case_insensitive: bool) ?usize {
+    if (parseLiteralAlternates(pattern)) |alternates| {
+        return literalAlternatesColumnParsed(line, alternates.slice(), case_insensitive);
+    }
+
     var best: ?usize = null;
     var start: usize = 0;
     while (start <= pattern.len) {
@@ -4379,6 +4451,98 @@ fn literalAlternatesColumn(line: []const u8, pattern: []const u8, case_insensiti
         start = end + 1;
     }
     return best;
+}
+
+fn countLiteralAlternates(line: []const u8, pattern: []const u8, case_insensitive: bool) usize {
+    if (parseLiteralAlternates(pattern)) |alternates| {
+        return countLiteralAlternatesParsed(line, alternates.slice(), case_insensitive);
+    }
+
+    var total: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < line.len) {
+        var best_index: ?usize = null;
+        var best_len: usize = 0;
+        var start: usize = 0;
+        while (start <= pattern.len) {
+            const end = std.mem.indexOfScalarPos(u8, pattern, start, '|') orelse pattern.len;
+            const branch = pattern[start..end];
+            if (branch.len > 0) {
+                if (indexOfLiteral(line[cursor..], branch, case_insensitive)) |index| {
+                    if (best_index == null or index < best_index.?) {
+                        best_index = index;
+                        best_len = branch.len;
+                    }
+                }
+            }
+            if (end == pattern.len) break;
+            start = end + 1;
+        }
+        const index = best_index orelse break;
+        total += 1;
+        cursor += index + best_len;
+    }
+    return total;
+}
+
+fn literalAlternatesColumnParsed(line: []const u8, branches: []const []const u8, case_insensitive: bool) ?usize {
+    var best: ?usize = null;
+    for (branches) |branch| {
+        if (indexOfLiteral(line, branch, case_insensitive)) |index| {
+            const col = index + 1;
+            if (best == null or col < best.?) best = col;
+        }
+    }
+    return best;
+}
+
+fn countLiteralAlternatesParsed(line: []const u8, branches: []const []const u8, case_insensitive: bool) usize {
+    var total: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < line.len) {
+        var best_index: ?usize = null;
+        var best_len: usize = 0;
+        for (branches) |branch| {
+            if (indexOfLiteral(line[cursor..], branch, case_insensitive)) |index| {
+                if (best_index == null or index < best_index.?) {
+                    best_index = index;
+                    best_len = branch.len;
+                }
+            }
+        }
+        const index = best_index orelse break;
+        total += 1;
+        cursor += index + best_len;
+    }
+    return total;
+}
+
+fn parseLiteralAlternates(pattern: []const u8) ?LiteralAlternates {
+    var alternates: LiteralAlternates = .{};
+    var start: usize = 0;
+    while (start <= pattern.len) {
+        const end = std.mem.indexOfScalarPos(u8, pattern, start, '|') orelse pattern.len;
+        const branch = pattern[start..end];
+        if (branch.len == 0) return null;
+        if (alternates.count == MAX_LITERAL_ALTERNATE_BRANCHES) return null;
+        alternates.branches[alternates.count] = branch;
+        alternates.count += 1;
+        if (end == pattern.len) break;
+        start = end + 1;
+    }
+    return if (alternates.count > 1) alternates else null;
+}
+
+fn firstLiteralAlternateBranchAtLeast(pattern: []const u8, min_len: usize) ?[]const u8 {
+    var start: usize = 0;
+    while (start <= pattern.len) {
+        const end = std.mem.indexOfScalarPos(u8, pattern, start, '|') orelse pattern.len;
+        const branch = pattern[start..end];
+        if (branch.len >= min_len) return branch;
+        if (end == pattern.len) break;
+        start = end + 1;
+    }
+    return null;
 }
 
 test "trigram gate rejects impossible complete file without verifier authority" {
@@ -4541,8 +4705,34 @@ test "byte shard plan admits word-boundary line kernels" {
     try std.testing.expectEqualStrings("Sherlock", decomposed.needle);
     try std.testing.expectEqualStrings("Sherlock\\s+Holmes", decomposed.pattern);
 
+    const regex_alternates = try expr.parse("re:Sherlock Holmes|John Watson|Irene Adler");
+    const alternates = byteShardPlan(regex_alternates).?;
+    try std.testing.expectEqual(ByteShardStrategy.literal_alternates_line, alternates.strategy);
+    try std.testing.expectEqualStrings("Sherlock Holmes", alternates.needle);
+    try std.testing.expectEqualStrings("Sherlock Holmes|John Watson|Irene Adler", alternates.pattern);
+
+    const regex_wrapped_alternates = try expr.parse("re:(Sherlock Holmes|John Watson|Irene Adler)");
+    const wrapped_alternates = byteShardPlan(regex_wrapped_alternates).?;
+    try std.testing.expectEqual(ByteShardStrategy.literal_alternates_line, wrapped_alternates.strategy);
+    try std.testing.expectEqualStrings("Sherlock Holmes", wrapped_alternates.needle);
+    try std.testing.expectEqualStrings("Sherlock Holmes|John Watson|Irene Adler", wrapped_alternates.pattern);
+
     const regex_casefold_word = try expr.parse("re:(?i)\\bSherlock Holmes\\b");
     try std.testing.expect(byteShardPlan(regex_casefold_word) == null);
+}
+
+test "literal alternates line range counts regex occurrences" {
+    const buffer =
+        "Sherlock Holmes and John Watson\n" ++
+        "Irene Adler\n" ++
+        "Professor Moriarty\n" ++
+        "plain line\n";
+    const count = countLiteralAlternatesLogicalLinesRange(buffer, "Sherlock Holmes|John Watson|Irene Adler", 0, buffer.len);
+    try std.testing.expect(!count.bailed_out);
+    try std.testing.expectEqual(@as(usize, 3), count.matches);
+
+    try std.testing.expectEqual(@as(?usize, 1), literalAlternatesColumn(buffer, expr.literalAlternatesBody("(Sherlock Holmes|John Watson|Irene Adler)"), false));
+    try std.testing.expectEqual(@as(usize, 3), countLiteralAlternates(buffer, expr.literalAlternatesBody("(Sherlock Holmes|John Watson|Irene Adler)"), false));
 }
 
 test "byte shard default fanout caps implicit hardware thread count" {
