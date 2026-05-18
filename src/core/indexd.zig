@@ -475,7 +475,8 @@ const INDEXABLE_LARGE_SOURCE_EXTENSIONS = [_][]const u8{
     ".d",    ".v",       ".vh",  ".sv",  ".svh",   ".vhd",  ".vhdl",   ".adb",
     ".ads",  ".zig",     ".rs",  ".json", ".jsonc", ".jsonl", ".xml",    ".yaml",
     ".yml",  ".toml",    ".html",".htm",  ".css",   ".scss",  ".less",   ".sql",
-    ".md",   ".markdown",
+    ".md",   ".markdown", ".ini", ".conf", ".cfg",   ".properties", ".lock",
+    ".csv",  ".tsv",      ".gradle",
 };
 
 fn isIndexableLargeSourcePath(path: []const u8) bool {
@@ -563,6 +564,14 @@ test "large source index admission includes script source family" {
     try std.testing.expect(isIndexableLargeSourcePath("styles/frontier.css"));
     try std.testing.expect(isIndexableLargeSourcePath("queries/frontier.sql"));
     try std.testing.expect(isIndexableLargeSourcePath("docs/frontier.markdown"));
+    try std.testing.expect(isIndexableLargeSourcePath("config/frontier.ini"));
+    try std.testing.expect(isIndexableLargeSourcePath("config/frontier.conf"));
+    try std.testing.expect(isIndexableLargeSourcePath("config/frontier.cfg"));
+    try std.testing.expect(isIndexableLargeSourcePath("config/frontier.properties"));
+    try std.testing.expect(isIndexableLargeSourcePath("Cargo.lock"));
+    try std.testing.expect(isIndexableLargeSourcePath("data/frontier.csv"));
+    try std.testing.expect(isIndexableLargeSourcePath("data/frontier.tsv"));
+    try std.testing.expect(isIndexableLargeSourcePath("build/frontier.gradle"));
     try std.testing.expect(!isIndexableLargeSourcePath("logs/runtime.txt"));
     try std.testing.expect(!isIndexableLargeSourcePath("assets/bundle.map"));
 }
