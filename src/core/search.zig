@@ -1675,7 +1675,9 @@ const DiscoveryShardReport = struct {
 };
 
 fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) bool {
-    if (!request.no_ignore) return false;
+    const protected_windows_roots = rootsAllProtectedWindows(roots);
+    if (!request.no_ignore and !protected_windows_roots) return false;
+    if (request.max_hits != null and !request.stats_only) return false;
     const requested_threads = request.threads orelse defaultParallelDiscoveryThreadBudget(request);
     if (requested_threads <= 1) return false;
     if (roots.count == 0) return false;
@@ -1688,6 +1690,15 @@ fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) 
 fn defaultParallelDiscoveryThreadBudget(request: cli.SearchRequest) usize {
     if (!request.stats_only) return 1;
     return @min(availableThreads(), 16);
+}
+
+fn rootsAllProtectedWindows(roots: PreparedRoots) bool {
+    if (comptime builtin.os.tag != .windows) return false;
+    if (roots.count == 0) return false;
+    for (roots.items[0..roots.count]) |root| {
+        if (!isProtectedWindowsPath(root.original)) return false;
+    }
+    return true;
 }
 
 fn discoverRootsParallelTopLevel(
@@ -5775,6 +5786,30 @@ test "protected Windows stats-only binary container skip stays scoped" {
         try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "E:\\repo\\arial.ttf"));
     } else {
         try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
+    }
+}
+
+test "protected Windows stats-only roots allow parallel discovery under default ignore policy" {
+    if (builtin.os.tag == .windows) {
+        var root_items = [_]PreparedRoot{.{
+            .original = "C:\\Windows",
+            .comparable = "c:/windows",
+            .is_directory = true,
+        }};
+        const roots: PreparedRoots = .{
+            .items = &root_items,
+            .count = root_items.len,
+            .duplicate_count = 0,
+            .overlap_pruned_count = 0,
+        };
+        var request = testSearchRequest("lit:needle", "C:\\Windows");
+        request.stats_only = true;
+        request.no_ignore = false;
+        try std.testing.expect(rootsAllProtectedWindows(roots));
+        try std.testing.expect(shouldUseParallelDiscovery(request, roots));
+        request.max_hits = 1;
+        request.stats_only = false;
+        try std.testing.expect(!shouldUseParallelDiscovery(request, roots));
     }
 }
 
