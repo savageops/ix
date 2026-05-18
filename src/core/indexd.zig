@@ -20,7 +20,7 @@ extern "kernel32" fn ReadDirectoryChangesW(
 pub const LIVE_MARKER_NAME = "index.live";
 const INDEX_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_FILE_READ_LIMIT: usize = 64 * 1024 * 1024;
-const INDEX_LARGE_SOURCE_TOTAL_READ_LIMIT: usize = 128 * 1024 * 1024;
+const INDEX_LARGE_SOURCE_TOTAL_READ_LIMIT: usize = 384 * 1024 * 1024;
 
 pub const Request = struct {
     root: []const u8,
@@ -463,68 +463,25 @@ fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
     });
 }
 
+const INDEXABLE_LARGE_SOURCE_EXTENSIONS = [_][]const u8{
+    ".c",    ".h",       ".cc",  ".hh",  ".cpp",   ".hpp",  ".cxx",    ".hxx",
+    ".js",   ".jsx",     ".mjs", ".cjs", ".ts",    ".tsx",  ".go",     ".py",
+    ".java", ".cs",      ".kt",  ".kts", ".swift", ".rb",   ".php",    ".scala",
+    ".sc",   ".dart",    ".lua", ".r",   ".jl",    ".vue",  ".svelte", ".astro",
+    ".mdx",  ".graphql", ".gql", ".sh",  ".bash",  ".zsh",  ".fish",   ".ps1",
+    ".psm1", ".psd1",    ".cmd", ".bat", ".m",     ".mm",   ".pl",     ".pm",
+    ".erl",  ".hrl",     ".ex",  ".exs", ".clj",   ".cljs", ".cljc",   ".fs",
+    ".fsx",  ".vb",      ".hs",  ".lhs", ".ml",    ".mli",  ".nim",    ".cr",
+    ".d",    ".v",       ".vh",  ".sv",  ".svh",   ".vhd",  ".vhdl",   ".adb",
+    ".ads",  ".zig",     ".rs",
+};
+
 fn isIndexableLargeSourcePath(path: []const u8) bool {
     const ext = std.fs.path.extension(path);
-    return std.ascii.eqlIgnoreCase(ext, ".c") or
-        std.ascii.eqlIgnoreCase(ext, ".h") or
-        std.ascii.eqlIgnoreCase(ext, ".cc") or
-        std.ascii.eqlIgnoreCase(ext, ".hh") or
-        std.ascii.eqlIgnoreCase(ext, ".cpp") or
-        std.ascii.eqlIgnoreCase(ext, ".hpp") or
-        std.ascii.eqlIgnoreCase(ext, ".cxx") or
-        std.ascii.eqlIgnoreCase(ext, ".hxx") or
-        std.ascii.eqlIgnoreCase(ext, ".js") or
-        std.ascii.eqlIgnoreCase(ext, ".jsx") or
-        std.ascii.eqlIgnoreCase(ext, ".mjs") or
-        std.ascii.eqlIgnoreCase(ext, ".cjs") or
-        std.ascii.eqlIgnoreCase(ext, ".ts") or
-        std.ascii.eqlIgnoreCase(ext, ".tsx") or
-        std.ascii.eqlIgnoreCase(ext, ".go") or
-        std.ascii.eqlIgnoreCase(ext, ".py") or
-        std.ascii.eqlIgnoreCase(ext, ".java") or
-        std.ascii.eqlIgnoreCase(ext, ".cs") or
-        std.ascii.eqlIgnoreCase(ext, ".kt") or
-        std.ascii.eqlIgnoreCase(ext, ".kts") or
-        std.ascii.eqlIgnoreCase(ext, ".swift") or
-        std.ascii.eqlIgnoreCase(ext, ".rb") or
-        std.ascii.eqlIgnoreCase(ext, ".php") or
-        std.ascii.eqlIgnoreCase(ext, ".scala") or
-        std.ascii.eqlIgnoreCase(ext, ".sc") or
-        std.ascii.eqlIgnoreCase(ext, ".dart") or
-        std.ascii.eqlIgnoreCase(ext, ".lua") or
-        std.ascii.eqlIgnoreCase(ext, ".r") or
-        std.ascii.eqlIgnoreCase(ext, ".jl") or
-        std.ascii.eqlIgnoreCase(ext, ".vue") or
-        std.ascii.eqlIgnoreCase(ext, ".svelte") or
-        std.ascii.eqlIgnoreCase(ext, ".astro") or
-        std.ascii.eqlIgnoreCase(ext, ".mdx") or
-        std.ascii.eqlIgnoreCase(ext, ".graphql") or
-        std.ascii.eqlIgnoreCase(ext, ".gql") or
-        std.ascii.eqlIgnoreCase(ext, ".sh") or
-        std.ascii.eqlIgnoreCase(ext, ".bash") or
-        std.ascii.eqlIgnoreCase(ext, ".zsh") or
-        std.ascii.eqlIgnoreCase(ext, ".fish") or
-        std.ascii.eqlIgnoreCase(ext, ".ps1") or
-        std.ascii.eqlIgnoreCase(ext, ".psm1") or
-        std.ascii.eqlIgnoreCase(ext, ".psd1") or
-        std.ascii.eqlIgnoreCase(ext, ".cmd") or
-        std.ascii.eqlIgnoreCase(ext, ".bat") or
-        std.ascii.eqlIgnoreCase(ext, ".m") or
-        std.ascii.eqlIgnoreCase(ext, ".mm") or
-        std.ascii.eqlIgnoreCase(ext, ".pl") or
-        std.ascii.eqlIgnoreCase(ext, ".pm") or
-        std.ascii.eqlIgnoreCase(ext, ".erl") or
-        std.ascii.eqlIgnoreCase(ext, ".hrl") or
-        std.ascii.eqlIgnoreCase(ext, ".ex") or
-        std.ascii.eqlIgnoreCase(ext, ".exs") or
-        std.ascii.eqlIgnoreCase(ext, ".clj") or
-        std.ascii.eqlIgnoreCase(ext, ".cljs") or
-        std.ascii.eqlIgnoreCase(ext, ".cljc") or
-        std.ascii.eqlIgnoreCase(ext, ".fs") or
-        std.ascii.eqlIgnoreCase(ext, ".fsx") or
-        std.ascii.eqlIgnoreCase(ext, ".vb") or
-        std.ascii.eqlIgnoreCase(ext, ".zig") or
-        std.ascii.eqlIgnoreCase(ext, ".rs");
+    for (INDEXABLE_LARGE_SOURCE_EXTENSIONS) |candidate| {
+        if (std.ascii.eqlIgnoreCase(ext, candidate)) return true;
+    }
+    return false;
 }
 
 test "large source index admission includes script source family" {
@@ -580,6 +537,21 @@ test "large source index admission includes script source family" {
     try std.testing.expect(isIndexableLargeSourcePath("src/frontier.fs"));
     try std.testing.expect(isIndexableLargeSourcePath("src/frontier.fsx"));
     try std.testing.expect(isIndexableLargeSourcePath("src/frontier.vb"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.hs"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.lhs"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.ml"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.mli"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.nim"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.cr"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.d"));
+    try std.testing.expect(isIndexableLargeSourcePath("rtl/frontier.v"));
+    try std.testing.expect(isIndexableLargeSourcePath("rtl/frontier.vh"));
+    try std.testing.expect(isIndexableLargeSourcePath("rtl/frontier.sv"));
+    try std.testing.expect(isIndexableLargeSourcePath("rtl/frontier.svh"));
+    try std.testing.expect(isIndexableLargeSourcePath("hdl/frontier.vhd"));
+    try std.testing.expect(isIndexableLargeSourcePath("hdl/frontier.vhdl"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.adb"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.ads"));
     try std.testing.expect(!isIndexableLargeSourcePath("logs/runtime.txt"));
     try std.testing.expect(!isIndexableLargeSourcePath("assets/bundle.map"));
 }
