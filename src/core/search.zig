@@ -1872,7 +1872,7 @@ fn isRecoverableScanAccessError(err: anyerror) bool {
 fn shouldSkipProtectedBinaryContainer(request: cli.SearchRequest, path: []const u8) bool {
     if (comptime builtin.os.tag != .windows) return false;
     if (!isProtectedWindowsPath(path)) return false;
-    if (request.stats_only and isProtectedVolatileSystemStore(path)) return true;
+    if (isProtectedVolatileSystemStore(path)) return true;
     const ext = pathExtension(path) orelse return false;
     if (!request.stats_only) return hasProtectedBinaryContainerExtension(ext);
     return !hasProtectedTextExtension(ext);
@@ -4503,6 +4503,7 @@ fn hasProtectedBinaryContainerExtension(ext: []const u8) bool {
     const binary_extensions = [_][]const u8{
         ".dll", ".exe", ".sys", ".mui", ".cat", ".ocx", ".cpl", ".drv",
         ".efi", ".scr", ".msi", ".msp", ".msu", ".cab", ".pnf",
+        ".nls", ".ttf", ".ttc", ".otf", ".fon",
     };
     for (binary_extensions) |candidate| {
         if (std.ascii.eqlIgnoreCase(ext, candidate)) return true;
@@ -5764,8 +5765,14 @@ test "protected Windows stats-only binary container skip stays scoped" {
         request.stats_only = false;
         try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
         try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\en-US\\shell32.dll.mui"));
-        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\catroot2\\edbtmp.log"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\Globalization\\Sorting\\sortdefault.nls"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\Fonts\\arial.ttf"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\Fonts\\msgothic.ttc"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\Fonts\\cascadia.otf"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\Fonts\\vgaoem.fon"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\catroot2\\edbtmp.log"));
         try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\DriverStore\\sample.inf"));
+        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "E:\\repo\\arial.ttf"));
     } else {
         try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
     }
