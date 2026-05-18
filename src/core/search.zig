@@ -253,7 +253,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         if (request.stats_only and !report.truncated and !warm_prepared.stats_result_cache_hit) {
             writeWarmQueryStatsResult(io, allocator, warm_prepared, request, report);
         }
-        if (!request.stats_only and request.max_hits == null and !report.truncated and !warm_prepared.hit_result_cache_hit) {
+        if (!request.stats_only and !report.truncated and !warm_prepared.hit_result_cache_hit) {
             writeWarmQueryHitResult(io, allocator, warm_prepared, request, report);
         }
         report.total_ms = elapsedMs(io, total_started);
@@ -695,7 +695,26 @@ fn loadWarmQueryHitResult(
     request: cli.SearchRequest,
     report: *SearchReport,
 ) ?WarmIndexFrontier {
-    const cache_path = warmQueryHitsCachePath(allocator, root, root_fingerprint, epoch, report.expression) catch return null;
+    if (loadWarmQueryHitResultFromCache(io, allocator, root, root_fingerprint, epoch, request, report, request.max_hits)) |cached| {
+        return cached;
+    }
+    if (request.max_hits != null) {
+        return loadWarmQueryHitResultFromCache(io, allocator, root, root_fingerprint, epoch, request, report, null);
+    }
+    return null;
+}
+
+fn loadWarmQueryHitResultFromCache(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    root_fingerprint: catalog.RootFingerprint,
+    epoch: generation.Epoch,
+    request: cli.SearchRequest,
+    report: *SearchReport,
+    cache_max_hits: ?usize,
+) ?WarmIndexFrontier {
+    const cache_path = warmQueryHitsCachePath(allocator, root, root_fingerprint, epoch, report.expression, cache_max_hits) catch return null;
     defer allocator.free(cache_path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, cache_path, allocator, .limited(WARM_QUERY_CACHE_READ_LIMIT)) catch return null;
     defer allocator.free(bytes);
@@ -805,11 +824,11 @@ fn writeWarmQueryHitResult(
     request: cli.SearchRequest,
     report: SearchReport,
 ) void {
-    if (request.stats_only or request.max_hits != null) return;
+    if (request.stats_only) return;
     const query_dir = std.fs.path.join(allocator, &.{ prepared.root, ".ix", "index", "query" }) catch return;
     defer allocator.free(query_dir);
     std.Io.Dir.cwd().createDirPath(io, query_dir) catch return;
-    const cache_path = warmQueryHitsCachePath(allocator, prepared.root, prepared.root_fingerprint, prepared.epoch, request.expression) catch return;
+    const cache_path = warmQueryHitsCachePath(allocator, prepared.root, prepared.root_fingerprint, prepared.epoch, request.expression, request.max_hits) catch return;
     defer allocator.free(cache_path);
     var file = std.Io.Dir.cwd().createFile(io, cache_path, .{ .truncate = true }) catch return;
     defer file.close(io);
@@ -892,8 +911,12 @@ fn warmQueryHitsCachePath(
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
     expression: []const u8,
+    max_hits: ?usize,
 ) ![]const u8 {
-    const hash = warmQueryHash(root_fingerprint, epoch, expression) ^ 0x4849545331;
+    var hash = warmQueryHash(root_fingerprint, epoch, expression) ^ 0x4849545331;
+    if (max_hits) |limit| {
+        hash = std.hash.Wyhash.hash(hash ^ 0x4d41584849545331, std.mem.asBytes(&limit));
+    }
     const file_name = try std.fmt.allocPrint(allocator, "{x}.ixqh", .{hash});
     defer allocator.free(file_name);
     return std.fs.path.join(allocator, &.{ root, ".ix", "index", "query", file_name });
@@ -2287,7 +2310,7 @@ fn trySerialMmapFastPath(
     var shard = ShardReport.empty;
     scanFileMmap(null, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, &shard, file_started) catch return false;
     var shards = [_]ShardReport{shard};
-    mergeShardsIntoReport(shards[0..], report);
+    mergeShardsIntoReport(shards[0..], request, report);
     return true;
 }
 
@@ -3171,7 +3194,7 @@ fn parallelScanFiles(
         }
         dynamicShardWorker(io, allocator, &next_file, files, request, plan, trigram_admission, trigram_program, &shards[0]);
         for (threads) |thread| thread.join();
-        mergeShardsIntoReport(shards, report);
+        mergeShardsIntoReport(shards, request, report);
         writeEvidenceFrontierCacheFromShards(io, allocator, evidence_runtime, shards);
         return;
     }
@@ -3203,11 +3226,12 @@ fn parallelScanFiles(
     // Join all worker threads.
     for (threads) |t| t.join();
 
-    mergeShardsIntoReport(shards, report);
+    mergeShardsIntoReport(shards, request, report);
     writeEvidenceFrontierCacheFromShards(io, allocator, evidence_runtime, shards);
 }
 
-fn mergeShardsIntoReport(shards: []const ShardReport, report: *SearchReport) void {
+fn mergeShardsIntoReport(shards: []const ShardReport, request: cli.SearchRequest, report: *SearchReport) void {
+    const retained_limit = if (request.max_hits) |max_hits| @min(max_hits, MAX_RETAINED_HITS) else MAX_RETAINED_HITS;
     for (shards) |shard| {
         report.bytes_scanned += shard.bytes_scanned;
         report.files_scanned += shard.files_scanned;
@@ -3227,7 +3251,7 @@ fn mergeShardsIntoReport(shards: []const ShardReport, report: *SearchReport) voi
             report.slowest_bytes = shard.slowest_bytes;
         }
         // Merge hits: copy from shard into report, respecting the global cap.
-        const available = MAX_RETAINED_HITS - report.hit_count;
+        const available = retained_limit -| report.hit_count;
         const to_copy = @min(shard.hit_count, available);
         for (0..to_copy) |j| {
             report.hits[report.hit_count] = shard.hits[j];
@@ -5496,6 +5520,48 @@ test "search run consumes live warm postings and scans only candidate files" {
     try std.testing.expectEqual(report.hits[0].line, capped_report.hits[0].line);
     try std.testing.expectEqual(report.hits[0].column, capped_report.hits[0].column);
     try std.testing.expectEqualStrings(report.hits[0].preview, capped_report.hits[0].preview);
+}
+
+test "capped warm query hit cache reuses capped-first result" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\nneedle\nneedle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
+    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    try std.Io.Dir.cwd().createDirPath(io, index_dir);
+    const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
+
+    var request = testSearchRequest("lit:needle", root_path);
+    request.index_enabled = true;
+    request.nexus_disabled = true;
+    request.max_hits = 1;
+    const plan = try expr.parse(request.expression);
+
+    const first_report = try run(io, allocator, request, plan);
+    try std.testing.expect(first_report.stats.postings_index.available);
+    try std.testing.expectEqual(@as(usize, 1), first_report.files_scanned);
+    try std.testing.expectEqual(@as(usize, 3), first_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), first_report.hit_count);
+
+    const cached_report = try run(io, allocator, request, plan);
+    try std.testing.expect(cached_report.stats.postings_index.available);
+    try std.testing.expectEqualStrings("live_query_hits_cache", cached_report.stats.generation_refresh.refresh_status);
+    try std.testing.expectEqual(@as(usize, 0), cached_report.files_scanned);
+    try std.testing.expectEqual(@as(usize, 3), cached_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), cached_report.hit_count);
+    try std.testing.expectEqualStrings(first_report.hits[0].path, cached_report.hits[0].path);
+    try std.testing.expectEqual(first_report.hits[0].line, cached_report.hits[0].line);
+    try std.testing.expectEqual(first_report.hits[0].column, cached_report.hits[0].column);
+    try std.testing.expectEqualStrings(first_report.hits[0].preview, cached_report.hits[0].preview);
 }
 
 test "stats-only warm query cache reuses exact pinned-generation count" {
