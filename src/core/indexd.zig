@@ -19,6 +19,8 @@ extern "kernel32" fn ReadDirectoryChangesW(
 
 pub const LIVE_MARKER_NAME = "index.live";
 const INDEX_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
+const INDEX_LARGE_SOURCE_FILE_READ_LIMIT: usize = 64 * 1024 * 1024;
+const INDEX_LARGE_SOURCE_TOTAL_READ_LIMIT: usize = 128 * 1024 * 1024;
 
 pub const Request = struct {
     root: []const u8,
@@ -382,6 +384,11 @@ const IndexedFile = struct {
 };
 
 fn collectIndexFiles(io: std.Io, allocator: std.mem.Allocator, root: []const u8, files: *std.ArrayList(IndexedFile)) !void {
+    var large_source_bytes: usize = 0;
+    try collectIndexFilesWithBudget(io, allocator, root, files, &large_source_bytes);
+}
+
+fn collectIndexFilesWithBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, files: *std.ArrayList(IndexedFile), large_source_bytes: *usize) !void {
     const dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         error.AccessDenied => return,
@@ -400,9 +407,9 @@ fn collectIndexFiles(io: std.Io, allocator: std.mem.Allocator, root: []const u8,
         if (isDefaultHiddenEntry(entry.name)) continue;
         const child_path = try joinPathForward(allocator, root, entry.name);
         switch (entry.kind) {
-            .file => try appendIndexedFile(io, allocator, child_path, files),
+            .file => try appendIndexedFile(io, allocator, child_path, files, large_source_bytes),
             .directory => {
-                try collectIndexFiles(io, allocator, child_path, files);
+                try collectIndexFilesWithBudget(io, allocator, child_path, files, large_source_bytes);
                 allocator.free(child_path);
             },
             else => allocator.free(child_path),
@@ -410,7 +417,7 @@ fn collectIndexFiles(io: std.Io, allocator: std.mem.Allocator, root: []const u8,
     }
 }
 
-fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, files: *std.ArrayList(IndexedFile)) !void {
+fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, files: *std.ArrayList(IndexedFile), large_source_bytes: *usize) !void {
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
         error.AccessDenied, error.FileNotFound => {
             allocator.free(path);
@@ -426,7 +433,9 @@ fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
         },
         else => return err,
     };
-    if (stat.size > INDEX_FILE_READ_LIMIT) {
+    const large_source = stat.size <= INDEX_LARGE_SOURCE_FILE_READ_LIMIT and isIndexableLargeSourcePath(path);
+    const large_source_allowed = large_source and stat.size <= INDEX_LARGE_SOURCE_TOTAL_READ_LIMIT - large_source_bytes.*;
+    if (stat.size > INDEX_FILE_READ_LIMIT and !large_source_allowed) {
         const bytes = try allocator.alloc(u8, 0);
         try files.append(allocator, .{
             .path = path,
@@ -437,19 +446,35 @@ fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
         });
         return;
     }
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(INDEX_FILE_READ_LIMIT)) catch |err| switch (err) {
+    const read_limit: usize = if (stat.size > INDEX_FILE_READ_LIMIT) INDEX_LARGE_SOURCE_FILE_READ_LIMIT else INDEX_FILE_READ_LIMIT;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(read_limit)) catch |err| switch (err) {
         error.AccessDenied, error.FileNotFound => {
             allocator.free(path);
             return;
         },
         else => return err,
     };
+    if (stat.size > INDEX_FILE_READ_LIMIT) large_source_bytes.* += bytes.len;
     try files.append(allocator, .{
         .path = path,
         .bytes = bytes,
         .size = stat.size,
         .mtime_ns = stat.mtime.nanoseconds,
     });
+}
+
+fn isIndexableLargeSourcePath(path: []const u8) bool {
+    const ext = std.fs.path.extension(path);
+    return std.ascii.eqlIgnoreCase(ext, ".c") or
+        std.ascii.eqlIgnoreCase(ext, ".h") or
+        std.ascii.eqlIgnoreCase(ext, ".cc") or
+        std.ascii.eqlIgnoreCase(ext, ".hh") or
+        std.ascii.eqlIgnoreCase(ext, ".cpp") or
+        std.ascii.eqlIgnoreCase(ext, ".hpp") or
+        std.ascii.eqlIgnoreCase(ext, ".cxx") or
+        std.ascii.eqlIgnoreCase(ext, ".hxx") or
+        std.ascii.eqlIgnoreCase(ext, ".zig") or
+        std.ascii.eqlIgnoreCase(ext, ".rs");
 }
 
 fn lessThanIndexedFilePath(_: void, lhs: IndexedFile, rhs: IndexedFile) bool {
