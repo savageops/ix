@@ -431,7 +431,7 @@ fn prepareWarmIndexFrontier(
         if (loadWarmQueryStatsResult(io, allocator, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
             return cached;
         }
-    } else if (request.max_hits == null) {
+    } else {
         if (loadWarmQueryHitResult(io, allocator, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
             return cached;
         }
@@ -695,7 +695,6 @@ fn loadWarmQueryHitResult(
     request: cli.SearchRequest,
     report: *SearchReport,
 ) ?WarmIndexFrontier {
-    _ = request;
     const cache_path = warmQueryHitsCachePath(allocator, root, root_fingerprint, epoch, report.expression) catch return null;
     defer allocator.free(cache_path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, cache_path, allocator, .limited(WARM_QUERY_CACHE_READ_LIMIT)) catch return null;
@@ -722,6 +721,7 @@ fn loadWarmQueryHitResult(
     if (hit_count > MAX_RETAINED_HITS) return null;
     if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return null, "\r"), "--")) return null;
 
+    const retained_hit_count = if (request.max_hits) |max_hits| @min(hit_count, max_hits) else hit_count;
     var loaded: usize = 0;
     while (loaded < hit_count) : (loaded += 1) {
         const line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
@@ -731,19 +731,21 @@ fn loadWarmQueryHitResult(
         const path_encoded = fields.next() orelse return null;
         const preview_encoded = fields.next() orelse return null;
         if (fields.next() != null) return null;
-        report.hits[loaded] = .{
-            .path = unescapeWarmQueryField(allocator, path_encoded) catch return null,
-            .line = hit_line,
-            .column = hit_column,
-            .preview = unescapeWarmQueryField(allocator, preview_encoded) catch return null,
-        };
+        if (loaded < retained_hit_count) {
+            report.hits[loaded] = .{
+                .path = unescapeWarmQueryField(allocator, path_encoded) catch return null,
+                .line = hit_line,
+                .column = hit_column,
+                .preview = unescapeWarmQueryField(allocator, preview_encoded) catch return null,
+            };
+        }
     }
 
     report.discover_ms = 0;
     report.files_discovered = discovered;
     report.files_scanned = 0;
     report.matches_found = matches;
-    report.hit_count = hit_count;
+    report.hit_count = retained_hit_count;
     report.stats.generation_refresh.available = true;
     report.stats.generation_refresh.epoch = epoch;
     report.stats.generation_refresh.refresh_status = "live_query_hits_cache";
@@ -5447,7 +5449,7 @@ test "search run consumes live warm postings and scans only candidate files" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\nneedle\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
     const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
@@ -5467,7 +5469,7 @@ test "search run consumes live warm postings and scans only candidate files" {
     try std.testing.expect(report.stats.postings_index.available);
     try std.testing.expectEqual(@as(usize, 2), report.files_discovered);
     try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
-    try std.testing.expectEqual(@as(usize, 1), report.matches_found);
+    try std.testing.expectEqual(@as(usize, 2), report.matches_found);
     try std.testing.expectEqual(@as(usize, 1), report.stats.postings_index.candidate_files);
     try std.testing.expectEqual(@as(usize, 1), report.stats.postings_index.pruned_files);
 
@@ -5475,12 +5477,25 @@ test "search run consumes live warm postings and scans only candidate files" {
     try std.testing.expect(cached_report.stats.postings_index.available);
     try std.testing.expectEqualStrings("live_query_hits_cache", cached_report.stats.generation_refresh.refresh_status);
     try std.testing.expectEqual(@as(usize, 0), cached_report.files_scanned);
-    try std.testing.expectEqual(@as(usize, 1), cached_report.matches_found);
-    try std.testing.expectEqual(@as(usize, 1), cached_report.hit_count);
+    try std.testing.expectEqual(@as(usize, 2), cached_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 2), cached_report.hit_count);
     try std.testing.expectEqualStrings(report.hits[0].path, cached_report.hits[0].path);
     try std.testing.expectEqual(report.hits[0].line, cached_report.hits[0].line);
     try std.testing.expectEqual(report.hits[0].column, cached_report.hits[0].column);
     try std.testing.expectEqualStrings(report.hits[0].preview, cached_report.hits[0].preview);
+
+    var capped_request = request;
+    capped_request.max_hits = 1;
+    const capped_report = try run(io, allocator, capped_request, plan);
+    try std.testing.expect(capped_report.stats.postings_index.available);
+    try std.testing.expectEqualStrings("live_query_hits_cache", capped_report.stats.generation_refresh.refresh_status);
+    try std.testing.expectEqual(@as(usize, 0), capped_report.files_scanned);
+    try std.testing.expectEqual(@as(usize, 2), capped_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), capped_report.hit_count);
+    try std.testing.expectEqualStrings(report.hits[0].path, capped_report.hits[0].path);
+    try std.testing.expectEqual(report.hits[0].line, capped_report.hits[0].line);
+    try std.testing.expectEqual(report.hits[0].column, capped_report.hits[0].column);
+    try std.testing.expectEqualStrings(report.hits[0].preview, capped_report.hits[0].preview);
 }
 
 test "stats-only warm query cache reuses exact pinned-generation count" {
