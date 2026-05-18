@@ -24,6 +24,7 @@ const WARM_INDEX_LIVE_READ_LIMIT = 4096;
 const WARM_INDEX_SEGMENT_READ_LIMIT: usize = 128 * 1024 * 1024;
 const WARM_QUERY_CACHE_MAGIC = "IXQUERY_FRONTIER1";
 const WARM_QUERY_STATS_CACHE_MAGIC = "IXQUERY_STATS1";
+const WARM_QUERY_HITS_CACHE_MAGIC = "IXQUERY_HITS1";
 const WARM_QUERY_CACHE_READ_LIMIT: usize = 4 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: usize = 4 * 1024;
 const REGEX_DECOMPOSITION_MIN_LITERAL_LEN: usize = 3;
@@ -252,6 +253,9 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         if (request.stats_only and !report.truncated and !warm_prepared.stats_result_cache_hit) {
             writeWarmQueryStatsResult(io, allocator, warm_prepared, request, report);
         }
+        if (!request.stats_only and request.max_hits == null and !report.truncated and !warm_prepared.hit_result_cache_hit) {
+            writeWarmQueryHitResult(io, allocator, warm_prepared, request, report);
+        }
         report.total_ms = elapsedMs(io, total_started);
         refreshStats(&report);
         return report;
@@ -383,6 +387,7 @@ const WarmIndexFrontier = struct {
     discovered: usize,
     candidate_count: usize,
     stats_result_cache_hit: bool = false,
+    hit_result_cache_hit: bool = false,
 };
 
 fn prepareWarmIndexFrontier(
@@ -424,6 +429,10 @@ fn prepareWarmIndexFrontier(
 
     if (request.stats_only) {
         if (loadWarmQueryStatsResult(io, allocator, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
+            return cached;
+        }
+    } else if (request.max_hits == null) {
+        if (loadWarmQueryHitResult(io, allocator, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
             return cached;
         }
     }
@@ -677,6 +686,92 @@ fn loadWarmQueryStatsResult(
     };
 }
 
+fn loadWarmQueryHitResult(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    root_fingerprint: catalog.RootFingerprint,
+    epoch: generation.Epoch,
+    request: cli.SearchRequest,
+    report: *SearchReport,
+) ?WarmIndexFrontier {
+    _ = request;
+    const cache_path = warmQueryHitsCachePath(allocator, root, root_fingerprint, epoch, report.expression) catch return null;
+    defer allocator.free(cache_path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, cache_path, allocator, .limited(WARM_QUERY_CACHE_READ_LIMIT)) catch return null;
+    defer allocator.free(bytes);
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return null, "\r"), WARM_QUERY_HITS_CACHE_MAGIC)) return null;
+    const epoch_line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+    const discovered_line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+    const candidates_line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+    const matches_line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+    const hits_line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+    if (!std.mem.startsWith(u8, epoch_line, "epoch=")) return null;
+    if (!std.mem.startsWith(u8, discovered_line, "discovered=")) return null;
+    if (!std.mem.startsWith(u8, candidates_line, "candidates=")) return null;
+    if (!std.mem.startsWith(u8, matches_line, "matches=")) return null;
+    if (!std.mem.startsWith(u8, hits_line, "hits=")) return null;
+    const parsed_epoch = std.fmt.parseInt(u64, epoch_line["epoch=".len..], 10) catch return null;
+    if (parsed_epoch != epoch) return null;
+    const discovered = std.fmt.parseInt(usize, discovered_line["discovered=".len..], 10) catch return null;
+    const candidates = std.fmt.parseInt(usize, candidates_line["candidates=".len..], 10) catch return null;
+    const matches = std.fmt.parseInt(usize, matches_line["matches=".len..], 10) catch return null;
+    const hit_count = std.fmt.parseInt(usize, hits_line["hits=".len..], 10) catch return null;
+    if (hit_count > MAX_RETAINED_HITS) return null;
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return null, "\r"), "--")) return null;
+
+    var loaded: usize = 0;
+    while (loaded < hit_count) : (loaded += 1) {
+        const line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+        var fields = std.mem.splitScalar(u8, line, '\t');
+        const hit_line = std.fmt.parseInt(usize, fields.next() orelse return null, 10) catch return null;
+        const hit_column = std.fmt.parseInt(usize, fields.next() orelse return null, 10) catch return null;
+        const path_encoded = fields.next() orelse return null;
+        const preview_encoded = fields.next() orelse return null;
+        if (fields.next() != null) return null;
+        report.hits[loaded] = .{
+            .path = unescapeWarmQueryField(allocator, path_encoded) catch return null,
+            .line = hit_line,
+            .column = hit_column,
+            .preview = unescapeWarmQueryField(allocator, preview_encoded) catch return null,
+        };
+    }
+
+    report.discover_ms = 0;
+    report.files_discovered = discovered;
+    report.files_scanned = 0;
+    report.matches_found = matches;
+    report.hit_count = hit_count;
+    report.stats.generation_refresh.available = true;
+    report.stats.generation_refresh.epoch = epoch;
+    report.stats.generation_refresh.refresh_status = "live_query_hits_cache";
+    report.stats.generation_refresh.fallback_reason = "";
+    report.stats.catalog_index.available = true;
+    report.stats.catalog_index.generation = epoch;
+    report.stats.catalog_index.path_count = discovered;
+    report.stats.catalog_index.fallback_reason = "query_hits_cache";
+    report.stats.postings_index.available = true;
+    report.stats.postings_index.generation = epoch;
+    report.stats.postings_index.file_count = discovered;
+    report.stats.postings_index.candidate_files = candidates;
+    report.stats.postings_index.pruned_files = discovered - candidates;
+    report.stats.postings_index.verified_files = 0;
+    report.stats.postings_index.fallback_reason = "query_hits_cache";
+
+    const empty = allocator.alloc(DiscoveredFile, 0) catch return null;
+    return .{
+        .active_files = empty,
+        .root = root,
+        .root_fingerprint = root_fingerprint,
+        .epoch = epoch,
+        .discovered = discovered,
+        .candidate_count = candidates,
+        .hit_result_cache_hit = true,
+    };
+}
+
 fn writeWarmQueryFrontier(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -698,6 +793,41 @@ fn writeWarmQueryFrontier(
     var writer = file.writer(io, &buffer);
     writer.interface.print("{s}\nepoch={}\ndiscovered={}\ncandidates={}\n--\n", .{ WARM_QUERY_CACHE_MAGIC, epoch, discovered, active.len }) catch return;
     for (active) |entry| writer.interface.print("{s}\n", .{entry.path}) catch return;
+    writer.interface.flush() catch return;
+}
+
+fn writeWarmQueryHitResult(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    prepared: WarmIndexFrontier,
+    request: cli.SearchRequest,
+    report: SearchReport,
+) void {
+    if (request.stats_only or request.max_hits != null) return;
+    const query_dir = std.fs.path.join(allocator, &.{ prepared.root, ".ix", "index", "query" }) catch return;
+    defer allocator.free(query_dir);
+    std.Io.Dir.cwd().createDirPath(io, query_dir) catch return;
+    const cache_path = warmQueryHitsCachePath(allocator, prepared.root, prepared.root_fingerprint, prepared.epoch, request.expression) catch return;
+    defer allocator.free(cache_path);
+    var file = std.Io.Dir.cwd().createFile(io, cache_path, .{ .truncate = true }) catch return;
+    defer file.close(io);
+    var buffer: [8192]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    writer.interface.print("{s}\nepoch={}\ndiscovered={}\ncandidates={}\nmatches={}\nhits={}\n--\n", .{
+        WARM_QUERY_HITS_CACHE_MAGIC,
+        prepared.epoch,
+        prepared.discovered,
+        prepared.candidate_count,
+        report.matches_found,
+        report.hit_count,
+    }) catch return;
+    for (report.hits[0..report.hit_count]) |hit| {
+        writer.interface.print("{}\t{}\t", .{ hit.line, hit.column }) catch return;
+        writeEscapedWarmQueryField(&writer.interface, hit.path) catch return;
+        writer.interface.writeByte('\t') catch return;
+        writeEscapedWarmQueryField(&writer.interface, hit.preview) catch return;
+        writer.interface.writeByte('\n') catch return;
+    }
     writer.interface.flush() catch return;
 }
 
@@ -750,6 +880,19 @@ fn warmQueryStatsCachePath(
 ) ![]const u8 {
     const hash = warmQueryHash(root_fingerprint, epoch, expression) ^ 0x535441545331;
     const file_name = try std.fmt.allocPrint(allocator, "{x}.ixqs", .{hash});
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ root, ".ix", "index", "query", file_name });
+}
+
+fn warmQueryHitsCachePath(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    root_fingerprint: catalog.RootFingerprint,
+    epoch: generation.Epoch,
+    expression: []const u8,
+) ![]const u8 {
+    const hash = warmQueryHash(root_fingerprint, epoch, expression) ^ 0x4849545331;
+    const file_name = try std.fmt.allocPrint(allocator, "{x}.ixqh", .{hash});
     defer allocator.free(file_name);
     return std.fs.path.join(allocator, &.{ root, ".ix", "index", "query", file_name });
 }
@@ -2150,6 +2293,41 @@ fn planUsesRegexDecompositionFastCount(plan: expr.ExpressionPlan, case_insensiti
     if (case_insensitive or plan.predicate_count != 1) return false;
     const predicate = plan.predicates[0];
     return predicate.kind == .regex and regexDecompositionNeedle(predicate.value) != null;
+}
+
+fn writeEscapedWarmQueryField(writer: anytype, value: []const u8) !void {
+    for (value) |byte| {
+        switch (byte) {
+            '\\' => try writer.writeAll("\\\\"),
+            '\t' => try writer.writeAll("\\t"),
+            '\n' => try writer.writeAll("\\n"),
+            '\r' => try writer.writeAll("\\r"),
+            else => try writer.writeByte(byte),
+        }
+    }
+}
+
+fn unescapeWarmQueryField(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
+    var out = try std.ArrayList(u8).initCapacity(allocator, value.len);
+    errdefer out.deinit(allocator);
+    var index: usize = 0;
+    while (index < value.len) : (index += 1) {
+        if (value[index] != '\\') {
+            try out.append(allocator, value[index]);
+            continue;
+        }
+        index += 1;
+        if (index >= value.len) return error.InvalidWarmQueryEscape;
+        const decoded: u8 = switch (value[index]) {
+            '\\' => '\\',
+            't' => '\t',
+            'n' => '\n',
+            'r' => '\r',
+            else => return error.InvalidWarmQueryEscape,
+        };
+        try out.append(allocator, decoded);
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 fn planUsesLiteralAlternatesFastCount(plan: expr.ExpressionPlan, case_insensitive: bool) bool {
@@ -5295,9 +5473,14 @@ test "search run consumes live warm postings and scans only candidate files" {
 
     const cached_report = try run(io, allocator, request, plan);
     try std.testing.expect(cached_report.stats.postings_index.available);
-    try std.testing.expectEqualStrings("live_query_cache", cached_report.stats.generation_refresh.refresh_status);
-    try std.testing.expectEqual(@as(usize, 1), cached_report.files_scanned);
+    try std.testing.expectEqualStrings("live_query_hits_cache", cached_report.stats.generation_refresh.refresh_status);
+    try std.testing.expectEqual(@as(usize, 0), cached_report.files_scanned);
     try std.testing.expectEqual(@as(usize, 1), cached_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), cached_report.hit_count);
+    try std.testing.expectEqualStrings(report.hits[0].path, cached_report.hits[0].path);
+    try std.testing.expectEqual(report.hits[0].line, cached_report.hits[0].line);
+    try std.testing.expectEqual(report.hits[0].column, cached_report.hits[0].column);
+    try std.testing.expectEqualStrings(report.hits[0].preview, cached_report.hits[0].preview);
 }
 
 test "stats-only warm query cache reuses exact pinned-generation count" {
