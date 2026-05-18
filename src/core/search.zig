@@ -4391,7 +4391,16 @@ fn countLiteralAlternatesLogicalLinesRange(buffer: []const u8, pattern: []const 
     const alternates = parseLiteralAlternates(pattern) orelse return .{ .bailed_out = true };
     const end = @min(logical_end, buffer.len);
     var counted = LiteralAlternatesRangeCount{};
-    var cursor = @min(logical_start, end);
+    const start = @min(logical_start, end);
+
+    if (literalAlternatesPcreRangeEligible(pattern, alternates.count)) {
+        if (pcre_regex.count(buffer[start..end], pattern, false)) |matches| {
+            counted.matches = matches;
+            return counted;
+        } else |_| {}
+    }
+
+    var cursor = start;
 
     while (cursor < end) {
         const newline = simd.indexOfByte(buffer[cursor..end], '\n');
@@ -4407,6 +4416,12 @@ fn countLiteralAlternatesLogicalLinesRange(buffer: []const u8, pattern: []const 
     }
 
     return counted;
+}
+
+fn literalAlternatesPcreRangeEligible(pattern: []const u8, branch_count: usize) bool {
+    if (pattern.len == 0) return false;
+    if (branch_count < 5) return false;
+    return std.mem.indexOfScalar(u8, pattern, '\\') == null;
 }
 
 fn wordBoundaryLiteralAt(buffer: []const u8, needle: []const u8, abs: usize) bool {
@@ -4736,6 +4751,27 @@ test "literal alternates line range counts regex occurrences" {
 
     try std.testing.expectEqual(@as(?usize, 1), literalAlternatesColumn(buffer, expr.literalAlternatesBody("(Sherlock Holmes|John Watson|Irene Adler)"), false));
     try std.testing.expectEqual(@as(usize, 3), countLiteralAlternates(buffer, expr.literalAlternatesBody("(Sherlock Holmes|John Watson|Irene Adler)"), false));
+}
+
+test "large literal alternates range may use pcre count path" {
+    const pattern = "Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty";
+    const buffer =
+        "Sherlock Holmes and John Watson\n" ++
+        "Irene Adler\n" ++
+        "Inspector Lestrade\n" ++
+        "Professor Moriarty Sherlock Holmes\n";
+
+    const alternates = parseLiteralAlternates(pattern).?;
+    try std.testing.expect(literalAlternatesPcreRangeEligible(pattern, alternates.count));
+
+    const count = countLiteralAlternatesLogicalLinesRange(buffer, pattern, 0, buffer.len);
+    try std.testing.expect(!count.bailed_out);
+    try std.testing.expectEqual(@as(usize, 6), count.matches);
+
+    const small = parseLiteralAlternates("Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade").?;
+    try std.testing.expect(!literalAlternatesPcreRangeEligible("Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade", small.count));
+    const escaped = parseLiteralAlternates("Sherlock\\.Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty").?;
+    try std.testing.expect(!literalAlternatesPcreRangeEligible("Sherlock\\.Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty", escaped.count));
 }
 
 test "byte shard default fanout caps implicit hardware thread count" {
