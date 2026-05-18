@@ -248,6 +248,8 @@ pub fn buildPostingsSegment(
 }
 
 pub fn lowerExpressionToLookupPlan(plan: expr.ExpressionPlan) LookupPlan {
+    if (literalAlternatesLookupPlan(plan)) |lookup| return lookup;
+
     const admission = trigram.admit(plan);
     var lookup = LookupPlan{
         .eligible = admission.eligible,
@@ -270,6 +272,92 @@ pub fn lowerExpressionToLookupPlan(plan: expr.ExpressionPlan) LookupPlan {
     }
     lookup.group_count = admission.group_count;
     return lookup;
+}
+
+fn literalAlternatesLookupPlan(plan: expr.ExpressionPlan) ?LookupPlan {
+    if (plan.predicate_count != 1) return null;
+
+    const predicate = plan.predicates[0];
+    if (predicate.kind != .regex) return null;
+    if (predicate.strategy != .regex_literal_alternates) return null;
+
+    const body = expr.literalAlternatesBody(predicate.value);
+    var lookup = LookupPlan{
+        .eligible = true,
+        .mode = .any,
+        .fallback = .none,
+    };
+
+    var branch_start: usize = 0;
+    var index: usize = 0;
+    while (index <= body.len) : (index += 1) {
+        if (index < body.len) {
+            if (body[index] == '\\') {
+                index += 1;
+                continue;
+            }
+            if (body[index] != '|') continue;
+        }
+
+        if (lookup.group_count == lookup.groups.len) return null;
+
+        var group = LookupGroup{ .source_index = 0 };
+        if (!appendLiteralBranchTrigrams(&group, body[branch_start..index])) return null;
+        lookup.groups[lookup.group_count] = group;
+        lookup.group_count += 1;
+        branch_start = index + 1;
+    }
+
+    if (lookup.group_count == 0) return null;
+    return lookup;
+}
+
+fn appendLiteralBranchTrigrams(group: *LookupGroup, branch: []const u8) bool {
+    var decoded_len: usize = 0;
+    var last: [2]u8 = undefined;
+    var index: usize = 0;
+
+    while (index < branch.len) : (index += 1) {
+        var byte = branch[index];
+        if (byte == '\\') {
+            index += 1;
+            if (index >= branch.len) return false;
+            byte = branch[index];
+            switch (byte) {
+                'b', 'B', 'd', 'D', 's', 'S', 'w', 'W', 'x', 'u', 'p', 'P' => return false,
+                else => {},
+            }
+        } else switch (byte) {
+            '(', ')', '[', ']', '{', '}', '.', '^', '$', '*', '+', '?', '|' => return false,
+            else => {},
+        }
+
+        if (decoded_len >= 2) {
+            const key = makeTrigramKey(&.{ last[0], last[1], byte });
+            appendUniqueLookupKey(group, key);
+        }
+
+        if (decoded_len == 0) {
+            last[0] = byte;
+        } else if (decoded_len == 1) {
+            last[1] = byte;
+        } else {
+            last[0] = last[1];
+            last[1] = byte;
+        }
+        decoded_len += 1;
+    }
+
+    return decoded_len >= 3 and group.key_count != 0;
+}
+
+fn appendUniqueLookupKey(group: *LookupGroup, key: TrigramKey) void {
+    for (group.keys[0..group.key_count]) |existing| {
+        if (existing == key) return;
+    }
+    if (group.key_count == group.keys.len) return;
+    group.keys[group.key_count] = key;
+    group.key_count += 1;
 }
 
 pub fn lookupRequiresFullScan(lookup: LookupPlan) bool {
@@ -985,6 +1073,28 @@ test "postings lookup lowering maps expression evidence to lookup keys" {
     try std.testing.expectEqual(LookupFallback.none, lookup.fallback);
 }
 
+test "postings lookup lowering maps literal alternate regex to branch evidence" {
+    const lookup = lowerExpressionToLookupPlan(try expr.parse("re:(alpha|beta)"));
+
+    try std.testing.expect(lookup.eligible);
+    try std.testing.expectEqual(LookupMode.any, lookup.mode);
+    try std.testing.expectEqual(@as(usize, 2), lookup.group_count);
+    try std.testing.expectEqual(LookupFallback.none, lookup.fallback);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'a', 'l', 'p' }), lookup.groups[0].keys[0]);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'l', 'p', 'h' }), lookup.groups[0].keys[1]);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'p', 'h', 'a' }), lookup.groups[0].keys[2]);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'b', 'e', 't' }), lookup.groups[1].keys[0]);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'e', 't', 'a' }), lookup.groups[1].keys[1]);
+}
+
+test "postings lookup lowering refuses literal alternates with short evidence branch" {
+    const lookup = lowerExpressionToLookupPlan(try expr.parse("re:(alpha|ix)"));
+
+    try std.testing.expect(!lookup.eligible);
+    try std.testing.expectEqual(LookupFallback.no_mandatory_evidence, lookup.fallback);
+    try std.testing.expect(lookupRequiresFullScan(lookup));
+}
+
 test "postings lookup lowering fails closed for unindexed disjunction branch" {
     const plan = try expr.parse("lit:auth || lit:x");
     const lookup = lowerExpressionToLookupPlan(plan);
@@ -1036,6 +1146,23 @@ test "postings lookup evaluation unions disjunctive evidence" {
     defer std.testing.allocator.free(candidates);
 
     try std.testing.expectEqualSlices(FileId, &.{ catalog.makeFileId(0), catalog.makeFileId(1) }, candidates);
+}
+
+test "postings lookup evaluation unions literal alternate regex branch evidence" {
+    const files = [_]PostingsFileInput{
+        .{ .file_id = catalog.makeFileId(0), .bytes = "alpha" },
+        .{ .file_id = catalog.makeFileId(1), .bytes = "beta" },
+        .{ .file_id = catalog.makeFileId(2), .bytes = "gamma" },
+        .{ .file_id = catalog.makeFileId(3), .bytes = "alphabet" },
+    };
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files);
+    defer segment.deinit(std.testing.allocator);
+
+    const lookup = lowerExpressionToLookupPlan(try expr.parse("re:(alpha|beta)"));
+    const candidates = try evaluateLookupPlan(std.testing.allocator, segment, lookup);
+    defer std.testing.allocator.free(candidates);
+
+    try std.testing.expectEqualSlices(FileId, &.{ catalog.makeFileId(0), catalog.makeFileId(1), catalog.makeFileId(3) }, candidates);
 }
 
 test "postings lookup evaluation returns empty candidates for missing evidence" {
