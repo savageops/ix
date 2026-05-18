@@ -7,6 +7,9 @@ pub const MAGIC: [8]u8 = .{ 'I', 'X', 'P', 'O', 'S', 'T', '0', '1' };
 pub const FORMAT_VERSION: u16 = 1;
 pub const MIN_HEADER_SIZE: usize = @sizeOf(PostingsSegmentHeader);
 pub const INVALID_TRIGRAM_KEY: TrigramKey = 0;
+pub const SERIALIZED_HEADER_SIZE: u64 = 8 + 2 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 8;
+pub const SERIALIZED_ENTRY_SIZE: u64 = 4 + 8 + 4 + 1 + 1 + 2;
+pub const SERIALIZED_FILE_ID_SIZE: u64 = 8;
 
 pub const TrigramKey = u32;
 pub const FileId = catalog.FileId;
@@ -73,6 +76,15 @@ pub const PostingsSegment = struct {
         const start: usize = @intCast(entry.file_offset);
         const end = start + entry.file_count;
         return self.file_ids[start..end];
+    }
+};
+
+pub const PostingsFileLookup = struct {
+    header: PostingsSegmentHeader,
+    candidates: []FileId,
+
+    pub fn deinit(self: PostingsFileLookup, allocator: std.mem.Allocator) void {
+        allocator.free(self.candidates);
     }
 };
 
@@ -298,6 +310,37 @@ pub fn evaluateLookupPlan(allocator: std.mem.Allocator, segment: PostingsSegment
     return current;
 }
 
+pub fn evaluateLookupPlanFromFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    expected_root: RootFingerprint,
+    expected_generation: u64,
+    lookup: LookupPlan,
+) !PostingsFileLookup {
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false });
+    defer file.close(io);
+    return evaluateLookupPlanFromOpenFile(io, allocator, &file, expected_root, expected_generation, lookup);
+}
+
+pub fn evaluateLookupPlanFromOpenFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: *std.Io.File,
+    expected_root: RootFingerprint,
+    expected_generation: u64,
+    lookup: LookupPlan,
+) !PostingsFileLookup {
+    if (lookupRequiresFullScan(lookup)) return error.RequiresFullScan;
+    const header = try readHeaderAt(io, file, 0);
+    try validatePostingsHeader(header, expected_root, expected_generation);
+    const candidates = try evaluateLookupPlanFromOpenFileHeader(io, allocator, file, header, lookup);
+    return .{
+        .header = header,
+        .candidates = candidates,
+    };
+}
+
 pub fn selectCatalogEntriesForCandidates(
     allocator: std.mem.Allocator,
     snapshot: catalog.CatalogSnapshot,
@@ -454,6 +497,163 @@ fn lookupFileIds(segment: PostingsSegment, key_value: TrigramKey) ?[]const FileI
         }
     }
     return null;
+}
+
+fn evaluateLookupPlanFromOpenFileHeader(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: *std.Io.File,
+    header: PostingsSegmentHeader,
+    lookup: LookupPlan,
+) ![]FileId {
+    var current = try evaluateLookupGroupFromOpenFile(io, allocator, file, header, lookup.groups[0]);
+    errdefer allocator.free(current);
+
+    var group_index: usize = 1;
+    while (group_index < lookup.group_count) : (group_index += 1) {
+        const next_group = try evaluateLookupGroupFromOpenFile(io, allocator, file, header, lookup.groups[group_index]);
+        defer allocator.free(next_group);
+        const merged = switch (lookup.mode) {
+            .all => try intersectFileIds(allocator, current, next_group),
+            .any => try unionFileIds(allocator, current, next_group),
+        };
+        allocator.free(current);
+        current = merged;
+    }
+
+    return current;
+}
+
+fn evaluateLookupGroupFromOpenFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: *std.Io.File,
+    header: PostingsSegmentHeader,
+    group: LookupGroup,
+) ![]FileId {
+    if (group.key_count == 0) return allocator.alloc(FileId, 0);
+    var current = try lookupFileIdsFromOpenFile(io, allocator, file, header, group.keys[0]) orelse return allocator.alloc(FileId, 0);
+    errdefer allocator.free(current);
+
+    var key_index: usize = 1;
+    while (key_index < group.key_count) : (key_index += 1) {
+        const ids = try lookupFileIdsFromOpenFile(io, allocator, file, header, group.keys[key_index]) orelse {
+            allocator.free(current);
+            return allocator.alloc(FileId, 0);
+        };
+        defer allocator.free(ids);
+        const merged = try intersectFileIds(allocator, current, ids);
+        allocator.free(current);
+        current = merged;
+    }
+    return current;
+}
+
+fn lookupFileIdsFromOpenFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: *std.Io.File,
+    header: PostingsSegmentHeader,
+    key_value: TrigramKey,
+) !?[]FileId {
+    const entry = try lookupEntryFromOpenFile(io, file, header, key_value) orelse return null;
+    const count = try checkedCount(entry.file_count);
+    const ids = try allocator.alloc(FileId, count);
+    errdefer allocator.free(ids);
+    const start = try fileIdByteOffset(header, entry.file_offset);
+    var offset = start;
+    for (ids) |*file_id| {
+        file_id.* = try readU64At(io, file, offset);
+        if (!catalog.isValidFileId(file_id.*)) return error.InvalidCatalogFileId;
+        offset += SERIALIZED_FILE_ID_SIZE;
+    }
+    var index: usize = 1;
+    while (index < ids.len) : (index += 1) {
+        if (ids[index - 1] >= ids[index]) return error.DuplicateOrUnsortedPostingsFileIds;
+    }
+    return ids;
+}
+
+fn lookupEntryFromOpenFile(
+    io: std.Io,
+    file: *std.Io.File,
+    header: PostingsSegmentHeader,
+    key_value: TrigramKey,
+) !?PostingsEntry {
+    var low: u64 = 0;
+    var high = header.trigram_count;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const entry = try readEntryAt(io, file, try entryByteOffset(mid));
+        if (entry.key == key_value) {
+            if (!isValidEntryForHeader(entry, header)) return error.InvalidPostingsEntry;
+            return entry;
+        }
+        if (entry.key < key_value) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return null;
+}
+
+fn validatePostingsHeader(header: PostingsSegmentHeader, expected_root: RootFingerprint, expected_generation: u64) !void {
+    if (!std.mem.eql(u8, &header.magic, &MAGIC)) return error.InvalidPostingsMagic;
+    if (header.version != FORMAT_VERSION) return error.UnsupportedPostingsVersion;
+    if (header.header_size != @sizeOf(PostingsSegmentHeader)) return error.InvalidPostingsHeaderSize;
+    if (header.rootFingerprint() != expected_root) return error.WrongPostingsRoot;
+    if (header.generation != expected_generation) return error.WrongPostingsGeneration;
+    _ = try checkedCount(header.trigram_count);
+    _ = try checkedCount(header.postings_count);
+}
+
+fn isValidEntryForHeader(entry: PostingsEntry, header: PostingsSegmentHeader) bool {
+    if (!isValidTrigramKey(entry.key)) return false;
+    if (entry.file_offset > header.postings_count) return false;
+    return entry.file_count <= header.postings_count - entry.file_offset;
+}
+
+fn entryByteOffset(entry_index: u64) !u64 {
+    if (entry_index > (std.math.maxInt(u64) - SERIALIZED_HEADER_SIZE) / SERIALIZED_ENTRY_SIZE) return error.PostingsOffsetOverflow;
+    return SERIALIZED_HEADER_SIZE + entry_index * SERIALIZED_ENTRY_SIZE;
+}
+
+fn fileIdsByteOffset(header: PostingsSegmentHeader) !u64 {
+    if (header.trigram_count > (std.math.maxInt(u64) - SERIALIZED_HEADER_SIZE) / SERIALIZED_ENTRY_SIZE) return error.PostingsOffsetOverflow;
+    return SERIALIZED_HEADER_SIZE + header.trigram_count * SERIALIZED_ENTRY_SIZE;
+}
+
+fn fileIdByteOffset(header: PostingsSegmentHeader, file_offset: u64) !u64 {
+    const base = try fileIdsByteOffset(header);
+    if (file_offset > (std.math.maxInt(u64) - base) / SERIALIZED_FILE_ID_SIZE) return error.PostingsOffsetOverflow;
+    return base + file_offset * SERIALIZED_FILE_ID_SIZE;
+}
+
+fn readHeaderAt(io: std.Io, file: *std.Io.File, offset: u64) !PostingsSegmentHeader {
+    var buffer: [SERIALIZED_HEADER_SIZE]u8 = undefined;
+    try readExactAt(io, file, &buffer, offset);
+    var cursor = Cursor{ .bytes = &buffer };
+    return readHeader(&cursor);
+}
+
+fn readEntryAt(io: std.Io, file: *std.Io.File, offset: u64) !PostingsEntry {
+    var buffer: [SERIALIZED_ENTRY_SIZE]u8 = undefined;
+    try readExactAt(io, file, &buffer, offset);
+    var cursor = Cursor{ .bytes = &buffer };
+    return readEntry(&cursor);
+}
+
+fn readU64At(io: std.Io, file: *std.Io.File, offset: u64) !u64 {
+    var buffer: [SERIALIZED_FILE_ID_SIZE]u8 = undefined;
+    try readExactAt(io, file, &buffer, offset);
+    var cursor = Cursor{ .bytes = &buffer };
+    return cursor.readU64();
+}
+
+fn readExactAt(io: std.Io, file: *std.Io.File, buffer: []u8, offset: u64) !void {
+    const read_len = try file.readPositionalAll(io, buffer, offset);
+    if (read_len != buffer.len) return error.TruncatedPostingsSegment;
 }
 
 fn intersectFileIds(allocator: std.mem.Allocator, lhs: []const FileId, rhs: []const FileId) ![]FileId {
@@ -850,6 +1050,35 @@ test "postings lookup evaluation returns empty candidates for missing evidence" 
     defer std.testing.allocator.free(candidates);
 
     try std.testing.expectEqual(@as(usize, 0), candidates.len);
+}
+
+test "postings file lookup evaluates candidates without full segment parse" {
+    const files = [_]PostingsFileInput{
+        .{ .file_id = catalog.makeFileId(0), .bytes = "alpha beta gamma" },
+        .{ .file_id = catalog.makeFileId(1), .bytes = "alpha gamma" },
+        .{ .file_id = catalog.makeFileId(2), .bytes = "beta gamma" },
+        .{ .file_id = catalog.makeFileId(3), .bytes = "omega" },
+    };
+    const segment = try buildPostingsSegment(std.testing.allocator, 0x1234, 77, &files);
+    defer segment.deinit(std.testing.allocator);
+    const encoded = try serializePostingsSegment(std.testing.allocator, segment);
+    defer std.testing.allocator.free(encoded);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "postings.ixpost", .data = encoded });
+    var file = try tmp.dir.openFile(std.testing.io, "postings.ixpost", .{});
+    defer file.close(std.testing.io);
+
+    const lookup = lowerExpressionToLookupPlan(try expr.parse("lit:alpha && lit:gamma"));
+    const expected = try evaluateLookupPlan(std.testing.allocator, segment, lookup);
+    defer std.testing.allocator.free(expected);
+    const actual = try evaluateLookupPlanFromOpenFile(std.testing.io, std.testing.allocator, &file, 0x1234, 77, lookup);
+    defer actual.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(segment.header.trigram_count, actual.header.trigram_count);
+    try std.testing.expectEqual(segment.header.postings_count, actual.header.postings_count);
+    try std.testing.expectEqualSlices(FileId, expected, actual.candidates);
 }
 
 test "postings lookup evaluation refuses unsafe fallback as zero candidates" {

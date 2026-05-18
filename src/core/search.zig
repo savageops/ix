@@ -425,13 +425,9 @@ fn prepareWarmIndexFrontier(
     defer snapshot.deinit(allocator);
     if (snapshot.header.generation != pin.epoch) return warmIndexFallback(report, "catalog_generation_mismatch");
 
-    const postings_bytes = std.Io.Dir.cwd().readFileAlloc(io, postings_path, allocator, .limited(WARM_INDEX_SEGMENT_READ_LIMIT)) catch return warmIndexFallback(report, "postings_read_failed");
-    defer allocator.free(postings_bytes);
-    const segment = postings.parsePostingsSegmentForRootGeneration(allocator, postings_bytes, root_identity.fingerprint, pin.epoch) catch |err| return warmIndexFallback(report, @errorName(err));
-    defer segment.deinit(allocator);
-
-    const candidate_ids = postings.evaluateLookupPlan(allocator, segment, lookup) catch return warmIndexFallback(report, "lookup_failed");
-    defer allocator.free(candidate_ids);
+    const lookup_result = postings.evaluateLookupPlanFromFile(io, allocator, postings_path, root_identity.fingerprint, pin.epoch, lookup) catch |err| return warmIndexFallback(report, @errorName(err));
+    defer lookup_result.deinit(allocator);
+    const candidate_ids = lookup_result.candidates;
     const selected = postings.selectCatalogEntriesForCandidates(allocator, snapshot, candidate_ids) catch return warmIndexFallback(report, "candidate_select_failed");
     defer allocator.free(selected);
 
@@ -458,9 +454,9 @@ fn prepareWarmIndexFrontier(
     report.stats.catalog_index.fallback_reason = "";
     report.stats.postings_index.available = true;
     report.stats.postings_index.generation = pin.epoch;
-    report.stats.postings_index.trigram_count = segment.entries.len;
-    report.stats.postings_index.postings_count = segment.file_ids.len;
-    report.stats.postings_index.file_count = @intCast(segment.header.file_count);
+    report.stats.postings_index.trigram_count = @intCast(lookup_result.header.trigram_count);
+    report.stats.postings_index.postings_count = @intCast(lookup_result.header.postings_count);
+    report.stats.postings_index.file_count = @intCast(lookup_result.header.file_count);
     report.stats.postings_index.candidate_files = candidate_ids.len;
     report.stats.postings_index.pruned_files = snapshot.entries.len - active.items.len;
     report.stats.postings_index.verified_files = active.items.len;
