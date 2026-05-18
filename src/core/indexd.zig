@@ -509,6 +509,20 @@ fn isIndexableLargeSourcePath(path: []const u8) bool {
         std.ascii.eqlIgnoreCase(ext, ".psd1") or
         std.ascii.eqlIgnoreCase(ext, ".cmd") or
         std.ascii.eqlIgnoreCase(ext, ".bat") or
+        std.ascii.eqlIgnoreCase(ext, ".m") or
+        std.ascii.eqlIgnoreCase(ext, ".mm") or
+        std.ascii.eqlIgnoreCase(ext, ".pl") or
+        std.ascii.eqlIgnoreCase(ext, ".pm") or
+        std.ascii.eqlIgnoreCase(ext, ".erl") or
+        std.ascii.eqlIgnoreCase(ext, ".hrl") or
+        std.ascii.eqlIgnoreCase(ext, ".ex") or
+        std.ascii.eqlIgnoreCase(ext, ".exs") or
+        std.ascii.eqlIgnoreCase(ext, ".clj") or
+        std.ascii.eqlIgnoreCase(ext, ".cljs") or
+        std.ascii.eqlIgnoreCase(ext, ".cljc") or
+        std.ascii.eqlIgnoreCase(ext, ".fs") or
+        std.ascii.eqlIgnoreCase(ext, ".fsx") or
+        std.ascii.eqlIgnoreCase(ext, ".vb") or
         std.ascii.eqlIgnoreCase(ext, ".zig") or
         std.ascii.eqlIgnoreCase(ext, ".rs");
 }
@@ -552,6 +566,20 @@ test "large source index admission includes script source family" {
     try std.testing.expect(isIndexableLargeSourcePath("modules/frontier.psd1"));
     try std.testing.expect(isIndexableLargeSourcePath("scripts/frontier.cmd"));
     try std.testing.expect(isIndexableLargeSourcePath("scripts/frontier.bat"));
+    try std.testing.expect(isIndexableLargeSourcePath("runtime/frontier.m"));
+    try std.testing.expect(isIndexableLargeSourcePath("runtime/frontier.mm"));
+    try std.testing.expect(isIndexableLargeSourcePath("lib/frontier.pl"));
+    try std.testing.expect(isIndexableLargeSourcePath("lib/frontier.pm"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.erl"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.hrl"));
+    try std.testing.expect(isIndexableLargeSourcePath("lib/frontier.ex"));
+    try std.testing.expect(isIndexableLargeSourcePath("lib/frontier.exs"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.clj"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.cljs"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.cljc"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.fs"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.fsx"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/frontier.vb"));
     try std.testing.expect(!isIndexableLargeSourcePath("logs/runtime.txt"));
     try std.testing.expect(!isIndexableLargeSourcePath("assets/bundle.map"));
 }
