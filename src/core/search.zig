@@ -1871,10 +1871,10 @@ fn isRecoverableScanAccessError(err: anyerror) bool {
 
 fn shouldSkipProtectedBinaryContainer(request: cli.SearchRequest, path: []const u8) bool {
     if (comptime builtin.os.tag != .windows) return false;
-    if (!request.stats_only) return false;
     if (!isProtectedWindowsPath(path)) return false;
-    if (isProtectedVolatileSystemStore(path)) return true;
+    if (request.stats_only and isProtectedVolatileSystemStore(path)) return true;
     const ext = pathExtension(path) orelse return false;
+    if (!request.stats_only) return hasProtectedBinaryContainerExtension(ext);
     return !hasProtectedTextExtension(ext);
 }
 
@@ -4499,6 +4499,17 @@ fn isHiddenPath(path: []const u8) bool {
     return false;
 }
 
+fn hasProtectedBinaryContainerExtension(ext: []const u8) bool {
+    const binary_extensions = [_][]const u8{
+        ".dll", ".exe", ".sys", ".mui", ".cat", ".ocx", ".cpl", ".drv",
+        ".efi", ".scr", ".msi", ".msp", ".msu", ".cab", ".pnf",
+    };
+    for (binary_extensions) |candidate| {
+        if (std.ascii.eqlIgnoreCase(ext, candidate)) return true;
+    }
+    return false;
+}
+
 // ── SIMD Casefold Infrastructure ──────────────────────────────────────
 //
 // ASCII case differs by exactly bit 5 (0x20). To search case-insensitively
@@ -5751,7 +5762,10 @@ test "protected Windows stats-only binary container skip stays scoped" {
         try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\drivers\\etc\\hosts"));
         try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "E:\\repo\\fake.dll"));
         request.stats_only = false;
-        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
+        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\en-US\\shell32.dll.mui"));
+        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\catroot2\\edbtmp.log"));
+        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\DriverStore\\sample.inf"));
     } else {
         try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
     }
