@@ -473,8 +473,27 @@ fn isIndexableLargeSourcePath(path: []const u8) bool {
         std.ascii.eqlIgnoreCase(ext, ".hpp") or
         std.ascii.eqlIgnoreCase(ext, ".cxx") or
         std.ascii.eqlIgnoreCase(ext, ".hxx") or
+        std.ascii.eqlIgnoreCase(ext, ".js") or
+        std.ascii.eqlIgnoreCase(ext, ".jsx") or
+        std.ascii.eqlIgnoreCase(ext, ".mjs") or
+        std.ascii.eqlIgnoreCase(ext, ".cjs") or
+        std.ascii.eqlIgnoreCase(ext, ".ts") or
+        std.ascii.eqlIgnoreCase(ext, ".tsx") or
         std.ascii.eqlIgnoreCase(ext, ".zig") or
         std.ascii.eqlIgnoreCase(ext, ".rs");
+}
+
+test "large source index admission includes script source family" {
+    try std.testing.expect(isIndexableLargeSourcePath("src/main.zig"));
+    try std.testing.expect(isIndexableLargeSourcePath("crates/lib.rs"));
+    try std.testing.expect(isIndexableLargeSourcePath("assets/bundle.js"));
+    try std.testing.expect(isIndexableLargeSourcePath("assets/component.jsx"));
+    try std.testing.expect(isIndexableLargeSourcePath("assets/server.mjs"));
+    try std.testing.expect(isIndexableLargeSourcePath("assets/runtime.cjs"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/app.ts"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/app.tsx"));
+    try std.testing.expect(!isIndexableLargeSourcePath("logs/runtime.txt"));
+    try std.testing.expect(!isIndexableLargeSourcePath("assets/bundle.map"));
 }
 
 fn lessThanIndexedFilePath(_: void, lhs: IndexedFile, rhs: IndexedFile) bool {
