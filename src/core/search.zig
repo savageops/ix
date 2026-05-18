@@ -498,7 +498,7 @@ fn warmIndexFallback(report: *SearchReport, reason: []const u8) ?[]DiscoveredFil
 }
 
 fn validateWarmIndexLiveMarker(bytes: []const u8, expected_root: []const u8) bool {
-    return validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, true);
+    return validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, false);
 }
 
 fn validateWarmIndexLiveMarkerWithOwnerCheck(bytes: []const u8, expected_root: []const u8, check_owner: bool) bool {
@@ -4628,6 +4628,12 @@ test "warm index live marker rejects dead Windows owner" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
     const marker = "IXINDEX_LIVE1\npid=999999\nroot=C:/repo\n";
     try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck(marker, "C:/repo", true));
+}
+
+test "warm foreground marker validation is generation-pin gated" {
+    const marker = "IXINDEX_LIVE1\npid=999999\nroot=C:/repo\n";
+    try std.testing.expect(validateWarmIndexLiveMarker(marker, "C:/repo"));
+    try std.testing.expect(!validateWarmIndexLiveMarker(marker, "D:/repo"));
 }
 
 test "regex prefilter does not reject top-level alternation branch literals" {
