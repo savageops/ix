@@ -488,6 +488,12 @@ fn isIndexableLargeSourcePath(path: []const u8) bool {
         std.ascii.eqlIgnoreCase(ext, ".swift") or
         std.ascii.eqlIgnoreCase(ext, ".rb") or
         std.ascii.eqlIgnoreCase(ext, ".php") or
+        std.ascii.eqlIgnoreCase(ext, ".scala") or
+        std.ascii.eqlIgnoreCase(ext, ".sc") or
+        std.ascii.eqlIgnoreCase(ext, ".dart") or
+        std.ascii.eqlIgnoreCase(ext, ".lua") or
+        std.ascii.eqlIgnoreCase(ext, ".r") or
+        std.ascii.eqlIgnoreCase(ext, ".jl") or
         std.ascii.eqlIgnoreCase(ext, ".zig") or
         std.ascii.eqlIgnoreCase(ext, ".rs");
 }
@@ -510,6 +516,12 @@ test "large source index admission includes script source family" {
     try std.testing.expect(isIndexableLargeSourcePath("Sources/SearchFrontier.swift"));
     try std.testing.expect(isIndexableLargeSourcePath("lib/frontier.rb"));
     try std.testing.expect(isIndexableLargeSourcePath("app/frontier.php"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/SearchFrontier.scala"));
+    try std.testing.expect(isIndexableLargeSourcePath("scripts/frontier.sc"));
+    try std.testing.expect(isIndexableLargeSourcePath("lib/frontier.dart"));
+    try std.testing.expect(isIndexableLargeSourcePath("runtime/frontier.lua"));
+    try std.testing.expect(isIndexableLargeSourcePath("analysis/frontier.R"));
+    try std.testing.expect(isIndexableLargeSourcePath("notebooks/frontier.jl"));
     try std.testing.expect(!isIndexableLargeSourcePath("logs/runtime.txt"));
     try std.testing.expect(!isIndexableLargeSourcePath("assets/bundle.map"));
 }
