@@ -479,6 +479,10 @@ fn isIndexableLargeSourcePath(path: []const u8) bool {
         std.ascii.eqlIgnoreCase(ext, ".cjs") or
         std.ascii.eqlIgnoreCase(ext, ".ts") or
         std.ascii.eqlIgnoreCase(ext, ".tsx") or
+        std.ascii.eqlIgnoreCase(ext, ".go") or
+        std.ascii.eqlIgnoreCase(ext, ".py") or
+        std.ascii.eqlIgnoreCase(ext, ".java") or
+        std.ascii.eqlIgnoreCase(ext, ".cs") or
         std.ascii.eqlIgnoreCase(ext, ".zig") or
         std.ascii.eqlIgnoreCase(ext, ".rs");
 }
@@ -492,6 +496,10 @@ test "large source index admission includes script source family" {
     try std.testing.expect(isIndexableLargeSourcePath("assets/runtime.cjs"));
     try std.testing.expect(isIndexableLargeSourcePath("src/app.ts"));
     try std.testing.expect(isIndexableLargeSourcePath("src/app.tsx"));
+    try std.testing.expect(isIndexableLargeSourcePath("cmd/search/main.go"));
+    try std.testing.expect(isIndexableLargeSourcePath("tools/frontier.py"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/SearchFrontier.java"));
+    try std.testing.expect(isIndexableLargeSourcePath("src/SearchFrontier.cs"));
     try std.testing.expect(!isIndexableLargeSourcePath("logs/runtime.txt"));
     try std.testing.expect(!isIndexableLargeSourcePath("assets/bundle.map"));
 }
