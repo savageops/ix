@@ -255,7 +255,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         } else {
             try scanPreparedFiles(io, allocator, warm_prepared.active_files, request, plan, trigram_admission, &trigram_program, &report);
         }
-        if (request.stats_only and !report.truncated and !warm_prepared.stats_result_cache_hit) {
+        if (!report.truncated and !warm_prepared.stats_result_cache_hit and !warm_prepared.hit_result_cache_hit) {
             writeWarmQueryStatsResult(io, allocator, warm_prepared, request, report);
         }
         if (!request.stats_only and !report.truncated and !warm_prepared.hit_result_cache_hit) {
@@ -916,7 +916,6 @@ fn writeWarmQueryStatsResult(
     request: cli.SearchRequest,
     report: SearchReport,
 ) void {
-    if (!request.stats_only) return;
     const query_dir = std.fs.path.join(allocator, &.{ prepared.root, ".ix", "index", "query" }) catch return;
     defer allocator.free(query_dir);
     std.Io.Dir.cwd().createDirPath(io, query_dir) catch return;
@@ -5700,6 +5699,43 @@ test "capped warm hit query uses stats cache for exact count and prefix scan" {
     try std.testing.expectEqual(@as(usize, 4), cached_report.matches_found);
     try std.testing.expectEqual(@as(usize, 1), cached_report.hit_count);
     try std.testing.expectEqual(@as(usize, 0), cached_report.files_scanned);
+}
+
+test "warm hit query seeds exact stats cache for stats-only reuse" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\nneedle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
+    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    try std.Io.Dir.cwd().createDirPath(io, index_dir);
+    const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
+
+    var hit_request = testSearchRequest("lit:needle", root_path);
+    hit_request.index_enabled = true;
+    hit_request.nexus_disabled = true;
+    const plan = try expr.parse(hit_request.expression);
+    const hit_report = try run(io, allocator, hit_request, plan);
+    try std.testing.expectEqual(@as(usize, 3), hit_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 3), hit_report.hit_count);
+    try std.testing.expectEqual(@as(usize, 2), hit_report.files_scanned);
+
+    var stats_request = hit_request;
+    stats_request.stats_only = true;
+    const stats_report = try run(io, allocator, stats_request, plan);
+    try std.testing.expectEqualStrings("live_query_stats_cache", stats_report.stats.generation_refresh.refresh_status);
+    try std.testing.expectEqual(@as(usize, 3), stats_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 0), stats_report.files_scanned);
+    try std.testing.expectEqual(@as(usize, 0), stats_report.hit_count);
 }
 
 test "protected Windows stats-only binary container skip stays scoped" {
