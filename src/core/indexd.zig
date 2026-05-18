@@ -473,7 +473,9 @@ const INDEXABLE_LARGE_SOURCE_EXTENSIONS = [_][]const u8{
     ".erl",  ".hrl",     ".ex",  ".exs", ".clj",   ".cljs", ".cljc",   ".fs",
     ".fsx",  ".vb",      ".hs",  ".lhs", ".ml",    ".mli",  ".nim",    ".cr",
     ".d",    ".v",       ".vh",  ".sv",  ".svh",   ".vhd",  ".vhdl",   ".adb",
-    ".ads",  ".zig",     ".rs",
+    ".ads",  ".zig",     ".rs",  ".json", ".jsonc", ".jsonl", ".xml",    ".yaml",
+    ".yml",  ".toml",    ".html",".htm",  ".css",   ".scss",  ".less",   ".sql",
+    ".md",   ".markdown",
 };
 
 fn isIndexableLargeSourcePath(path: []const u8) bool {
@@ -552,6 +554,15 @@ test "large source index admission includes script source family" {
     try std.testing.expect(isIndexableLargeSourcePath("hdl/frontier.vhdl"));
     try std.testing.expect(isIndexableLargeSourcePath("src/frontier.adb"));
     try std.testing.expect(isIndexableLargeSourcePath("src/frontier.ads"));
+    try std.testing.expect(isIndexableLargeSourcePath("data/frontier.json"));
+    try std.testing.expect(isIndexableLargeSourcePath("data/frontier.jsonl"));
+    try std.testing.expect(isIndexableLargeSourcePath("config/frontier.yaml"));
+    try std.testing.expect(isIndexableLargeSourcePath("config/frontier.toml"));
+    try std.testing.expect(isIndexableLargeSourcePath("docs/frontier.xml"));
+    try std.testing.expect(isIndexableLargeSourcePath("pages/frontier.html"));
+    try std.testing.expect(isIndexableLargeSourcePath("styles/frontier.css"));
+    try std.testing.expect(isIndexableLargeSourcePath("queries/frontier.sql"));
+    try std.testing.expect(isIndexableLargeSourcePath("docs/frontier.markdown"));
     try std.testing.expect(!isIndexableLargeSourcePath("logs/runtime.txt"));
     try std.testing.expect(!isIndexableLargeSourcePath("assets/bundle.map"));
 }
