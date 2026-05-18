@@ -479,7 +479,25 @@ const INDEXABLE_LARGE_SOURCE_EXTENSIONS = [_][]const u8{
     ".csv",  ".tsv",      ".gradle",
 };
 
+const INDEXABLE_LARGE_SOURCE_BASENAMES = [_][]const u8{
+    "Dockerfile",
+    "Containerfile",
+    "Makefile",
+    "CMakeLists.txt",
+    "BUILD",
+    "BUILD.bazel",
+    "WORKSPACE",
+    "WORKSPACE.bazel",
+    "BUCK",
+    "Justfile",
+    "Taskfile",
+};
+
 fn isIndexableLargeSourcePath(path: []const u8) bool {
+    const basename = std.fs.path.basename(path);
+    for (INDEXABLE_LARGE_SOURCE_BASENAMES) |candidate| {
+        if (std.ascii.eqlIgnoreCase(basename, candidate)) return true;
+    }
     const ext = std.fs.path.extension(path);
     for (INDEXABLE_LARGE_SOURCE_EXTENSIONS) |candidate| {
         if (std.ascii.eqlIgnoreCase(ext, candidate)) return true;
@@ -572,6 +590,15 @@ test "large source index admission includes script source family" {
     try std.testing.expect(isIndexableLargeSourcePath("data/frontier.csv"));
     try std.testing.expect(isIndexableLargeSourcePath("data/frontier.tsv"));
     try std.testing.expect(isIndexableLargeSourcePath("build/frontier.gradle"));
+    try std.testing.expect(isIndexableLargeSourcePath("Dockerfile"));
+    try std.testing.expect(isIndexableLargeSourcePath("containers/Containerfile"));
+    try std.testing.expect(isIndexableLargeSourcePath("Makefile"));
+    try std.testing.expect(isIndexableLargeSourcePath("build/CMakeLists.txt"));
+    try std.testing.expect(isIndexableLargeSourcePath("bazel/BUILD"));
+    try std.testing.expect(isIndexableLargeSourcePath("bazel/WORKSPACE.bazel"));
+    try std.testing.expect(isIndexableLargeSourcePath("buck/BUCK"));
+    try std.testing.expect(isIndexableLargeSourcePath("tasks/Justfile"));
+    try std.testing.expect(isIndexableLargeSourcePath("tasks/Taskfile"));
     try std.testing.expect(!isIndexableLargeSourcePath("logs/runtime.txt"));
     try std.testing.expect(!isIndexableLargeSourcePath("assets/bundle.map"));
 }
