@@ -249,7 +249,12 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     report.stats.admission.enabled = !request.no_ignore;
 
     if (prepareWarmIndexFrontier(io, allocator, request, plan, &report)) |warm_prepared| {
-        try scanPreparedFiles(io, allocator, warm_prepared.active_files, request, plan, trigram_admission, &trigram_program, &report);
+        if (!request.stats_only and request.max_hits != null and warm_prepared.known_matches != null) {
+            try scanPreparedHitPrefixFiles(io, allocator, warm_prepared.active_files, request, plan, trigram_admission, &trigram_program, &report);
+            report.matches_found = warm_prepared.known_matches.?;
+        } else {
+            try scanPreparedFiles(io, allocator, warm_prepared.active_files, request, plan, trigram_admission, &trigram_program, &report);
+        }
         if (request.stats_only and !report.truncated and !warm_prepared.stats_result_cache_hit) {
             writeWarmQueryStatsResult(io, allocator, warm_prepared, request, report);
         }
@@ -353,6 +358,29 @@ fn scanPreparedFiles(
     report.aggregate_ms = elapsedMs(io, aggregate_started);
 }
 
+fn scanPreparedHitPrefixFiles(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    active_files: []DiscoveredFile,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    trigram_admission: trigram.Admission,
+    trigram_program: *const TrigramAdmissionProgram,
+    report: *SearchReport,
+) !void {
+    initNtCwdPrefix(io);
+    const scan_started = std.Io.Timestamp.now(io, .awake);
+    report.outer_scan_threads = 1;
+    const retained_limit = request.max_hits orelse MAX_RETAINED_HITS;
+    for (active_files) |entry| {
+        if (report.hit_count >= retained_limit or report.truncated) break;
+        try scanDiscoveredFile(io, allocator, entry.path, request, plan, trigram_admission, trigram_program, report);
+    }
+    report.scan_ms = elapsedMs(io, scan_started);
+    const aggregate_started = std.Io.Timestamp.now(io, .awake);
+    report.aggregate_ms = elapsedMs(io, aggregate_started);
+}
+
 /// Adaptive thread count scaling based on file count.
 ///
 /// Each thread spawn costs ~100 μs on Windows (CreateThread + stack alloc).
@@ -386,6 +414,7 @@ const WarmIndexFrontier = struct {
     epoch: generation.Epoch,
     discovered: usize,
     candidate_count: usize,
+    known_matches: ?usize = null,
     stats_result_cache_hit: bool = false,
     hit_result_cache_hit: bool = false,
 };
@@ -427,6 +456,7 @@ fn prepareWarmIndexFrontier(
     const lookup = postings.lowerExpressionToLookupPlan(plan);
     if (postings.lookupRequiresFullScan(lookup)) return warmIndexFallback(report, postings.lookupFallbackReasonText(lookup));
 
+    var known_matches: ?usize = null;
     if (request.stats_only) {
         if (loadWarmQueryStatsResult(io, allocator, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
             return cached;
@@ -434,6 +464,11 @@ fn prepareWarmIndexFrontier(
     } else {
         if (loadWarmQueryHitResult(io, allocator, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
             return cached;
+        }
+        if (request.max_hits != null) {
+            if (loadWarmQueryStatsCount(io, allocator, root, root_identity.fingerprint, pin.epoch, request)) |record| {
+                known_matches = record.matches;
+            }
         }
     }
 
@@ -445,6 +480,7 @@ fn prepareWarmIndexFrontier(
             .epoch = pin.epoch,
             .discovered = report.files_discovered,
             .candidate_count = cached.len,
+            .known_matches = known_matches,
         };
     }
 
@@ -506,6 +542,7 @@ fn prepareWarmIndexFrontier(
         .epoch = pin.epoch,
         .discovered = snapshot.entries.len,
         .candidate_count = owned.len,
+        .known_matches = known_matches,
     };
 }
 
@@ -624,15 +661,20 @@ fn loadWarmQueryFrontier(
     return active.toOwnedSlice(allocator) catch null;
 }
 
-fn loadWarmQueryStatsResult(
+const WarmQueryStatsCacheRecord = struct {
+    discovered: usize,
+    candidates: usize,
+    matches: usize,
+};
+
+fn loadWarmQueryStatsCount(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: []const u8,
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
     request: cli.SearchRequest,
-    report: *SearchReport,
-) ?WarmIndexFrontier {
+) ?WarmQueryStatsCacheRecord {
     const cache_path = warmQueryStatsCachePath(allocator, root, root_fingerprint, epoch, request.expression) catch return null;
     defer allocator.free(cache_path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, cache_path, allocator, .limited(1024)) catch return null;
@@ -650,27 +692,41 @@ fn loadWarmQueryStatsResult(
     if (!std.mem.startsWith(u8, matches_line, "matches=")) return null;
     const parsed_epoch = std.fmt.parseInt(u64, epoch_line["epoch=".len..], 10) catch return null;
     if (parsed_epoch != epoch) return null;
-    const discovered = std.fmt.parseInt(usize, discovered_line["discovered=".len..], 10) catch return null;
-    const candidates = std.fmt.parseInt(usize, candidates_line["candidates=".len..], 10) catch return null;
-    const matches = std.fmt.parseInt(usize, matches_line["matches=".len..], 10) catch return null;
+    return .{
+        .discovered = std.fmt.parseInt(usize, discovered_line["discovered=".len..], 10) catch return null,
+        .candidates = std.fmt.parseInt(usize, candidates_line["candidates=".len..], 10) catch return null,
+        .matches = std.fmt.parseInt(usize, matches_line["matches=".len..], 10) catch return null,
+    };
+}
+
+fn loadWarmQueryStatsResult(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    root_fingerprint: catalog.RootFingerprint,
+    epoch: generation.Epoch,
+    request: cli.SearchRequest,
+    report: *SearchReport,
+) ?WarmIndexFrontier {
+    const record = loadWarmQueryStatsCount(io, allocator, root, root_fingerprint, epoch, request) orelse return null;
 
     report.discover_ms = 0;
-    report.files_discovered = discovered;
+    report.files_discovered = record.discovered;
     report.files_scanned = 0;
-    report.matches_found = matches;
+    report.matches_found = record.matches;
     report.stats.generation_refresh.available = true;
     report.stats.generation_refresh.epoch = epoch;
     report.stats.generation_refresh.refresh_status = "live_query_stats_cache";
     report.stats.generation_refresh.fallback_reason = "";
     report.stats.catalog_index.available = true;
     report.stats.catalog_index.generation = epoch;
-    report.stats.catalog_index.path_count = discovered;
+    report.stats.catalog_index.path_count = record.discovered;
     report.stats.catalog_index.fallback_reason = "query_stats_cache";
     report.stats.postings_index.available = true;
     report.stats.postings_index.generation = epoch;
-    report.stats.postings_index.file_count = discovered;
-    report.stats.postings_index.candidate_files = candidates;
-    report.stats.postings_index.pruned_files = discovered - candidates;
+    report.stats.postings_index.file_count = record.discovered;
+    report.stats.postings_index.candidate_files = record.candidates;
+    report.stats.postings_index.pruned_files = record.discovered - record.candidates;
     report.stats.postings_index.verified_files = 0;
     report.stats.postings_index.fallback_reason = "query_stats_cache";
 
@@ -680,8 +736,9 @@ fn loadWarmQueryStatsResult(
         .root = root,
         .root_fingerprint = root_fingerprint,
         .epoch = epoch,
-        .discovered = discovered,
-        .candidate_count = candidates,
+        .discovered = record.discovered,
+        .candidate_count = record.candidates,
+        .known_matches = record.matches,
         .stats_result_cache_hit = true,
     };
 }
@@ -5598,6 +5655,51 @@ test "stats-only warm query cache reuses exact pinned-generation count" {
     try std.testing.expectEqual(@as(f64, 0), cached.discover_ms);
     try std.testing.expectEqualStrings("live_query_stats_cache", cached.stats.generation_refresh.refresh_status);
     try std.testing.expectEqualStrings("query_stats_cache", cached.stats.postings_index.fallback_reason);
+}
+
+test "capped warm hit query uses stats cache for exact count and prefix scan" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "needle\nneedle\nneedle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
+    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    try std.Io.Dir.cwd().createDirPath(io, index_dir);
+    const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
+
+    var stats_request = testSearchRequest("lit:needle", root_path);
+    stats_request.index_enabled = true;
+    stats_request.nexus_disabled = true;
+    stats_request.stats_only = true;
+    const plan = try expr.parse(stats_request.expression);
+    const stats_report = try run(io, allocator, stats_request, plan);
+    try std.testing.expectEqual(@as(usize, 4), stats_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 2), stats_report.files_scanned);
+
+    var capped_request = stats_request;
+    capped_request.stats_only = false;
+    capped_request.max_hits = 1;
+    const capped_report = try run(io, allocator, capped_request, plan);
+    try std.testing.expect(capped_report.stats.postings_index.available);
+    try std.testing.expectEqualStrings("live_query_cache", capped_report.stats.generation_refresh.refresh_status);
+    try std.testing.expectEqual(@as(usize, 4), capped_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), capped_report.hit_count);
+    try std.testing.expectEqual(@as(usize, 1), capped_report.files_scanned);
+
+    const cached_report = try run(io, allocator, capped_request, plan);
+    try std.testing.expectEqualStrings("live_query_hits_cache", cached_report.stats.generation_refresh.refresh_status);
+    try std.testing.expectEqual(@as(usize, 4), cached_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), cached_report.hit_count);
+    try std.testing.expectEqual(@as(usize, 0), cached_report.files_scanned);
 }
 
 test "protected Windows stats-only binary container skip stays scoped" {
