@@ -2318,7 +2318,8 @@ fn countRegexDecompositionLogicalLinesRange(
 
 fn shouldRunByteShardBeforeAdmission(plan: expr.ExpressionPlan) bool {
     const shard_plan = byteShardPlan(plan) orelse return false;
-    return shard_plan.strategy == .literal_alternates_line or
+    return shard_plan.strategy == .literal_occurrence or
+        shard_plan.strategy == .literal_alternates_line or
         shard_plan.strategy == .word_boundary_line or
         shard_plan.strategy == .regex_decomposition_line;
 }
