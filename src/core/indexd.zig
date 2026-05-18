@@ -494,6 +494,12 @@ fn isIndexableLargeSourcePath(path: []const u8) bool {
         std.ascii.eqlIgnoreCase(ext, ".lua") or
         std.ascii.eqlIgnoreCase(ext, ".r") or
         std.ascii.eqlIgnoreCase(ext, ".jl") or
+        std.ascii.eqlIgnoreCase(ext, ".vue") or
+        std.ascii.eqlIgnoreCase(ext, ".svelte") or
+        std.ascii.eqlIgnoreCase(ext, ".astro") or
+        std.ascii.eqlIgnoreCase(ext, ".mdx") or
+        std.ascii.eqlIgnoreCase(ext, ".graphql") or
+        std.ascii.eqlIgnoreCase(ext, ".gql") or
         std.ascii.eqlIgnoreCase(ext, ".zig") or
         std.ascii.eqlIgnoreCase(ext, ".rs");
 }
@@ -522,6 +528,12 @@ test "large source index admission includes script source family" {
     try std.testing.expect(isIndexableLargeSourcePath("runtime/frontier.lua"));
     try std.testing.expect(isIndexableLargeSourcePath("analysis/frontier.R"));
     try std.testing.expect(isIndexableLargeSourcePath("notebooks/frontier.jl"));
+    try std.testing.expect(isIndexableLargeSourcePath("components/Frontier.vue"));
+    try std.testing.expect(isIndexableLargeSourcePath("components/Frontier.svelte"));
+    try std.testing.expect(isIndexableLargeSourcePath("pages/frontier.astro"));
+    try std.testing.expect(isIndexableLargeSourcePath("docs/frontier.mdx"));
+    try std.testing.expect(isIndexableLargeSourcePath("schema/frontier.graphql"));
+    try std.testing.expect(isIndexableLargeSourcePath("schema/frontier.gql"));
     try std.testing.expect(!isIndexableLargeSourcePath("logs/runtime.txt"));
     try std.testing.expect(!isIndexableLargeSourcePath("assets/bundle.map"));
 }
