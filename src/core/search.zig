@@ -4560,7 +4560,7 @@ fn asciiLowerBuf(dst: []u8, src: []const u8) void {
 /// case-sensitive calls that take the early return. Isolating the 2 KiB
 /// casefold buffers into their own function eliminates that overhead.
 fn indexOfLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) ?usize {
-    if (!case_insensitive) return simd.indexOf(line, needle);
+    if (!case_insensitive) return sz.indexOf(line, needle);
     if (needle.len == 0) return 0;
     if (needle.len > line.len) return null;
     return indexOfLiteralCasefold(line, needle);
@@ -4720,14 +4720,14 @@ fn stripWordBoundaryAnchors(pattern: []const u8) []const u8 {
 /// (transition between \w and \W or string edge). Returns 1-based column.
 fn wordBoundaryLiteralColumn(line: []const u8, needle: []const u8, case_insensitive: bool) ?usize {
     if (needle.len == 0) return null;
+    const first_is_word = isWordChar(needle[0]);
+    const last_is_word = isWordChar(needle[needle.len - 1]);
     var start: usize = 0;
     while (start + needle.len <= line.len) {
         const index = indexOfLiteral(line[start..], needle, case_insensitive) orelse return null;
         const abs = start + index;
         const left_is_word = abs > 0 and isWordChar(line[abs - 1]);
         const right_is_word = (abs + needle.len) < line.len and isWordChar(line[abs + needle.len]);
-        const first_is_word = isWordChar(needle[0]);
-        const last_is_word = isWordChar(needle[needle.len - 1]);
         const left_ok = left_is_word != first_is_word or abs == 0;
         const right_ok = right_is_word != last_is_word or (abs + needle.len) == line.len;
         if (left_ok and right_ok) return abs + 1;
