@@ -21,6 +21,8 @@ pub const LIVE_MARKER_NAME = "index.live";
 const INDEX_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_FILE_READ_LIMIT: usize = 64 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_TOTAL_READ_LIMIT: usize = 384 * 1024 * 1024;
+const MUTATION_SETTLE_WINDOW_NS: u64 = 75 * std.time.ns_per_ms;
+const MUTATION_SETTLE_MAX_WINDOWS: u32 = 2;
 
 pub const Request = struct {
     root: []const u8,
@@ -129,6 +131,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
                     const live = try writeLiveMarker(io, allocator, config);
                     holdLiveUntilRootMutation(io, config.root);
                     live.remove(io, allocator);
+                    settleRootMutationBurst(io);
                     _ = try publishRootGeneration(io, allocator, config.root);
                 }
             } else {
@@ -636,8 +639,19 @@ fn holdLiveUntilRootMutation(io: std.Io, root_path: []const u8) void {
     if (builtin.os.tag == .windows) {
         holdLiveUntilRootMutationWindows(io, root_path);
     } else {
-        std.Thread.sleep(@as(u64, 120) * std.time.ns_per_s);
+        io.sleep(std.Io.Duration.fromSeconds(120), .awake) catch {};
     }
+}
+
+fn settleRootMutationBurst(io: std.Io) void {
+    var remaining = mutationSettleWindowCount();
+    while (remaining > 0) : (remaining -= 1) {
+        io.sleep(std.Io.Duration.fromNanoseconds(MUTATION_SETTLE_WINDOW_NS), .awake) catch {};
+    }
+}
+
+fn mutationSettleWindowCount() u32 {
+    return MUTATION_SETTLE_MAX_WINDOWS;
 }
 
 fn holdLiveUntilRootMutationWindows(io: std.Io, root_path: []const u8) void {
@@ -921,4 +935,41 @@ test "indexd repair command writes reconcile request marker" {
     try std.testing.expect(std.mem.indexOf(u8, contents, "state=reconcile_requested") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "reason=operator_requested_reconcile") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "mode=foreground_repair") != null);
+}
+
+test "indexd watcher ignores index maintenance notifications" {
+    var maintenance: [64]u8 = undefined;
+    const maintenance_record = writeTestNotifyRecord(&maintenance, ".ix\\catalog.ixcat", 0);
+    try std.testing.expect(!bufferHasExternalRootMutation(maintenance_record));
+
+    var external: [64]u8 = undefined;
+    const external_record = writeTestNotifyRecord(&external, "src\\main.zig", 0);
+    try std.testing.expect(bufferHasExternalRootMutation(external_record));
+}
+
+test "indexd mutation settle policy is explicitly bounded" {
+    try std.testing.expect(mutationSettleWindowCount() > 0);
+    try std.testing.expect(mutationSettleWindowCount() <= 4);
+    try std.testing.expect(MUTATION_SETTLE_WINDOW_NS <= 100 * std.time.ns_per_ms);
+    const max_settle_ns = @as(u64, mutationSettleWindowCount()) * MUTATION_SETTLE_WINDOW_NS;
+    try std.testing.expect(max_settle_ns <= 250 * std.time.ns_per_ms);
+}
+
+fn writeTestNotifyRecord(buffer: []u8, ascii_name: []const u8, next: u32) []const u8 {
+    @memset(buffer, 0);
+    writeLeU32(buffer[0..4], next);
+    writeLeU32(buffer[4..8], 3);
+    writeLeU32(buffer[8..12], @intCast(ascii_name.len * 2));
+    for (ascii_name, 0..) |byte, index| {
+        buffer[12 + index * 2] = byte;
+        buffer[13 + index * 2] = 0;
+    }
+    return buffer[0 .. 12 + ascii_name.len * 2];
+}
+
+fn writeLeU32(bytes: []u8, value: u32) void {
+    bytes[0] = @intCast(value & 0xff);
+    bytes[1] = @intCast((value >> 8) & 0xff);
+    bytes[2] = @intCast((value >> 16) & 0xff);
+    bytes[3] = @intCast((value >> 24) & 0xff);
 }
