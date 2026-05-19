@@ -124,9 +124,18 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
     if (!config.repair) {
         _ = try publishRootGeneration(io, allocator, config.root);
         if (config.mode != .foreground_once) {
-            const live = try writeLiveMarker(io, allocator, config);
-            defer live.remove(io, allocator);
-            holdLiveUntilRootMutation(io, config.root);
+            if (builtin.os.tag == .windows) {
+                while (true) {
+                    const live = try writeLiveMarker(io, allocator, config);
+                    holdLiveUntilRootMutation(io, config.root);
+                    live.remove(io, allocator);
+                    _ = try publishRootGeneration(io, allocator, config.root);
+                }
+            } else {
+                const live = try writeLiveMarker(io, allocator, config);
+                defer live.remove(io, allocator);
+                holdLiveUntilRootMutation(io, config.root);
+            }
         }
     }
     return .{
