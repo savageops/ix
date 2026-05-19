@@ -2262,6 +2262,7 @@ fn scanFileMmap(
         }
     }
 
+    var literal_admission_satisfied = false;
     if (mono) |m| {
         if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
             if (!request.case_insensitive and sz.indexOfAdmission(data, needle) == null) {
@@ -2271,11 +2272,13 @@ fn scanFileMmap(
                 if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
                 return;
             }
+            literal_admission_satisfied = !request.case_insensitive;
         }
     }
 
     // Trigram prune — entire file available as one contiguous buffer.
-    if (shouldAttemptTrigramPrune(file_bytes, true, trigram_admission, request.case_insensitive) and
+    if (!shouldSkipTrigramAfterLiteralAdmission(plan, literal_admission_satisfied) and
+        shouldAttemptTrigramPrune(file_bytes, true, trigram_admission, request.case_insensitive) and
         tryTrigramPruneFile(data, trigram_program, &shard.trigram_stats))
     {
         recordEvidencePruned(shard, file_bytes);
@@ -2724,10 +2727,15 @@ fn countRegexDecompositionLogicalLinesRange(
 
 fn shouldRunByteShardBeforeAdmission(plan: expr.ExpressionPlan) bool {
     const shard_plan = byteShardPlan(plan) orelse return false;
-    return shard_plan.strategy == .literal_occurrence or
-        shard_plan.strategy == .literal_alternates_line or
-        shard_plan.strategy == .word_boundary_line or
+    return shard_plan.strategy == .literal_alternates_line or
         shard_plan.strategy == .regex_decomposition_line;
+}
+
+fn shouldSkipTrigramAfterLiteralAdmission(plan: expr.ExpressionPlan, literal_admission_satisfied: bool) bool {
+    if (!literal_admission_satisfied) return false;
+    const shard_plan = byteShardPlan(plan) orelse return false;
+    return shard_plan.strategy == .literal_occurrence or
+        shard_plan.strategy == .word_boundary_line;
 }
 
 fn byteShardPlan(plan: expr.ExpressionPlan) ?ByteShardPlan {
@@ -2885,6 +2893,7 @@ fn scanOpenFileIntoShardImpl(
         shard.slowest_path = display_path;
         shard.slowest_bytes = file_bytes;
     }
+    var literal_admission_satisfied = false;
     if (mono) |m| {
         if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
             if (!request.case_insensitive and sz.indexOfAdmission(read_buffer[0..first_read], needle) == null) {
@@ -2894,10 +2903,12 @@ fn scanOpenFileIntoShardImpl(
                 if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
                 return;
             }
+            literal_admission_satisfied = !request.case_insensitive;
         }
     }
     _ = linux_dominant_target;
-    if (shouldAttemptTrigramPrune(file_bytes, single_chunk, trigram_admission, request.case_insensitive) and
+    if (!shouldSkipTrigramAfterLiteralAdmission(plan, literal_admission_satisfied) and
+        shouldAttemptTrigramPrune(file_bytes, single_chunk, trigram_admission, request.case_insensitive) and
         tryTrigramPruneFile(read_buffer[0..first_read], trigram_program, &shard.trigram_stats))
     {
         recordEvidencePruned(shard, file_bytes);
