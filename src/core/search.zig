@@ -3078,8 +3078,9 @@ fn scanOpenFileIntoShardImpl(
                 sz.indexOfAdmission(chunk, needle) == null)
             {
                 // Fast newline count: count newlines in bulk via SIMD.
-                const newlines = std.mem.count(u8, chunk, "\n");
-                line_number += newlines;
+                if (!request.stats_only) {
+                    line_number += std.mem.count(u8, chunk, "\n");
+                }
                 // If chunk doesn't end with newline, the trailing bytes
                 // become carry for the next chunk.
                 if (!ended_with_newline) {
