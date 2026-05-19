@@ -205,12 +205,12 @@ fn nexusDisabled(init: std.process.Init) bool {
 }
 
 fn indexdEnabled(init: std.process.Init) bool {
-    const value = init.environ_map.getPtr("IX_INDEX") orelse return false;
-    return indexdEnvValueEnabled(value.*);
+    const value = init.environ_map.getPtr("IX_INDEX") orelse return true;
+    return !indexdEnvValueDisabled(value.*);
 }
 
-fn indexdEnvValueEnabled(value: []const u8) bool {
-    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
+fn indexdEnvValueDisabled(value: []const u8) bool {
+    return std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off");
 }
 
 fn shouldLaunchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest, plan: expr.ExpressionPlan, report: search.SearchReport) bool {
@@ -367,7 +367,7 @@ test "nexus sidecar launch is gated after evidence-pruned foreground reuse" {
     try std.testing.expect(!shouldConsiderNexusSidecar(disabled, testSearchReportForSidecar(0)));
 }
 
-test "indexd sidecar launch is opt in single root and workload gated" {
+test "indexd sidecar launch is default-on single root and workload gated" {
     var request = testSearchRequestForSidecar(false);
     var report = testSearchReportForSidecar(0);
     report.files_discovered = 12;
@@ -387,15 +387,15 @@ test "indexd sidecar launch is opt in single root and workload gated" {
     try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
 }
 
-test "indexd environment gate only accepts explicit opt in values" {
-    try std.testing.expect(indexdEnvValueEnabled("1"));
-    try std.testing.expect(indexdEnvValueEnabled("true"));
-    try std.testing.expect(indexdEnvValueEnabled("TRUE"));
-    try std.testing.expect(indexdEnvValueEnabled("on"));
-    try std.testing.expect(!indexdEnvValueEnabled("0"));
-    try std.testing.expect(!indexdEnvValueEnabled("false"));
-    try std.testing.expect(!indexdEnvValueEnabled("off"));
-    try std.testing.expect(!indexdEnvValueEnabled(""));
+test "indexd environment gate is explicit opt out" {
+    try std.testing.expect(!indexdEnvValueDisabled("1"));
+    try std.testing.expect(!indexdEnvValueDisabled("true"));
+    try std.testing.expect(!indexdEnvValueDisabled("TRUE"));
+    try std.testing.expect(!indexdEnvValueDisabled("on"));
+    try std.testing.expect(indexdEnvValueDisabled("0"));
+    try std.testing.expect(indexdEnvValueDisabled("false"));
+    try std.testing.expect(indexdEnvValueDisabled("off"));
+    try std.testing.expect(!indexdEnvValueDisabled(""));
 }
 
 test "windows command argument quoting preserves spaces quotes and trailing slashes" {
