@@ -127,10 +127,10 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
         _ = try publishRootGeneration(io, allocator, config.root);
         if (config.mode != .foreground_once) {
             if (builtin.os.tag == .windows) {
+                const live = try writeLiveMarker(io, allocator, config);
+                defer live.remove(io, allocator);
                 while (true) {
-                    const live = try writeLiveMarker(io, allocator, config);
                     holdLiveUntilRootMutation(io, config.root);
-                    live.remove(io, allocator);
                     settleRootMutationBurst(io);
                     _ = try publishRootGeneration(io, allocator, config.root);
                 }

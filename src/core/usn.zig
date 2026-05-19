@@ -240,6 +240,14 @@ pub const DeltaApplyMode = enum {
     root_reconcile_publish,
 };
 
+pub const DeltaApplyPolicy = struct {
+    max_delta_tasks: usize = 256,
+
+    pub fn admits(self: DeltaApplyPolicy, task_count: usize) bool {
+        return task_count <= self.max_delta_tasks;
+    }
+};
+
 pub const DeltaApplyPlan = struct {
     mode: DeltaApplyMode,
     upsert_count: usize = 0,
@@ -576,7 +584,15 @@ pub fn directoryWatchInvalidationTask(backend: FreshnessBackend) ?DeltaTask {
 }
 
 pub fn planDeltaApply(tasks: []const DeltaTask) DeltaApplyPlan {
+    return planDeltaApplyWithPolicy(tasks, .{});
+}
+
+pub fn planDeltaApplyWithPolicy(tasks: []const DeltaTask, policy: DeltaApplyPolicy) DeltaApplyPlan {
     var plan = DeltaApplyPlan{ .mode = .incremental_segment_update };
+    if (!policy.admits(tasks.len)) {
+        plan.mode = .root_reconcile_publish;
+        plan.reconcile_required = true;
+    }
     for (tasks) |task| {
         switch (task.kind) {
             .upsert_file => plan.upsert_count += 1,
@@ -1440,6 +1456,33 @@ test "usn delta apply planning distinguishes surgical and reconcile batches" {
     try std.testing.expectEqual(DeltaApplyMode.root_reconcile_publish, reconcile_plan.mode);
     try std.testing.expect(reconcile_plan.publishesFullGeneration());
     try std.testing.expect(reconcile_plan.reconcile_required);
+}
+
+test "usn delta apply policy caps churn before overlay publish" {
+    const tasks = [_]DeltaTask{
+        .{
+            .kind = .upsert_file,
+            .reason = USN_REASON_DATA_EXTEND,
+            .resolution = .{ .catalog_file_id = 1 },
+        },
+        .{
+            .kind = .delete_file,
+            .reason = USN_REASON_FILE_DELETE,
+            .resolution = .{ .catalog_file_id = 2 },
+        },
+    };
+
+    const admitted = planDeltaApplyWithPolicy(&tasks, .{ .max_delta_tasks = 2 });
+    try std.testing.expectEqual(DeltaApplyMode.incremental_segment_update, admitted.mode);
+    try std.testing.expect(!admitted.reconcile_required);
+    try std.testing.expectEqual(@as(usize, 1), admitted.upsert_count);
+    try std.testing.expectEqual(@as(usize, 1), admitted.delete_count);
+
+    const overflow = planDeltaApplyWithPolicy(&tasks, .{ .max_delta_tasks = 1 });
+    try std.testing.expectEqual(DeltaApplyMode.root_reconcile_publish, overflow.mode);
+    try std.testing.expect(overflow.reconcile_required);
+    try std.testing.expectEqual(@as(usize, 1), overflow.upsert_count);
+    try std.testing.expectEqual(@as(usize, 1), overflow.delete_count);
 }
 
 test "usn delta generation publish writes refreshed catalog postings and manifest" {
