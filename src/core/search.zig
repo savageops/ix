@@ -584,7 +584,7 @@ fn warmIndexFallback(report: *SearchReport, reason: []const u8) ?WarmIndexFronti
 }
 
 fn validateWarmIndexLiveMarker(bytes: []const u8, expected_root: []const u8) bool {
-    return validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, false);
+    return validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, builtin.os.tag == .windows);
 }
 
 fn validateWarmIndexLiveMarkerWithOwnerCheck(bytes: []const u8, expected_root: []const u8, check_owner: bool) bool {
@@ -5189,9 +5189,42 @@ test "warm index live marker rejects dead Windows owner" {
 }
 
 test "warm foreground marker validation is generation-pin gated" {
-    const marker = "IXINDEX_LIVE1\npid=999999\nroot=C:/repo\n";
+    const marker = try std.fmt.allocPrint(std.testing.allocator, "IXINDEX_LIVE1\npid={}\nroot=C:/repo\n", .{currentProcessId()});
+    defer std.testing.allocator.free(marker);
     try std.testing.expect(validateWarmIndexLiveMarker(marker, "C:/repo"));
     try std.testing.expect(!validateWarmIndexLiveMarker(marker, "D:/repo"));
+}
+
+test "warm index rejects dead owner before trusting generation" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
+    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    try std.Io.Dir.cwd().createDirPath(io, index_dir);
+    const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid=999999\nroot={s}\n", .{root_path});
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
+
+    var request = testSearchRequest("lit:needle", root_path);
+    request.index_enabled = true;
+    request.nexus_disabled = true;
+    const plan = try expr.parse(request.expression);
+    const report = try run(io, allocator, request, plan);
+
+    try std.testing.expect(!report.stats.catalog_index.available);
+    try std.testing.expect(!report.stats.postings_index.available);
+    try std.testing.expectEqualStrings("invalid_live_owner", report.stats.generation_refresh.fallback_reason);
+    try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
+    try std.testing.expectEqual(@as(usize, 1), report.matches_found);
 }
 
 test "regex prefilter does not reject top-level alternation branch literals" {
