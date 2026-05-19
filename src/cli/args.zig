@@ -554,6 +554,20 @@ test "search admission flags parse into one deterministic contract" {
     try std.testing.expectEqualStrings("src", request.paths[0]);
 }
 
+test "search defaults preserve explicit no-ignore discovery" {
+    const argv = [_][]const u8{
+        "ix-zig",
+        "search",
+        "lit:needle",
+        "src",
+    };
+    const invocation = try parseInvocation(std.testing.allocator, &argv);
+    try std.testing.expect(invocation.command == .search);
+    const request = invocation.command.search;
+    try std.testing.expect(request.no_ignore);
+    try std.testing.expect(!request.hidden);
+}
+
 test "compat admission flags preserve rg-shaped entrypoint" {
     const argv = [_][]const u8{
         "ix-zig",
@@ -570,6 +584,20 @@ test "compat admission flags preserve rg-shaped entrypoint" {
     try std.testing.expect(request.no_ignore);
     try std.testing.expectEqual(@as(usize, 1), request.ignore_file_count);
     try std.testing.expectEqualStrings("extra.ignore", request.ignore_files[0]);
+}
+
+test "compat defaults preserve explicit no-ignore discovery" {
+    const argv = [_][]const u8{
+        "ix-zig",
+        "needle",
+        "src",
+    };
+    const invocation = try parseInvocation(std.testing.allocator, &argv);
+    try std.testing.expect(invocation.command == .search);
+    const request = invocation.command.search;
+    defer std.testing.allocator.free(request.expression);
+    try std.testing.expect(request.no_ignore);
+    try std.testing.expect(!request.hidden);
 }
 
 test "hidden indexd command parses without public command exposure" {

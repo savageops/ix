@@ -175,12 +175,17 @@ fn matchesPatternNormalized(pattern: Pattern, normalized: []const u8, is_directo
     if (rel.len == 0) return false;
     if (pattern.path_glob) {
         if (!pattern.has_meta) return std.mem.eql(u8, pattern.glob, rel);
+        if (simpleGlobMatch(pattern.glob, rel)) |matched| return matched;
         return globMatch(pattern.glob, rel);
     }
     var segments = std.mem.tokenizeScalar(u8, rel, '/');
     while (segments.next()) |segment| {
         if (!pattern.has_meta) {
             if (std.mem.eql(u8, pattern.glob, segment)) return true;
+            continue;
+        }
+        if (simpleGlobMatch(pattern.glob, segment)) |matched| {
+            if (matched) return true;
             continue;
         }
         if (globMatch(pattern.glob, segment)) return true;
@@ -193,6 +198,26 @@ fn hasGlobMeta(pattern: []const u8) bool {
         if (byte == '*' or byte == '?' or byte == '[' or byte == '\\') return true;
     }
     return false;
+}
+
+fn simpleGlobMatch(pattern: []const u8, text: []const u8) ?bool {
+    var star_index: ?usize = null;
+    for (pattern, 0..) |byte, index| {
+        switch (byte) {
+            '*' => {
+                if (star_index != null) return null;
+                star_index = index;
+            },
+            '?', '[', '\\' => return null,
+            else => {},
+        }
+    }
+    const star = star_index orelse return std.mem.eql(u8, pattern, text);
+    const prefix = pattern[0..star];
+    const suffix = pattern[star + 1 ..];
+    return text.len >= prefix.len + suffix.len and
+        std.mem.startsWith(u8, text, prefix) and
+        std.mem.endsWith(u8, text, suffix);
 }
 
 fn relativeTo(base: []const u8, path: []const u8) ?[]const u8 {

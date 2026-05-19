@@ -282,8 +282,13 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
             report.stats.admission.ignore_files_loaded += 1;
         }
     }
-    if (!try discoverRootsParallelTopLevel(io, allocator, roots, request, &file_list, &report)) {
+    if (!try discoverRootsParallelTopLevel(io, allocator, roots, request, &admission_engine, &file_list, &report)) {
         for (roots.items[0..roots.count]) |root| {
+            const root_ignore_mark = admission_engine.checkpoint();
+            defer admission_engine.restore(root_ignore_mark);
+            if (!request.no_ignore) {
+                report.stats.admission.ignore_files_loaded += try admission_engine.loadDirectoryIgnoreFiles(io, root.original);
+            }
             try discoverFiles(io, allocator, root.original, request, &admission_engine, &file_list, &report);
         }
     }
@@ -396,6 +401,7 @@ fn effectiveThreadCount(request: cli.SearchRequest, file_count: usize) usize {
     if (request.threads) |threads| return @max(threads, 1);
     const cpus = availableThreads();
     if (file_count <= 4) return @min(cpus, @max(file_count, 1));
+    if (file_count >= 4096 and cpus > 8) return cpus - 3;
     const sqrt_files = std.math.sqrt(@as(f64, @floatFromInt(file_count)));
     const scaled: usize = @intFromFloat(@min(sqrt_files, @as(f64, @floatFromInt(cpus))));
     return @max(scaled, 4);
@@ -1573,7 +1579,7 @@ fn discoverDirectory(
             else => return err,
         };
         const entry = maybe_entry orelse break;
-        if (!request.hidden and isHiddenPath(entry.name)) {
+        if (!request.hidden and shouldSkipDefaultDiscoveryEntry(entry.name, entry.kind == .directory)) {
             report.files_skipped += 1;
             recordDiscoveryAdmissionSkip(io, report, path, entry.name, entry.kind == .file, "hidden");
             continue;
@@ -1675,8 +1681,6 @@ const DiscoveryShardReport = struct {
 };
 
 fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) bool {
-    const protected_windows_roots = rootsAllProtectedWindows(roots);
-    if (!request.no_ignore and !protected_windows_roots) return false;
     if (request.max_hits != null and !request.stats_only) return false;
     const requested_threads = request.threads orelse defaultParallelDiscoveryThreadBudget(request);
     if (requested_threads <= 1) return false;
@@ -1706,6 +1710,7 @@ fn discoverRootsParallelTopLevel(
     allocator: std.mem.Allocator,
     roots: PreparedRoots,
     request: cli.SearchRequest,
+    admission_engine: *path_admission.Engine,
     file_list: *FileList,
     report: *SearchReport,
 ) !bool {
@@ -1713,7 +1718,10 @@ fn discoverRootsParallelTopLevel(
 
     var top_dirs = try FileList.initWithCapacity(allocator, 64);
     for (roots.items[0..roots.count]) |root| {
-        try discoverRootTopLevel(io, allocator, root.original, request, &top_dirs, file_list, report);
+        if (!request.no_ignore) {
+            report.stats.admission.ignore_files_loaded += try admission_engine.loadDirectoryIgnoreFiles(io, root.original);
+        }
+        try discoverRootTopLevel(io, allocator, root.original, request, admission_engine, &top_dirs, file_list, report);
     }
 
     const top_dir_items = top_dirs.mutableItems();
@@ -1724,7 +1732,8 @@ fn discoverRootsParallelTopLevel(
     if (actual_threads <= 1 or top_dir_items.len < 2) {
         var disabled_admission = path_admission.Engine.init(allocator, false);
         for (top_dir_items) |entry| {
-            try discoverDirectory(io, allocator, entry.path, request, &disabled_admission, file_list, report);
+            const engine = if (request.no_ignore) &disabled_admission else admission_engine;
+            try discoverDirectory(io, allocator, entry.path, request, engine, file_list, report);
         }
         return true;
     }
@@ -1739,9 +1748,9 @@ fn discoverRootsParallelTopLevel(
     const threads = try allocator.alloc(std.Thread, worker_count);
     for (0..worker_count) |i| {
         const shard_index = i + 1;
-        threads[i] = try std.Thread.spawn(.{}, discoveryShardWorker, .{ io, allocator, &next_dir, top_dir_items, request, &shards[shard_index] });
+        threads[i] = try std.Thread.spawn(.{}, discoveryShardWorker, .{ io, allocator, &next_dir, top_dir_items, request, admission_engine, &shards[shard_index] });
     }
-    discoveryShardWorker(io, allocator, &next_dir, top_dir_items, request, &shards[0]);
+    discoveryShardWorker(io, allocator, &next_dir, top_dir_items, request, admission_engine, &shards[0]);
     for (threads) |thread| thread.join();
 
     for (shards) |*shard| {
@@ -1761,6 +1770,7 @@ fn discoverRootTopLevel(
     allocator: std.mem.Allocator,
     path: []const u8,
     request: cli.SearchRequest,
+    admission_engine: *const path_admission.Engine,
     top_dirs: *FileList,
     file_list: *FileList,
     report: *SearchReport,
@@ -1785,11 +1795,15 @@ fn discoverRootTopLevel(
             else => return err,
         };
         const entry = maybe_entry orelse break;
-        if (!request.hidden and isHiddenPath(entry.name)) {
+        if (!request.hidden and shouldSkipDefaultDiscoveryEntry(entry.name, entry.kind == .directory)) {
             report.files_skipped += 1;
             continue;
         }
         const child_path = try joinPathForward(allocator, path, entry.name);
+        if (admission_engine.decide(child_path, entry.kind == .directory) == .ignore) {
+            report.files_skipped += 1;
+            continue;
+        }
         switch (entry.kind) {
             .file => {
                 report.files_discovered += 1;
@@ -1807,12 +1821,13 @@ fn discoveryShardWorker(
     next_dir: *usize,
     dirs: []const DiscoveredFile,
     request: cli.SearchRequest,
+    admission_engine: *const path_admission.Engine,
     shard: *DiscoveryShardReport,
 ) void {
     while (true) {
         const index = @atomicRmw(usize, next_dir, .Add, 1, .monotonic);
         if (index >= dirs.len) break;
-        discoverDirectoryShard(io, allocator, dirs[index].path, request, shard) catch {
+        discoverDirectoryShard(io, allocator, dirs[index].path, request, admission_engine, shard) catch {
             shard.had_error = true;
             return;
         };
@@ -1824,6 +1839,7 @@ fn discoverDirectoryShard(
     allocator: std.mem.Allocator,
     path: []const u8,
     request: cli.SearchRequest,
+    admission_engine: *const path_admission.Engine,
     shard: *DiscoveryShardReport,
 ) anyerror!void {
     const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
@@ -1846,17 +1862,21 @@ fn discoverDirectoryShard(
             else => return err,
         };
         const entry = maybe_entry orelse break;
-        if (!request.hidden and isHiddenPath(entry.name)) {
+        if (!request.hidden and shouldSkipDefaultDiscoveryEntry(entry.name, entry.kind == .directory)) {
             shard.files_skipped += 1;
             continue;
         }
         const child_path = try joinPathForward(allocator, path, entry.name);
+        if (admission_engine.decide(child_path, entry.kind == .directory) == .ignore) {
+            shard.files_skipped += 1;
+            continue;
+        }
         switch (entry.kind) {
             .file => {
                 shard.files_discovered += 1;
                 try shard.file_list.append(allocator, .{ .path = child_path });
             },
-            .directory => try discoverDirectoryShard(io, allocator, child_path, request, shard),
+            .directory => try discoverDirectoryShard(io, allocator, child_path, request, admission_engine, shard),
             else => {},
         }
     }
@@ -2682,6 +2702,73 @@ fn countLiteralLogicalRange(data: []const u8, needle: []const u8, logical_start:
     return total;
 }
 
+fn streamingLiteralNeedle(plan: expr.ExpressionPlan) ?[]const u8 {
+    const shard_plan = byteShardPlan(plan) orelse return null;
+    if (shard_plan.strategy != .literal_occurrence or shard_plan.case_insensitive) return null;
+    if (shard_plan.needle.len == 0 or shard_plan.needle.len > STREAMING_LITERAL_TAIL_CAP) return null;
+    return shard_plan.needle;
+}
+
+const STREAMING_LITERAL_TAIL_CAP: usize = 256;
+
+fn countLiteralStreamingChunks(
+    io: std.Io,
+    file: std.Io.File,
+    buffer: []u8,
+    first_read: usize,
+    file_bytes: usize,
+    needle: []const u8,
+) !usize {
+    if (needle.len == 0 or first_read == 0 or first_read > buffer.len) return 0;
+    if (needle.len > STREAMING_LITERAL_TAIL_CAP) return error.StreamingLiteralNeedleTooLong;
+    var total = countLiteralLogicalRange(buffer[0..first_read], needle, 0, first_read, 0, first_read);
+    var tail_buf: [STREAMING_LITERAL_TAIL_CAP]u8 = undefined;
+    var tail_len = updateLiteralTail(&tail_buf, &.{}, buffer[0..first_read], needle.len - 1);
+    var offset: u64 = first_read;
+    while (offset < file_bytes) {
+        const remaining = file_bytes - @as(usize, @intCast(offset));
+        const target_len = @min(buffer.len, remaining);
+        const read_len = try file.readPositionalAll(io, buffer[0..target_len], offset);
+        if (read_len == 0) break;
+        total += countLiteralCrossBoundary(tail_buf[0..tail_len], buffer[0..read_len], needle);
+        total += countLiteralLogicalRange(buffer[0..read_len], needle, 0, read_len, 0, read_len);
+        tail_len = updateLiteralTail(&tail_buf, tail_buf[0..tail_len], buffer[0..read_len], needle.len - 1);
+        offset += read_len;
+    }
+    return total;
+}
+
+fn countLiteralCrossBoundary(tail: []const u8, chunk: []const u8, needle: []const u8) usize {
+    if (tail.len == 0 or chunk.len == 0 or needle.len <= 1) return 0;
+    var window: [STREAMING_LITERAL_TAIL_CAP * 2]u8 = undefined;
+    const prefix_len = @min(chunk.len, needle.len - 1);
+    @memcpy(window[0..tail.len], tail);
+    @memcpy(window[tail.len .. tail.len + prefix_len], chunk[0..prefix_len]);
+    const window_len = tail.len + prefix_len;
+    const first_start = tail.len -| (needle.len - 1);
+    var total: usize = 0;
+    var start = first_start;
+    while (start < tail.len) : (start += 1) {
+        if (start + needle.len <= window_len and std.mem.eql(u8, window[start .. start + needle.len], needle)) total += 1;
+    }
+    return total;
+}
+
+fn updateLiteralTail(out: *[STREAMING_LITERAL_TAIL_CAP]u8, previous_tail: []const u8, chunk: []const u8, overlap: usize) usize {
+    if (overlap == 0) return 0;
+    if (chunk.len >= overlap) {
+        @memcpy(out[0..overlap], chunk[chunk.len - overlap ..]);
+        return overlap;
+    }
+    var window: [STREAMING_LITERAL_TAIL_CAP * 2]u8 = undefined;
+    @memcpy(window[0..previous_tail.len], previous_tail);
+    @memcpy(window[previous_tail.len .. previous_tail.len + chunk.len], chunk);
+    const window_len = previous_tail.len + chunk.len;
+    const keep = @min(overlap, window_len);
+    @memcpy(out[0..keep], window[window_len - keep .. window_len]);
+    return keep;
+}
+
 fn countRegexDecompositionLogicalLinesRange(
     data: []const u8,
     needle: []const u8,
@@ -2893,6 +2980,19 @@ fn scanOpenFileIntoShardImpl(
         shard.slowest_path = display_path;
         shard.slowest_bytes = file_bytes;
     }
+    if (request.stats_only and !single_chunk and !request.case_insensitive) {
+        if (streamingLiteralNeedle(plan)) |needle| {
+            if (countLiteralStreamingChunks(io, file, read_buffer[0..], first_read, file_bytes, needle)) |count| {
+                if (linux_dominant_target) recordLinuxDominantFileActivation(shard);
+                shard.matches_found += count;
+                recordEvidenceCandidate(shard, display_path);
+                const file_ms = elapsedMs(io, file_started);
+                shard.scan_work_ms_total += file_ms;
+                if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+                return;
+            } else |_| {}
+        }
+    }
     var literal_admission_satisfied = false;
     if (mono) |m| {
         if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
@@ -2906,7 +3006,6 @@ fn scanOpenFileIntoShardImpl(
             literal_admission_satisfied = !request.case_insensitive;
         }
     }
-    _ = linux_dominant_target;
     if (!shouldSkipTrigramAfterLiteralAdmission(plan, literal_admission_satisfied) and
         shouldAttemptTrigramPrune(file_bytes, single_chunk, trigram_admission, request.case_insensitive) and
         tryTrigramPruneFile(read_buffer[0..first_read], trigram_program, &shard.trigram_stats))
@@ -4519,6 +4618,19 @@ fn isHiddenPath(path: []const u8) bool {
         if (part.len > 1 and part[0] == '.' and !std.mem.eql(u8, part, "..")) return true;
     }
     return false;
+}
+
+fn isHiddenDirectoryEntry(name: []const u8, is_directory: bool) bool {
+    return is_directory and isHiddenPath(name);
+}
+
+fn shouldSkipDefaultDiscoveryEntry(name: []const u8, is_directory: bool) bool {
+    return isHiddenDirectoryEntry(name, is_directory) or isGeneratedSourceIndexEntry(name, is_directory);
+}
+
+fn isGeneratedSourceIndexEntry(name: []const u8, is_directory: bool) bool {
+    if (!is_directory) return false;
+    return std.mem.eql(u8, name, "tags") or std.mem.eql(u8, name, "TAGS");
 }
 
 fn hasProtectedBinaryContainerExtension(ext: []const u8) bool {
