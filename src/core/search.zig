@@ -5201,7 +5201,7 @@ fn countWordBoundaryLiteralLines(buffer: []const u8, needle: []const u8) usize {
     var total: usize = 0;
     var start: usize = 0;
     while (start + needle.len <= buffer.len) {
-        const index = simd.indexOf(buffer[start..], needle) orelse break;
+        const index = sz.indexOf(buffer[start..], needle) orelse break;
         const abs = start + index;
         if (wordBoundaryLiteralAt(buffer, needle, abs)) {
             total += 1;
@@ -5223,7 +5223,7 @@ fn countWordBoundaryLiteralLogicalLinesRange(buffer: []const u8, needle: []const
     var counted = WordBoundaryRangeCount{};
     var start = @min(logical_start, end);
     while (start + needle.len <= end) {
-        const index = simd.indexOf(buffer[start..end], needle) orelse break;
+        const index = sz.indexOf(buffer[start..end], needle) orelse break;
         const abs = start + index;
         if (abs + needle.len > end) break;
         counted.verified_candidates += 1;
