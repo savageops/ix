@@ -23,7 +23,7 @@ const WARM_INDEX_LIVE_MARKER_MAGIC = "IXINDEX_LIVE1";
 const WARM_INDEX_LIVE_READ_LIMIT = 4096;
 const WARM_INDEX_SEGMENT_READ_LIMIT: usize = 128 * 1024 * 1024;
 const WARM_QUERY_CACHE_MAGIC = "IXQUERY_FRONTIER1";
-const WARM_QUERY_STATS_CACHE_MAGIC = "IXQUERY_STATS1";
+const WARM_QUERY_STATS_CACHE_MAGIC = "IXQUERY_STATS2";
 const WARM_QUERY_HITS_CACHE_MAGIC = "IXQUERY_HITS1";
 const WARM_QUERY_CACHE_READ_LIMIT: usize = 4 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: usize = 4 * 1024;
@@ -143,7 +143,7 @@ const EVIDENCE_FRONTIER_LIVE_READ_LIMIT = 4096;
 const EVIDENCE_FRONTIER_CACHE_CANDIDATE_LIMIT = 262144;
 const EVIDENCE_FRONTIER_LIVE_TTL_NS: i96 = 120 * std.time.ns_per_s;
 const EVIDENCE_FRONTIER_BUILD_TTL_NS: i128 = 120 * std.time.ns_per_s;
-const WARM_STATS_RESULT_CACHE_MAGIC = "IXWARMSTATS1";
+const WARM_STATS_RESULT_CACHE_MAGIC = "IXWARMSTATS2";
 const WARM_STATS_RESULT_CACHE_READ_LIMIT = 4096;
 const WARM_STATS_RESULT_CACHE_MAX_FILES = 4096;
 
@@ -526,7 +526,7 @@ fn prepareWarmIndexFrontier(
     errdefer active.deinit(allocator);
     for (selected) |entry| {
         const path = snapshot.path(entry);
-        if (!request.hidden and isHiddenPath(warmIndexRelativePath(root, path))) continue;
+        if (!request.hidden and isHiddenDirectoryPath(warmIndexRelativePath(root, path))) continue;
         active.append(allocator, .{ .path = allocator.dupe(u8, path) catch return warmIndexFallback(report, "candidate_path_alloc_failed") }) catch return warmIndexFallback(report, "candidate_append_failed");
     }
     var verify_required_count: usize = 0;
@@ -580,7 +580,7 @@ fn appendWarmVerificationFrontier(
         verify_required_count.* += 1;
         if (postings.containsFileId(candidate_ids, entry.file_id)) continue;
         const path = snapshot.path(entry);
-        if (!request.hidden and isHiddenPath(warmIndexRelativePath(root, path))) continue;
+        if (!request.hidden and isHiddenDirectoryPath(warmIndexRelativePath(root, path))) continue;
         try active.append(allocator, .{ .path = try allocator.dupe(u8, path) });
     }
 }
@@ -2073,11 +2073,11 @@ fn pathExtension(path: []const u8) ?[]const u8 {
 
 fn hasProtectedTextExtension(ext: []const u8) bool {
     const text_extensions = [_][]const u8{
-        ".inf", ".inf_loc", ".mof", ".man", ".cdxml", ".ps1xml", ".log",
-        ".ini", ".psd1", ".xml", ".psm1", ".yaml", ".yml", ".xsd", ".msc",
-        ".gpd", ".strings", ".forms", ".rtf", ".dis", ".txt", ".json",
-        ".xsl", ".rs", ".gdl", ".vbs", ".table", ".hlp", ".cfg", ".dic",
-        ".1", ".ppd",
+        ".inf",  ".inf_loc", ".mof",     ".man",   ".cdxml", ".ps1xml", ".log",
+        ".ini",  ".psd1",    ".xml",     ".psm1",  ".yaml",  ".yml",    ".xsd",
+        ".msc",  ".gpd",     ".strings", ".forms", ".rtf",   ".dis",    ".txt",
+        ".json", ".xsl",     ".rs",      ".gdl",   ".vbs",   ".table",  ".hlp",
+        ".cfg",  ".dic",     ".1",       ".ppd",
     };
     for (text_extensions) |candidate| {
         if (std.ascii.eqlIgnoreCase(ext, candidate)) return true;
@@ -4759,6 +4759,18 @@ fn isHiddenPath(path: []const u8) bool {
     return false;
 }
 
+fn isHiddenDirectoryPath(path: []const u8) bool {
+    var iterator = std.mem.splitAny(u8, path, "/\\");
+    var previous: ?[]const u8 = null;
+    while (iterator.next()) |part| {
+        if (previous) |candidate| {
+            if (candidate.len > 1 and candidate[0] == '.' and !std.mem.eql(u8, candidate, "..")) return true;
+        }
+        previous = part;
+    }
+    return false;
+}
+
 fn isHiddenDirectoryEntry(name: []const u8, is_directory: bool) bool {
     return is_directory and isHiddenPath(name);
 }
@@ -4775,8 +4787,8 @@ fn isGeneratedSourceIndexEntry(name: []const u8, is_directory: bool) bool {
 fn hasProtectedBinaryContainerExtension(ext: []const u8) bool {
     const binary_extensions = [_][]const u8{
         ".dll", ".exe", ".sys", ".mui", ".cat", ".ocx", ".cpl", ".drv",
-        ".efi", ".scr", ".msi", ".msp", ".msu", ".cab", ".pnf",
-        ".nls", ".ttf", ".ttc", ".otf", ".fon",
+        ".efi", ".scr", ".msi", ".msp", ".msu", ".cab", ".pnf", ".nls",
+        ".ttf", ".ttc", ".otf", ".fon",
     };
     for (binary_extensions) |candidate| {
         if (std.ascii.eqlIgnoreCase(ext, candidate)) return true;
@@ -5966,6 +5978,15 @@ test "stats-only warm query cache reuses exact pinned-generation count" {
     try std.testing.expectEqual(@as(usize, 1), first.files_scanned);
     try std.testing.expectEqualStrings("live_pinned", first.stats.generation_refresh.refresh_status);
 
+    const root_identity = try catalog.identifyRoot(allocator, root_path);
+    defer root_identity.deinit(allocator);
+    const stale_cache_path = try warmQueryStatsCachePath(allocator, root_path, root_identity.fingerprint, first.stats.generation_refresh.epoch.?, request.expression);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_cache_path, .data = "IXQUERY_STATS1\nepoch=1\ndiscovered=2\ncandidates=1\nmatches=999\n" });
+    const stale_rejected = try run(io, allocator, request, plan);
+    try std.testing.expectEqual(@as(usize, 2), stale_rejected.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), stale_rejected.files_scanned);
+    try std.testing.expect(!std.mem.eql(u8, "live_query_stats_cache", stale_rejected.stats.generation_refresh.refresh_status));
+
     const cached = try run(io, allocator, request, plan);
     try std.testing.expectEqual(@as(usize, 2), cached.matches_found);
     try std.testing.expectEqual(@as(usize, 0), cached.files_scanned);
@@ -5995,6 +6016,13 @@ test "stats-only warm result cache is content-signature pinned without live inde
     try std.testing.expectEqual(@as(usize, 2), first.files_scanned);
     try std.testing.expectEqualStrings("not_wired", first.stats.generation_refresh.refresh_status);
 
+    const stale_cache_path = try warmStatsResultCachePath(io, allocator, request, plan, true);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_cache_path, .data = "IXWARMSTATS1\ncontent_signature=0\nfile_count=2\nmatches=999\n" });
+    const stale_rejected = try run(io, allocator, request, plan);
+    try std.testing.expectEqual(@as(usize, 2), stale_rejected.matches_found);
+    try std.testing.expectEqual(@as(usize, 2), stale_rejected.files_scanned);
+    try std.testing.expectEqualStrings("not_wired", stale_rejected.stats.generation_refresh.refresh_status);
+
     const cached = try run(io, allocator, request, plan);
     try std.testing.expectEqual(@as(usize, 2), cached.matches_found);
     try std.testing.expectEqual(@as(usize, 0), cached.files_scanned);
@@ -6005,6 +6033,13 @@ test "stats-only warm result cache is content-signature pinned without live inde
     try std.testing.expectEqual(@as(usize, 3), refreshed.matches_found);
     try std.testing.expectEqual(@as(usize, 2), refreshed.files_scanned);
     try std.testing.expectEqualStrings("not_wired", refreshed.stats.generation_refresh.refresh_status);
+}
+
+test "warm hidden filter preserves dotfile parity with cold default traversal" {
+    try std.testing.expect(!isHiddenDirectoryPath(".rootfile"));
+    try std.testing.expect(!isHiddenDirectoryPath("src/.clang-format"));
+    try std.testing.expect(isHiddenDirectoryPath(".git/config"));
+    try std.testing.expect(isHiddenDirectoryPath("src/.git/config"));
 }
 
 test "capped warm hit query uses stats cache for exact count and prefix scan" {

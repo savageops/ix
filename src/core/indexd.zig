@@ -416,11 +416,14 @@ fn collectIndexFilesWithBudget(io: std.Io, allocator: std.mem.Allocator, root: [
         };
         const entry = maybe_entry orelse break;
         if (std.mem.eql(u8, entry.name, ".ix")) continue;
-        if (isDefaultHiddenEntry(entry.name)) continue;
         const child_path = try joinPathForward(allocator, root, entry.name);
         switch (entry.kind) {
             .file => try appendIndexedFile(io, allocator, child_path, files, large_source_bytes),
             .directory => {
+                if (isDefaultHiddenEntry(entry.name) or isGeneratedSourceIndexEntry(entry.name)) {
+                    allocator.free(child_path);
+                    continue;
+                }
                 try collectIndexFilesWithBudget(io, allocator, child_path, files, large_source_bytes);
                 allocator.free(child_path);
             },
@@ -476,19 +479,19 @@ fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
 }
 
 const INDEXABLE_LARGE_SOURCE_EXTENSIONS = [_][]const u8{
-    ".c",    ".h",       ".cc",  ".hh",  ".cpp",   ".hpp",  ".cxx",    ".hxx",
-    ".js",   ".jsx",     ".mjs", ".cjs", ".ts",    ".tsx",  ".go",     ".py",
-    ".java", ".cs",      ".kt",  ".kts", ".swift", ".rb",   ".php",    ".scala",
-    ".sc",   ".dart",    ".lua", ".r",   ".jl",    ".vue",  ".svelte", ".astro",
-    ".mdx",  ".graphql", ".gql", ".sh",  ".bash",  ".zsh",  ".fish",   ".ps1",
-    ".psm1", ".psd1",    ".cmd", ".bat", ".m",     ".mm",   ".pl",     ".pm",
-    ".erl",  ".hrl",     ".ex",  ".exs", ".clj",   ".cljs", ".cljc",   ".fs",
-    ".fsx",  ".vb",      ".hs",  ".lhs", ".ml",    ".mli",  ".nim",    ".cr",
-    ".d",    ".v",       ".vh",  ".sv",  ".svh",   ".vhd",  ".vhdl",   ".adb",
-    ".ads",  ".zig",     ".rs",  ".json", ".jsonc", ".jsonl", ".xml",    ".yaml",
-    ".yml",  ".toml",    ".html",".htm",  ".css",   ".scss",  ".less",   ".sql",
-    ".md",   ".markdown", ".ini", ".conf", ".cfg",   ".properties", ".lock",
-    ".csv",  ".tsv",      ".gradle",
+    ".c",    ".h",        ".cc",   ".hh",   ".cpp",   ".hpp",        ".cxx",    ".hxx",
+    ".js",   ".jsx",      ".mjs",  ".cjs",  ".ts",    ".tsx",        ".go",     ".py",
+    ".java", ".cs",       ".kt",   ".kts",  ".swift", ".rb",         ".php",    ".scala",
+    ".sc",   ".dart",     ".lua",  ".r",    ".jl",    ".vue",        ".svelte", ".astro",
+    ".mdx",  ".graphql",  ".gql",  ".sh",   ".bash",  ".zsh",        ".fish",   ".ps1",
+    ".psm1", ".psd1",     ".cmd",  ".bat",  ".m",     ".mm",         ".pl",     ".pm",
+    ".erl",  ".hrl",      ".ex",   ".exs",  ".clj",   ".cljs",       ".cljc",   ".fs",
+    ".fsx",  ".vb",       ".hs",   ".lhs",  ".ml",    ".mli",        ".nim",    ".cr",
+    ".d",    ".v",        ".vh",   ".sv",   ".svh",   ".vhd",        ".vhdl",   ".adb",
+    ".ads",  ".zig",      ".rs",   ".json", ".jsonc", ".jsonl",      ".xml",    ".yaml",
+    ".yml",  ".toml",     ".html", ".htm",  ".css",   ".scss",       ".less",   ".sql",
+    ".md",   ".markdown", ".ini",  ".conf", ".cfg",   ".properties", ".lock",   ".csv",
+    ".tsv",  ".gradle",
 };
 
 const INDEXABLE_LARGE_SOURCE_BASENAMES = [_][]const u8{
@@ -621,6 +624,10 @@ fn lessThanIndexedFilePath(_: void, lhs: IndexedFile, rhs: IndexedFile) bool {
 
 fn isDefaultHiddenEntry(name: []const u8) bool {
     return name.len > 1 and name[0] == '.' and !std.mem.eql(u8, name, "..");
+}
+
+fn isGeneratedSourceIndexEntry(name: []const u8) bool {
+    return std.mem.eql(u8, name, "tags") or std.mem.eql(u8, name, "TAGS");
 }
 
 fn joinPathForward(allocator: std.mem.Allocator, parent: []const u8, name: []const u8) ![]u8 {
@@ -913,6 +920,65 @@ test "indexd foreground once publishes catalog postings generation" {
     const postings_path = try std.fs.path.join(std.testing.allocator, &.{ paths.generation_dir, "postings.ixpost" });
     defer std.testing.allocator.free(postings_path);
     _ = try std.Io.Dir.cwd().readFile(std.testing.io, postings_path, &buffer);
+}
+
+test "indexd default traversal indexes dotfiles but skips dot directories" {
+    const root = ".zig-cache\\ix-indexd-dotfile-parity-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const dotfile_path = try joinPathForward(std.testing.allocator, root, ".rootfile");
+    defer std.testing.allocator.free(dotfile_path);
+    const dotdir_path = try joinPathForward(std.testing.allocator, root, ".git");
+    defer std.testing.allocator.free(dotdir_path);
+    const hidden_path = try std.fs.path.join(std.testing.allocator, &.{ root, ".git", "hidden.txt" });
+    defer std.testing.allocator.free(hidden_path);
+    const tags_dir_path = try joinPathForward(std.testing.allocator, root, "tags");
+    defer std.testing.allocator.free(tags_dir_path);
+    const tags_file_path = try std.fs.path.join(std.testing.allocator, &.{ root, "tags", "generated.txt" });
+    defer std.testing.allocator.free(tags_file_path);
+    const visible_path = try joinPathForward(std.testing.allocator, root, "visible.txt");
+    defer std.testing.allocator.free(visible_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = dotfile_path, .data = "static\n" });
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, dotdir_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = hidden_path, .data = "static\n" });
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, tags_dir_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = tags_file_path, .data = "static\n" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = visible_path, .data = "static\n" });
+
+    const result = try run(std.testing.io, std.testing.allocator, .{
+        .root = root,
+        .foreground = true,
+        .once = true,
+    });
+    defer result.deinit(std.testing.allocator);
+
+    const root_identity = try catalog.identifyRoot(std.testing.allocator, root);
+    defer root_identity.deinit(std.testing.allocator);
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ result.config.index_dir, "current.ixgen" });
+    defer std.testing.allocator.free(current_path);
+    const pin = (try generation.tryPinCurrentGeneration(std.testing.io, std.testing.allocator, current_path, root_identity.fingerprint)) orelse return error.TestExpectedCurrentGeneration;
+    const paths = try generation.buildGenerationPaths(std.testing.allocator, root, pin.epoch);
+    defer paths.deinit(std.testing.allocator);
+    const catalog_path = try std.fs.path.join(std.testing.allocator, &.{ paths.generation_dir, "catalog.ixcat" });
+    defer std.testing.allocator.free(catalog_path);
+    const catalog_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, catalog_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(catalog_bytes);
+    const snapshot = try catalog.parseCatalogForRoot(std.testing.allocator, catalog_bytes, root_identity.fingerprint);
+    defer snapshot.deinit(std.testing.allocator);
+
+    var saw_dotfile = false;
+    var saw_hidden_dir_file = false;
+    var saw_tags_dir_file = false;
+    for (snapshot.entries) |entry| {
+        const path = snapshot.path(entry);
+        if (std.mem.endsWith(u8, path, ".rootfile")) saw_dotfile = true;
+        if (std.mem.indexOf(u8, path, ".git") != null) saw_hidden_dir_file = true;
+        if (std.mem.indexOf(u8, path, "tags") != null) saw_tags_dir_file = true;
+    }
+    try std.testing.expect(saw_dotfile);
+    try std.testing.expect(!saw_hidden_dir_file);
+    try std.testing.expect(!saw_tags_dir_file);
 }
 
 test "indexd repair command writes reconcile request marker" {
