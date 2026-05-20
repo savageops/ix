@@ -1275,7 +1275,7 @@ fn tryLoadWarmStatsResultCache(
     if (request.follow_symlinks) return false;
     if (files.len > WARM_STATS_RESULT_CACHE_MAX_FILES) return false;
 
-    const cache_path = warmStatsResultCachePath(io, allocator, request, plan) catch return false;
+    const cache_path = warmStatsResultCachePath(io, allocator, request, plan, false) catch return false;
     const content_signature = computeContentSignature(io, files) catch {
         allocator.free(cache_path);
         return false;
@@ -1287,16 +1287,30 @@ fn tryLoadWarmStatsResultCache(
         .file_count = files.len,
     };
 
+    return loadWarmStatsResultCacheRecord(io, allocator, cache_path, content_signature, files.len, report);
+}
+
+fn loadWarmStatsResultCacheRecord(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    cache_path: []const u8,
+    content_signature: u64,
+    file_count: usize,
+    report: *SearchReport,
+) bool {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, cache_path, allocator, .limited(WARM_STATS_RESULT_CACHE_READ_LIMIT)) catch return false;
     defer allocator.free(bytes);
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return false, "\r"), WARM_STATS_RESULT_CACHE_MAGIC)) return false;
     const signature = parseCacheU64(lines.next() orelse return false, "content_signature=");
-    const file_count = parseCacheUsize(lines.next() orelse return false, "file_count=");
+    const cached_file_count = parseCacheUsize(lines.next() orelse return false, "file_count=");
     const matches = parseCacheUsize(lines.next() orelse return false, "matches=");
-    if (signature != content_signature or file_count != files.len) return false;
+    if (signature != content_signature or cached_file_count != file_count) return false;
 
-    report.files_discovered = files.len;
+    report.discover_ms = 0;
+    report.scan_ms = 0;
+    report.aggregate_ms = 0;
+    report.files_discovered = file_count;
     report.files_scanned = 0;
     report.bytes_scanned = 0;
     report.files_skipped = 0;
@@ -1305,10 +1319,10 @@ fn tryLoadWarmStatsResultCache(
     report.stats.generation_refresh.refresh_status = "warm_stats_result_cache";
     report.stats.generation_refresh.fallback_reason = "";
     report.stats.catalog_index.available = true;
-    report.stats.catalog_index.path_count = files.len;
+    report.stats.catalog_index.path_count = file_count;
     report.stats.catalog_index.fallback_reason = "warm_stats_result_cache";
     report.stats.postings_index.available = true;
-    report.stats.postings_index.file_count = files.len;
+    report.stats.postings_index.file_count = file_count;
     report.stats.postings_index.verified_files = 0;
     report.stats.postings_index.fallback_reason = "warm_stats_result_cache";
     return true;
@@ -1322,12 +1336,12 @@ fn writeWarmStatsResultCache(
     context: WarmStatsResultCacheContext,
     report: SearchReport,
 ) void {
-    _ = request;
-    _ = plan;
     if (!context.enabled) return;
     defer allocator.free(context.path);
     if (report.truncated) return;
-    var file = std.Io.Dir.cwd().createFile(io, context.path, .{ .truncate = true }) catch return;
+    const write_path = warmStatsResultCachePath(io, allocator, request, plan, true) catch return;
+    defer allocator.free(write_path);
+    var file = std.Io.Dir.cwd().createFile(io, write_path, .{ .truncate = true }) catch return;
     defer file.close(io);
     var buffer: [512]u8 = undefined;
     var writer = file.writer(io, &buffer);
@@ -1345,11 +1359,14 @@ fn warmStatsResultCachePath(
     allocator: std.mem.Allocator,
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
+    create_dir: bool,
 ) ![]const u8 {
     const root = request.paths[0];
-    const cache_dir = try std.fs.path.join(allocator, &.{ ".ix", "stats" });
-    defer allocator.free(cache_dir);
-    try std.Io.Dir.cwd().createDirPath(io, cache_dir);
+    if (create_dir) {
+        const cache_dir = try std.fs.path.join(allocator, &.{ ".ix", "stats" });
+        defer allocator.free(cache_dir);
+        try std.Io.Dir.cwd().createDirPath(io, cache_dir);
+    }
     var hasher = std.hash.Wyhash.init(0x4958_5354_4154_5352);
     hasher.update(plan.source);
     hasher.update(root);
