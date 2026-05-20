@@ -143,6 +143,9 @@ const EVIDENCE_FRONTIER_LIVE_READ_LIMIT = 4096;
 const EVIDENCE_FRONTIER_CACHE_CANDIDATE_LIMIT = 262144;
 const EVIDENCE_FRONTIER_LIVE_TTL_NS: i96 = 120 * std.time.ns_per_s;
 const EVIDENCE_FRONTIER_BUILD_TTL_NS: i128 = 120 * std.time.ns_per_s;
+const WARM_STATS_RESULT_CACHE_MAGIC = "IXWARMSTATS1";
+const WARM_STATS_RESULT_CACHE_READ_LIMIT = 4096;
+const WARM_STATS_RESULT_CACHE_MAX_FILES = 4096;
 
 /// Comptime predicate specialization for single-predicate plans. When passed to
 /// scanOpenFileIntoShardImpl / recordLineIntoShardImpl, the per-line match
@@ -303,6 +306,15 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     const discovered_mut = file_list.mutableItems();
     const evidence_prepared = prepareEvidenceFrontier(io, allocator, request, plan, trigram_admission, discovered_mut, &report);
     const active_files = evidence_prepared.active_files orelse discovered_mut;
+    var warm_stats_cache: WarmStatsResultCacheContext = .{};
+    if (tryLoadWarmStatsResultCache(io, allocator, request, plan, discovered_mut, &warm_stats_cache, &report)) {
+        allocator.free(warm_stats_cache.path);
+        report.scan_ms = 0;
+        report.aggregate_ms = 0;
+        report.total_ms = elapsedMs(io, total_started);
+        refreshStats(&report);
+        return report;
+    }
     const thread_count = effectiveThreadCount(request, active_files.len);
     report.outer_scan_threads = thread_count;
 
@@ -324,6 +336,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         try parallelScanFiles(io, allocator, discovered, request, plan, trigram_admission, &trigram_program, thread_count, evidence_prepared.runtime, &report);
     }
     report.scan_ms = elapsedMs(io, scan_started);
+    writeWarmStatsResultCache(io, allocator, request, plan, warm_stats_cache, report);
 
     const aggregate_started = std.Io.Timestamp.now(io, .awake);
     report.aggregate_ms = elapsedMs(io, aggregate_started);
@@ -1088,6 +1101,13 @@ const EvidenceFrontierPrepared = struct {
     runtime: EvidenceFrontierRuntime = .{},
 };
 
+const WarmStatsResultCacheContext = struct {
+    enabled: bool = false,
+    path: []const u8 = "",
+    content_signature: u64 = 0,
+    file_count: usize = 0,
+};
+
 fn prepareLiveEvidenceFrontier(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1238,6 +1258,107 @@ fn computeContentSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
     hashU64(&hasher, xor_acc);
     hashU64(&hasher, sum_acc);
     return hasher.final();
+}
+
+fn tryLoadWarmStatsResultCache(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    files: []const DiscoveredFile,
+    context: *WarmStatsResultCacheContext,
+    report: *SearchReport,
+) bool {
+    if (request.nexus_disabled) return false;
+    if (!request.stats_only) return false;
+    if (request.path_count != 1) return false;
+    if (request.follow_symlinks) return false;
+    if (files.len > WARM_STATS_RESULT_CACHE_MAX_FILES) return false;
+
+    const cache_path = warmStatsResultCachePath(io, allocator, request, plan) catch return false;
+    const content_signature = computeContentSignature(io, files) catch {
+        allocator.free(cache_path);
+        return false;
+    };
+    context.* = .{
+        .enabled = true,
+        .path = cache_path,
+        .content_signature = content_signature,
+        .file_count = files.len,
+    };
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, cache_path, allocator, .limited(WARM_STATS_RESULT_CACHE_READ_LIMIT)) catch return false;
+    defer allocator.free(bytes);
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return false, "\r"), WARM_STATS_RESULT_CACHE_MAGIC)) return false;
+    const signature = parseCacheU64(lines.next() orelse return false, "content_signature=");
+    const file_count = parseCacheUsize(lines.next() orelse return false, "file_count=");
+    const matches = parseCacheUsize(lines.next() orelse return false, "matches=");
+    if (signature != content_signature or file_count != files.len) return false;
+
+    report.files_discovered = files.len;
+    report.files_scanned = 0;
+    report.bytes_scanned = 0;
+    report.files_skipped = 0;
+    report.matches_found = matches;
+    report.stats.generation_refresh.available = true;
+    report.stats.generation_refresh.refresh_status = "warm_stats_result_cache";
+    report.stats.generation_refresh.fallback_reason = "";
+    report.stats.catalog_index.available = true;
+    report.stats.catalog_index.path_count = files.len;
+    report.stats.catalog_index.fallback_reason = "warm_stats_result_cache";
+    report.stats.postings_index.available = true;
+    report.stats.postings_index.file_count = files.len;
+    report.stats.postings_index.verified_files = 0;
+    report.stats.postings_index.fallback_reason = "warm_stats_result_cache";
+    return true;
+}
+
+fn writeWarmStatsResultCache(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    context: WarmStatsResultCacheContext,
+    report: SearchReport,
+) void {
+    _ = request;
+    _ = plan;
+    if (!context.enabled) return;
+    defer allocator.free(context.path);
+    if (report.truncated) return;
+    var file = std.Io.Dir.cwd().createFile(io, context.path, .{ .truncate = true }) catch return;
+    defer file.close(io);
+    var buffer: [512]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    writer.interface.print("{s}\ncontent_signature={x}\nfile_count={}\nmatches={}\n", .{
+        WARM_STATS_RESULT_CACHE_MAGIC,
+        context.content_signature,
+        context.file_count,
+        report.matches_found,
+    }) catch return;
+    writer.interface.flush() catch return;
+}
+
+fn warmStatsResultCachePath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+) ![]const u8 {
+    const root = request.paths[0];
+    const cache_dir = try std.fs.path.join(allocator, &.{ ".ix", "stats" });
+    defer allocator.free(cache_dir);
+    try std.Io.Dir.cwd().createDirPath(io, cache_dir);
+    var hasher = std.hash.Wyhash.init(0x4958_5354_4154_5352);
+    hasher.update(plan.source);
+    hasher.update(root);
+    hashU64(&hasher, if (request.case_insensitive) 1 else 0);
+    hashU64(&hasher, if (request.hidden) 1 else 0);
+    hashU64(&hasher, if (request.no_ignore) 1 else 0);
+    const file_name = try std.fmt.allocPrint(allocator, "{x}.ixstats", .{hasher.final()});
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ ".ix", "stats", file_name });
 }
 
 fn writeEvidenceFrontierCacheFromShards(
@@ -5834,6 +5955,39 @@ test "stats-only warm query cache reuses exact pinned-generation count" {
     try std.testing.expectEqual(@as(f64, 0), cached.discover_ms);
     try std.testing.expectEqualStrings("live_query_stats_cache", cached.stats.generation_refresh.refresh_status);
     try std.testing.expectEqualStrings("query_stats_cache", cached.stats.postings_index.fallback_reason);
+}
+
+test "stats-only warm result cache is content-signature pinned without live index owner" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "needle\nneedle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "absent\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+
+    var request = testSearchRequest("lit:needle", root_path);
+    request.stats_only = true;
+    const plan = try expr.parse(request.expression);
+
+    const first = try run(io, allocator, request, plan);
+    try std.testing.expectEqual(@as(usize, 2), first.matches_found);
+    try std.testing.expectEqual(@as(usize, 2), first.files_scanned);
+    try std.testing.expectEqualStrings("not_wired", first.stats.generation_refresh.refresh_status);
+
+    const cached = try run(io, allocator, request, plan);
+    try std.testing.expectEqual(@as(usize, 2), cached.matches_found);
+    try std.testing.expectEqual(@as(usize, 0), cached.files_scanned);
+    try std.testing.expectEqualStrings("warm_stats_result_cache", cached.stats.generation_refresh.refresh_status);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "needle\n" });
+    const refreshed = try run(io, allocator, request, plan);
+    try std.testing.expectEqual(@as(usize, 3), refreshed.matches_found);
+    try std.testing.expectEqual(@as(usize, 2), refreshed.files_scanned);
+    try std.testing.expectEqualStrings("not_wired", refreshed.stats.generation_refresh.refresh_status);
 }
 
 test "capped warm hit query uses stats cache for exact count and prefix scan" {
