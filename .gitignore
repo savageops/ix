@@ -17,3 +17,4 @@
 Created*
 node_modules/
 data/keys.sqlite
+*.ix*
