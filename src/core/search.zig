@@ -4489,6 +4489,10 @@ fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, ca
 }
 
 fn countRegexWithPrefilter(line: []const u8, pattern: []const u8, case_insensitive: bool) usize {
+    if (fixedWordWhitespaceChain(pattern)) |chain| {
+        return countFixedWordWhitespaceChain(line, chain);
+    }
+
     const cached = cachedLiteralFragment(pattern);
     if (cached.len >= 2) {
         if (indexOfLiteral(line, cached, case_insensitive) == null) return 0;
@@ -4498,6 +4502,72 @@ fn countRegexWithPrefilter(line: []const u8, pattern: []const u8, case_insensiti
 
 fn isSurroundingWordLiteralPattern(pattern: []const u8) bool {
     return std.mem.startsWith(u8, pattern, "\\w+\\s+") and std.mem.endsWith(u8, pattern, "\\s+\\w+");
+}
+
+const FIXED_WORD_CHAIN_MAX_PARTS = 16;
+
+const FixedWordWhitespaceChain = struct {
+    word_lens: [FIXED_WORD_CHAIN_MAX_PARTS]usize = undefined,
+    count: usize = 0,
+};
+
+fn fixedWordWhitespaceChain(pattern: []const u8) ?FixedWordWhitespaceChain {
+    var parsed: FixedWordWhitespaceChain = .{};
+    var index: usize = 0;
+
+    while (index < pattern.len) {
+        if (parsed.count == FIXED_WORD_CHAIN_MAX_PARTS) return null;
+        if (index + 3 > pattern.len) return null;
+        if (pattern[index] != '\\' or pattern[index + 1] != 'w' or pattern[index + 2] != '{') return null;
+        const close = std.mem.indexOfScalarPos(u8, pattern, index + 3, '}') orelse return null;
+        const width = std.fmt.parseInt(usize, pattern[index + 3 .. close], 10) catch return null;
+        if (width == 0) return null;
+        parsed.word_lens[parsed.count] = width;
+        parsed.count += 1;
+        index = close + 1;
+        if (index == pattern.len) break;
+        if (index + 3 > pattern.len) return null;
+        if (pattern[index] != '\\' or pattern[index + 1] != 's' or pattern[index + 2] != '+') return null;
+        index += 3;
+    }
+
+    return if (parsed.count >= 2) parsed else null;
+}
+
+fn countFixedWordWhitespaceChain(line: []const u8, chain: FixedWordWhitespaceChain) usize {
+    var total: usize = 0;
+    var cursor: usize = 0;
+    while (cursor < line.len) {
+        if (fixedWordWhitespaceChainEnd(line, cursor, chain)) |end| {
+            total += 1;
+            cursor = end;
+        } else {
+            cursor += 1;
+        }
+    }
+    return total;
+}
+
+fn fixedWordWhitespaceChainEnd(line: []const u8, start: usize, chain: FixedWordWhitespaceChain) ?usize {
+    var cursor = start;
+    var part: usize = 0;
+    while (part < chain.count) : (part += 1) {
+        const width = chain.word_lens[part];
+        if (cursor + width > line.len) return null;
+        for (line[cursor .. cursor + width]) |byte| {
+            if (!isWordChar(byte)) return null;
+        }
+        cursor += width;
+        if (part + 1 == chain.count) return cursor;
+        const ws_start = cursor;
+        while (cursor < line.len and isRegexWhitespace(line[cursor])) : (cursor += 1) {}
+        if (cursor == ws_start) return null;
+    }
+    return cursor;
+}
+
+fn isRegexWhitespace(byte: u8) bool {
+    return byte == ' ' or byte == '\t' or byte == '\r' or byte == '\n';
 }
 
 fn elapsedMs(io: std.Io, start: std.Io.Timestamp) f64 {
@@ -5609,6 +5679,32 @@ test "large literal alternates range may use pcre count path" {
     try std.testing.expect(!literalAlternatesPcreRangeEligible("Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade", small.count));
     const escaped = parseLiteralAlternates("Sherlock\\.Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty").?;
     try std.testing.expect(!literalAlternatesPcreRangeEligible("Sherlock\\.Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty", escaped.count));
+}
+
+test "fixed word whitespace chain fast count matches regex count semantics" {
+    const pattern = "\\w{5}\\s+\\w{5}\\s+\\w{5}\\s+\\w{5}\\s+\\w{5}";
+    const chain = fixedWordWhitespaceChain(pattern) orelse return error.TestExpectedEqual;
+
+    const cases = [_][]const u8{
+        "alpha beta gamma delta omega",
+        "abcdef beta gamma delta omega",
+        "alpha  beta\tgamma delta omega",
+        "alpha beta gamma delta omega alpha beta gamma delta omega",
+        "abcd beta gamma delta omega",
+        "alpha beta gamma delta",
+        "alpha beta gamma delta omega_tail",
+    };
+
+    for (cases) |line| {
+        try std.testing.expectEqual(
+            countRegexStatsOnly(line, pattern, false),
+            countFixedWordWhitespaceChain(line, chain),
+        );
+    }
+
+    try std.testing.expect(fixedWordWhitespaceChain("\\w{5}\\s+") == null);
+    try std.testing.expect(fixedWordWhitespaceChain("\\w+\\s+\\w+") == null);
+    try std.testing.expect(fixedWordWhitespaceChain("\\d{5}\\s+\\w{5}") == null);
 }
 
 test "byte shard default fanout caps implicit hardware thread count" {
