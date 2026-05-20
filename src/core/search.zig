@@ -414,6 +414,7 @@ fn effectiveThreadCount(request: cli.SearchRequest, file_count: usize) usize {
     if (request.threads) |threads| return @max(threads, 1);
     const cpus = availableThreads();
     if (file_count <= 4) return @min(cpus, @max(file_count, 1));
+    if (file_count <= 32) return @min(cpus, @as(usize, 2));
     if (file_count >= 4096 and cpus > 8) return cpus - 3;
     const sqrt_files = std.math.sqrt(@as(f64, @floatFromInt(file_count)));
     const scaled: usize = @intFromFloat(@min(sqrt_files, @as(f64, @floatFromInt(cpus))));
@@ -2477,7 +2478,7 @@ fn scanFileMmap(
     var literal_admission_satisfied = false;
     if (mono) |m| {
         if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
-            if (!request.case_insensitive and sz.indexOfAdmission(data, needle) == null) {
+            if (!request.case_insensitive and simd.indexOf(data, needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
                 shard.scan_work_ms_total += file_ms;
@@ -2885,7 +2886,7 @@ fn countLiteralLogicalRange(data: []const u8, needle: []const u8, logical_start:
     var total: usize = 0;
     var cursor = @min(widened_start, end);
     while (cursor + needle.len <= end) {
-        const index = sz.indexOf(data[cursor..end], needle) orelse break;
+        const index = simd.indexOf(data[cursor..end], needle) orelse break;
         const match_start = cursor + index;
         if (match_start >= logical_end) break;
         if (match_start >= logical_start) total += 1;
@@ -4165,16 +4166,16 @@ fn recordLine(
 /// from the file proves absence of a match without invoking the line verifier.
 fn fileAdmissionNeedle(comptime kind: expr.PredicateKind, comptime strategy: expr.MatcherStrategy, predicate: expr.Predicate) ?[]const u8 {
     switch (kind) {
-        .literal, .prefix, .suffix => return if (predicate.value.len >= 2) predicate.value else null,
+        .literal, .prefix, .suffix => return admissionProbeNeedle(predicate.value),
         .regex => switch (strategy) {
             .regex_plain_literal => {
                 if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null and predicate.value.len >= 2)
-                    return predicate.value;
+                    return admissionProbeNeedle(predicate.value);
                 return null;
             },
             .regex_word_boundary_literal => {
                 const body = stripWordBoundaryAnchors(predicate.value);
-                return if (body.len >= 2) body else null;
+                return admissionProbeNeedle(body);
             },
             else => return null,
         },
@@ -4188,20 +4189,26 @@ fn fileAdmissionNeedleRuntimeForPlan(plan: expr.ExpressionPlan) ?[]const u8 {
 
 fn fileAdmissionNeedleRuntime(predicate: expr.Predicate) ?[]const u8 {
     switch (predicate.kind) {
-        .literal, .prefix, .suffix => return if (predicate.value.len >= 2) predicate.value else null,
+        .literal, .prefix, .suffix => return admissionProbeNeedle(predicate.value),
         .regex => switch (predicate.strategy) {
             .regex_plain_literal => {
                 if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null and predicate.value.len >= 2)
-                    return predicate.value;
+                    return admissionProbeNeedle(predicate.value);
                 return null;
             },
             .regex_word_boundary_literal => {
                 const body = stripWordBoundaryAnchors(predicate.value);
-                return if (body.len >= 2) body else null;
+                return admissionProbeNeedle(body);
             },
             else => return null,
         },
     }
+}
+
+fn admissionProbeNeedle(needle: []const u8) ?[]const u8 {
+    if (needle.len < 2) return null;
+    if (needle.len <= 16) return needle;
+    return needle[0..8];
 }
 
 fn multiPredicateFileAdmissionMiss(data: []const u8, plan: expr.ExpressionPlan, case_insensitive: bool) bool {
@@ -5362,6 +5369,13 @@ test "multi predicate file admission proves literal any absence" {
 test "multi predicate file admission preserves unsupported any predicates" {
     const plan = try expr.parse("lit:PM_RESUME || re:PM_.*");
     try std.testing.expect(!multiPredicateFileAdmissionMiss("PM_SUSPEND", plan, false));
+}
+
+test "long file admission uses mandatory prefix probe" {
+    const probe = admissionProbeNeedle("__IX_ABSENT_SENTINEL_DO_NOT_MATCH__") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("__IX_ABS", probe);
+    try std.testing.expectEqualStrings("static", admissionProbeNeedle("static").?);
+    try std.testing.expect(admissionProbeNeedle("x") == null);
 }
 
 test "trigram gate admits possible file for exact verifier" {
