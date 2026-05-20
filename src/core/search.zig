@@ -2454,6 +2454,14 @@ fn scanFileMmap(
         shard.slowest_bytes = file_bytes;
     }
 
+    if (multiPredicateFileAdmissionMiss(data, plan, request.case_insensitive)) {
+        recordEvidencePruned(shard, file_bytes);
+        const file_ms = elapsedMs(io, file_started);
+        shard.scan_work_ms_total += file_ms;
+        if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+        return;
+    }
+
     if (request.stats_only and shouldRunByteShardBeforeAdmission(plan)) {
         if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
             if (linux_dominant_target) recordLinuxDominantFileActivation(shard);
@@ -4196,6 +4204,30 @@ fn fileAdmissionNeedleRuntime(predicate: expr.Predicate) ?[]const u8 {
     }
 }
 
+fn multiPredicateFileAdmissionMiss(data: []const u8, plan: expr.ExpressionPlan, case_insensitive: bool) bool {
+    if (case_insensitive or plan.predicate_count < 2) return false;
+    const predicates = plan.predicates[0..plan.predicate_count];
+    return switch (plan.mode) {
+        .any => {
+            var checked: usize = 0;
+            for (predicates) |predicate| {
+                const needle = fileAdmissionNeedleRuntime(predicate) orelse return false;
+                checked += 1;
+                if (sz.indexOfAdmission(data, needle) != null) return false;
+            }
+            return checked != 0;
+        },
+        .all => {
+            for (predicates) |predicate| {
+                if (fileAdmissionNeedleRuntime(predicate)) |needle| {
+                    if (sz.indexOfAdmission(data, needle) == null) return true;
+                }
+            }
+            return false;
+        },
+    };
+}
+
 /// Extracts a mandatory literal needle suitable for chunk-level prefiltering.
 /// Returns null when the predicate cannot be reduced to a simple substring
 /// test (case-insensitive, character classes, alternation, etc.).
@@ -4375,7 +4407,15 @@ fn statsOnlyMatchCount(line: []const u8, plan: expr.ExpressionPlan, case_insensi
     if (plan.predicate_count == 1) {
         return predicateMatchCount(line, plan.predicates[0], case_insensitive, chunk_casefolded);
     }
-    return if (matchingColumn(line, plan, case_insensitive) != null) 1 else 0;
+    return if (statsOnlyPlanMatches(line, plan, case_insensitive)) 1 else 0;
+}
+
+fn statsOnlyPlanMatches(line: []const u8, plan: expr.ExpressionPlan, case_insensitive: bool) bool {
+    const predicates = plan.predicates[0..plan.predicate_count];
+    return switch (plan.mode) {
+        .all => allPredicatesMatch(line, predicates, case_insensitive),
+        .any => anyPredicateMatches(line, predicates, case_insensitive),
+    };
 }
 
 fn predicateMatchCount(line: []const u8, predicate: expr.Predicate, case_insensitive: bool, chunk_casefolded: bool) usize {
@@ -5311,6 +5351,17 @@ test "trigram gate rejects impossible complete file without verifier authority" 
     try std.testing.expectEqual(@as(usize, 1), stats.candidate_files_checked);
     try std.testing.expectEqual(@as(usize, 1), stats.pruned_files);
     try std.testing.expectEqual(@as(usize, 0), stats.verified_files);
+}
+
+test "multi predicate file admission proves literal any absence" {
+    const plan = try expr.parse("lit:PM_RESUME || lit:PM_SUSPEND");
+    try std.testing.expect(multiPredicateFileAdmissionMiss("no power-management token here", plan, false));
+    try std.testing.expect(!multiPredicateFileAdmissionMiss("calls PM_RESUME once", plan, false));
+}
+
+test "multi predicate file admission preserves unsupported any predicates" {
+    const plan = try expr.parse("lit:PM_RESUME || re:PM_.*");
+    try std.testing.expect(!multiPredicateFileAdmissionMiss("PM_SUSPEND", plan, false));
 }
 
 test "trigram gate admits possible file for exact verifier" {
