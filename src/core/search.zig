@@ -510,15 +510,18 @@ fn prepareWarmIndexFrontier(
     const postings_path = std.fs.path.join(allocator, &.{ paths.generation_dir, "postings.ixpost" }) catch return warmIndexFallback(report, "postings_path_failed");
     defer allocator.free(postings_path);
 
+    const lookup_result = postings.evaluateLookupPlanFromFile(io, allocator, postings_path, root_identity.fingerprint, pin.epoch, lookup) catch |err| return warmIndexFallback(report, @errorName(err));
+    defer lookup_result.deinit(allocator);
+    const candidate_ids = lookup_result.candidates;
+    if (candidate_ids.len == 0 and lookup_result.header.verify_required_count == 0) {
+        return prepareEmptyWarmIndexFrontier(io, allocator, root, root_identity.fingerprint, pin.epoch, lookup_result.header, request, report);
+    }
+
     const catalog_bytes = std.Io.Dir.cwd().readFileAlloc(io, catalog_path, allocator, .limited(WARM_INDEX_SEGMENT_READ_LIMIT)) catch return warmIndexFallback(report, "catalog_read_failed");
     defer allocator.free(catalog_bytes);
     const snapshot = catalog.parseCatalogForRoot(allocator, catalog_bytes, root_identity.fingerprint) catch |err| return warmIndexFallback(report, @errorName(err));
     defer snapshot.deinit(allocator);
     if (snapshot.header.generation != pin.epoch) return warmIndexFallback(report, "catalog_generation_mismatch");
-
-    const lookup_result = postings.evaluateLookupPlanFromFile(io, allocator, postings_path, root_identity.fingerprint, pin.epoch, lookup) catch |err| return warmIndexFallback(report, @errorName(err));
-    defer lookup_result.deinit(allocator);
-    const candidate_ids = lookup_result.candidates;
     const selected = postings.selectCatalogEntriesForCandidates(allocator, snapshot, candidate_ids) catch return warmIndexFallback(report, "candidate_select_failed");
     defer allocator.free(selected);
 
@@ -562,6 +565,49 @@ fn prepareWarmIndexFrontier(
         .discovered = snapshot.entries.len,
         .candidate_count = owned.len,
         .known_matches = known_matches,
+    };
+}
+
+fn prepareEmptyWarmIndexFrontier(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    root_fingerprint: catalog.RootFingerprint,
+    epoch: generation.Epoch,
+    header: postings.PostingsSegmentHeader,
+    request: cli.SearchRequest,
+    report: *SearchReport,
+) ?WarmIndexFrontier {
+    const active = allocator.alloc(DiscoveredFile, 0) catch return warmIndexFallback(report, "empty_frontier_alloc_failed");
+    report.discover_ms = 0;
+    report.files_discovered = @intCast(header.file_count);
+    report.stats.generation_refresh.available = true;
+    report.stats.generation_refresh.epoch = epoch;
+    report.stats.generation_refresh.refresh_status = "live_pinned";
+    report.stats.generation_refresh.fallback_reason = "";
+    report.stats.catalog_index.available = true;
+    report.stats.catalog_index.generation = epoch;
+    report.stats.catalog_index.path_count = @intCast(header.file_count);
+    report.stats.catalog_index.meta_count = @intCast(header.file_count);
+    report.stats.catalog_index.fallback_reason = "empty_postings";
+    report.stats.postings_index.available = true;
+    report.stats.postings_index.generation = epoch;
+    report.stats.postings_index.trigram_count = @intCast(header.trigram_count);
+    report.stats.postings_index.postings_count = @intCast(header.postings_count);
+    report.stats.postings_index.file_count = @intCast(header.file_count);
+    report.stats.postings_index.candidate_files = 0;
+    report.stats.postings_index.pruned_files = @intCast(header.file_count);
+    report.stats.postings_index.verified_files = 0;
+    report.stats.postings_index.fallback_reason = "empty_postings";
+    writeWarmQueryFrontier(io, allocator, root, root_fingerprint, epoch, request, @intCast(header.file_count), active);
+    return .{
+        .active_files = active,
+        .root = root,
+        .root_fingerprint = root_fingerprint,
+        .epoch = epoch,
+        .discovered = @intCast(header.file_count),
+        .candidate_count = 0,
+        .known_matches = if (request.stats_only) 0 else null,
     };
 }
 
@@ -5906,6 +5952,42 @@ test "search run consumes live warm postings and scans only candidate files" {
     try std.testing.expectEqual(report.hits[0].line, capped_report.hits[0].line);
     try std.testing.expectEqual(report.hits[0].column, capped_report.hits[0].column);
     try std.testing.expectEqualStrings(report.hits[0].preview, capped_report.hits[0].preview);
+}
+
+test "stats-only live warm postings return empty frontier without catalog scan" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "other\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
+    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    try std.Io.Dir.cwd().createDirPath(io, index_dir);
+    const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
+
+    var request = testSearchRequest("lit:absent_token", root_path);
+    request.index_enabled = true;
+    request.nexus_disabled = true;
+    request.stats_only = true;
+    const plan = try expr.parse(request.expression);
+    const report = try run(io, allocator, request, plan);
+
+    try std.testing.expect(report.stats.catalog_index.available);
+    try std.testing.expect(report.stats.postings_index.available);
+    try std.testing.expectEqualStrings("empty_postings", report.stats.catalog_index.fallback_reason);
+    try std.testing.expectEqualStrings("empty_postings", report.stats.postings_index.fallback_reason);
+    try std.testing.expectEqual(@as(usize, 2), report.files_discovered);
+    try std.testing.expectEqual(@as(usize, 0), report.files_scanned);
+    try std.testing.expectEqual(@as(usize, 0), report.matches_found);
+    try std.testing.expectEqual(@as(usize, 0), report.stats.postings_index.candidate_files);
+    try std.testing.expectEqual(@as(usize, 2), report.stats.postings_index.pruned_files);
 }
 
 test "capped warm query hit cache reuses capped-first result" {

@@ -321,7 +321,8 @@ pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []c
 
     const catalog_bytes = try catalog.buildCatalogBytes(allocator, root, epoch, catalog_inputs);
     defer allocator.free(catalog_bytes);
-    const segment = try postings.buildPostingsSegment(allocator, root_identity.fingerprint, epoch, postings_inputs.items);
+    const verify_required_count = files.items.len - postings_inputs.items.len;
+    const segment = try postings.buildPostingsSegment(allocator, root_identity.fingerprint, epoch, postings_inputs.items, verify_required_count);
     defer segment.deinit(allocator);
     const postings_bytes = try postings.serializePostingsSegment(allocator, segment);
     defer allocator.free(postings_bytes);

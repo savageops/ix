@@ -628,7 +628,7 @@ pub fn publishDeltaGeneration(
 
     const catalog_bytes = try catalog.buildCatalogBytes(allocator, input.root, input.epoch, input.catalog_files);
     defer allocator.free(catalog_bytes);
-    const postings_segment = try postings.buildPostingsSegment(allocator, input.root_fingerprint, input.epoch, input.postings_files);
+    const postings_segment = try postings.buildPostingsSegment(allocator, input.root_fingerprint, input.epoch, input.postings_files, 0);
     defer postings_segment.deinit(allocator);
     const postings_bytes = try postings.serializePostingsSegment(allocator, postings_segment);
     defer allocator.free(postings_bytes);

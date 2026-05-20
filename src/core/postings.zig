@@ -4,10 +4,10 @@ const expr = @import("expr.zig");
 const trigram = @import("trigram.zig");
 
 pub const MAGIC: [8]u8 = .{ 'I', 'X', 'P', 'O', 'S', 'T', '0', '1' };
-pub const FORMAT_VERSION: u16 = 1;
+pub const FORMAT_VERSION: u16 = 2;
 pub const MIN_HEADER_SIZE: usize = @sizeOf(PostingsSegmentHeader);
 pub const INVALID_TRIGRAM_KEY: TrigramKey = 0;
-pub const SERIALIZED_HEADER_SIZE: u64 = 8 + 2 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 8;
+pub const SERIALIZED_HEADER_SIZE: u64 = 8 + 2 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8;
 pub const SERIALIZED_ENTRY_SIZE: u64 = 4 + 8 + 4 + 1 + 1 + 2;
 pub const SERIALIZED_FILE_ID_SIZE: u64 = 8;
 
@@ -40,6 +40,7 @@ pub const PostingsSegmentHeader = extern struct {
     trigram_count: u64 = 0,
     postings_count: u64 = 0,
     file_count: u64 = 0,
+    verify_required_count: u64 = 0,
 
     pub fn rootFingerprint(self: PostingsSegmentHeader) RootFingerprint {
         return (@as(RootFingerprint, self.root_fingerprint_hi) << 64) | @as(RootFingerprint, self.root_fingerprint_lo);
@@ -178,6 +179,7 @@ pub fn buildPostingsSegment(
     root_fingerprint: RootFingerprint,
     generation: u64,
     files: []const PostingsFileInput,
+    verify_required_count: u64,
 ) !PostingsSegment {
     var pairs = std.ArrayList(PostingPair).empty;
     errdefer pairs.deinit(allocator);
@@ -238,6 +240,7 @@ pub fn buildPostingsSegment(
     header.trigram_count = @intCast(entries.len);
     header.postings_count = @intCast(file_ids.len);
     header.file_count = @intCast(files.len);
+    header.verify_required_count = verify_required_count;
 
     pairs.deinit(allocator);
     return .{
@@ -504,6 +507,7 @@ pub fn isValidEntry(entry: PostingsEntry, file_ids_len: usize) bool {
     if (!isValidTrigramKey(entry.key)) return false;
     if (entry.file_offset > std.math.maxInt(usize)) return false;
     const start: usize = @intCast(entry.file_offset);
+    if (start > file_ids_len) return false;
     return entry.file_count <= file_ids_len - start;
 }
 
@@ -620,6 +624,12 @@ fn evaluateLookupGroupFromOpenFile(
     group: LookupGroup,
 ) ![]FileId {
     if (group.key_count == 0) return allocator.alloc(FileId, 0);
+    if (group.key_count > 1) {
+        for (group.keys[0..group.key_count]) |key| {
+            _ = try lookupEntryFromOpenFile(io, file, header, key) orelse return allocator.alloc(FileId, 0);
+        }
+    }
+
     var current = try lookupFileIdsFromOpenFile(io, allocator, file, header, group.keys[0]) orelse return allocator.alloc(FileId, 0);
     errdefer allocator.free(current);
 
@@ -645,6 +655,16 @@ fn lookupFileIdsFromOpenFile(
     key_value: TrigramKey,
 ) !?[]FileId {
     const entry = try lookupEntryFromOpenFile(io, file, header, key_value) orelse return null;
+    return try readFileIdsForEntryFromOpenFile(io, allocator, file, header, entry);
+}
+
+fn readFileIdsForEntryFromOpenFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: *std.Io.File,
+    header: PostingsSegmentHeader,
+    entry: PostingsEntry,
+) ![]FileId {
     const count = try checkedCount(entry.file_count);
     const ids = try allocator.alloc(FileId, count);
     errdefer allocator.free(ids);
@@ -816,6 +836,7 @@ fn writeHeader(bytes: *std.ArrayList(u8), allocator: std.mem.Allocator, header: 
     try appendU64(bytes, allocator, header.trigram_count);
     try appendU64(bytes, allocator, header.postings_count);
     try appendU64(bytes, allocator, header.file_count);
+    try appendU64(bytes, allocator, header.verify_required_count);
 }
 
 fn readHeader(cursor: *Cursor) !PostingsSegmentHeader {
@@ -830,6 +851,7 @@ fn readHeader(cursor: *Cursor) !PostingsSegmentHeader {
     header.trigram_count = try cursor.readU64();
     header.postings_count = try cursor.readU64();
     header.file_count = try cursor.readU64();
+    header.verify_required_count = try cursor.readU64();
     return header;
 }
 
@@ -942,8 +964,8 @@ const Cursor = struct {
 
 test "postings constants define a versioned file format" {
     try std.testing.expectEqualStrings("IXPOST01", &MAGIC);
-    try std.testing.expectEqual(@as(u16, 1), FORMAT_VERSION);
-    try std.testing.expect(MIN_HEADER_SIZE >= 56);
+    try std.testing.expectEqual(@as(u16, 2), FORMAT_VERSION);
+    try std.testing.expect(MIN_HEADER_SIZE >= 64);
 }
 
 test "postings root fingerprint splits and joins deterministically" {
@@ -1024,7 +1046,7 @@ test "postings builder emits sorted unique trigram to file-id postings" {
         .{ .file_id = catalog.makeFileId(1), .bytes = "bandana" },
         .{ .file_id = catalog.makeFileId(2), .bytes = "ix" },
     };
-    const segment = try buildPostingsSegment(std.testing.allocator, 0x1234, 7, &files);
+    const segment = try buildPostingsSegment(std.testing.allocator, 0x1234, 7, &files, 0);
     defer segment.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(u64, 7), segment.header.generation);
@@ -1044,7 +1066,7 @@ test "postings builder rejects invalid catalog file ids" {
     const files = [_]PostingsFileInput{
         .{ .file_id = catalog.INVALID_FILE_ID, .bytes = "auth" },
     };
-    try std.testing.expectError(error.InvalidCatalogFileId, buildPostingsSegment(std.testing.allocator, 1, 1, &files));
+    try std.testing.expectError(error.InvalidCatalogFileId, buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0));
 }
 
 test "postings builder deduplicates repeated file trigram pairs" {
@@ -1052,7 +1074,7 @@ test "postings builder deduplicates repeated file trigram pairs" {
         .{ .file_id = catalog.makeFileId(0), .bytes = "auth" },
         .{ .file_id = catalog.makeFileId(0), .bytes = "auth" },
     };
-    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files);
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0);
     defer segment.deinit(std.testing.allocator);
 
     const key = makeTrigramKey(&.{ 'a', 'u', 't' });
@@ -1122,7 +1144,7 @@ test "postings lookup evaluation intersects mandatory evidence" {
         .{ .file_id = catalog.makeFileId(1), .bytes = "auth only" },
         .{ .file_id = catalog.makeFileId(2), .bytes = "token only" },
     };
-    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files);
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0);
     defer segment.deinit(std.testing.allocator);
 
     const lookup = lowerExpressionToLookupPlan(try expr.parse("lit:auth && lit:token"));
@@ -1138,7 +1160,7 @@ test "postings lookup evaluation unions disjunctive evidence" {
         .{ .file_id = catalog.makeFileId(1), .bytes = "token" },
         .{ .file_id = catalog.makeFileId(2), .bytes = "none" },
     };
-    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files);
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0);
     defer segment.deinit(std.testing.allocator);
 
     const lookup = lowerExpressionToLookupPlan(try expr.parse("lit:auth || lit:token"));
@@ -1155,7 +1177,7 @@ test "postings lookup evaluation unions literal alternate regex branch evidence"
         .{ .file_id = catalog.makeFileId(2), .bytes = "gamma" },
         .{ .file_id = catalog.makeFileId(3), .bytes = "alphabet" },
     };
-    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files);
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0);
     defer segment.deinit(std.testing.allocator);
 
     const lookup = lowerExpressionToLookupPlan(try expr.parse("re:(alpha|beta)"));
@@ -1169,7 +1191,7 @@ test "postings lookup evaluation returns empty candidates for missing evidence" 
     const files = [_]PostingsFileInput{
         .{ .file_id = catalog.makeFileId(0), .bytes = "auth" },
     };
-    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files);
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0);
     defer segment.deinit(std.testing.allocator);
 
     const lookup = lowerExpressionToLookupPlan(try expr.parse("lit:missing"));
@@ -1186,7 +1208,7 @@ test "postings file lookup evaluates candidates without full segment parse" {
         .{ .file_id = catalog.makeFileId(2), .bytes = "beta gamma" },
         .{ .file_id = catalog.makeFileId(3), .bytes = "omega" },
     };
-    const segment = try buildPostingsSegment(std.testing.allocator, 0x1234, 77, &files);
+    const segment = try buildPostingsSegment(std.testing.allocator, 0x1234, 77, &files, 0);
     defer segment.deinit(std.testing.allocator);
     const encoded = try serializePostingsSegment(std.testing.allocator, segment);
     defer std.testing.allocator.free(encoded);
@@ -1212,7 +1234,7 @@ test "postings lookup evaluation refuses unsafe fallback as zero candidates" {
     const files = [_]PostingsFileInput{
         .{ .file_id = catalog.makeFileId(0), .bytes = "auth" },
     };
-    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files);
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0);
     defer segment.deinit(std.testing.allocator);
 
     const lookup = lowerExpressionToLookupPlan(try expr.parse("lit:auth || lit:x"));
@@ -1247,7 +1269,7 @@ test "postings serialization round trips header entries and file ids" {
         .{ .file_id = catalog.makeFileId(0), .bytes = "auth" },
         .{ .file_id = catalog.makeFileId(1), .bytes = "author" },
     };
-    const segment = try buildPostingsSegment(std.testing.allocator, 0xfeed, 3, &files);
+    const segment = try buildPostingsSegment(std.testing.allocator, 0xfeed, 3, &files, 2);
     defer segment.deinit(std.testing.allocator);
 
     const encoded = try serializePostingsSegment(std.testing.allocator, segment);
@@ -1258,6 +1280,7 @@ test "postings serialization round trips header entries and file ids" {
 
     try std.testing.expectEqual(@as(RootFingerprint, 0xfeed), parsed.header.rootFingerprint());
     try std.testing.expectEqual(@as(u64, 3), parsed.header.generation);
+    try std.testing.expectEqual(@as(u64, 2), parsed.header.verify_required_count);
     try std.testing.expectEqual(segment.entries.len, parsed.entries.len);
     try std.testing.expectEqual(segment.file_ids.len, parsed.file_ids.len);
     try std.testing.expectEqual(segment.entries[0].key, parsed.entries[0].key);
@@ -1281,15 +1304,13 @@ test "postings parser rejects invalid density byte" {
     const files = [_]PostingsFileInput{
         .{ .file_id = catalog.makeFileId(0), .bytes = "auth" },
     };
-    const segment = try buildPostingsSegment(std.testing.allocator, 0xfeed, 3, &files);
+    const segment = try buildPostingsSegment(std.testing.allocator, 0xfeed, 3, &files, 0);
     defer segment.deinit(std.testing.allocator);
 
     const encoded = try serializePostingsSegment(std.testing.allocator, segment);
     defer std.testing.allocator.free(encoded);
 
-    const density_offset =
-        8 + 2 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 8 +
-        4 + 8 + 4;
+    const density_offset: usize = @intCast(SERIALIZED_HEADER_SIZE + 4 + 8 + 4);
     encoded[density_offset] = 255;
 
     try std.testing.expectError(error.InvalidPostingsDensity, parsePostingsSegment(std.testing.allocator, encoded));
