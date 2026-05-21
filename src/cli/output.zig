@@ -415,6 +415,19 @@ pub fn writeSearchHits(writer: anytype, report: search.SearchReport) !void {
     }
 }
 
+pub fn writeMatchesJsonHits(writer: anytype, report: search.SearchReport) !void {
+    try writer.writeAll("{\"hits\":[");
+    for (report.hits[0..report.hit_count], 0..) |hit, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writer.writeAll("{\"path\":");
+        try writeJsonString(writer, hit.path);
+        try writer.print(",\"line\":{},\"column\":{},\"preview\":", .{ hit.line, hit.column });
+        try writeJsonString(writer, hit.preview);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}\n");
+}
+
 pub fn writeInspectWindow(writer: anytype, window: inspect.InspectWindow) !void {
     try writer.print(
         "== ix.inspect.file path=\"{s}\" request={s} range={}:{} emitted={} eof={s}",
@@ -567,6 +580,53 @@ test "error sentinel is versioned" {
     var writer = std.Io.Writer.fixed(&buffer);
     try writeError(&writer, "invalid_arguments", "MissingCommand");
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ix.error.v1") != null);
+}
+
+test "matches json emits hit records only" {
+    var report = search.SearchReport{
+        .expression = "lit:needle",
+        .input_roots = 1,
+        .effective_roots = 1,
+        .pruned_roots = 0,
+        .overlap_pruned_roots = 0,
+        .discovered_duplicate_paths = 0,
+        .collect_hits = true,
+        .stats = .{},
+        .bytes_scanned = 128,
+        .files_discovered = 1,
+        .files_scanned = 1,
+        .files_skipped = 0,
+        .matches_found = 1,
+        .truncated = false,
+        .slowest_path = "fixture.txt",
+        .slowest_bytes = 128,
+        .slowest_ms = 0,
+        .discover_ms = 0,
+        .scan_ms = 0,
+        .aggregate_ms = 0,
+        .total_ms = 0,
+        .scan_work_ms_total = 0,
+        .matcher_strategy_supported = true,
+        .outer_parallel_shard_safe = true,
+        .uses_single_literal_counter = true,
+        .fast_count_range_overlap = null,
+        .available_threads = 1,
+        .outer_scan_threads = 1,
+        .hits = undefined,
+        .hit_count = 1,
+    };
+    report.hits[0] = .{ .path = "fixture.txt", .line = 7, .column = 3, .preview = "a needle" };
+
+    var buffer: [512]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeMatchesJsonHits(&writer, report);
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"hits\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"path\":\"fixture.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"line\":7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"stats\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"matches_found\"") == null);
 }
 
 test "access error json exposes partial-search diagnostics" {

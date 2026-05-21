@@ -121,7 +121,7 @@ pub fn main(init: std.process.Init) !void {
             if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
             if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
             if (effective_request.json) {
-                try output.writeSearchJsonReport(stdout, report);
+                try output.writeMatchesJsonHits(stdout, report);
             } else if (!effective_request.stats_only) {
                 try output.writeSearchHits(stdout, report);
             }
@@ -133,24 +133,24 @@ pub fn main(init: std.process.Init) !void {
                     try stderr.flush();
                     std.process.exit(1);
                 };
-                const reports = try allocator.alloc(inspect.ContextReport, request.path_count);
-                var report_count: usize = 0;
-                var path_index: usize = 0;
-                while (path_index < request.path_count) : (path_index += 1) {
-                    reports[report_count] = inspect.contextForPath(init.io, allocator, request, request.paths[path_index], plan) catch |err| {
-                        try output.writeError(stderr, "inspect_failed", @errorName(err));
-                        try stderr.flush();
-                        std.process.exit(1);
-                    };
-                    report_count += 1;
-                }
+                const search_request = inspectSearchRequest(init, request, expression);
+                const search_report = search.run(init.io, allocator, search_request, plan) catch |err| {
+                    try output.writeError(stderr, "inspect_search_failed", @errorName(err));
+                    try stderr.flush();
+                    std.process.exit(1);
+                };
+                const reports = inspect.contextReportsFromSearchReport(init.io, allocator, request, search_report) catch |err| {
+                    try output.writeError(stderr, "inspect_failed", @errorName(err));
+                    try stderr.flush();
+                    std.process.exit(1);
+                };
                 if (request.format == .json) {
                     const context_expression = request.expression orelse plan.source;
-                    try output.writeInspectContextJsonReports(stdout, context_expression, reports[0..report_count]);
+                    try output.writeInspectContextJsonReports(stdout, context_expression, reports);
                 } else if (request.format == .records) {
-                    for (reports[0..report_count]) |report| try output.writeInspectContextRecords(stdout, report);
+                    for (reports) |report| try output.writeInspectContextRecords(stdout, report);
                 } else {
-                    for (reports[0..report_count]) |report| try output.writeInspectContext(stdout, report);
+                    for (reports) |report| try output.writeInspectContext(stdout, report);
                 }
             } else {
                 const windows = try allocator.alloc(inspect.InspectWindow, request.path_count);
@@ -211,6 +211,30 @@ fn indexdEnabled(init: std.process.Init) bool {
 
 fn indexdEnvValueDisabled(value: []const u8) bool {
     return std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off");
+}
+
+fn inspectSearchRequest(init: std.process.Init, request: cli.InspectRequest, expression: []const u8) cli.SearchRequest {
+    return .{
+        .expression = expression,
+        .paths = request.paths,
+        .path_count = request.path_count,
+        .json = false,
+        .stats_only = false,
+        .hidden = request.hidden,
+        .line_numbers = true,
+        .fixed_strings = false,
+        .case_insensitive = false,
+        .follow_symlinks = request.follow_symlinks,
+        .no_ignore = true,
+        .ignore_files = undefined,
+        .ignore_file_count = 0,
+        .max_hits = request.max_hits,
+        .threads = request.threads,
+        .emit_report = null,
+        .nexus_build = false,
+        .nexus_disabled = nexusDisabled(init),
+        .index_enabled = false,
+    };
 }
 
 fn shouldLaunchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest, plan: expr.ExpressionPlan, report: search.SearchReport) bool {

@@ -118,6 +118,30 @@ pub fn context(io: std.Io, allocator: std.mem.Allocator, request: cli.InspectReq
     return contextForPath(io, allocator, request, request.paths[0], plan);
 }
 
+pub fn contextReportsFromSearchReport(io: std.Io, allocator: std.mem.Allocator, request: cli.InspectRequest, search_report: search.SearchReport) ![]ContextReport {
+    var reports = std.ArrayList(ContextReport).empty;
+    errdefer reports.deinit(allocator);
+
+    var hit_index: usize = 0;
+    while (hit_index < search_report.hit_count) {
+        const path = search_report.hits[hit_index].path;
+        const start = hit_index;
+        hit_index += 1;
+        while (hit_index < search_report.hit_count and std.mem.eql(u8, search_report.hits[hit_index].path, path)) : (hit_index += 1) {}
+
+        try reports.append(allocator, try contextForSearchHitsPath(
+            io,
+            allocator,
+            request,
+            search_report.expression,
+            path,
+            search_report.hits[start..hit_index],
+        ));
+    }
+
+    return reports.toOwnedSlice(allocator);
+}
+
 pub fn contextForPath(io: std.Io, allocator: std.mem.Allocator, request: cli.InspectRequest, path: []const u8, plan: expr.ExpressionPlan) !ContextReport {
     var report = ContextReport{
         .path = try normalizeDisplayPath(allocator, path),
@@ -165,6 +189,72 @@ pub fn contextForPath(io: std.Io, allocator: std.mem.Allocator, request: cli.Ins
             report.line_count += 1;
             if (report.line_count >= MAX_CONTEXT_LINES) return report;
         }
+    }
+    return report;
+}
+
+fn contextForSearchHitsPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    request: cli.InspectRequest,
+    expression: []const u8,
+    path: []const u8,
+    hits: []const search.SearchHit,
+) !ContextReport {
+    var report = ContextReport{
+        .path = try normalizeDisplayPath(allocator, path),
+        .expression = request.expression orelse expression,
+        .lines = undefined,
+        .line_count = 0,
+    };
+    if (hits.len == 0) return report;
+
+    const before = request.before_context orelse request.context orelse 0;
+    const after = request.after_context orelse request.context orelse 0;
+    const last_needed = hits[hits.len - 1].line + after;
+
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false });
+    defer file.close(io);
+    var read_buffer: [8192]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
+    const bytes = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024 * 1024));
+
+    var cursor: usize = 0;
+    var line_number: usize = 1;
+    var next_hit_index: usize = 0;
+    var last_emitted: usize = 0;
+    while (cursor < bytes.len and line_number <= last_needed) : (line_number += 1) {
+        const newline_offset = std.mem.indexOfScalar(u8, bytes[cursor..], '\n');
+        const end = if (newline_offset) |offset| cursor + offset else bytes.len;
+        const raw_line = bytes[cursor..end];
+        cursor = if (newline_offset != null) end + 1 else bytes.len;
+
+        while (next_hit_index < hits.len and hits[next_hit_index].line + after < line_number) : (next_hit_index += 1) {}
+        if (next_hit_index >= hits.len) break;
+
+        const hit_line = hits[next_hit_index].line;
+        const window_start = if (hit_line > before) hit_line - before else 1;
+        if (line_number < window_start) continue;
+
+        var is_match = false;
+        var probe = next_hit_index;
+        while (probe < hits.len and hits[probe].line <= line_number) : (probe += 1) {
+            if (hits[probe].line == line_number) {
+                is_match = true;
+                break;
+            }
+        }
+        const in_window = line_number <= hit_line + after or is_match;
+        if (!in_window or line_number == last_emitted) continue;
+
+        report.lines[report.line_count] = .{
+            .number = line_number,
+            .role = if (is_match) "match" else "context",
+            .text = std.mem.trimEnd(u8, raw_line, "\r"),
+        };
+        report.line_count += 1;
+        last_emitted = line_number;
+        if (report.line_count >= MAX_CONTEXT_LINES) return report;
     }
     return report;
 }
@@ -226,4 +316,84 @@ fn requestLabel(allocator: std.mem.Allocator, bounds: Bounds) ![]const u8 {
         return try std.fmt.allocPrint(allocator, "{}:+{}", .{ bounds.start_line, limit });
     }
     return try std.fmt.allocPrint(allocator, "{}:*", .{bounds.start_line});
+}
+
+test "inspect context materializes from search hits across roots" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "before\nneedle\ninside\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "alpha\nneedle\nomega\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const path_a = try std.fs.path.join(allocator, &.{ root_path, "a.txt" });
+    const path_b = try std.fs.path.join(allocator, &.{ root_path, "b.txt" });
+
+    var report = search.SearchReport{
+        .expression = "lit:needle",
+        .input_roots = 1,
+        .effective_roots = 1,
+        .pruned_roots = 0,
+        .overlap_pruned_roots = 0,
+        .discovered_duplicate_paths = 0,
+        .collect_hits = true,
+        .stats = .{},
+        .bytes_scanned = 0,
+        .files_discovered = 2,
+        .files_scanned = 2,
+        .files_skipped = 0,
+        .matches_found = 2,
+        .truncated = false,
+        .slowest_path = "",
+        .slowest_bytes = 0,
+        .slowest_ms = 0,
+        .discover_ms = 0,
+        .scan_ms = 0,
+        .aggregate_ms = 0,
+        .total_ms = 0,
+        .scan_work_ms_total = 0,
+        .matcher_strategy_supported = true,
+        .outer_parallel_shard_safe = true,
+        .uses_single_literal_counter = true,
+        .fast_count_range_overlap = null,
+        .available_threads = 1,
+        .outer_scan_threads = 1,
+        .hits = undefined,
+        .hit_count = 2,
+    };
+    report.hits[0] = .{ .path = path_a, .line = 2, .column = 1, .preview = "needle" };
+    report.hits[1] = .{ .path = path_b, .line = 2, .column = 1, .preview = "needle" };
+
+    var request = cli.InspectRequest{
+        .paths = undefined,
+        .path_count = 1,
+        .expression = "lit:needle",
+        .range = null,
+        .start_line = null,
+        .end_line = null,
+        .limit = null,
+        .total_count = null,
+        .skip = null,
+        .all = false,
+        .context = 1,
+        .before_context = null,
+        .after_context = null,
+        .hidden = false,
+        .follow_symlinks = false,
+        .threads = null,
+        .max_hits = null,
+        .json = true,
+        .format = .json,
+    };
+    request.paths[0] = root_path;
+
+    const reports = try contextReportsFromSearchReport(io, allocator, request, report);
+    try std.testing.expectEqual(@as(usize, 2), reports.len);
+    try std.testing.expectEqual(@as(usize, 3), reports[0].line_count);
+    try std.testing.expectEqual(@as(usize, 3), reports[1].line_count);
+    try std.testing.expectEqualStrings("match", reports[0].lines[1].role);
+    try std.testing.expectEqualStrings("match", reports[1].lines[1].role);
 }
