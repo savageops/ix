@@ -30,10 +30,9 @@ test {
 /// pipeline at crates/iex-cli/src/main.rs.
 ///
 /// MEMORY STRATEGY:
-/// Uses Zig's arena allocator from process init. All allocations live for
-/// the process lifetime — no individual frees needed. This is safe because
-/// IX is a short-lived CLI tool, not a long-running server. The arena is
-/// backed by the OS page allocator and released on process exit.
+/// Uses Zig's arena allocator from process init for short-lived command paths.
+/// The hidden indexd watch command is long-lived and switches to a freeing
+/// allocator at dispatch so regeneration cycles can release indexed buffers.
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
 
@@ -188,7 +187,7 @@ pub fn main(init: std.process.Init) !void {
             search.holdEvidenceFrontierLive(init.io, allocator, effective_request, plan);
         },
         .indexd => |request| {
-            _ = indexd.run(init.io, allocator, .{
+            _ = indexd.run(init.io, indexdCommandAllocator(), .{
                 .root = request.root,
                 .foreground = request.foreground,
                 .once = request.once,
@@ -197,6 +196,10 @@ pub fn main(init: std.process.Init) !void {
         },
     }
     try stdout.flush();
+}
+
+fn indexdCommandAllocator() std.mem.Allocator {
+    return std.heap.page_allocator;
 }
 
 fn nexusDisabled(init: std.process.Init) bool {
@@ -454,6 +457,13 @@ test "indexd sidecar launch keeps hidden argv shape" {
 
     try std.testing.expectEqualStrings("__ix_indexd", argv.items[1]);
     try std.testing.expectEqualStrings("E:\\Workspaces\\ix-zig", argv.items[2]);
+}
+
+test "indexd command uses freeing allocator for watch lifecycle" {
+    const allocator = indexdCommandAllocator();
+    try std.testing.expectEqual(std.heap.page_allocator.vtable, allocator.vtable);
+    const bytes = try allocator.alloc(u8, 4096);
+    allocator.free(bytes);
 }
 
 fn testSearchReportForSidecar(pruned_files: usize) search.SearchReport {
