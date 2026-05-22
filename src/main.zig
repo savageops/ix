@@ -203,17 +203,17 @@ fn indexdCommandAllocator() std.mem.Allocator {
 }
 
 fn nexusDisabled(init: std.process.Init) bool {
-    const value = init.environ_map.getPtr("IX_NEXUS") orelse return false;
-    return std.mem.eql(u8, value.*, "0") or std.ascii.eqlIgnoreCase(value.*, "false") or std.ascii.eqlIgnoreCase(value.*, "off");
+    const value = init.environ_map.getPtr("IX_NEXUS") orelse return true;
+    return !sidecarEnvValueEnabled(value.*);
 }
 
 fn indexdEnabled(init: std.process.Init) bool {
-    const value = init.environ_map.getPtr("IX_INDEX") orelse return true;
-    return !indexdEnvValueDisabled(value.*);
+    const value = init.environ_map.getPtr("IX_INDEX") orelse return false;
+    return sidecarEnvValueEnabled(value.*);
 }
 
-fn indexdEnvValueDisabled(value: []const u8) bool {
-    return std.mem.eql(u8, value, "0") or std.ascii.eqlIgnoreCase(value, "false") or std.ascii.eqlIgnoreCase(value, "off");
+fn sidecarEnvValueEnabled(value: []const u8) bool {
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
 }
 
 fn inspectSearchRequest(init: std.process.Init, request: cli.InspectRequest, expression: []const u8) cli.SearchRequest {
@@ -434,15 +434,16 @@ test "indexd sidecar launch refuses generated dependency roots" {
     try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
 }
 
-test "indexd environment gate is explicit opt out" {
-    try std.testing.expect(!indexdEnvValueDisabled("1"));
-    try std.testing.expect(!indexdEnvValueDisabled("true"));
-    try std.testing.expect(!indexdEnvValueDisabled("TRUE"));
-    try std.testing.expect(!indexdEnvValueDisabled("on"));
-    try std.testing.expect(indexdEnvValueDisabled("0"));
-    try std.testing.expect(indexdEnvValueDisabled("false"));
-    try std.testing.expect(indexdEnvValueDisabled("off"));
-    try std.testing.expect(!indexdEnvValueDisabled(""));
+test "background sidecar environment gate is explicit opt in" {
+    try std.testing.expect(sidecarEnvValueEnabled("1"));
+    try std.testing.expect(sidecarEnvValueEnabled("true"));
+    try std.testing.expect(sidecarEnvValueEnabled("TRUE"));
+    try std.testing.expect(sidecarEnvValueEnabled("on"));
+    try std.testing.expect(!sidecarEnvValueEnabled("0"));
+    try std.testing.expect(!sidecarEnvValueEnabled("false"));
+    try std.testing.expect(!sidecarEnvValueEnabled("off"));
+    try std.testing.expect(!sidecarEnvValueEnabled(""));
+    try std.testing.expect(!sidecarEnvValueEnabled("yes"));
 }
 
 test "windows command argument quoting preserves spaces quotes and trailing slashes" {

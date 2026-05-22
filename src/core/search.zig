@@ -1838,6 +1838,12 @@ fn skippedFileBytes(io: std.Io, path: []const u8) usize {
 }
 
 fn joinPathForwardBounded(left: []const u8, right: []const u8, out: []u8) ?[]const u8 {
+    if (left.len == 0 or std.mem.eql(u8, left, ".")) {
+        if (right.len > out.len) return null;
+        for (right, 0..) |byte, index| out[index] = if (byte == '\\') '/' else byte;
+        return out[0..right.len];
+    }
+
     var n: usize = 0;
     for (left) |byte| {
         if (n >= out.len) return null;
@@ -4584,11 +4590,22 @@ fn normalizeDisplayPath(allocator: std.mem.Allocator, path: []const u8) ![]const
 }
 
 fn joinPathForward(allocator: std.mem.Allocator, parent: []const u8, child: []const u8) ![]const u8 {
+    if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return normalizeDisplayPath(allocator, child);
     const buf = try allocator.alloc(u8, parent.len + 1 + child.len);
     @memcpy(buf[0..parent.len], parent);
     buf[parent.len] = '/';
     @memcpy(buf[parent.len + 1 ..][0..child.len], child);
     return buf;
+}
+
+test "search path join normalizes dot root for Windows NT open path" {
+    const joined = try joinPathForward(std.testing.allocator, ".", "packages\\shared\\src\\index.ts");
+    defer std.testing.allocator.free(joined);
+    try std.testing.expectEqualStrings("packages/shared/src/index.ts", joined);
+
+    var buffer: [64]u8 = undefined;
+    const bounded = joinPathForwardBounded(".", "apps\\backend", &buffer) orelse return error.TestExpectedJoin;
+    try std.testing.expectEqualStrings("apps/backend", bounded);
 }
 
 pub fn matchesLine(line: []const u8, plan: expr.ExpressionPlan) bool {
