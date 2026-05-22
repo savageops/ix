@@ -116,6 +116,11 @@ pub const IndexDiagnostics = struct {
 
 pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResult {
     const config = try buildConfig(allocator, request);
+    if (config.mode == .background_watch and !isManagedRoot(config.root)) {
+        return .{
+            .config = config,
+        };
+    }
     try std.Io.Dir.cwd().createDirPath(io, config.root);
     var lock = try acquireRootLock(io, allocator, config);
     defer lock.release(io, allocator);
@@ -421,7 +426,7 @@ fn collectIndexFilesWithBudget(io: std.Io, allocator: std.mem.Allocator, root: [
         switch (entry.kind) {
             .file => try appendIndexedFile(io, allocator, child_path, files, large_source_bytes),
             .directory => {
-                if (isDefaultHiddenEntry(entry.name) or isGeneratedSourceIndexEntry(entry.name)) {
+                if (isExcludedIndexEntry(entry.name)) {
                     allocator.free(child_path);
                     continue;
                 }
@@ -627,6 +632,34 @@ fn isDefaultHiddenEntry(name: []const u8) bool {
     return name.len > 1 and name[0] == '.' and !std.mem.eql(u8, name, "..");
 }
 
+pub fn isManagedRoot(root: []const u8) bool {
+    var saw_segment = false;
+    var iterator = std.mem.splitAny(u8, root, "/\\");
+    while (iterator.next()) |segment| {
+        if (segment.len == 0) continue;
+        saw_segment = true;
+        if (isExcludedIndexEntry(segment)) return false;
+    }
+    return saw_segment or std.mem.eql(u8, root, ".");
+}
+
+fn isExcludedIndexEntry(name: []const u8) bool {
+    return isDefaultHiddenEntry(name) or isDependencyOrGeneratedIndexEntry(name);
+}
+
+fn isDependencyOrGeneratedIndexEntry(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "node_modules") or
+        std.ascii.eqlIgnoreCase(name, "vendor") or
+        std.ascii.eqlIgnoreCase(name, "dist") or
+        std.ascii.eqlIgnoreCase(name, "build") or
+        std.ascii.eqlIgnoreCase(name, "target") or
+        std.ascii.eqlIgnoreCase(name, "zig-cache") or
+        std.ascii.eqlIgnoreCase(name, "zig-out") or
+        std.ascii.eqlIgnoreCase(name, "tmp") or
+        std.ascii.eqlIgnoreCase(name, "temp") or
+        isGeneratedSourceIndexEntry(name);
+}
+
 fn isGeneratedSourceIndexEntry(name: []const u8) bool {
     return std.mem.eql(u8, name, "tags") or std.mem.eql(u8, name, "TAGS");
 }
@@ -747,6 +780,30 @@ test "indexd entrypoint preserves hidden request shape" {
     try std.testing.expectEqual(Mode.foreground_once, result.config.mode);
     try std.testing.expect(result.config.foreground);
     try std.testing.expect(result.config.once);
+}
+
+test "indexd managed root admission rejects dependency generated and hidden paths" {
+    try std.testing.expect(isManagedRoot("."));
+    try std.testing.expect(isManagedRoot("src"));
+    try std.testing.expect(isManagedRoot("apps/backend/convex"));
+    try std.testing.expect(!isManagedRoot("apps/backend/node_modules/convex/dist"));
+    try std.testing.expect(!isManagedRoot(".docs/reports/subzero"));
+    try std.testing.expect(!isManagedRoot("tmp/warm-owner-bench-current"));
+    try std.testing.expect(!isManagedRoot("zig-out/bin"));
+    try std.testing.expect(!isManagedRoot("src/.ix"));
+}
+
+test "indexd background watch no-ops for unmanaged dependency roots" {
+    const root = ".zig-cache\\ix-indexd-unmanaged-root\\node_modules\\convex\\dist";
+    const top = ".zig-cache\\ix-indexd-unmanaged-root";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, top) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, top) catch {};
+
+    const result = try run(std.testing.io, std.testing.allocator, .{ .root = root });
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(Mode.background_watch, result.config.mode);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, root, .{}));
 }
 
 test "indexd config owns repo-local index directory" {

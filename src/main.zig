@@ -260,6 +260,7 @@ fn shouldLaunchIndexdSidecar(enabled: bool, request: cli.SearchRequest, report: 
     if (request.case_insensitive) return false;
     if (request.hidden) return false;
     if (request.path_count != 1) return false;
+    if (!indexd.isManagedRoot(request.paths[0])) return false;
     return report.files_discovered > 0;
 }
 
@@ -396,6 +397,7 @@ test "nexus sidecar launch is gated after evidence-pruned foreground reuse" {
 
 test "indexd sidecar launch is default-on single root and workload gated" {
     var request = testSearchRequestForSidecar(false);
+    request.paths[0] = "src";
     var report = testSearchReportForSidecar(0);
     report.files_discovered = 12;
 
@@ -411,6 +413,24 @@ test "indexd sidecar launch is default-on single root and workload gated" {
     request.case_insensitive = false;
 
     report.files_discovered = 0;
+    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
+}
+
+test "indexd sidecar launch refuses generated dependency roots" {
+    var request = testSearchRequestForSidecar(false);
+    var report = testSearchReportForSidecar(0);
+    report.files_discovered = 12;
+
+    request.paths[0] = "src";
+    try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
+
+    request.paths[0] = "apps/backend/node_modules/convex/dist";
+    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
+
+    request.paths[0] = ".docs/reports/subzero";
+    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
+
+    request.paths[0] = "zig-out/bin";
     try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
 }
 
