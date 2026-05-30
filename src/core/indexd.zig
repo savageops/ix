@@ -18,6 +18,14 @@ extern "kernel32" fn ReadDirectoryChangesW(
     lpCompletionRoutine: ?*anyopaque,
 ) callconv(.winapi) windows.BOOL;
 
+extern "kernel32" fn GetProcessTimes(
+    hProcess: windows.HANDLE,
+    lpCreationTime: *windows.FILETIME,
+    lpExitTime: *windows.FILETIME,
+    lpKernelTime: *windows.FILETIME,
+    lpUserTime: *windows.FILETIME,
+) callconv(.winapi) windows.BOOL;
+
 pub const LIVE_MARKER_NAME = "index.live";
 const INDEX_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_FILE_READ_LIMIT: usize = 64 * 1024 * 1024;
@@ -226,8 +234,10 @@ pub fn writeHeartbeat(io: std.Io, allocator: std.mem.Allocator, config: Config, 
 
     var buffer: [256]u8 = undefined;
     var writer = file.writer(io, &buffer);
-    try writer.interface.print("IXINDEXD1\npid={}\nmode={s}\nroot={s}\n", .{
+    try writer.interface.print("IXINDEXD1\npid={}\nprocess_start_ns={}\ncreated_ns={}\nmode={s}\nroot={s}\n", .{
         pid,
+        try currentProcessStartNs(),
+        std.Io.Timestamp.now(io, .real).nanoseconds,
         modeText(config.mode),
         config.root,
     });
@@ -281,9 +291,32 @@ pub fn writeLiveMarker(io: std.Io, allocator: std.mem.Allocator, config: Config)
 
     var buffer: [256]u8 = undefined;
     var writer = file.writer(io, &buffer);
-    try writer.interface.print("IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), config.root });
+    try writer.interface.print("IXINDEX_LIVE1\npid={}\nprocess_start_ns={}\ncreated_ns={}\nroot={s}\n", .{
+        currentProcessId(),
+        try currentProcessStartNs(),
+        std.Io.Timestamp.now(io, .real).nanoseconds,
+        config.root,
+    });
     try writer.interface.flush();
     return .{ .path = live_path };
+}
+
+fn currentProcessStartNs() !i128 {
+    if (builtin.os.tag != .windows) return 0;
+    var creation: windows.FILETIME = undefined;
+    var exit: windows.FILETIME = undefined;
+    var kernel: windows.FILETIME = undefined;
+    var user: windows.FILETIME = undefined;
+    if (GetProcessTimes(windows.GetCurrentProcess(), &creation, &exit, &kernel, &user) == windows.BOOL.FALSE) {
+        return error.ProcessStartUnavailable;
+    }
+    return fileTimeToUnixNs(creation);
+}
+
+fn fileTimeToUnixNs(file_time: windows.FILETIME) i128 {
+    const windows_epoch_to_unix_epoch_100ns: i128 = 116_444_736_000_000_000;
+    const ticks_100ns = (@as(i128, file_time.dwHighDateTime) << 32) | @as(i128, file_time.dwLowDateTime);
+    return (ticks_100ns - windows_epoch_to_unix_epoch_100ns) * 100;
 }
 
 pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !generation.ReaderPin {
@@ -855,6 +888,8 @@ test "indexd heartbeat marker records process ownership" {
     const contents = try std.Io.Dir.cwd().readFile(std.testing.io, heartbeat.path, &buffer);
     try std.testing.expect(std.mem.indexOf(u8, contents, "IXINDEXD1") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "pid=42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "process_start_ns=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "created_ns=") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "mode=foreground_once") != null);
 }
 

@@ -50,6 +50,14 @@ extern "kernel32" fn OpenProcess(
 
 extern "kernel32" fn CloseHandle(hObject: windows.HANDLE) callconv(.winapi) windows.BOOL;
 
+extern "kernel32" fn GetProcessTimes(
+    hProcess: windows.HANDLE,
+    lpCreationTime: *windows.FILETIME,
+    lpExitTime: *windows.FILETIME,
+    lpKernelTime: *windows.FILETIME,
+    lpUserTime: *windows.FILETIME,
+) callconv(.winapi) windows.BOOL;
+
 // ---------------------------------------------------------------------------
 // NT Object Path Bypass (Windows)
 //
@@ -656,15 +664,22 @@ fn validateWarmIndexLiveMarkerWithOwnerCheck(bytes: []const u8, expected_root: [
     var lines = std.mem.splitScalar(u8, bytes, '\n');
     if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return false, "\r"), WARM_INDEX_LIVE_MARKER_MAGIC)) return false;
     const pid_line = std.mem.trimEnd(u8, lines.next() orelse return false, "\r");
+    const process_start_line = std.mem.trimEnd(u8, lines.next() orelse return false, "\r");
+    const created_line = std.mem.trimEnd(u8, lines.next() orelse return false, "\r");
     const root_line = std.mem.trimEnd(u8, lines.next() orelse return false, "\r");
     if (!std.mem.startsWith(u8, pid_line, "pid=")) return false;
+    if (!std.mem.startsWith(u8, process_start_line, "process_start_ns=")) return false;
+    if (!std.mem.startsWith(u8, created_line, "created_ns=")) return false;
     if (!std.mem.startsWith(u8, root_line, "root=")) return false;
     const owner_pid = std.fmt.parseInt(usize, pid_line["pid=".len..], 10) catch return false;
     if (owner_pid == 0) return false;
+    const owner_start_ns = std.fmt.parseInt(i128, process_start_line["process_start_ns=".len..], 10) catch return false;
+    const created_ns = std.fmt.parseInt(i128, created_line["created_ns=".len..], 10) catch return false;
+    if (created_ns <= 0) return false;
     const marker_root = root_line["root=".len..];
     if (!std.mem.eql(u8, marker_root, expected_root)) return false;
     if (check_owner and builtin.os.tag == .windows) {
-        if (!processIsAlive(@intCast(owner_pid))) return false;
+        if (processStartNs(@intCast(owner_pid)) != owner_start_ns) return false;
     }
     return true;
 }
@@ -1604,6 +1619,25 @@ fn processIsAlive(pid: windows.DWORD) bool {
     const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, windows.BOOL.FALSE, pid) orelse return false;
     _ = CloseHandle(handle);
     return true;
+}
+
+fn processStartNs(pid: windows.DWORD) ?i128 {
+    if (pid == 0) return null;
+    const PROCESS_QUERY_LIMITED_INFORMATION: windows.DWORD = 0x0000_1000;
+    const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, windows.BOOL.FALSE, pid) orelse return null;
+    defer _ = CloseHandle(handle);
+    var creation: windows.FILETIME = undefined;
+    var exit: windows.FILETIME = undefined;
+    var kernel: windows.FILETIME = undefined;
+    var user: windows.FILETIME = undefined;
+    if (GetProcessTimes(handle, &creation, &exit, &kernel, &user) == windows.BOOL.FALSE) return null;
+    return fileTimeToUnixNs(creation);
+}
+
+fn fileTimeToUnixNs(file_time: windows.FILETIME) i128 {
+    const windows_epoch_to_unix_epoch_100ns: i128 = 116_444_736_000_000_000;
+    const ticks_100ns = (@as(i128, file_time.dwHighDateTime) << 32) | @as(i128, file_time.dwLowDateTime);
+    return (ticks_100ns - windows_epoch_to_unix_epoch_100ns) * 100;
 }
 
 pub fn holdEvidenceFrontierLive(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest, plan: expr.ExpressionPlan) void {
@@ -5543,17 +5577,31 @@ test "file admission needle lowers only contract-safe predicate shapes" {
 }
 
 test "warm index live marker validates magic pid and root" {
-    const marker = "IXINDEX_LIVE1\npid=1234\nroot=C:/repo\n";
+    const marker = "IXINDEX_LIVE1\npid=1234\nprocess_start_ns=55\ncreated_ns=99\nroot=C:/repo\n";
     try std.testing.expect(validateWarmIndexLiveMarkerWithOwnerCheck(marker, "C:/repo", false));
     try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck("BROKEN\npid=1234\nroot=C:/repo\n", "C:/repo", false));
-    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck("IXINDEX_LIVE1\npid=0\nroot=C:/repo\n", "C:/repo", false));
-    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck("IXINDEX_LIVE1\npid=abc\nroot=C:/repo\n", "C:/repo", false));
+    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck("IXINDEX_LIVE1\npid=0\nprocess_start_ns=55\ncreated_ns=99\nroot=C:/repo\n", "C:/repo", false));
+    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck("IXINDEX_LIVE1\npid=abc\nprocess_start_ns=55\ncreated_ns=99\nroot=C:/repo\n", "C:/repo", false));
+    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck("IXINDEX_LIVE1\npid=1234\nprocess_start_ns=55\ncreated_ns=0\nroot=C:/repo\n", "C:/repo", false));
+    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck("IXINDEX_LIVE1\npid=1234\nroot=C:/repo\n", "C:/repo", false));
     try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck(marker, "D:/repo", false));
 }
 
 test "warm index live marker rejects dead Windows owner" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
-    const marker = "IXINDEX_LIVE1\npid=999999\nroot=C:/repo\n";
+    const marker = "IXINDEX_LIVE1\npid=999999\nprocess_start_ns=55\ncreated_ns=99\nroot=C:/repo\n";
+    try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck(marker, "C:/repo", true));
+}
+
+test "warm index live marker rejects reused Windows pid start mismatch" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const pid = currentProcessId();
+    const start_ns = processStartNs(pid) orelse return error.TestExpectedProcessStart;
+    const marker = try std.fmt.allocPrint(std.testing.allocator, "IXINDEX_LIVE1\npid={}\nprocess_start_ns={}\ncreated_ns=99\nroot=C:/repo\n", .{
+        pid,
+        start_ns - 1,
+    });
+    defer std.testing.allocator.free(marker);
     try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck(marker, "C:/repo", true));
 }
 
@@ -5565,8 +5613,14 @@ fn testRootIndexDir(allocator: std.mem.Allocator, root: []const u8) ![]const u8 
     return state.index_dir;
 }
 
+fn testLiveMarker(allocator: std.mem.Allocator, root: []const u8) ![]const u8 {
+    const pid = if (builtin.os.tag == .windows) currentProcessId() else 1;
+    const start_ns = if (builtin.os.tag == .windows) (processStartNs(pid) orelse return error.TestExpectedProcessStart) else 0;
+    return std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nprocess_start_ns={}\ncreated_ns=99\nroot={s}\n", .{ pid, start_ns, root });
+}
+
 test "warm foreground marker validation is generation-pin gated" {
-    const marker = try std.fmt.allocPrint(std.testing.allocator, "IXINDEX_LIVE1\npid={}\nroot=C:/repo\n", .{currentProcessId()});
+    const marker = try testLiveMarker(std.testing.allocator, "C:/repo");
     defer std.testing.allocator.free(marker);
     try std.testing.expect(validateWarmIndexLiveMarker(marker, "C:/repo"));
     try std.testing.expect(!validateWarmIndexLiveMarker(marker, "D:/repo"));
@@ -5588,7 +5642,7 @@ test "warm index rejects dead owner before trusting generation" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
-    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid=999999\nroot={s}\n", .{root_path});
+    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid=999999\nprocess_start_ns=55\ncreated_ns=99\nroot={s}\n", .{root_path});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
     var request = testSearchRequest("lit:needle", root_path);
@@ -6119,7 +6173,7 @@ test "search run consumes live warm postings and scans only candidate files" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
-    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
     var request = testSearchRequest("lit:needle", root_path);
@@ -6176,7 +6230,7 @@ test "stats-only live warm postings return empty frontier without catalog scan" 
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
-    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
     var request = testSearchRequest("lit:absent_token", root_path);
@@ -6212,7 +6266,7 @@ test "capped warm query hit cache reuses capped-first result" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
-    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
     var request = testSearchRequest("lit:needle", root_path);
@@ -6254,7 +6308,7 @@ test "stats-only warm query cache reuses exact pinned-generation count" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
-    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
     var request = testSearchRequest("lit:needle", root_path);
@@ -6348,7 +6402,7 @@ test "capped warm hit query uses stats cache for exact count and prefix scan" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
-    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
     var stats_request = testSearchRequest("lit:needle", root_path);
@@ -6393,7 +6447,7 @@ test "warm hit query seeds exact stats cache for stats-only reuse" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
-    const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
+    const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
     var hit_request = testSearchRequest("lit:needle", root_path);
