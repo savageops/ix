@@ -24,6 +24,7 @@ const previousIxBinary = argValue(args, "--previous-ix-binary", process.env.IX_P
 const pairedImprovementTolerancePct = Number(argValue(args, "--paired-improvement-tolerance-pct", process.env.IX_ARCH_GATE_PAIRED_IMPROVEMENT_TOLERANCE_PCT ?? "1.5"));
 const patchNoRegressionTolerancePct = Number(argValue(args, "--patch-no-regression-tolerance-pct", process.env.IX_ARCH_GATE_PATCH_NO_REGRESSION_TOLERANCE_PCT ?? "1.5"));
 const benchmarkControlDriftTolerancePct = Number(argValue(args, "--benchmark-control-drift-pct", process.env.IX_ARCH_GATE_CONTROL_DRIFT_PCT ?? "3"));
+const benchmarkControlRobustCvPct = Number(argValue(args, "--benchmark-control-robust-cv-pct", process.env.IX_ARCH_GATE_CONTROL_ROBUST_CV_PCT ?? "8"));
 const planningChainSlug = argValue(
   args,
   "--planning-chain",
@@ -1114,9 +1115,13 @@ function ripgrepLane(controlLane = null) {
         patchNoRegressionMaxRatio,
         ixSampleDurationsMs: latest.iexSampleDurationsMs ?? [],
         ixEngineSampleDurationsMs: latest.iexEngineSampleDurationsMs ?? [],
+        ixSampleSummary: latest.iexSampleSummary ?? null,
+        ixEngineSampleSummary: latest.iexEngineSampleSummary ?? null,
         previousIxEngineSampleDurationsMs: latest.competitors?.iex_previous?.engineSampleDurationsMs ?? [],
+        previousIxEngineSampleSummary: latest.competitors?.iex_previous?.engineSampleSummary ?? null,
         previousIxPairing: latest.competitors?.iex_previous?.pairing ?? null,
         rgSampleDurationsMs: latest.competitors?.ripgrep?.sampleDurationsMs ?? [],
+        rgSampleSummary: latest.competitors?.ripgrep?.sampleSummary ?? null,
         speedupPct: latest.speedupPct,
         matchCount,
         phaseMs: latest.phaseMs ?? {},
@@ -1267,6 +1272,13 @@ function benchmarkControlLane() {
   const baselineRegressionPct =
     baselineComparable && Number.isFinite(ixMs) && baselineIxMs > 0 ? ((ixMs - baselineIxMs) / baselineIxMs) * 100 : null;
   const baselineOk = baselineComparable && Number.isFinite(ixMs) && ixMs <= baselineIxMs * (1 + baselineTolerancePct / 100);
+  const currentRobustCvPct = Number(latest.iexEngineSampleSummary?.robustCvPct);
+  const previousRobustCvPct = Number(latest.competitors?.iex_previous?.engineSampleSummary?.robustCvPct);
+  const robustCvOk =
+    Number.isFinite(currentRobustCvPct) &&
+    Number.isFinite(previousRobustCvPct) &&
+    currentRobustCvPct <= benchmarkControlRobustCvPct &&
+    previousRobustCvPct <= benchmarkControlRobustCvPct;
   const authority = latest.previousIexAuthority ?? null;
   const matchCountParity = latest.previousIexMatchCountParity ?? null;
   const selfOk =
@@ -1276,9 +1288,11 @@ function benchmarkControlLane() {
     Number.isFinite(selfMs) &&
     Number.isFinite(driftPct) &&
     driftPct <= benchmarkControlDriftTolerancePct;
-  const ok = selfOk && baselineOk;
+  const ok = selfOk && robustCvOk && baselineOk;
   const reason = !selfOk
     ? "same-binary control drift exceeded tolerance; benchmark window is too noisy for attribution"
+    : !robustCvOk
+      ? "same-binary control sample spread exceeded robust CV tolerance; benchmark window is too noisy for fixed-baseline attribution"
     : !baselineComparable
       ? "control benchmark warmup does not match the fixed baseline; rerun with the baseline warmup or provide a matching baseline"
       : !baselineOk
@@ -1303,6 +1317,10 @@ function benchmarkControlLane() {
       maxAllowedIxMs: baselineIxMs * (1 + baselineTolerancePct / 100),
       baselineRegressionPct,
       baselineOk,
+      robustCvOk,
+      currentRobustCvPct,
+      previousRobustCvPct,
+      benchmarkControlRobustCvPct,
       ixBinaryIdentity: latest.ixBinaryIdentity ?? null,
       selfBinaryIdentity: latest.competitors?.iex_previous?.binaryIdentity ?? null,
       selfSourceRelation: latest.previousIxSourceRelation ?? null,
@@ -1313,9 +1331,12 @@ function benchmarkControlLane() {
       authority,
       matchCountParity,
       ixEngineSampleDurationsMs: latest.iexEngineSampleDurationsMs ?? [],
+      ixEngineSampleSummary: latest.iexEngineSampleSummary ?? null,
       selfEngineSampleDurationsMs: latest.competitors?.iex_previous?.engineSampleDurationsMs ?? [],
+      selfEngineSampleSummary: latest.competitors?.iex_previous?.engineSampleSummary ?? null,
       selfPairing: latest.competitors?.iex_previous?.pairing ?? null,
       rgSampleDurationsMs: latest.competitors?.ripgrep?.sampleDurationsMs ?? [],
+      rgSampleSummary: latest.competitors?.ripgrep?.sampleSummary ?? null,
       matchCount: latest.matchCount ?? null,
       phaseMs: latest.phaseMs ?? {},
     },

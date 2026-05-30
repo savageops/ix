@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
-import { classifyHotspot, computeRatio, computeSpeedupPct } from "./metrics.mjs";
+import { classifyHotspot, computeRatio, computeSpeedupPct, summarizeSeries } from "./metrics.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports");
@@ -232,6 +232,10 @@ function compareBinaryIdentities(currentIdentity, previousIdentity) {
   return "different_binary_unknown_source";
 }
 
+function sampleSummary(values) {
+  return summarizeSeries(values ?? []);
+}
+
 function measureIxSearch(binaryPath, context, measureOptions) {
   const args = buildIxSearchArgs(context);
   const warmup = Math.max(0, Number(measureOptions.warmup ?? 0));
@@ -278,6 +282,8 @@ function measureIxSearch(binaryPath, context, measureOptions) {
     processOverheadMs: Math.max(0, selected.cliMs - selected.engineMs),
     sampleDurationsMs: cliSamples,
     engineSampleDurationsMs: engineSamples,
+    sampleSummary: sampleSummary(cliSamples),
+    engineSampleSummary: sampleSummary(engineSamples),
     timingSource: selected.report?.stats?.timings?.total_ms ? "engine_total_ms" : "wall_clock_ms",
   };
 }
@@ -318,6 +324,8 @@ function summarizeIxEntries(binaryPath, args, measuredRuns) {
     processOverheadMs: Math.max(0, selected.cliMs - selected.engineMs),
     sampleDurationsMs: cliSamples,
     engineSampleDurationsMs: engineSamples,
+    sampleSummary: sampleSummary(cliSamples),
+    engineSampleSummary: sampleSummary(engineSamples),
     timingSource: selected.report?.stats?.timings?.total_ms ? "engine_total_ms" : "wall_clock_ms",
   };
 }
@@ -729,6 +737,8 @@ function ixMeasurementToCompetitor(measured, { label, kind, pairing }) {
     processOverheadMs: measured.processOverheadMs,
     sampleDurationsMs: measured.sampleDurationsMs,
     engineSampleDurationsMs: measured.engineSampleDurationsMs,
+    sampleSummary: measured.sampleSummary,
+    engineSampleSummary: measured.engineSampleSummary,
     status: measured.result.status,
     timingSource: measured.timingSource,
     matchCount: measured.report?.stats?.matches_found ?? null,
@@ -800,6 +810,7 @@ function runCompetitors(context, measureOptions) {
         strategy: optimizedInvocation.strategy,
         durationMs: run.durationMs,
         sampleDurationsMs: run.sampleDurationsMs ?? [],
+        sampleSummary: sampleSummary(run.sampleDurationsMs ?? []),
         status: run.status,
         suppressOutput,
       };
@@ -1058,6 +1069,8 @@ export function runOneBenchmark(options = {}) {
     iexProcessOverheadMs: ixMeasurement.processOverheadMs,
     iexSampleDurationsMs: ixMeasurement.sampleDurationsMs,
     iexEngineSampleDurationsMs: ixMeasurement.engineSampleDurationsMs,
+    iexSampleSummary: ixMeasurement.sampleSummary,
+    iexEngineSampleSummary: ixMeasurement.engineSampleSummary,
     rgMs,
     iexToRgRatio,
     iexToPreviousRatio: computeRatio(ixEngineMs, previousIxMs),
