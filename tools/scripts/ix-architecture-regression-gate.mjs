@@ -115,11 +115,24 @@ function ripgrepWindowFixedPass(window) {
   return isPlainObject(window) && window.ok === true;
 }
 
+function ripgrepWindowStrongPass(window) {
+  return isPlainObject(window) && window.ok === true && (window.softOk === true || window.pairedOk === true);
+}
+
 function validateRipgrepLane(entry, failures) {
   if (entry.id !== "ripgrep_12_sample" || entry.status !== "ok") return;
   const fixedPasses = ["primary", "confirm", "tiebreaker"].filter((key) => ripgrepWindowFixedPass(entry[key])).length;
   if (fixedPasses === 0) {
     failures.push("ripgrep_12_sample: ok status requires at least one fixed-baseline passing window");
+  }
+  const windowKeys = ["primary", "confirm", "tiebreaker"].filter((key) => isPlainObject(entry[key]));
+  const weakWindows = windowKeys.filter((key) => {
+    const window = entry[key];
+    return window.ok !== true && window.softOk !== true && window.pairedOk !== true;
+  });
+  const strongPasses = windowKeys.filter((key) => ripgrepWindowStrongPass(entry[key])).length;
+  if (weakWindows.length > 0 && strongPasses < 2) {
+    failures.push("ripgrep_12_sample: ok status with a hard-regression window requires two strong independent passes");
   }
   const sameSourcePairedPass = ["primary", "confirm", "tiebreaker"].some((key) => {
     const window = entry[key];
@@ -147,6 +160,7 @@ function validateReport(report) {
     "zig_test",
     "cold_smoke",
     "surface_parity",
+    "warm_cold_parity",
     "warm_index_live",
     "runtime_state_location",
     "indexd_memory_cap",
@@ -252,6 +266,16 @@ function runSchemaSelfTest() {
         passed: true,
         failures: [],
         evidence: {},
+        primary: { ok: false, softOk: false, pairedOk: false, metrics: { ixMs: 620 } },
+        confirm: { ok: true, softOk: false, pairedOk: false, metrics: { ixMs: 594 } },
+        tiebreaker: { ok: true, softOk: false, pairedOk: false, metrics: { ixMs: 595 } },
+      },
+      {
+        id: "ripgrep_12_sample",
+        status: "ok",
+        passed: true,
+        failures: [],
+        evidence: {},
         primary: {
           ok: true,
           pairedOk: true,
@@ -271,6 +295,7 @@ function runSchemaSelfTest() {
     "worktree.failures: must be an array of strings",
     "worktree.evidence: must be an object",
     "ripgrep_12_sample: ok status requires at least one fixed-baseline passing window",
+    "ripgrep_12_sample: ok status with a hard-regression window requires two strong independent passes",
     "ripgrep_12_sample: same-source comparator artifact cannot provide paired improvement evidence",
   ];
   const missing = required.filter((needle) => !failures.includes(needle));
@@ -511,6 +536,128 @@ function surfaceParityLane() {
       matchesFound: searchValue.stats?.matches_found ?? null,
     },
     failures: parityFailures,
+  });
+}
+
+function normalizeHit(hit, root) {
+  return {
+    path: path.relative(root, hit.path ?? "").replaceAll("\\", "/"),
+    line: hit.line ?? null,
+    column: hit.column ?? null,
+    preview: hit.preview ?? null,
+  };
+}
+
+function sortHitsForParity(hits) {
+  return [...hits].sort((a, b) =>
+    String(a.path).localeCompare(String(b.path)) ||
+    Number(a.line ?? 0) - Number(b.line ?? 0) ||
+    Number(a.column ?? 0) - Number(b.column ?? 0) ||
+    String(a.preview ?? "").localeCompare(String(b.preview ?? "")),
+  );
+}
+
+function warmColdParityLane() {
+  const ix = findBuiltIx();
+  if (!ix) return lane("warm_cold_parity", "skipped", { reason: "zig-out binary missing; run build first" });
+  const root = path.join(os.tmpdir(), `ix-warm-cold-parity-root-${process.pid}`);
+  const localState = path.join(os.tmpdir(), `ix-warm-cold-parity-state-${process.pid}`);
+  rmSync(root, { recursive: true, force: true });
+  rmSync(localState, { recursive: true, force: true });
+  mkdirSync(root, { recursive: true });
+  writeFileSync(path.join(root, "alpha.zig"), "pub const needle = \"needle\";\r\npub const edge = \"line-boundary\";\r\n");
+  writeFileSync(path.join(root, "nested.txt"), "haystack\nneedle\nneedle suffix\n");
+  writeFileSync(path.join(root, "binary-like.bin"), Buffer.from([0, 1, 2, 3, 0, 110, 101, 101, 100, 108, 101, 0]));
+  writeFileSync(path.join(root, ".hidden.zig"), "pub const needle = \"hidden\";\n");
+
+  const script = `
+$ErrorActionPreference = 'Continue'
+$ix = ${psQuote(ix)}
+$root = ${psQuote(root)}
+$stateDir = ${psQuote(localState)}
+$env:IX_STATE_DIR = $stateDir
+$env:IX_INDEXD_MEMORY_LIMIT_MB = '256'
+$owner = Start-Process -FilePath $ix -ArgumentList @('__ix_indexd', $root, '--foreground') -PassThru -WindowStyle Hidden
+try {
+  $live = $null
+  for ($i = 0; $i -lt 80; $i++) {
+    $live = Get-ChildItem -LiteralPath $stateDir -Recurse -Force -Filter 'index.live' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($live) { break }
+    Start-Sleep -Milliseconds 100
+  }
+  if (-not $live) {
+    [pscustomobject]@{ status = 'no_live_marker'; ownerPid = $owner.Id } | ConvertTo-Json -Compress
+    exit 2
+  }
+  $env:IX_NEXUS = '0'
+  $env:IX_INDEX = '0'
+  $coldStatsOut = & $ix search 'lit:needle' $root --json --stats-only
+  $coldHitsOut = & $ix search 'lit:needle' $root --json --max-hits 20
+  $env:IX_INDEX = '1'
+  $warmStatsOut = & $ix search 'lit:needle' $root --json --stats-only
+  $warmHitsOut = & $ix search 'lit:needle' $root --json --max-hits 20
+  [pscustomobject]@{
+    status = 'ok'
+    ownerPid = $owner.Id
+    liveMarker = $live.FullName
+    coldStats = ($coldStatsOut | ConvertFrom-Json)
+    coldHits = ($coldHitsOut | ConvertFrom-Json)
+    warmStats = ($warmStatsOut | ConvertFrom-Json)
+    warmHits = ($warmHitsOut | ConvertFrom-Json)
+  } | ConvertTo-Json -Compress -Depth 30
+} finally {
+  Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($root) -and ($_.CommandLine.Contains('__ix_indexd') -or $_.Name -match '^(ix|iex|ix-zig)(\\.exe)?$') } | ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  Stop-Process -Id $owner.Id -Force -ErrorAction SilentlyContinue
+}
+exit 0
+`;
+
+  const probe = run("powershell", ["-NoProfile", "-Command", script]);
+  rmSync(root, { recursive: true, force: true });
+  rmSync(localState, { recursive: true, force: true });
+  let parsed;
+  try {
+    parsed = JSON.parse(probe.stdout || "{}");
+  } catch {
+    return lane("warm_cold_parity", "failed", { evidence: probe, reason: "warm/cold parity probe did not emit JSON" });
+  }
+
+  const failures = [];
+  if (parsed.status !== "ok") failures.push(parsed.status ?? `powershell exited ${probe.exitCode}`);
+  const coldStats = parsed.coldStats ?? {};
+  const warmStats = parsed.warmStats ?? {};
+  const coldHits = Array.isArray(parsed.coldHits?.hits) ? parsed.coldHits.hits.map((hit) => normalizeHit(hit, root)) : [];
+  const warmHits = Array.isArray(parsed.warmHits?.hits) ? parsed.warmHits.hits.map((hit) => normalizeHit(hit, root)) : [];
+  const coldHitsSorted = sortHitsForParity(coldHits);
+  const warmHitsSorted = sortHitsForParity(warmHits);
+  const sameHitOrder = JSON.stringify(coldHits) === JSON.stringify(warmHits);
+  const coldMatches = coldStats.stats?.matches_found ?? null;
+  const warmMatches = warmStats.stats?.matches_found ?? null;
+  if (coldStats.status !== "ok") failures.push("cold stats status is not ok");
+  if (warmStats.status !== "ok") failures.push("warm stats status is not ok");
+  if (coldMatches !== warmMatches) failures.push(`stats matches diverged cold=${coldMatches} warm=${warmMatches}`);
+  if (JSON.stringify(coldHitsSorted) !== JSON.stringify(warmHitsSorted)) failures.push("hit records diverged between cold and warm paths");
+  if (coldMatches !== 5) failures.push(`expected 5 text matches including default dotfile traversal, got ${coldMatches}`);
+  if (coldHits.some((hit) => hit.path.includes("binary-like.bin"))) failures.push("binary-like fixture leaked into hit records");
+
+  return lane("warm_cold_parity", failures.length === 0 ? "ok" : "failed", {
+    evidence: probe,
+    checks: {
+      coldMatches,
+      warmMatches,
+      coldHitCount: coldHits.length,
+      warmHitCount: warmHits.length,
+      sameHitOrder,
+      coldHits,
+      warmHits,
+      coldHitsSorted,
+      warmHitsSorted,
+      warmRefreshStatus: warmStats.stats?.generation_refresh?.refresh_status ?? null,
+      warmRefreshAvailable: warmStats.stats?.generation_refresh?.available ?? null,
+    },
+    failures,
   });
 }
 
@@ -872,20 +1019,22 @@ function ripgrepLane() {
   if (confirm.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm });
 
   const hardPasses = (primary.ok ? 1 : 0) + (confirm.ok ? 1 : 0);
-  const accepted = hardPasses === 2 && (primary.softOk || confirm.softOk);
+  const strongPasses = (ripgrepWindowStrongPass(primary) ? 1 : 0) + (ripgrepWindowStrongPass(confirm) ? 1 : 0);
+  const accepted = hardPasses === 2 && strongPasses >= 1;
   if (hardPasses === 1) {
     const tiebreaker = runWindow("tiebreaker");
     if (tiebreaker.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm, tiebreaker });
     const tiebreakerHardPasses = hardPasses + (tiebreaker.ok ? 1 : 0);
-    const tiebreakerAccepted = tiebreakerHardPasses >= 2;
+    const tiebreakerStrongPasses = strongPasses + (ripgrepWindowStrongPass(tiebreaker) ? 1 : 0);
+    const tiebreakerAccepted = tiebreakerHardPasses >= 2 && tiebreakerStrongPasses >= 2;
     return lane("ripgrep_12_sample", tiebreakerAccepted ? "ok" : "failed", {
       corpus,
       primary,
       confirm,
       tiebreaker,
       interpretation: tiebreakerAccepted
-        ? "one measured window crossed the hard guard, but two independent windows stayed inside the hard regression guard"
-        : "benchmark windows disagreed and the tiebreaker did not produce two hard-pass windows",
+        ? "one measured window crossed the hard guard, but two independent windows produced strong fixed-baseline or paired-improvement passes"
+        : "benchmark windows disagreed and did not produce two strong independent passes",
     });
   }
 
@@ -992,6 +1141,7 @@ const lanes = [
   buildLane(),
   smokeLane(),
   surfaceParityLane(),
+  warmColdParityLane(),
   warmIndexLane(),
   runtimeStateLocationLane(),
   memoryCapLane(),
