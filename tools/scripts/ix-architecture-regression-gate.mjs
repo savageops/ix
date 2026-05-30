@@ -13,6 +13,14 @@ const outPath = argValue(args, "--out", path.join(REPORT_DIR, `architecture-gate
 const stateDir = argValue(args, "--state-dir", path.join(os.tmpdir(), `ix-architecture-gate-${process.pid}`));
 const baselineIxMs = Number(argValue(args, "--baseline-ix-ms", process.env.IX_ARCH_GATE_BASELINE_IX_MS ?? "575.3829"));
 const baselineTolerancePct = Number(argValue(args, "--baseline-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_TOLERANCE_PCT ?? "5"));
+const planningChainSlug = argValue(
+  args,
+  "--planning-chain",
+  process.env.IX_ARCH_GATE_PLANNING_CHAIN ?? "149-nextgen-architecture-validation-spine",
+);
+const planningChainPhases = parseCsvArg(
+  argValue(args, "--planning-phases", process.env.IX_ARCH_GATE_PLANNING_PHASES ?? "a,b,c,d"),
+);
 
 function run(command, commandArgs, options = {}) {
   const started = process.hrtime.bigint();
@@ -39,6 +47,13 @@ function psQuote(value) {
 
 function lane(id, status, evidence = {}) {
   return { id, status, ...evidence };
+}
+
+function parseCsvArg(value) {
+  return String(value)
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
 
 function writeReport(report) {
@@ -91,13 +106,18 @@ function diffCheckLane() {
 }
 
 function planningLane() {
-  const required = [
-    ".docs/todo/changelog/149-nextgen-architecture-validation-spine.md",
-    ".docs/todo/changelog/149a-nextgen-architecture-validation-spine.md",
-    ".docs/todo/changelog/149b-nextgen-architecture-validation-spine.md",
-    ".docs/todo/changelog/149c-nextgen-architecture-validation-spine.md",
-    ".docs/todo/changelog/149d-nextgen-architecture-validation-spine.md",
-  ];
+  const match = planningChainSlug.match(/^(\d+)-(.+)$/);
+  const chainConfigFailures = [];
+  if (!match) chainConfigFailures.push(`planning chain slug must start with a numeric prefix: ${planningChainSlug}`);
+  if (planningChainPhases.length === 0) chainConfigFailures.push("planning chain phases must not be empty");
+  const prefix = match?.[1] ?? "";
+  const suffix = match?.[2] ?? planningChainSlug;
+  const required = match
+    ? [
+        `.docs/todo/changelog/${planningChainSlug}.md`,
+        ...planningChainPhases.map((phase) => `.docs/todo/changelog/${prefix}${phase}-${suffix}.md`),
+      ]
+    : [];
   const stalePending = required.map((file) => file.replace("/changelog/", "/pending/")).filter((file) => existsSync(path.join(ROOT, file)));
   const missing = required.filter((file) => !existsSync(path.join(ROOT, file)));
   const incomplete = [];
@@ -108,8 +128,15 @@ function planningLane() {
     if (!body.includes("status: done")) incomplete.push(`${file}: status is not done`);
     if (/^evidence:.*PLACEHOLDER/m.test(body)) incomplete.push(`${file}: evidence still contains PLACEHOLDER`);
   }
-  const failures = [...missing.map((file) => `${file}: missing`), ...stalePending.map((file) => `${file}: stale pending file remains`), ...incomplete];
+  const failures = [
+    ...chainConfigFailures,
+    ...missing.map((file) => `${file}: missing`),
+    ...stalePending.map((file) => `${file}: stale pending file remains`),
+    ...incomplete,
+  ];
   return lane("planning_chain", failures.length === 0 ? "ok" : "failed", {
+    chain: planningChainSlug,
+    phases: planningChainPhases,
     required,
     missing,
     stalePending,
