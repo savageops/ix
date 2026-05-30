@@ -261,12 +261,12 @@ function parsePowerScheme(text) {
   };
 }
 
-function topProcessSnapshot() {
+function processSnapshot(sortProperty) {
   if (process.platform !== "win32") return [];
   const json = safeCommand("powershell", [
     "-NoProfile",
     "-Command",
-    "Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 8 Id,ProcessName,CPU,WorkingSet64 | ConvertTo-Json -Compress",
+    `Get-Process | Sort-Object ${sortProperty} -Descending | Select-Object -First 8 Id,ProcessName,CPU,WorkingSet64 | ConvertTo-Json -Compress`,
   ]);
   if (!json) return [];
   try {
@@ -277,11 +277,60 @@ function topProcessSnapshot() {
   }
 }
 
+function topProcessSnapshot() {
+  return processSnapshot("WorkingSet64");
+}
+
+function topCpuProcessSnapshot() {
+  return processSnapshot("CPU");
+}
+
+function classifyHostForBenchmark(snapshot) {
+  const issues = [];
+  const powerName = snapshot.powerScheme?.name?.toLowerCase?.() ?? "";
+  if (process.platform === "win32" && powerName && !powerName.includes("performance")) {
+    issues.push({
+      id: "non_performance_power_plan",
+      severity: "warning",
+      detail: snapshot.powerScheme?.name ?? "unknown",
+    });
+  }
+  const topNames = new Set((snapshot.topProcessesByWorkingSet ?? []).map((entry) => String(entry.ProcessName ?? "").toLowerCase()));
+  if (topNames.has("msmpeng")) {
+    issues.push({
+      id: "defender_active_in_top_working_set",
+      severity: "warning",
+      detail: "MsMpEng appeared among top working-set processes",
+    });
+  }
+  const browserOrAgentCount = [...topNames].filter((name) => name === "chrome" || name === "codex").length;
+  if (browserOrAgentCount >= 2) {
+    issues.push({
+      id: "interactive_workloads_present",
+      severity: "info",
+      detail: "Codex or Chrome processes appeared among top working-set processes",
+    });
+  }
+  const freeMemRatio = snapshot.totalMemBytes > 0 ? snapshot.freeMemBytes / snapshot.totalMemBytes : 1;
+  if (freeMemRatio < 0.2) {
+    issues.push({
+      id: "low_available_memory",
+      severity: "warning",
+      detail: `${Math.round(freeMemRatio * 100)}% free`,
+    });
+  }
+  const warningCount = issues.filter((issue) => issue.severity === "warning").length;
+  return {
+    status: warningCount === 0 ? "clean" : "noisy",
+    issues,
+  };
+}
+
 function hostSnapshot() {
   const cpus = os.cpus();
   const cpuSpeeds = cpus.map((cpu) => cpu.speed).filter((speed) => Number.isFinite(speed));
   const powerScheme = process.platform === "win32" ? parsePowerScheme(safeCommand("powercfg", ["/getactivescheme"])) : null;
-  return {
+  const snapshot = {
     timestamp: new Date().toISOString(),
     platform: process.platform,
     arch: process.arch,
@@ -300,7 +349,10 @@ function hostSnapshot() {
     },
     powerScheme,
     topProcessesByWorkingSet: topProcessSnapshot(),
+    topProcessesByCpu: topCpuProcessSnapshot(),
   };
+  snapshot.benchmarkEnvironment = classifyHostForBenchmark(snapshot);
+  return snapshot;
 }
 
 function measureIxSearch(binaryPath, context, measureOptions) {

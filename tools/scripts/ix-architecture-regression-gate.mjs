@@ -198,6 +198,21 @@ function ripgrepProofInterpretation(summary) {
   }
 }
 
+function hostBenchmarkIssues(host) {
+  const before = Array.isArray(host?.before?.benchmarkEnvironment?.issues) ? host.before.benchmarkEnvironment.issues : [];
+  const after = Array.isArray(host?.after?.benchmarkEnvironment?.issues) ? host.after.benchmarkEnvironment.issues : [];
+  const seen = new Set();
+  const issues = [];
+  for (const issue of [...before, ...after]) {
+    if (!isPlainObject(issue) || typeof issue.id !== "string") continue;
+    const key = `${issue.id}:${issue.detail ?? ""}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    issues.push(issue);
+  }
+  return issues;
+}
+
 function validateRipgrepLane(entry, failures) {
   if (entry.id !== "ripgrep_12_sample" || entry.status !== "ok") return;
   const fixedPasses = ["primary", "confirm", "tiebreaker"].filter((key) => ripgrepWindowFixedPass(entry[key])).length;
@@ -1125,6 +1140,7 @@ function ripgrepLane(controlLane = null) {
         speedupPct: latest.speedupPct,
         matchCount,
         phaseMs: latest.phaseMs ?? {},
+        hostIssues: hostBenchmarkIssues(latest.host ?? null),
         host: latest.host ?? null,
         baselineIxMs,
         baselineWarmupSamples,
@@ -1265,6 +1281,8 @@ function benchmarkControlLane() {
   }
 
   const latest = JSON.parse(readFileSync(latestPath, "utf8"));
+  const host = latest.host ?? null;
+  const hostIssues = hostBenchmarkIssues(host);
   const ixMs = Number(latest.iexMs);
   const selfMs = Number(latest.competitors?.iex_previous?.durationMs);
   const selfRatio = Number(latest.iexToPreviousRatio);
@@ -1338,9 +1356,10 @@ function benchmarkControlLane() {
       selfPairing: latest.competitors?.iex_previous?.pairing ?? null,
       rgSampleDurationsMs: latest.competitors?.ripgrep?.sampleDurationsMs ?? [],
       rgSampleSummary: latest.competitors?.ripgrep?.sampleSummary ?? null,
+      hostIssues,
       matchCount: latest.matchCount ?? null,
       phaseMs: latest.phaseMs ?? {},
-      host: latest.host ?? null,
+      host,
     },
   });
 }
