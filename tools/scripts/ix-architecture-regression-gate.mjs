@@ -92,14 +92,30 @@ function diffCheckLane() {
 
 function planningLane() {
   const required = [
-    ".docs/todo/pending/149-nextgen-architecture-validation-spine.md",
-    ".docs/todo/pending/149a-nextgen-architecture-validation-spine.md",
-    ".docs/todo/pending/149b-nextgen-architecture-validation-spine.md",
-    ".docs/todo/pending/149c-nextgen-architecture-validation-spine.md",
-    ".docs/todo/pending/149d-nextgen-architecture-validation-spine.md",
+    ".docs/todo/changelog/149-nextgen-architecture-validation-spine.md",
+    ".docs/todo/changelog/149a-nextgen-architecture-validation-spine.md",
+    ".docs/todo/changelog/149b-nextgen-architecture-validation-spine.md",
+    ".docs/todo/changelog/149c-nextgen-architecture-validation-spine.md",
+    ".docs/todo/changelog/149d-nextgen-architecture-validation-spine.md",
   ];
+  const stalePending = required.map((file) => file.replace("/changelog/", "/pending/")).filter((file) => existsSync(path.join(ROOT, file)));
   const missing = required.filter((file) => !existsSync(path.join(ROOT, file)));
-  return lane("planning_chain", missing.length === 0 ? "ok" : "failed", { missing });
+  const incomplete = [];
+  for (const file of required) {
+    const absolute = path.join(ROOT, file);
+    if (!existsSync(absolute)) continue;
+    const body = readFileSync(absolute, "utf8");
+    if (!body.includes("status: done")) incomplete.push(`${file}: status is not done`);
+    if (/^evidence:.*PLACEHOLDER/m.test(body)) incomplete.push(`${file}: evidence still contains PLACEHOLDER`);
+  }
+  const failures = [...missing.map((file) => `${file}: missing`), ...stalePending.map((file) => `${file}: stale pending file remains`), ...incomplete];
+  return lane("planning_chain", failures.length === 0 ? "ok" : "failed", {
+    required,
+    missing,
+    stalePending,
+    incomplete,
+    failures,
+  });
 }
 
 function agentDryRunLane() {
