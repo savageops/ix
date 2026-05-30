@@ -427,6 +427,56 @@ pub fn tryPinCurrentGeneration(io: std.Io, allocator: std.mem.Allocator, manifes
     return pinManifestBytesForRoot(bytes, expected_root) catch null;
 }
 
+pub fn tryPinCurrentGenerationWithPayloads(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    index_dir: []const u8,
+    manifest_path: []const u8,
+    expected_root: RootFingerprint,
+) !?ReaderPin {
+    return pinCurrentGenerationWithPayloads(io, allocator, index_dir, manifest_path, expected_root) catch |err| switch (err) {
+        error.NoCurrentGeneration => return null,
+        else => return null,
+    };
+}
+
+pub fn pinCurrentGenerationWithPayloads(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    index_dir: []const u8,
+    manifest_path: []const u8,
+    expected_root: RootFingerprint,
+) !ReaderPin {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(MANIFEST_READ_LIMIT)) catch |err| switch (err) {
+        error.FileNotFound => return error.NoCurrentGeneration,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    return pinManifestBytesAndPayloadsForRoot(io, allocator, index_dir, bytes, expected_root);
+}
+
+pub fn pinManifestBytesAndPayloadsForRoot(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    index_dir: []const u8,
+    bytes: []const u8,
+    expected_root: RootFingerprint,
+) !ReaderPin {
+    var cursor = Cursor{ .bytes = bytes };
+    const header = try readHeader(&cursor);
+    const pin = try ReaderPin.fromHeader(try validateManifestHeaderForRoot(header, expected_root));
+    const paths = try buildGenerationPathsInIndexDir(allocator, index_dir, pin.epoch);
+    defer paths.deinit(allocator);
+
+    var index: usize = 0;
+    while (index < pin.segment_count) : (index += 1) {
+        const segment = try readSegmentRecord(&cursor, pin.epoch);
+        try validatePublishedSegmentPayload(io, allocator, paths.generation_dir, segment);
+    }
+    if (cursor.remaining() != 0) return error.TrailingGenerationManifestData;
+    return pin;
+}
+
 pub fn validateManifestShape(manifest: GenerationManifest) !void {
     if (!std.mem.eql(u8, &manifest.header.magic, &MAGIC)) return error.BadGenerationMagic;
     if (manifest.header.version != FORMAT_VERSION) return error.UnsupportedGenerationVersion;
@@ -441,6 +491,37 @@ pub fn validateManifestShape(manifest: GenerationManifest) !void {
         if (std.fs.path.isAbsolute(segment.relative_path)) return error.AbsoluteGenerationSegmentPath;
         if (segment.generation != manifest.header.epoch) return error.WrongSegmentGeneration;
     }
+}
+
+fn validateManifestHeaderForRoot(header: GenerationManifestHeader, expected_root: RootFingerprint) !GenerationManifestHeader {
+    if (!std.mem.eql(u8, &header.magic, &MAGIC)) return error.BadGenerationMagic;
+    if (header.version > FORMAT_VERSION) return error.UnsupportedGenerationVersion;
+    if (header.header_size != @sizeOf(GenerationManifestHeader)) return error.BadGenerationHeaderSize;
+    if (!header.flags.complete) return error.IncompleteGenerationManifest;
+    if (header.rootFingerprint() != expected_root) return error.WrongGenerationRoot;
+    if (header.epoch == INVALID_EPOCH) return error.InvalidGenerationEpoch;
+    if (header.flags.has_parent and header.parent_epoch >= header.epoch) return error.InvalidParentGeneration;
+    if (header.segment_count > std.math.maxInt(usize)) return error.GenerationSegmentCountOverflow;
+    return header;
+}
+
+fn validatePublishedSegmentPayload(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    generation_dir: []const u8,
+    segment: GenerationSegment,
+) !void {
+    if (segment.byte_len > std.math.maxInt(usize) - 1) return error.GenerationSegmentTooLarge;
+    const segment_path = try std.fs.path.join(allocator, &.{ generation_dir, segment.relative_path });
+    defer allocator.free(segment_path);
+    const read_limit: usize = @intCast(segment.byte_len + 1);
+    const payload = std.Io.Dir.cwd().readFileAlloc(io, segment_path, allocator, .limited(read_limit)) catch |err| switch (err) {
+        error.FileNotFound => return error.MissingGenerationSegment,
+        else => return err,
+    };
+    defer allocator.free(payload);
+    if (payload.len != segment.byte_len) return error.GenerationSegmentLengthMismatch;
+    if (std.hash.Wyhash.hash(0, payload) != segment.checksum) return error.GenerationSegmentChecksumMismatch;
 }
 
 fn writeHeader(bytes: *std.ArrayList(u8), allocator: std.mem.Allocator, header: GenerationManifestHeader) !void {
@@ -817,6 +898,58 @@ test "generation payload publish writes catalog postings and manifest through ep
     defer std.testing.allocator.free(catalog_path);
     const catalog_bytes = try std.Io.Dir.cwd().readFile(std.testing.io, catalog_path, &buffer);
     try std.testing.expectEqualStrings("CATALOG", catalog_bytes);
+}
+
+test "generation payload validation rejects missing published segment" {
+    const root = ".zig-cache\\ix-generation-missing-payload-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 61);
+    defer paths.deinit(std.testing.allocator);
+
+    const payloads = [_]SegmentPayload{
+        .{ .kind = .catalog, .relative_path = "catalog.ixcat", .bytes = "CATALOG-61" },
+        .{ .kind = .postings, .relative_path = "postings.ixpost", .bytes = "POSTINGS-61" },
+    };
+    _ = try publishGenerationPayloads(std.testing.io, std.testing.allocator, paths, 0x6161, 61, null, &payloads);
+
+    const postings_path = try std.fs.path.join(std.testing.allocator, &.{ paths.generation_dir, "postings.ixpost" });
+    defer std.testing.allocator.free(postings_path);
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, postings_path);
+
+    var buffer: [1024]u8 = undefined;
+    const manifest_bytes = try std.Io.Dir.cwd().readFile(std.testing.io, paths.current_manifest_path, &buffer);
+    try std.testing.expectError(error.MissingGenerationSegment, pinManifestBytesAndPayloadsForRoot(std.testing.io, std.testing.allocator, paths.index_dir, manifest_bytes, 0x6161));
+    try std.testing.expectError(error.MissingGenerationSegment, pinCurrentGenerationWithPayloads(std.testing.io, std.testing.allocator, paths.index_dir, paths.current_manifest_path, 0x6161));
+    try std.testing.expectEqual(@as(?ReaderPin, null), tryPinCurrentGenerationWithPayloads(std.testing.io, std.testing.allocator, paths.index_dir, paths.current_manifest_path, 0x6161));
+}
+
+test "generation payload validation rejects checksum mismatch" {
+    const root = ".zig-cache\\ix-generation-checksum-payload-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 62);
+    defer paths.deinit(std.testing.allocator);
+
+    const payloads = [_]SegmentPayload{
+        .{ .kind = .catalog, .relative_path = "catalog.ixcat", .bytes = "CATALOG-62" },
+        .{ .kind = .postings, .relative_path = "postings.ixpost", .bytes = "POSTINGS-62" },
+    };
+    _ = try publishGenerationPayloads(std.testing.io, std.testing.allocator, paths, 0x6262, 62, null, &payloads);
+
+    const catalog_path = try std.fs.path.join(std.testing.allocator, &.{ paths.generation_dir, "catalog.ixcat" });
+    defer std.testing.allocator.free(catalog_path);
+    var file = try std.Io.Dir.cwd().createFile(std.testing.io, catalog_path, .{ .truncate = true });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "CATALOG-XX");
+
+    var buffer: [1024]u8 = undefined;
+    const manifest_bytes = try std.Io.Dir.cwd().readFile(std.testing.io, paths.current_manifest_path, &buffer);
+    try std.testing.expectError(error.GenerationSegmentChecksumMismatch, pinManifestBytesAndPayloadsForRoot(std.testing.io, std.testing.allocator, paths.index_dir, manifest_bytes, 0x6262));
+    try std.testing.expectError(error.GenerationSegmentChecksumMismatch, pinCurrentGenerationWithPayloads(std.testing.io, std.testing.allocator, paths.index_dir, paths.current_manifest_path, 0x6262));
+    try std.testing.expectEqual(@as(?ReaderPin, null), tryPinCurrentGenerationWithPayloads(std.testing.io, std.testing.allocator, paths.index_dir, paths.current_manifest_path, 0x6262));
 }
 
 test "generation compacted publish writes canonical catalog and postings payloads" {

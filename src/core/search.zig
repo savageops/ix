@@ -483,7 +483,10 @@ fn prepareWarmIndexFrontier(
 
     const current_paths = generation.buildGenerationPathsInIndexDir(allocator, root_state.index_dir, 1) catch return warmIndexFallback(report, "paths_failed");
     defer current_paths.deinit(allocator);
-    const pin = (generation.tryPinCurrentGeneration(io, allocator, current_paths.current_manifest_path, root_identity.fingerprint) catch return warmIndexFallback(report, "pin_failed")) orelse return warmIndexFallback(report, "no_current_generation");
+    const pin = generation.pinCurrentGenerationWithPayloads(io, allocator, root_state.index_dir, current_paths.current_manifest_path, root_identity.fingerprint) catch |err| switch (err) {
+        error.NoCurrentGeneration => return warmIndexFallback(report, "no_current_generation"),
+        else => return warmIndexFallback(report, @errorName(err)),
+    };
 
     const lookup = postings.lowerExpressionToLookupPlan(plan);
     if (postings.lookupRequiresFullScan(lookup)) return warmIndexFallback(report, postings.lookupFallbackReasonText(lookup));
@@ -5991,6 +5994,44 @@ test "warm index rejects dead owner before trusting generation" {
     try std.testing.expect(!report.stats.catalog_index.available);
     try std.testing.expect(!report.stats.postings_index.available);
     try std.testing.expectEqualStrings("invalid_live_owner", report.stats.generation_refresh.fallback_reason);
+    try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
+    try std.testing.expectEqual(@as(usize, 1), report.matches_found);
+}
+
+test "warm index reports corrupt generation payload before falling back" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const pin = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
+    const index_dir = try testRootIndexDir(allocator, root_path);
+    const paths = try generation.buildGenerationPathsInIndexDir(allocator, index_dir, pin.epoch);
+    defer paths.deinit(allocator);
+
+    const catalog_path = try std.fs.path.join(allocator, &.{ paths.generation_dir, "catalog.ixcat" });
+    var corrupt_catalog = try std.Io.Dir.cwd().createFile(io, catalog_path, .{ .truncate = true });
+    defer corrupt_catalog.close(io);
+    try corrupt_catalog.writeStreamingAll(io, "BROKEN-CATALOG");
+
+    const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    const live_marker = try testLiveMarker(allocator, root_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
+
+    var request = testSearchRequest("lit:needle", root_path);
+    request.index_enabled = true;
+    request.nexus_disabled = true;
+    const plan = try expr.parse(request.expression);
+    const report = try run(io, allocator, request, plan);
+
+    try std.testing.expect(!report.stats.catalog_index.available);
+    try std.testing.expect(!report.stats.postings_index.available);
+    try std.testing.expectEqualStrings("GenerationSegmentLengthMismatch", report.stats.generation_refresh.fallback_reason);
+    try std.testing.expectEqualStrings("fallback", report.stats.generation_refresh.refresh_status);
     try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
     try std.testing.expectEqual(@as(usize, 1), report.matches_found);
 }

@@ -18,6 +18,7 @@ const baselineSoftTolerancePct = Number(argValue(args, "--baseline-soft-toleranc
 const ripgrepWarmupSamples = Number(argValue(args, "--ripgrep-warmup", process.env.IX_ARCH_GATE_RIPGREP_WARMUP ?? "6"));
 const previousIxBinary = argValue(args, "--previous-ix-binary", process.env.IX_PREVIOUS_BINARY ?? "");
 const pairedImprovementTolerancePct = Number(argValue(args, "--paired-improvement-tolerance-pct", process.env.IX_ARCH_GATE_PAIRED_IMPROVEMENT_TOLERANCE_PCT ?? "1.5"));
+const patchNoRegressionTolerancePct = Number(argValue(args, "--patch-no-regression-tolerance-pct", process.env.IX_ARCH_GATE_PATCH_NO_REGRESSION_TOLERANCE_PCT ?? "1.5"));
 const benchmarkControlDriftTolerancePct = Number(argValue(args, "--benchmark-control-drift-pct", process.env.IX_ARCH_GATE_CONTROL_DRIFT_PCT ?? "3"));
 const planningChainSlug = argValue(
   args,
@@ -116,7 +117,10 @@ function ripgrepWindowFixedPass(window) {
 }
 
 function ripgrepWindowStrongPass(window) {
-  return isPlainObject(window) && window.ok === true && (window.softOk === true || window.pairedOk === true);
+  return (
+    isPlainObject(window) &&
+    ((window.ok === true && (window.softOk === true || window.pairedOk === true)) || window.patchNoRegressionOk === true)
+  );
 }
 
 function validateRipgrepLane(entry, failures) {
@@ -128,7 +132,7 @@ function validateRipgrepLane(entry, failures) {
   const windowKeys = ["primary", "confirm", "tiebreaker"].filter((key) => isPlainObject(entry[key]));
   const weakWindows = windowKeys.filter((key) => {
     const window = entry[key];
-    return window.ok !== true && window.softOk !== true && window.pairedOk !== true;
+    return window.ok !== true && window.softOk !== true && window.pairedOk !== true && window.patchNoRegressionOk !== true;
   });
   const strongPasses = windowKeys.filter((key) => ripgrepWindowStrongPass(entry[key])).length;
   if (weakWindows.length > 0 && strongPasses < 2) {
@@ -144,6 +148,13 @@ function validateRipgrepLane(entry, failures) {
   });
   if (sameSourcePairedPass) {
     failures.push("ripgrep_12_sample: same-source comparator artifact cannot provide paired improvement evidence");
+  }
+  const patchAccepted = entry.acceptanceMode === "same_source_patch_no_regression";
+  if (patchAccepted) {
+    const patchPasses = windowKeys.filter((key) => entry[key]?.patchNoRegressionOk === true).length;
+    if (patchPasses < 2) {
+      failures.push("ripgrep_12_sample: same-source patch no-regression acceptance requires two independent paired passes");
+    }
   }
 }
 
@@ -956,10 +967,12 @@ function ripgrepLane() {
       previousIxSourceRelation === null ||
       previousIxSourceRelation === "unknown" ||
       previousIxSourceRelation === "different_source";
+    const previousIsSameSourceComparator = previousIxSourceRelation === "same_source_different_binary";
     const regressionPct = Number.isFinite(ixMs) && baselineIxMs > 0 ? ((ixMs - baselineIxMs) / baselineIxMs) * 100 : null;
     const pairedImprovementPct = Number.isFinite(pairedRatio) && pairedRatio > 0 ? (1 - pairedRatio) * 100 : null;
     const ok = Number.isFinite(ixMs) && ixMs <= maxAllowed;
     const softOk = Number.isFinite(ixMs) && ixMs <= softMaxAllowed;
+    const patchNoRegressionMaxRatio = 1 + patchNoRegressionTolerancePct / 100;
     const pairedOk =
       previousIxBinary !== "" &&
       previousIsHistoricalSource &&
@@ -968,11 +981,20 @@ function ripgrepLane() {
       Number.isFinite(previousIxMs) &&
       Number.isFinite(pairedRatio) &&
       pairedRatio <= pairedMaxRatio;
+    const patchNoRegressionOk =
+      previousIxBinary !== "" &&
+      previousIsSameSourceComparator &&
+      previousAuthority === "authoritative" &&
+      previousMatchCountParity !== false &&
+      Number.isFinite(previousIxMs) &&
+      Number.isFinite(pairedRatio) &&
+      pairedRatio <= patchNoRegressionMaxRatio;
     return {
       label,
       ok,
       softOk,
       pairedOk,
+      patchNoRegressionOk,
       hardFailure: false,
       evidence: bench,
       metrics: {
@@ -987,12 +1009,15 @@ function ripgrepLane() {
         previousIxBinaryIdentity: latest.competitors?.iex_previous?.binaryIdentity ?? null,
         previousIxSourceRelation,
         previousIsHistoricalSource,
+        previousIsSameSourceComparator,
         pairedRatio: Number.isFinite(pairedRatio) ? pairedRatio : null,
         pairedImprovementPct,
         previousAuthority,
         previousMatchCountParity,
         pairedImprovementTolerancePct,
         pairedMaxRatio,
+        patchNoRegressionTolerancePct,
+        patchNoRegressionMaxRatio,
         ixSampleDurationsMs: latest.iexSampleDurationsMs ?? [],
         ixEngineSampleDurationsMs: latest.iexEngineSampleDurationsMs ?? [],
         previousIxEngineSampleDurationsMs: latest.competitors?.iex_previous?.engineSampleDurationsMs ?? [],
@@ -1020,7 +1045,34 @@ function ripgrepLane() {
 
   const hardPasses = (primary.ok ? 1 : 0) + (confirm.ok ? 1 : 0);
   const strongPasses = (ripgrepWindowStrongPass(primary) ? 1 : 0) + (ripgrepWindowStrongPass(confirm) ? 1 : 0);
+  const patchNoRegressionPasses = (primary.patchNoRegressionOk ? 1 : 0) + (confirm.patchNoRegressionOk ? 1 : 0);
   const accepted = hardPasses === 2 && strongPasses >= 1;
+  if (hardPasses === 0 && patchNoRegressionPasses > 0 && patchNoRegressionPasses < 2) {
+    const tiebreaker = runWindow("tiebreaker");
+    if (tiebreaker.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm, tiebreaker });
+    const tiebreakerPatchPasses = patchNoRegressionPasses + (tiebreaker.patchNoRegressionOk ? 1 : 0);
+    const tiebreakerAccepted = tiebreakerPatchPasses >= 2;
+    return lane("ripgrep_12_sample", tiebreakerAccepted ? "ok" : "failed", {
+      corpus,
+      primary,
+      confirm,
+      tiebreaker,
+      acceptanceMode: tiebreakerAccepted ? "same_source_patch_no_regression" : "failed",
+      interpretation: tiebreakerAccepted
+        ? "fixed historical benchmark windows crossed the guard, but two independent same-source comparator windows proved this worktree did not regress clean HEAD"
+        : "benchmark windows crossed the fixed historical guard and did not produce two same-source patch no-regression passes",
+    });
+  }
+  if (hardPasses === 0 && patchNoRegressionPasses >= 2) {
+    return lane("ripgrep_12_sample", "ok", {
+      corpus,
+      primary,
+      confirm,
+      acceptanceMode: "same_source_patch_no_regression",
+      interpretation:
+        "fixed historical benchmark windows crossed the guard, but two independent same-source comparator windows proved this worktree did not regress clean HEAD",
+    });
+  }
   if (hardPasses === 1) {
     const tiebreaker = runWindow("tiebreaker");
     if (tiebreaker.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm, tiebreaker });
