@@ -13,6 +13,7 @@ const outPath = argValue(args, "--out", path.join(REPORT_DIR, `architecture-gate
 const stateDir = argValue(args, "--state-dir", path.join(os.tmpdir(), `ix-architecture-gate-${process.pid}`));
 const baselineIxMs = Number(argValue(args, "--baseline-ix-ms", process.env.IX_ARCH_GATE_BASELINE_IX_MS ?? "575.3829"));
 const baselineTolerancePct = Number(argValue(args, "--baseline-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_TOLERANCE_PCT ?? "5"));
+const baselineSoftTolerancePct = Number(argValue(args, "--baseline-soft-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_SOFT_TOLERANCE_PCT ?? "2.5"));
 const planningChainSlug = argValue(
   args,
   "--planning-chain",
@@ -423,6 +424,7 @@ function ripgrepLane() {
   if (quick) return lane("ripgrep_12_sample", "skipped", { reason: "--quick", corpus });
   const latestPath = path.join(ROOT, "tools", "reports", "latest.json");
   const maxAllowed = baselineIxMs * (1 + baselineTolerancePct / 100);
+  const softMaxAllowed = baselineIxMs * (1 + baselineSoftTolerancePct / 100);
 
   const runWindow = (label) => {
     const bench = run(process.execPath, [
@@ -456,10 +458,13 @@ function ripgrepLane() {
     const ixMs = Number(latest.iexMs);
     const rgMs = Number(latest.rgMs);
     const matchCount = Number(latest.matchCount);
+    const regressionPct = Number.isFinite(ixMs) && baselineIxMs > 0 ? ((ixMs - baselineIxMs) / baselineIxMs) * 100 : null;
     const ok = Number.isFinite(ixMs) && ixMs <= maxAllowed;
+    const softOk = Number.isFinite(ixMs) && ixMs <= softMaxAllowed;
     return {
       label,
       ok,
+      softOk,
       hardFailure: false,
       evidence: bench,
       metrics: {
@@ -473,26 +478,29 @@ function ripgrepLane() {
         matchCount,
         baselineIxMs,
         baselineTolerancePct,
+        baselineSoftTolerancePct,
         maxAllowedIxMs: maxAllowed,
-        regressionPct: Number.isFinite(ixMs) && baselineIxMs > 0 ? ((ixMs - baselineIxMs) / baselineIxMs) * 100 : null,
+        softMaxAllowedIxMs: softMaxAllowed,
+        regressionPct,
       },
     };
   };
 
   const primary = runWindow("primary");
   if (primary.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary });
-  if (primary.ok) return lane("ripgrep_12_sample", "ok", { corpus, primary });
+  if (primary.ok && primary.softOk) return lane("ripgrep_12_sample", "ok", { corpus, primary });
 
   const confirm = runWindow("confirm");
   if (confirm.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm });
 
-  return lane("ripgrep_12_sample", confirm.ok ? "ok" : "failed", {
+  const accepted = primary.ok && confirm.ok && (primary.softOk || confirm.softOk);
+  return lane("ripgrep_12_sample", accepted ? "ok" : "failed", {
     corpus,
     primary,
     confirm,
-    interpretation: confirm.ok
-      ? "primary window crossed the guard, confirm window stayed within the unchanged 5% regression limit"
-      : "primary and confirm windows both crossed the unchanged 5% regression limit",
+    interpretation: accepted
+      ? "one measured window crossed the soft regression band, but the paired control stayed inside it"
+      : "paired benchmark windows crossed the regression guard; treat as performance regression until a focused run proves otherwise",
   });
 }
 
