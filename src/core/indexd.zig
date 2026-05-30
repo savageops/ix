@@ -26,12 +26,33 @@ extern "kernel32" fn GetProcessTimes(
     lpUserTime: *windows.FILETIME,
 ) callconv(.winapi) windows.BOOL;
 
+extern "kernel32" fn K32GetProcessMemoryInfo(
+    Process: windows.HANDLE,
+    ppsmemCounters: *PROCESS_MEMORY_COUNTERS,
+    cb: windows.DWORD,
+) callconv(.winapi) windows.BOOL;
+
 pub const LIVE_MARKER_NAME = "index.live";
+pub const MEMORY_LIMIT_ENV = "IX_INDEXD_MEMORY_LIMIT_MB";
 const INDEX_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_FILE_READ_LIMIT: usize = 64 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_TOTAL_READ_LIMIT: usize = 384 * 1024 * 1024;
+const INDEXD_DEFAULT_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MUTATION_SETTLE_WINDOW_NS: u64 = 75 * std.time.ns_per_ms;
 const MUTATION_SETTLE_MAX_WINDOWS: u32 = 2;
+
+const PROCESS_MEMORY_COUNTERS = extern struct {
+    cb: windows.DWORD,
+    PageFaultCount: windows.DWORD,
+    PeakWorkingSetSize: windows.SIZE_T,
+    WorkingSetSize: windows.SIZE_T,
+    QuotaPeakPagedPoolUsage: windows.SIZE_T,
+    QuotaPagedPoolUsage: windows.SIZE_T,
+    QuotaPeakNonPagedPoolUsage: windows.SIZE_T,
+    QuotaNonPagedPoolUsage: windows.SIZE_T,
+    PagefileUsage: windows.SIZE_T,
+    PeakPagefileUsage: windows.SIZE_T,
+};
 
 pub const Request = struct {
     root: []const u8,
@@ -54,6 +75,7 @@ pub const Config = struct {
     foreground: bool,
     once: bool,
     repair: bool,
+    memory_limit_bytes: usize,
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.index_dir);
@@ -133,7 +155,10 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
     if (config.repair) try writeRepairState(io, allocator, config, "operator_requested_reconcile");
     if (config.mode == .foreground_once) try writeBootstrapState(io, allocator, config);
     if (!config.repair) {
-        _ = try publishRootGeneration(io, allocator, config.root);
+        _ = publishRootGenerationForConfig(io, allocator, config) catch |err| {
+            try recordPublishFailure(io, allocator, config, err);
+            return err;
+        };
         if (config.mode != .foreground_once) {
             if (builtin.os.tag == .windows) {
                 const live = try writeLiveMarker(io, allocator, config);
@@ -141,7 +166,10 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
                 while (true) {
                     holdLiveUntilRootMutation(io, config.root);
                     settleRootMutationBurst(io);
-                    _ = try publishRootGeneration(io, allocator, config.root);
+                    _ = publishRootGenerationForConfig(io, allocator, config) catch |err| {
+                        try recordPublishFailure(io, allocator, config, err);
+                        return err;
+                    };
                 }
             } else {
                 const live = try writeLiveMarker(io, allocator, config);
@@ -205,6 +233,7 @@ pub fn buildConfig(allocator: std.mem.Allocator, request: Request) !Config {
         .foreground = request.foreground,
         .once = request.once,
         .repair = request.repair,
+        .memory_limit_bytes = configuredMemoryLimitBytes(),
     };
 }
 
@@ -319,14 +348,57 @@ fn fileTimeToUnixNs(file_time: windows.FILETIME) i128 {
     return (ticks_100ns - windows_epoch_to_unix_epoch_100ns) * 100;
 }
 
+fn configuredMemoryLimitBytes() usize {
+    const value_ptr = std.c.getenv(MEMORY_LIMIT_ENV ++ "\x00") orelse return INDEXD_DEFAULT_MEMORY_LIMIT_BYTES;
+    return parseMemoryLimitMb(std.mem.span(value_ptr)) orelse INDEXD_DEFAULT_MEMORY_LIMIT_BYTES;
+}
+
+fn parseMemoryLimitMb(value: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const mb = std.fmt.parseInt(usize, trimmed, 10) catch return null;
+    if (mb == 0) return 0;
+    const bytes_per_mb = 1024 * 1024;
+    if (mb > std.math.maxInt(usize) / bytes_per_mb) return std.math.maxInt(usize);
+    return mb * bytes_per_mb;
+}
+
+fn enforceMemoryBudget(limit_bytes: usize) !void {
+    if (limit_bytes == 0) return;
+    const resident = currentResidentBytes() orelse return;
+    if (memoryBudgetExceeded(resident, limit_bytes)) return error.MemoryBudgetExceeded;
+}
+
+fn memoryBudgetExceeded(current_bytes: usize, limit_bytes: usize) bool {
+    return limit_bytes != 0 and current_bytes > limit_bytes;
+}
+
+fn currentResidentBytes() ?usize {
+    if (builtin.os.tag != .windows) return null;
+    var counters: PROCESS_MEMORY_COUNTERS = undefined;
+    counters.cb = @sizeOf(PROCESS_MEMORY_COUNTERS);
+    if (K32GetProcessMemoryInfo(windows.GetCurrentProcess(), &counters, @sizeOf(PROCESS_MEMORY_COUNTERS)) == windows.BOOL.FALSE) return null;
+    return counters.WorkingSetSize;
+}
+
 pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !generation.ReaderPin {
+    return publishRootGenerationWithBudget(io, allocator, root, configuredMemoryLimitBytes());
+}
+
+fn publishRootGenerationForConfig(io: std.Io, allocator: std.mem.Allocator, config: Config) !generation.ReaderPin {
+    return publishRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes);
+}
+
+pub fn publishRootGenerationWithBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, memory_limit_bytes: usize) !generation.ReaderPin {
+    try enforceMemoryBudget(memory_limit_bytes);
     var files = std.ArrayList(IndexedFile).empty;
     defer {
         for (files.items) |file| file.deinit(allocator);
         files.deinit(allocator);
     }
 
-    try collectIndexFiles(io, allocator, root, &files);
+    try collectIndexFiles(io, allocator, root, &files, memory_limit_bytes);
+    try enforceMemoryBudget(memory_limit_bytes);
     std.mem.sort(IndexedFile, files.items, {}, lessThanIndexedFilePath);
 
     const epoch = currentEpoch(io);
@@ -359,11 +431,14 @@ pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []c
 
     const catalog_bytes = try catalog.buildCatalogBytes(allocator, root, epoch, catalog_inputs);
     defer allocator.free(catalog_bytes);
+    try enforceMemoryBudget(memory_limit_bytes);
     const verify_required_count = files.items.len - postings_inputs.items.len;
     const segment = try postings.buildPostingsSegment(allocator, root_identity.fingerprint, epoch, postings_inputs.items, verify_required_count);
     defer segment.deinit(allocator);
+    try enforceMemoryBudget(memory_limit_bytes);
     const postings_bytes = try postings.serializePostingsSegment(allocator, segment);
     defer allocator.free(postings_bytes);
+    try enforceMemoryBudget(memory_limit_bytes);
 
     const state = try state_dir.buildRootIndexState(allocator, root_identity.fingerprint);
     defer state.deinit(allocator);
@@ -374,6 +449,13 @@ pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []c
         .{ .kind = .postings, .relative_path = "postings.ixpost", .bytes = postings_bytes },
     };
     return generation.publishGenerationPayloads(io, allocator, paths, root_identity.fingerprint, epoch, null, &payloads);
+}
+
+fn recordPublishFailure(io: std.Io, allocator: std.mem.Allocator, config: Config, err: anyerror) !void {
+    switch (err) {
+        error.MemoryBudgetExceeded => try writeRepairState(io, allocator, config, "memory_budget_exceeded"),
+        else => {},
+    }
 }
 
 fn modeFor(request: Request) Mode {
@@ -436,12 +518,13 @@ const IndexedFile = struct {
     }
 };
 
-fn collectIndexFiles(io: std.Io, allocator: std.mem.Allocator, root: []const u8, files: *std.ArrayList(IndexedFile)) !void {
+fn collectIndexFiles(io: std.Io, allocator: std.mem.Allocator, root: []const u8, files: *std.ArrayList(IndexedFile), memory_limit_bytes: usize) !void {
     var large_source_bytes: usize = 0;
-    try collectIndexFilesWithBudget(io, allocator, root, files, &large_source_bytes);
+    try collectIndexFilesWithBudget(io, allocator, root, files, &large_source_bytes, memory_limit_bytes);
 }
 
-fn collectIndexFilesWithBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, files: *std.ArrayList(IndexedFile), large_source_bytes: *usize) !void {
+fn collectIndexFilesWithBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, files: *std.ArrayList(IndexedFile), large_source_bytes: *usize, memory_limit_bytes: usize) !void {
+    try enforceMemoryBudget(memory_limit_bytes);
     const dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return,
         error.AccessDenied => return,
@@ -459,13 +542,13 @@ fn collectIndexFilesWithBudget(io: std.Io, allocator: std.mem.Allocator, root: [
         if (std.mem.eql(u8, entry.name, ".ix")) continue;
         const child_path = try joinPathForward(allocator, root, entry.name);
         switch (entry.kind) {
-            .file => try appendIndexedFile(io, allocator, child_path, files, large_source_bytes),
+            .file => try appendIndexedFile(io, allocator, child_path, files, large_source_bytes, memory_limit_bytes),
             .directory => {
                 if (isExcludedIndexEntry(entry.name)) {
                     allocator.free(child_path);
                     continue;
                 }
-                try collectIndexFilesWithBudget(io, allocator, child_path, files, large_source_bytes);
+                try collectIndexFilesWithBudget(io, allocator, child_path, files, large_source_bytes, memory_limit_bytes);
                 allocator.free(child_path);
             },
             else => allocator.free(child_path),
@@ -473,7 +556,8 @@ fn collectIndexFilesWithBudget(io: std.Io, allocator: std.mem.Allocator, root: [
     }
 }
 
-fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, files: *std.ArrayList(IndexedFile), large_source_bytes: *usize) !void {
+fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8, files: *std.ArrayList(IndexedFile), large_source_bytes: *usize, memory_limit_bytes: usize) !void {
+    try enforceMemoryBudget(memory_limit_bytes);
     var file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
         error.AccessDenied, error.FileNotFound => {
             allocator.free(path);
@@ -500,6 +584,7 @@ fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
             .mtime_ns = stat.mtime.nanoseconds,
             .verify_required = true,
         });
+        try enforceMemoryBudget(memory_limit_bytes);
         return;
     }
     const read_limit: usize = if (stat.size > INDEX_FILE_READ_LIMIT) INDEX_LARGE_SOURCE_FILE_READ_LIMIT else INDEX_FILE_READ_LIMIT;
@@ -517,6 +602,7 @@ fn appendIndexedFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8,
         .size = stat.size,
         .mtime_ns = stat.mtime.nanoseconds,
     });
+    try enforceMemoryBudget(memory_limit_bytes);
 }
 
 const INDEXABLE_LARGE_SOURCE_EXTENSIONS = [_][]const u8{
@@ -1099,6 +1185,24 @@ test "indexd repair command writes reconcile request marker" {
     try std.testing.expect(std.mem.indexOf(u8, contents, "state=reconcile_requested") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "reason=operator_requested_reconcile") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "mode=foreground_repair") != null);
+}
+
+test "indexd memory limit parser is explicit and bounded" {
+    try std.testing.expectEqual(@as(?usize, 512 * 1024 * 1024), parseMemoryLimitMb("512"));
+    try std.testing.expectEqual(@as(?usize, 0), parseMemoryLimitMb("0"));
+    try std.testing.expectEqual(@as(?usize, null), parseMemoryLimitMb(""));
+    try std.testing.expectEqual(@as(?usize, null), parseMemoryLimitMb("invalid"));
+}
+
+test "indexd memory budget rejects resident usage over cap" {
+    try std.testing.expect(memoryBudgetExceeded(2, 1));
+    try std.testing.expect(!memoryBudgetExceeded(1, 1));
+    try std.testing.expect(!memoryBudgetExceeded(std.math.maxInt(usize), 0));
+    if (builtin.os.tag == .windows) {
+        const resident = currentResidentBytes() orelse return error.TestExpectedResidentMemory;
+        try std.testing.expect(resident > 0);
+        try std.testing.expectError(error.MemoryBudgetExceeded, enforceMemoryBudget(1));
+    }
 }
 
 test "indexd watcher ignores index maintenance notifications" {

@@ -7,6 +7,8 @@
     "bench:once": "node tools/scripts/run-once-benchmark.mjs",
     "bench:loop": "node tools/scripts/bench-loop-suite.mjs",
     "bench:loop:infinite": "node tools/scripts/bench-loop-suite.mjs --loops 0",
+    "gate:architecture": "node tools/scripts/ix-architecture-regression-gate.mjs",
+    "eval:agent": "node tools/scripts/ix-agent-real-eval.mjs",
     "dashboard": "node tools/scripts/dashboard-server.mjs"
   }
 }
