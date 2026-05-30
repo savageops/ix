@@ -152,6 +152,9 @@ pub const GenerationRefreshStats = struct {
     enabled: bool = false,
     available: bool = false,
     epoch: ?u64 = null,
+    parent_epoch: ?u64 = null,
+    delta_entries: usize = 0,
+    delta_tombstones: usize = 0,
     refresh_status: []const u8 = "not_wired",
     fallback_reason: []const u8 = "not_wired",
 };

@@ -11,6 +11,7 @@ const postings = @import("postings.zig");
 const state_dir = @import("state_dir.zig");
 const core_stats = @import("stats.zig");
 const trigram = @import("trigram.zig");
+const usn = @import("usn.zig");
 // Pure Zig SIMD search kernels — same VPCMPEQB/VPMOVMSKB/TZCNT instructions
 // as StringZilla but inlineable (no FFI call overhead). Eliminates ~5 ns/call
 // FFI overhead across ~600K calls per search (~3 ms total). Used on the hottest
@@ -515,6 +516,22 @@ fn prepareWarmIndexFrontier(
         };
     }
 
+    if (pin.parent_epoch) |parent_epoch| {
+        return prepareDeltaWarmIndexFrontier(
+            io,
+            allocator,
+            root_state.index_dir,
+            root,
+            root_identity.fingerprint,
+            parent_epoch,
+            pin.epoch,
+            lookup,
+            request,
+            report,
+            known_matches,
+        );
+    }
+
     const paths = generation.buildGenerationPathsInIndexDir(allocator, root_state.index_dir, pin.epoch) catch return warmIndexFallback(report, "generation_paths_failed");
     defer paths.deinit(allocator);
     const catalog_path = std.fs.path.join(allocator, &.{ paths.generation_dir, "catalog.ixcat" }) catch return warmIndexFallback(report, "catalog_path_failed");
@@ -643,6 +660,209 @@ fn appendWarmVerificationFrontier(
         if (!request.hidden and isHiddenDirectoryPath(warmIndexRelativePath(root, path))) continue;
         try active.append(allocator, .{ .path = try allocator.dupe(u8, path) });
     }
+}
+
+fn prepareDeltaWarmIndexFrontier(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    index_dir: []const u8,
+    root: []const u8,
+    root_fingerprint: catalog.RootFingerprint,
+    parent_epoch: generation.Epoch,
+    delta_epoch: generation.Epoch,
+    lookup: postings.LookupPlan,
+    request: cli.SearchRequest,
+    report: *SearchReport,
+    known_matches: ?usize,
+) ?WarmIndexFrontier {
+    const parent_paths = generation.buildGenerationPathsInIndexDir(allocator, index_dir, parent_epoch) catch return warmIndexFallback(report, "parent_generation_paths_failed");
+    defer parent_paths.deinit(allocator);
+    const delta_paths = generation.buildGenerationPathsInIndexDir(allocator, index_dir, delta_epoch) catch return warmIndexFallback(report, "delta_generation_paths_failed");
+    defer delta_paths.deinit(allocator);
+
+    const parent_catalog_path = std.fs.path.join(allocator, &.{ parent_paths.generation_dir, "catalog.ixcat" }) catch return warmIndexFallback(report, "parent_catalog_path_failed");
+    defer allocator.free(parent_catalog_path);
+    const parent_postings_path = std.fs.path.join(allocator, &.{ parent_paths.generation_dir, "postings.ixpost" }) catch return warmIndexFallback(report, "parent_postings_path_failed");
+    defer allocator.free(parent_postings_path);
+    const delta_catalog_path = std.fs.path.join(allocator, &.{ delta_paths.generation_dir, "catalog.ixcat" }) catch return warmIndexFallback(report, "delta_catalog_path_failed");
+    defer allocator.free(delta_catalog_path);
+    const delta_postings_path = std.fs.path.join(allocator, &.{ delta_paths.generation_dir, "postings.ixpost" }) catch return warmIndexFallback(report, "delta_postings_path_failed");
+    defer allocator.free(delta_postings_path);
+
+    const parent_lookup = postings.evaluateLookupPlanFromFile(io, allocator, parent_postings_path, root_fingerprint, parent_epoch, lookup) catch |err| return warmIndexFallback(report, @errorName(err));
+    defer parent_lookup.deinit(allocator);
+    const delta_lookup = postings.evaluateLookupPlanFromFile(io, allocator, delta_postings_path, root_fingerprint, delta_epoch, lookup) catch |err| return warmIndexFallback(report, @errorName(err));
+    defer delta_lookup.deinit(allocator);
+
+    const parent_catalog_bytes = std.Io.Dir.cwd().readFileAlloc(io, parent_catalog_path, allocator, .limited(WARM_INDEX_SEGMENT_READ_LIMIT)) catch return warmIndexFallback(report, "parent_catalog_read_failed");
+    defer allocator.free(parent_catalog_bytes);
+    const delta_catalog_bytes = std.Io.Dir.cwd().readFileAlloc(io, delta_catalog_path, allocator, .limited(WARM_INDEX_SEGMENT_READ_LIMIT)) catch return warmIndexFallback(report, "delta_catalog_read_failed");
+    defer allocator.free(delta_catalog_bytes);
+
+    const parent_snapshot = catalog.parseCatalogForRoot(allocator, parent_catalog_bytes, root_fingerprint) catch |err| return warmIndexFallback(report, @errorName(err));
+    defer parent_snapshot.deinit(allocator);
+    const delta_snapshot = catalog.parseCatalogForRoot(allocator, delta_catalog_bytes, root_fingerprint) catch |err| return warmIndexFallback(report, @errorName(err));
+    defer delta_snapshot.deinit(allocator);
+    if (parent_snapshot.header.generation != parent_epoch) return warmIndexFallback(report, "parent_catalog_generation_mismatch");
+    if (delta_snapshot.header.generation != delta_epoch) return warmIndexFallback(report, "delta_catalog_generation_mismatch");
+
+    const parent_selected = postings.selectCatalogEntriesForCandidates(allocator, parent_snapshot, parent_lookup.candidates) catch return warmIndexFallback(report, "parent_candidate_select_failed");
+    defer allocator.free(parent_selected);
+    const delta_selected = postings.selectCatalogEntriesForCandidates(allocator, delta_snapshot, delta_lookup.candidates) catch return warmIndexFallback(report, "delta_candidate_select_failed");
+    defer allocator.free(delta_selected);
+
+    var active = std.ArrayList(DiscoveredFile).empty;
+    errdefer active.deinit(allocator);
+    for (parent_selected) |entry| {
+        const path = parent_snapshot.path(entry);
+        if (deltaSnapshotContainsPath(delta_snapshot, path)) continue;
+        if (!request.hidden and isHiddenDirectoryPath(warmIndexRelativePath(root, path))) continue;
+        active.append(allocator, .{ .path = allocator.dupe(u8, path) catch return warmIndexFallback(report, "parent_candidate_path_alloc_failed") }) catch return warmIndexFallback(report, "parent_candidate_append_failed");
+    }
+    for (delta_selected) |entry| {
+        const delta_index = catalogEntryIndex(delta_snapshot, entry) orelse return warmIndexFallback(report, "delta_candidate_index_failed");
+        if (catalog.metaIsTombstone(delta_snapshot.metas[delta_index])) continue;
+        const path = delta_snapshot.path(entry);
+        if (!request.hidden and isHiddenDirectoryPath(warmIndexRelativePath(root, path))) continue;
+        active.append(allocator, .{ .path = allocator.dupe(u8, path) catch return warmIndexFallback(report, "delta_candidate_path_alloc_failed") }) catch return warmIndexFallback(report, "delta_candidate_append_failed");
+    }
+
+    var verify_required_count: usize = 0;
+    appendWarmVerificationFrontierWithDelta(allocator, root, request, parent_snapshot, parent_lookup.candidates, delta_snapshot, &active, &verify_required_count) catch return warmIndexFallback(report, "parent_verify_required_append_failed");
+    appendDeltaVerificationFrontier(allocator, root, request, delta_snapshot, delta_lookup.candidates, &active, &verify_required_count) catch return warmIndexFallback(report, "delta_verify_required_append_failed");
+
+    const tombstone_count = countDeltaTombstones(delta_snapshot);
+    const logical_count = logicalDeltaPathCount(parent_snapshot, delta_snapshot, tombstone_count);
+    report.discover_ms = 0;
+    report.files_discovered = logical_count;
+    report.stats.generation_refresh.available = true;
+    report.stats.generation_refresh.epoch = delta_epoch;
+    report.stats.generation_refresh.parent_epoch = parent_epoch;
+    report.stats.generation_refresh.delta_entries = delta_snapshot.entries.len;
+    report.stats.generation_refresh.delta_tombstones = tombstone_count;
+    report.stats.generation_refresh.refresh_status = "live_delta_pinned";
+    report.stats.generation_refresh.fallback_reason = "";
+    report.stats.catalog_index.available = true;
+    report.stats.catalog_index.generation = delta_epoch;
+    report.stats.catalog_index.path_count = logical_count;
+    report.stats.catalog_index.meta_count = logical_count;
+    report.stats.catalog_index.fallback_reason = "";
+    report.stats.postings_index.available = true;
+    report.stats.postings_index.generation = delta_epoch;
+    report.stats.postings_index.trigram_count = @intCast(parent_lookup.header.trigram_count + delta_lookup.header.trigram_count);
+    report.stats.postings_index.postings_count = @intCast(parent_lookup.header.postings_count + delta_lookup.header.postings_count);
+    report.stats.postings_index.file_count = logical_count;
+    report.stats.postings_index.candidate_files = parent_lookup.candidates.len + delta_lookup.candidates.len;
+    report.stats.postings_index.pruned_files = if (logical_count >= active.items.len) logical_count - active.items.len else 0;
+    report.stats.postings_index.verified_files = active.items.len;
+    report.stats.postings_index.fallback_reason = "";
+
+    const owned = active.toOwnedSlice(allocator) catch return warmIndexFallback(report, "delta_candidate_finalize_failed");
+    writeWarmQueryFrontier(io, allocator, index_dir, root_fingerprint, delta_epoch, request, logical_count, owned);
+    return .{
+        .active_files = owned,
+        .root = root,
+        .root_fingerprint = root_fingerprint,
+        .epoch = delta_epoch,
+        .discovered = logical_count,
+        .candidate_count = owned.len,
+        .known_matches = known_matches,
+    };
+}
+
+fn appendWarmVerificationFrontierWithDelta(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    request: cli.SearchRequest,
+    snapshot: catalog.CatalogSnapshot,
+    candidate_ids: []const catalog.FileId,
+    delta_snapshot: catalog.CatalogSnapshot,
+    active: *std.ArrayList(DiscoveredFile),
+    verify_required_count: *usize,
+) !void {
+    const count = @min(snapshot.entries.len, snapshot.metas.len);
+    for (snapshot.entries[0..count], snapshot.metas[0..count]) |entry, meta| {
+        if (!catalog.metaRequiresVerification(meta)) continue;
+        const path = snapshot.path(entry);
+        if (deltaSnapshotContainsPath(delta_snapshot, path)) continue;
+        verify_required_count.* += 1;
+        if (postings.containsFileId(candidate_ids, entry.file_id)) continue;
+        if (!request.hidden and isHiddenDirectoryPath(warmIndexRelativePath(root, path))) continue;
+        try active.append(allocator, .{ .path = try allocator.dupe(u8, path) });
+    }
+}
+
+fn appendDeltaVerificationFrontier(
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    request: cli.SearchRequest,
+    snapshot: catalog.CatalogSnapshot,
+    candidate_ids: []const catalog.FileId,
+    active: *std.ArrayList(DiscoveredFile),
+    verify_required_count: *usize,
+) !void {
+    const count = @min(snapshot.entries.len, snapshot.metas.len);
+    for (snapshot.entries[0..count], snapshot.metas[0..count]) |entry, meta| {
+        if (catalog.metaIsTombstone(meta)) continue;
+        if (!catalog.metaRequiresVerification(meta)) continue;
+        verify_required_count.* += 1;
+        if (postings.containsFileId(candidate_ids, entry.file_id)) continue;
+        const path = snapshot.path(entry);
+        if (!request.hidden and isHiddenDirectoryPath(warmIndexRelativePath(root, path))) continue;
+        try active.append(allocator, .{ .path = try allocator.dupe(u8, path) });
+    }
+}
+
+fn deltaSnapshotContainsPath(snapshot: catalog.CatalogSnapshot, path: []const u8) bool {
+    for (snapshot.entries) |entry| {
+        if (warmOverlayPathEql(snapshot.path(entry), path)) return true;
+    }
+    return false;
+}
+
+fn warmOverlayPathEql(lhs: []const u8, rhs: []const u8) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        const left_path = if (left == '\\') '/' else left;
+        const right_path = if (right == '\\') '/' else right;
+        if (builtin.os.tag == .windows) {
+            if (std.ascii.toLower(left_path) != std.ascii.toLower(right_path)) return false;
+        } else if (left_path != right_path) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn catalogEntryIndex(snapshot: catalog.CatalogSnapshot, target: catalog.PathEntry) ?usize {
+    for (snapshot.entries, 0..) |entry, index| {
+        if (entry.file_id == target.file_id) return index;
+    }
+    return null;
+}
+
+fn countDeltaTombstones(snapshot: catalog.CatalogSnapshot) usize {
+    var count: usize = 0;
+    for (snapshot.metas) |meta| {
+        if (catalog.metaIsTombstone(meta)) count += 1;
+    }
+    return count;
+}
+
+fn logicalDeltaPathCount(parent_snapshot: catalog.CatalogSnapshot, delta_snapshot: catalog.CatalogSnapshot, _: usize) usize {
+    var overridden_existing: usize = 0;
+    var added_live: usize = 0;
+    for (delta_snapshot.entries, 0..) |entry, index| {
+        const path = delta_snapshot.path(entry);
+        const exists_in_parent = deltaSnapshotContainsPath(parent_snapshot, path);
+        const tombstone = index < delta_snapshot.metas.len and catalog.metaIsTombstone(delta_snapshot.metas[index]);
+        if (exists_in_parent) {
+            overridden_existing += 1;
+        } else if (!tombstone) {
+            added_live += 1;
+        }
+    }
+    return parent_snapshot.entries.len - @min(parent_snapshot.entries.len, overridden_existing) + added_live;
 }
 
 fn warmIndexFallback(report: *SearchReport, reason: []const u8) ?WarmIndexFrontier {
@@ -6213,6 +6433,85 @@ test "search run consumes live warm postings and scans only candidate files" {
     try std.testing.expectEqual(report.hits[0].line, capped_report.hits[0].line);
     try std.testing.expectEqual(report.hits[0].column, capped_report.hits[0].column);
     try std.testing.expectEqualStrings(report.hits[0].preview, capped_report.hits[0].preview);
+}
+
+test "warm delta generation overlays parent postings without stale base matches" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "fresh.txt", .data = "absent\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dead.txt", .data = "needle\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const base_pin = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "absent\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "fresh.txt", .data = "needle\n" });
+    const candidate_path = try std.fs.path.join(allocator, &.{ root_path, "candidate.txt" });
+    const fresh_path = try std.fs.path.join(allocator, &.{ root_path, "fresh.txt" });
+    const dead_path = try std.fs.path.join(allocator, &.{ root_path, "dead.txt" });
+    const delta_epoch = base_pin.epoch + 1;
+    const index_dir = try testRootIndexDir(allocator, root_path);
+    const delta_paths = try generation.buildGenerationPathsInIndexDir(allocator, index_dir, delta_epoch);
+    defer delta_paths.deinit(allocator);
+    const delta_catalog = [_]catalog.CatalogFileInput{
+        .{
+            .path = candidate_path,
+            .size = 7,
+            .mtime_ns = 2,
+            .sample = "absent\n",
+        },
+        .{
+            .path = dead_path,
+            .size = 0,
+            .mtime_ns = 2,
+            .sample = "",
+            .tombstone = true,
+        },
+        .{
+            .path = fresh_path,
+            .size = 7,
+            .mtime_ns = 2,
+            .sample = "needle\n",
+        },
+    };
+    const delta_postings = [_]postings.PostingsFileInput{
+        .{ .file_id = 3, .bytes = "needle\n" },
+    };
+    _ = try usn.publishDeltaGeneration(io, allocator, delta_paths, .{
+        .root = root_path,
+        .root_fingerprint = base_pin.root_fingerprint,
+        .epoch = delta_epoch,
+        .parent_epoch = base_pin.epoch,
+        .catalog_files = &delta_catalog,
+        .postings_files = &delta_postings,
+    });
+    try std.Io.Dir.cwd().createDirPath(io, index_dir);
+    const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    const live_marker = try testLiveMarker(allocator, root_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
+
+    var request = testSearchRequest("lit:needle", root_path);
+    request.index_enabled = true;
+    request.nexus_disabled = true;
+    const plan = try expr.parse(request.expression);
+    const report = try run(io, allocator, request, plan);
+
+    try std.testing.expect(report.stats.catalog_index.available);
+    try std.testing.expect(report.stats.postings_index.available);
+    try std.testing.expectEqualStrings("live_delta_pinned", report.stats.generation_refresh.refresh_status);
+    try std.testing.expectEqual(base_pin.epoch, report.stats.generation_refresh.parent_epoch.?);
+    try std.testing.expectEqual(delta_epoch, report.stats.generation_refresh.epoch.?);
+    try std.testing.expectEqual(@as(usize, 3), report.stats.generation_refresh.delta_entries);
+    try std.testing.expectEqual(@as(usize, 1), report.stats.generation_refresh.delta_tombstones);
+    try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
+    try std.testing.expectEqual(@as(usize, 1), report.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), report.hit_count);
+    try std.testing.expectEqualStrings(fresh_path, report.hits[0].path);
 }
 
 test "stats-only live warm postings return empty frontier without catalog scan" {

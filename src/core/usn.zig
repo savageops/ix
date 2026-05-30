@@ -624,7 +624,7 @@ pub fn publishDeltaGeneration(
     paths: generation.GenerationPaths,
     input: DeltaGenerationInput,
 ) !generation.ReaderPin {
-    if (input.catalog_files.len != input.postings_files.len) return error.DeltaApplyInputCountMismatch;
+    if (input.postings_files.len > input.catalog_files.len) return error.DeltaApplyInputCountMismatch;
 
     const catalog_bytes = try catalog.buildCatalogBytes(allocator, input.root, input.epoch, input.catalog_files);
     defer allocator.free(catalog_bytes);

@@ -162,6 +162,7 @@ pub const FileMeta = extern struct {
 };
 
 pub const FILE_META_VERIFY_REQUIRED: u16 = 1;
+pub const FILE_META_TOMBSTONE: u16 = 2;
 
 pub const FileMetaInput = struct {
     file_id: FileId,
@@ -171,6 +172,7 @@ pub const FileMetaInput = struct {
     kind: FileKind = .regular,
     sample: []const u8 = "",
     verify_required: bool = false,
+    tombstone: bool = false,
 };
 
 pub const CatalogFileInput = struct {
@@ -181,6 +183,7 @@ pub const CatalogFileInput = struct {
     kind: FileKind = .regular,
     sample: []const u8 = "",
     verify_required: bool = false,
+    tombstone: bool = false,
 };
 
 pub fn isValidFileId(value: FileId) bool {
@@ -260,6 +263,9 @@ fn lessThanPath(_: void, lhs: []const u8, rhs: []const u8) bool {
 }
 
 pub fn makeFileMeta(input: FileMetaInput) FileMeta {
+    var reserved: u16 = 0;
+    if (input.verify_required) reserved |= FILE_META_VERIFY_REQUIRED;
+    if (input.tombstone) reserved |= FILE_META_TOMBSTONE;
     return .{
         .file_id = input.file_id,
         .size = input.size,
@@ -267,12 +273,16 @@ pub fn makeFileMeta(input: FileMetaInput) FileMeta {
         .file_index_or_inode = input.file_index_or_inode,
         .kind = input.kind,
         .text = classifySample(input.sample),
-        .reserved = if (input.verify_required) FILE_META_VERIFY_REQUIRED else 0,
+        .reserved = reserved,
     };
 }
 
 pub fn metaRequiresVerification(meta: FileMeta) bool {
     return (meta.reserved & FILE_META_VERIFY_REQUIRED) != 0;
+}
+
+pub fn metaIsTombstone(meta: FileMeta) bool {
+    return (meta.reserved & FILE_META_TOMBSTONE) != 0;
 }
 
 pub fn classifySample(sample: []const u8) TextKind {
@@ -314,6 +324,7 @@ pub fn buildCatalogBytes(
             .kind = file.kind,
             .sample = file.sample,
             .verify_required = file.verify_required,
+            .tombstone = file.tombstone,
         });
     }
 

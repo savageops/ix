@@ -402,6 +402,16 @@ fn writeGenerationRefreshJson(writer: anytype, generation_refresh: core_stats.Ge
     } else {
         try writer.writeAll("null");
     }
+    try writer.writeAll(",\"parent_epoch\":");
+    if (generation_refresh.parent_epoch) |parent_epoch| {
+        try writer.print("{}", .{parent_epoch});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.print(",\"delta_entries\":{},\"delta_tombstones\":{}", .{
+        generation_refresh.delta_entries,
+        generation_refresh.delta_tombstones,
+    });
     try writer.writeAll(",\"refresh_status\":");
     try writeJsonString(writer, generation_refresh.refresh_status);
     try writer.writeAll(",\"fallback_reason\":");
