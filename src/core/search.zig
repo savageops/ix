@@ -2759,7 +2759,7 @@ fn scanFileMmap(
     var literal_admission_satisfied = false;
     if (mono) |m| {
         if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
-            if (!request.case_insensitive and simd.indexOf(data, needle) == null) {
+            if (!request.case_insensitive and sz.indexOfAdmission(data, needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
                 shard.scan_work_ms_total += file_ms;

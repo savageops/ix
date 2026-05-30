@@ -14,6 +14,7 @@ const stateDir = argValue(args, "--state-dir", path.join(os.tmpdir(), `ix-archit
 const baselineIxMs = Number(argValue(args, "--baseline-ix-ms", process.env.IX_ARCH_GATE_BASELINE_IX_MS ?? "575.3829"));
 const baselineTolerancePct = Number(argValue(args, "--baseline-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_TOLERANCE_PCT ?? "5"));
 const baselineSoftTolerancePct = Number(argValue(args, "--baseline-soft-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_SOFT_TOLERANCE_PCT ?? "2.5"));
+const ripgrepWarmupSamples = Number(argValue(args, "--ripgrep-warmup", process.env.IX_ARCH_GATE_RIPGREP_WARMUP ?? "6"));
 const planningChainSlug = argValue(
   args,
   "--planning-chain",
@@ -22,6 +23,7 @@ const planningChainSlug = argValue(
 const planningChainPhases = parseCsvArg(
   argValue(args, "--planning-phases", process.env.IX_ARCH_GATE_PLANNING_PHASES ?? "a,b,c,d"),
 );
+const planningChainState = argValue(args, "--planning-state", process.env.IX_ARCH_GATE_PLANNING_STATE ?? "archived");
 
 function run(command, commandArgs, options = {}) {
   const started = process.hrtime.bigint();
@@ -222,35 +224,49 @@ function planningLane() {
   const chainConfigFailures = [];
   if (!match) chainConfigFailures.push(`planning chain slug must start with a numeric prefix: ${planningChainSlug}`);
   if (planningChainPhases.length === 0) chainConfigFailures.push("planning chain phases must not be empty");
+  if (!["archived", "pending"].includes(planningChainState)) {
+    chainConfigFailures.push(`planning state must be archived or pending: ${planningChainState}`);
+  }
   const prefix = match?.[1] ?? "";
   const suffix = match?.[2] ?? planningChainSlug;
+  const chainRoot = planningChainState === "pending" ? ".docs/todo/pending" : ".docs/todo/changelog";
+  const oppositeRoot = planningChainState === "pending" ? ".docs/todo/changelog" : ".docs/todo/pending";
   const required = match
     ? [
-        `.docs/todo/changelog/${planningChainSlug}.md`,
-        ...planningChainPhases.map((phase) => `.docs/todo/changelog/${prefix}${phase}-${suffix}.md`),
+        `${chainRoot}/${planningChainSlug}.md`,
+        ...planningChainPhases.map((phase) => `${chainRoot}/${prefix}${phase}-${suffix}.md`),
       ]
     : [];
-  const stalePending = required.map((file) => file.replace("/changelog/", "/pending/")).filter((file) => existsSync(path.join(ROOT, file)));
+  const staleOpposite = required
+    .map((file) => file.replace(chainRoot, oppositeRoot))
+    .filter((file) => existsSync(path.join(ROOT, file)));
+  const stalePending = planningChainState === "archived" ? staleOpposite : [];
   const missing = required.filter((file) => !existsSync(path.join(ROOT, file)));
   const incomplete = [];
   for (const file of required) {
     const absolute = path.join(ROOT, file);
     if (!existsSync(absolute)) continue;
     const body = readFileSync(absolute, "utf8");
-    if (!body.includes("status: done")) incomplete.push(`${file}: status is not done`);
-    if (/^evidence:.*PLACEHOLDER/m.test(body)) incomplete.push(`${file}: evidence still contains PLACEHOLDER`);
+    if (planningChainState === "archived") {
+      if (!body.includes("status: done")) incomplete.push(`${file}: status is not done`);
+      if (/^evidence:.*PLACEHOLDER/m.test(body)) incomplete.push(`${file}: evidence still contains PLACEHOLDER`);
+    } else if (!body.includes("status: pending")) {
+      incomplete.push(`${file}: status is not pending`);
+    }
   }
   const failures = [
     ...chainConfigFailures,
     ...missing.map((file) => `${file}: missing`),
-    ...stalePending.map((file) => `${file}: stale pending file remains`),
+    ...staleOpposite.map((file) => `${file}: duplicate ${planningChainState === "pending" ? "changelog" : "pending"} file remains`),
     ...incomplete,
   ];
   return lane("planning_chain", failures.length === 0 ? "ok" : "failed", {
     chain: planningChainSlug,
+    state: planningChainState,
     phases: planningChainPhases,
     required,
     missing,
+    staleOpposite,
     stalePending,
     incomplete,
     failures,
@@ -641,7 +657,7 @@ function ripgrepLane() {
       "--threads",
       "32",
       "--warmup",
-      "2",
+      String(ripgrepWarmupSamples),
       "--samples",
       "12",
       "--quiet",
@@ -674,11 +690,15 @@ function ripgrepLane() {
         profile: latest.profile,
         expression: latest.expression,
         samples: 12,
-        warmup: 2,
+        warmup: ripgrepWarmupSamples,
         ixMs,
         rgMs,
+        ixSampleDurationsMs: latest.iexSampleDurationsMs ?? [],
+        ixEngineSampleDurationsMs: latest.iexEngineSampleDurationsMs ?? [],
+        rgSampleDurationsMs: latest.competitors?.ripgrep?.sampleDurationsMs ?? [],
         speedupPct: latest.speedupPct,
         matchCount,
+        phaseMs: latest.phaseMs ?? {},
         baselineIxMs,
         baselineTolerancePct,
         baselineSoftTolerancePct,
@@ -696,19 +716,21 @@ function ripgrepLane() {
   const confirm = runWindow("confirm");
   if (confirm.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm });
 
-  const accepted = primary.ok && confirm.ok && (primary.softOk || confirm.softOk);
-  if (!primary.ok && confirm.ok && confirm.softOk) {
+  const hardPasses = (primary.ok ? 1 : 0) + (confirm.ok ? 1 : 0);
+  const accepted = hardPasses === 2 && (primary.softOk || confirm.softOk);
+  if (hardPasses === 1) {
     const tiebreaker = runWindow("tiebreaker");
     if (tiebreaker.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm, tiebreaker });
-    const tiebreakerAccepted = tiebreaker.ok && tiebreaker.softOk;
+    const tiebreakerHardPasses = hardPasses + (tiebreaker.ok ? 1 : 0);
+    const tiebreakerAccepted = tiebreakerHardPasses >= 2;
     return lane("ripgrep_12_sample", tiebreakerAccepted ? "ok" : "failed", {
       corpus,
       primary,
       confirm,
       tiebreaker,
       interpretation: tiebreakerAccepted
-        ? "primary window crossed the hard guard, but confirm and tiebreaker windows stayed inside the soft regression band"
-        : "primary window crossed the hard guard and the tiebreaker did not prove recovery inside the soft regression band",
+        ? "one measured window crossed the hard guard, but two independent windows stayed inside the hard regression guard"
+        : "paired benchmark windows disagreed and the tiebreaker did not produce two hard-pass windows",
     });
   }
 

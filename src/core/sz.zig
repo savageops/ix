@@ -33,6 +33,15 @@ extern fn ix_sz_find(haystack: [*]const u8, h_len: usize, needle: [*]const u8, n
 extern fn ix_sz_find_byte(haystack: [*]const u8, h_len: usize, needle: [*]const u8) ?[*]const u8;
 extern fn ix_sz_find_byteset(haystack: [*]const u8, h_len: usize, set: *const ByteSet) ?[*]const u8;
 
+const AdmissionSkipCache = struct {
+    initialized: bool = false,
+    ptr: [*]const u8 = undefined,
+    len: usize = 0,
+    table: [256]usize = undefined,
+};
+
+threadlocal var admission_skip_cache: AdmissionSkipCache = .{};
+
 /// 256-bit byte membership bitmap, ABI-compatible with `sz_byteset_t`.
 /// 4 × u64 = 32 bytes. Bit `c` is set iff byte value `c` is in the set.
 pub const ByteSet = extern struct {
@@ -78,18 +87,26 @@ pub fn indexOfAdmission(haystack: []const u8, needle: []const u8) ?usize {
 fn indexOfBoyerMooreHorspool(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return null;
-    var skip_table: [256]usize = undefined;
-    @memset(&skip_table, needle.len);
-    for (needle[0 .. needle.len - 1], 0..) |byte, index| {
-        skip_table[byte] = needle.len - 1 - index;
+    if (!admission_skip_cache.initialized or
+        admission_skip_cache.ptr != needle.ptr or
+        admission_skip_cache.len != needle.len)
+    {
+        admission_skip_cache.initialized = true;
+        admission_skip_cache.ptr = needle.ptr;
+        admission_skip_cache.len = needle.len;
+        @memset(&admission_skip_cache.table, needle.len);
+        for (needle[0 .. needle.len - 1], 0..) |byte, index| {
+            admission_skip_cache.table[byte] = needle.len - 1 - index;
+        }
     }
 
     var cursor: usize = 0;
     const last = needle.len - 1;
     const limit = haystack.len - needle.len;
     while (cursor <= limit) {
-        if (std.mem.eql(u8, haystack[cursor .. cursor + needle.len], needle)) return cursor;
-        cursor += skip_table[haystack[cursor + last]];
+        const tail = haystack[cursor + last];
+        if (tail == needle[last] and std.mem.eql(u8, haystack[cursor .. cursor + needle.len], needle)) return cursor;
+        cursor += admission_skip_cache.table[tail];
     }
     return null;
 }

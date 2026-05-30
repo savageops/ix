@@ -175,22 +175,51 @@ function parseIxReport(stdout) {
 
 function measureIxSearch(binaryPath, context, measureOptions) {
   const args = buildIxSearchArgs(context);
-  const result = runMeasuredCommand(binaryPath, args, [0], measureOptions);
-  const report = parseIxReport(result.stdout);
-  if (result.stdout?.trim() && !report) {
-    throw new Error(`IX-Zig benchmark output was not valid JSON for ${binaryPath}`);
+  const warmup = Math.max(0, Number(measureOptions.warmup ?? 0));
+  const samples = Math.max(1, Number(measureOptions.samples ?? 1));
+
+  for (let i = 0; i < warmup; i += 1) {
+    runTimedCommand(binaryPath, args, [0], measureOptions);
   }
-  const engineMs = report?.stats?.timings?.total_ms ?? result.durationMs;
+
+  const measuredRuns = [];
+  for (let i = 0; i < samples; i += 1) {
+    const result = runTimedCommand(binaryPath, args, [0], measureOptions);
+    const report = parseIxReport(result.stdout);
+    if (result.stdout?.trim() && !report) {
+      throw new Error(`IX-Zig benchmark output was not valid JSON for ${binaryPath}`);
+    }
+    const engineMs = report?.stats?.timings?.total_ms ?? result.durationMs;
+    measuredRuns.push({
+      result,
+      report,
+      engineMs,
+      cliMs: result.durationMs,
+      sampleIndex: i,
+    });
+  }
+
+  const byEngine = [...measuredRuns].sort((left, right) => left.engineMs - right.engineMs);
+  const medianIndex = Math.floor(byEngine.length / 2);
+  const selected = byEngine[medianIndex];
+  const engineSamples = byEngine.map((run) => run.engineMs);
+  const cliSamples = [...measuredRuns].sort((left, right) => left.cliMs - right.cliMs).map((run) => run.cliMs);
 
   return {
     binaryPath,
     args,
-    result,
-    report,
-    engineMs,
-    cliMs: result.durationMs,
-    processOverheadMs: Math.max(0, result.durationMs - engineMs),
-    timingSource: report?.stats?.timings?.total_ms ? "engine_total_ms" : "wall_clock_ms",
+    result: {
+      ...selected.result,
+      selectionStrategy: "median_engine_duration",
+      sampleDurationsMs: cliSamples,
+    },
+    report: selected.report,
+    engineMs: selected.engineMs,
+    cliMs: selected.cliMs,
+    processOverheadMs: Math.max(0, selected.cliMs - selected.engineMs),
+    sampleDurationsMs: cliSamples,
+    engineSampleDurationsMs: engineSamples,
+    timingSource: selected.report?.stats?.timings?.total_ms ? "engine_total_ms" : "wall_clock_ms",
   };
 }
 
@@ -539,6 +568,8 @@ function measureIxCompetitor(context, measureOptions, binaryPath, { label, kind,
       durationMs: measured.engineMs,
       cliDurationMs: measured.cliMs,
       processOverheadMs: measured.processOverheadMs,
+      sampleDurationsMs: measured.sampleDurationsMs,
+      engineSampleDurationsMs: measured.engineSampleDurationsMs,
       status: measured.result.status,
       timingSource: measured.timingSource,
       matchCount: measured.report?.stats?.matches_found ?? null,
@@ -626,6 +657,7 @@ function runCompetitors(context, measureOptions) {
         args: renderedArgs,
         strategy: optimizedInvocation.strategy,
         durationMs: run.durationMs,
+        sampleDurationsMs: run.sampleDurationsMs ?? [],
         status: run.status,
         suppressOutput,
       };
@@ -851,6 +883,8 @@ export function runOneBenchmark(options = {}) {
     iexMs: ixEngineMs,
     iexCliMs: ixMeasurement.cliMs,
     iexProcessOverheadMs: ixMeasurement.processOverheadMs,
+    iexSampleDurationsMs: ixMeasurement.sampleDurationsMs,
+    iexEngineSampleDurationsMs: ixMeasurement.engineSampleDurationsMs,
     rgMs,
     iexToRgRatio,
     iexToPreviousRatio: computeRatio(ixEngineMs, previousIxMs),
