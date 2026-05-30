@@ -9,13 +9,17 @@ const REPORT_DIR = path.join(ROOT, "tools", "reports", "architecture-gate");
 
 const args = process.argv.slice(2);
 const quick = args.includes("--quick");
+const speedOnly = args.includes("--speed-only");
 const schemaSelfTest = args.includes("--schema-self-test");
 const outPath = argValue(args, "--out", path.join(REPORT_DIR, `architecture-gate-${timestampSlug()}.json`));
 const stateDir = argValue(args, "--state-dir", path.join(os.tmpdir(), `ix-architecture-gate-${process.pid}`));
 const baselineIxMs = Number(argValue(args, "--baseline-ix-ms", process.env.IX_ARCH_GATE_BASELINE_IX_MS ?? "575.3829"));
 const baselineTolerancePct = Number(argValue(args, "--baseline-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_TOLERANCE_PCT ?? "5"));
 const baselineSoftTolerancePct = Number(argValue(args, "--baseline-soft-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_SOFT_TOLERANCE_PCT ?? "2.5"));
-const ripgrepWarmupSamples = Number(argValue(args, "--ripgrep-warmup", process.env.IX_ARCH_GATE_RIPGREP_WARMUP ?? "6"));
+const ripgrepWarmupSamples = Number(argValue(args, "--ripgrep-warmup", process.env.IX_ARCH_GATE_RIPGREP_WARMUP ?? "2"));
+const baselineWarmupSamples = Number(
+  argValue(args, "--baseline-warmup", process.env.IX_ARCH_GATE_BASELINE_WARMUP ?? "2"),
+);
 const previousIxBinary = argValue(args, "--previous-ix-binary", process.env.IX_PREVIOUS_BINARY ?? "");
 const pairedImprovementTolerancePct = Number(argValue(args, "--paired-improvement-tolerance-pct", process.env.IX_ARCH_GATE_PAIRED_IMPROVEMENT_TOLERANCE_PCT ?? "1.5"));
 const patchNoRegressionTolerancePct = Number(argValue(args, "--patch-no-regression-tolerance-pct", process.env.IX_ARCH_GATE_PATCH_NO_REGRESSION_TOLERANCE_PCT ?? "1.5"));
@@ -123,6 +127,76 @@ function ripgrepWindowStrongPass(window) {
   );
 }
 
+function ripgrepWindowRegressionPct(window) {
+  const value = window?.metrics?.regressionPct;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function ripgrepProofSummary(windows) {
+  const present = windows.filter(isPlainObject);
+  const fixedPasses = present.filter((window) => window.ok === true).length;
+  const softPasses = present.filter((window) => window.softOk === true).length;
+  const hardRegressionWindows = present.filter((window) => window.ok !== true && window.patchNoRegressionOk !== true).length;
+  const patchNoRegressionPasses = present.filter((window) => window.patchNoRegressionOk === true).length;
+  const pairedImprovementPasses = present.filter((window) => window.pairedOk === true).length;
+  const incomparableBaselineWindows = present.filter((window) => window.baselineComparable === false).length;
+  const regressionPcts = present.map(ripgrepWindowRegressionPct).filter((value) => value !== null);
+  const worstRegressionPct = regressionPcts.length > 0 ? Math.max(...regressionPcts) : null;
+  const bestRegressionPct = regressionPcts.length > 0 ? Math.min(...regressionPcts) : null;
+  const spreadPct =
+    worstRegressionPct !== null && bestRegressionPct !== null ? Math.abs(worstRegressionPct - bestRegressionPct) : null;
+  let proofKind = "missing";
+  if (present.length > 0 && incomparableBaselineWindows > 0) {
+    proofKind = "incomparable_baseline_config";
+  } else if (present.length > 0 && fixedPasses === present.length && softPasses === present.length) {
+    proofKind = "fixed_baseline_improved";
+  } else if (fixedPasses >= 2 && softPasses >= 1 && hardRegressionWindows === 0) {
+    proofKind = "fixed_baseline_no_regression";
+  } else if (pairedImprovementPasses >= 2 && fixedPasses >= 1) {
+    proofKind = "historical_paired_improvement";
+  } else if (patchNoRegressionPasses >= 2) {
+    proofKind = "same_source_patch_no_regression";
+  } else if (fixedPasses > 0 && hardRegressionWindows > 0) {
+    proofKind = "unstable_mixed_baseline";
+  } else {
+    proofKind = "failed_baseline";
+  }
+  return {
+    proofKind,
+    fixedPasses,
+    softPasses,
+    pairedImprovementPasses,
+    patchNoRegressionPasses,
+    incomparableBaselineWindows,
+    hardRegressionWindows,
+    worstRegressionPct,
+    bestRegressionPct,
+    spreadPct,
+    windows: present.length,
+  };
+}
+
+function ripgrepProofInterpretation(summary) {
+  switch (summary.proofKind) {
+    case "fixed_baseline_improved":
+      return "all measured windows stayed inside the fixed baseline soft band; this is speed improvement evidence";
+    case "fixed_baseline_no_regression":
+      return "fixed-baseline windows passed, but at least one window missed the soft improvement band; this is no-regression evidence, not speed progress";
+    case "historical_paired_improvement":
+      return "paired historical-source windows improved while fixed-baseline evidence stayed partially healthy";
+    case "same_source_patch_no_regression":
+      return "same-source comparator windows proved this patch did not materially worsen clean HEAD; this is not historical speed improvement evidence";
+    case "incomparable_baseline_config":
+      return "ripgrep benchmark warmup configuration does not match the fixed baseline; rerun with the baseline warmup or provide a matching baseline";
+    case "unstable_mixed_baseline":
+      return "fixed-baseline windows disagreed; treat this as benchmark instability until a tighter attribution run explains the spread";
+    case "failed_baseline":
+      return "fixed-baseline windows failed and no stronger comparator evidence rescued the lane";
+    default:
+      return "ripgrep benchmark evidence is missing or incomplete";
+  }
+}
+
 function validateRipgrepLane(entry, failures) {
   if (entry.id !== "ripgrep_12_sample" || entry.status !== "ok") return;
   const fixedPasses = ["primary", "confirm", "tiebreaker"].filter((key) => ripgrepWindowFixedPass(entry[key])).length;
@@ -156,6 +230,11 @@ function validateRipgrepLane(entry, failures) {
       failures.push("ripgrep_12_sample: same-source patch no-regression acceptance requires two independent paired passes");
     }
   }
+  if (!isPlainObject(entry.proof)) {
+    failures.push("ripgrep_12_sample: ok status requires proof classification");
+  } else if (typeof entry.proof.proofKind !== "string") {
+    failures.push("ripgrep_12_sample.proof.proofKind: must be a string");
+  }
 }
 
 function validateReport(report) {
@@ -182,7 +261,7 @@ function validateReport(report) {
 
   if (!isPlainObject(report)) failures.push("report: must be an object");
   if (!["ok", "failed"].includes(report.status)) failures.push("report.status: must be ok or failed");
-  if (!["quick", "full"].includes(report.mode)) failures.push("report.mode: must be quick or full");
+  if (!["quick", "full", "speed-only"].includes(report.mode)) failures.push("report.mode: must be quick, full, or speed-only");
   if (typeof report.stateDir !== "string" || report.stateDir.length === 0) failures.push("report.stateDir: must be a non-empty string");
   if (typeof report.reportPath !== "string" || report.reportPath.length === 0) failures.push("report.reportPath: must be a non-empty string");
   if (!Array.isArray(report.lanes)) {
@@ -223,6 +302,7 @@ function validateReport(report) {
       entry.status === "failed" &&
       entry.failures.length === 0 &&
       !Object.hasOwn(entry, "reason") &&
+      !Object.hasOwn(entry, "evidence") &&
       !Object.hasOwn(entry, "primary") &&
       !Object.hasOwn(entry, "confirm")
     ) {
@@ -308,6 +388,7 @@ function runSchemaSelfTest() {
     "ripgrep_12_sample: ok status requires at least one fixed-baseline passing window",
     "ripgrep_12_sample: ok status with a hard-regression window requires two strong independent passes",
     "ripgrep_12_sample: same-source comparator artifact cannot provide paired improvement evidence",
+    "ripgrep_12_sample: ok status requires proof classification",
   ];
   const missing = required.filter((needle) => !failures.includes(needle));
   const report = {
@@ -424,12 +505,14 @@ function planningLane() {
 }
 
 function agentDryRunLane() {
+  if (speedOnly) return lane("agent_real_dry_run", "skipped", { reason: "--speed-only" });
   const agent = run(process.execPath, ["tools/scripts/ix-agent-real-eval.mjs", "--dry-run"]);
   return lane("agent_real_dry_run", agent.exitCode === 0 ? "ok" : "failed", { evidence: agent });
 }
 
 function agentRealLane() {
   if (quick) return lane("agent_real", "skipped", { reason: "--quick" });
+  if (speedOnly) return lane("agent_real", "skipped", { reason: "--speed-only" });
   const agent = run(process.execPath, ["tools/scripts/ix-agent-real-eval.mjs"]);
   if (agent.exitCode !== 0) return lane("agent_real", "failed", { evidence: agent });
   let parsed;
@@ -456,6 +539,7 @@ function agentRealLane() {
 }
 
 function buildLane() {
+  if (speedOnly) return lane("zig_test", "skipped", { reason: "--speed-only" });
   if (quick) return lane("zig_test", "skipped", { reason: "--quick" });
   const test = run(resolveZigExe(), ["build", "test", "--summary", "all"], {
     env: {
@@ -915,10 +999,18 @@ function memoryCapLane() {
   });
 }
 
-function ripgrepLane() {
+function ripgrepLane(controlLane = null) {
   const corpus = process.env.IX_BENCHSUITE_LINUX ?? "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux";
   if (!existsSync(corpus)) return lane("ripgrep_12_sample", "skipped", { reason: "ripgrep benchsuite corpus missing", corpus });
   if (quick) return lane("ripgrep_12_sample", "skipped", { reason: "--quick", corpus });
+  if (controlLane?.status === "failed") {
+    return lane("ripgrep_12_sample", "skipped", {
+      corpus,
+      reason: "benchmark control failed; skipping source-regression attribution until the control window is valid",
+      controlReason: controlLane.reason ?? null,
+      controlMetrics: controlLane.metrics ?? null,
+    });
+  }
   const latestPath = path.join(ROOT, "tools", "reports", "latest.json");
   const maxAllowed = baselineIxMs * (1 + baselineTolerancePct / 100);
   const softMaxAllowed = baselineIxMs * (1 + baselineSoftTolerancePct / 100);
@@ -968,10 +1060,12 @@ function ripgrepLane() {
       previousIxSourceRelation === "unknown" ||
       previousIxSourceRelation === "different_source";
     const previousIsSameSourceComparator = previousIxSourceRelation === "same_source_different_binary";
-    const regressionPct = Number.isFinite(ixMs) && baselineIxMs > 0 ? ((ixMs - baselineIxMs) / baselineIxMs) * 100 : null;
+    const baselineComparable = ripgrepWarmupSamples === baselineWarmupSamples;
+    const regressionPct =
+      baselineComparable && Number.isFinite(ixMs) && baselineIxMs > 0 ? ((ixMs - baselineIxMs) / baselineIxMs) * 100 : null;
     const pairedImprovementPct = Number.isFinite(pairedRatio) && pairedRatio > 0 ? (1 - pairedRatio) * 100 : null;
-    const ok = Number.isFinite(ixMs) && ixMs <= maxAllowed;
-    const softOk = Number.isFinite(ixMs) && ixMs <= softMaxAllowed;
+    const ok = baselineComparable && Number.isFinite(ixMs) && ixMs <= maxAllowed;
+    const softOk = baselineComparable && Number.isFinite(ixMs) && ixMs <= softMaxAllowed;
     const patchNoRegressionMaxRatio = 1 + patchNoRegressionTolerancePct / 100;
     const pairedOk =
       previousIxBinary !== "" &&
@@ -1027,6 +1121,8 @@ function ripgrepLane() {
         matchCount,
         phaseMs: latest.phaseMs ?? {},
         baselineIxMs,
+        baselineWarmupSamples,
+        baselineComparable,
         baselineTolerancePct,
         baselineSoftTolerancePct,
         maxAllowedIxMs: maxAllowed,
@@ -1038,7 +1134,24 @@ function ripgrepLane() {
 
   const primary = runWindow("primary");
   if (primary.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary });
-  if (primary.ok && primary.softOk) return lane("ripgrep_12_sample", "ok", { corpus, primary });
+  if (primary.metrics?.baselineComparable === false) {
+    const proof = ripgrepProofSummary([primary]);
+    return lane("ripgrep_12_sample", "failed", {
+      corpus,
+      primary,
+      proof,
+      interpretation: ripgrepProofInterpretation(proof),
+    });
+  }
+  if (primary.ok && primary.softOk) {
+    const proof = ripgrepProofSummary([primary]);
+    return lane("ripgrep_12_sample", "ok", {
+      corpus,
+      primary,
+      proof,
+      interpretation: ripgrepProofInterpretation(proof),
+    });
+  }
 
   const confirm = runWindow("confirm");
   if (confirm.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm });
@@ -1052,25 +1165,28 @@ function ripgrepLane() {
     if (tiebreaker.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm, tiebreaker });
     const tiebreakerPatchPasses = patchNoRegressionPasses + (tiebreaker.patchNoRegressionOk ? 1 : 0);
     const tiebreakerAccepted = tiebreakerPatchPasses >= 2;
+    const proof = ripgrepProofSummary([primary, confirm, tiebreaker]);
     return lane("ripgrep_12_sample", tiebreakerAccepted ? "ok" : "failed", {
       corpus,
       primary,
       confirm,
       tiebreaker,
       acceptanceMode: tiebreakerAccepted ? "same_source_patch_no_regression" : "failed",
+      proof,
       interpretation: tiebreakerAccepted
-        ? "fixed historical benchmark windows crossed the guard, but two independent same-source comparator windows proved this worktree did not regress clean HEAD"
+        ? ripgrepProofInterpretation(proof)
         : "benchmark windows crossed the fixed historical guard and did not produce two same-source patch no-regression passes",
     });
   }
   if (hardPasses === 0 && patchNoRegressionPasses >= 2) {
+    const proof = ripgrepProofSummary([primary, confirm]);
     return lane("ripgrep_12_sample", "ok", {
       corpus,
       primary,
       confirm,
       acceptanceMode: "same_source_patch_no_regression",
-      interpretation:
-        "fixed historical benchmark windows crossed the guard, but two independent same-source comparator windows proved this worktree did not regress clean HEAD",
+      proof,
+      interpretation: ripgrepProofInterpretation(proof),
     });
   }
   if (hardPasses === 1) {
@@ -1079,23 +1195,27 @@ function ripgrepLane() {
     const tiebreakerHardPasses = hardPasses + (tiebreaker.ok ? 1 : 0);
     const tiebreakerStrongPasses = strongPasses + (ripgrepWindowStrongPass(tiebreaker) ? 1 : 0);
     const tiebreakerAccepted = tiebreakerHardPasses >= 2 && tiebreakerStrongPasses >= 2;
+    const proof = ripgrepProofSummary([primary, confirm, tiebreaker]);
     return lane("ripgrep_12_sample", tiebreakerAccepted ? "ok" : "failed", {
       corpus,
       primary,
       confirm,
       tiebreaker,
+      proof,
       interpretation: tiebreakerAccepted
-        ? "one measured window crossed the hard guard, but two independent windows produced strong fixed-baseline or paired-improvement passes"
+        ? ripgrepProofInterpretation(proof)
         : "benchmark windows disagreed and did not produce two strong independent passes",
     });
   }
 
+  const proof = ripgrepProofSummary([primary, confirm]);
   return lane("ripgrep_12_sample", accepted ? "ok" : "failed", {
     corpus,
     primary,
     confirm,
+    proof,
     interpretation: accepted
-      ? "one measured window crossed the soft regression band, but the fixed historical control stayed inside it"
+      ? ripgrepProofInterpretation(proof)
       : "benchmark windows crossed the fixed historical regression guard; paired previous-binary metrics are diagnostic only and do not override the baseline",
   });
 }
@@ -1143,20 +1263,32 @@ function benchmarkControlLane() {
   const selfMs = Number(latest.competitors?.iex_previous?.durationMs);
   const selfRatio = Number(latest.iexToPreviousRatio);
   const driftPct = Number.isFinite(selfRatio) && selfRatio > 0 ? Math.abs(1 - selfRatio) * 100 : null;
+  const baselineComparable = ripgrepWarmupSamples === baselineWarmupSamples;
+  const baselineRegressionPct =
+    baselineComparable && Number.isFinite(ixMs) && baselineIxMs > 0 ? ((ixMs - baselineIxMs) / baselineIxMs) * 100 : null;
+  const baselineOk = baselineComparable && Number.isFinite(ixMs) && ixMs <= baselineIxMs * (1 + baselineTolerancePct / 100);
   const authority = latest.previousIexAuthority ?? null;
   const matchCountParity = latest.previousIexMatchCountParity ?? null;
-  const ok =
+  const selfOk =
     authority === "authoritative" &&
     matchCountParity !== false &&
     Number.isFinite(ixMs) &&
     Number.isFinite(selfMs) &&
     Number.isFinite(driftPct) &&
     driftPct <= benchmarkControlDriftTolerancePct;
+  const ok = selfOk && baselineOk;
+  const reason = !selfOk
+    ? "same-binary control drift exceeded tolerance; benchmark window is too noisy for attribution"
+    : !baselineComparable
+      ? "control benchmark warmup does not match the fixed baseline; rerun with the baseline warmup or provide a matching baseline"
+      : !baselineOk
+        ? "control benchmark crossed the fixed baseline guard; benchmark window cannot prove speed improvement"
+        : undefined;
 
   return lane("benchmark_control", ok ? "ok" : "failed", {
     corpus,
     evidence: bench,
-    reason: ok ? undefined : "same-binary control drift exceeded tolerance; benchmark window is too noisy for attribution",
+    reason,
     metrics: {
       profile: latest.profile,
       expression: latest.expression,
@@ -1164,11 +1296,19 @@ function benchmarkControlLane() {
       warmup: ripgrepWarmupSamples,
       ixMs,
       selfMs,
+      baselineIxMs,
+      baselineWarmupSamples,
+      baselineComparable,
+      baselineTolerancePct,
+      maxAllowedIxMs: baselineIxMs * (1 + baselineTolerancePct / 100),
+      baselineRegressionPct,
+      baselineOk,
       ixBinaryIdentity: latest.ixBinaryIdentity ?? null,
       selfBinaryIdentity: latest.competitors?.iex_previous?.binaryIdentity ?? null,
       selfSourceRelation: latest.previousIxSourceRelation ?? null,
       selfRatio: Number.isFinite(selfRatio) ? selfRatio : null,
       driftPct,
+      selfOk,
       benchmarkControlDriftTolerancePct,
       authority,
       matchCountParity,
@@ -1182,12 +1322,18 @@ function benchmarkControlLane() {
   });
 }
 
+const worktree = worktreeLane();
+const planning = planningLane();
+const diffCheck = diffCheckLane();
+const benchmarkControl = benchmarkControlLane();
+const ripgrep = ripgrepLane(benchmarkControl);
+
 const lanes = [
-  worktreeLane(),
-  planningLane(),
-  diffCheckLane(),
-  benchmarkControlLane(),
-  ripgrepLane(),
+  worktree,
+  planning,
+  diffCheck,
+  benchmarkControl,
+  ripgrep,
   agentDryRunLane(),
   agentRealLane(),
   buildLane(),
@@ -1203,7 +1349,7 @@ const lanes = [
 const failed = lanes.filter((entry) => entry.status === "failed");
 const report = {
   status: failed.length === 0 ? "ok" : "failed",
-  mode: quick ? "quick" : "full",
+  mode: quick ? "quick" : speedOnly ? "speed-only" : "full",
   stateDir,
   lanes,
   reportPath: outPath,

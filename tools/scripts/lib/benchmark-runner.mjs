@@ -102,6 +102,7 @@ export function runTimedCommand(command, args, allowedCodes = [0], options = {})
   const started = process.hrtime.bigint();
   const result = spawnSync(command, args, {
     cwd: ROOT,
+    env: { ...process.env, ...(options.env ?? {}) },
     encoding: "utf8",
     stdio,
     maxBuffer: 128 * 1024 * 1024,
@@ -962,7 +963,14 @@ export function runOneBenchmark(options = {}) {
   const threads = options.threads;
   const warmup = Number(options.warmup ?? 0);
   const samples = Number(options.samples ?? 1);
-  const measureOptions = { warmup, samples };
+  const measureOptions = {
+    warmup,
+    samples,
+    env: {
+      IX_INDEX: "0",
+      IX_NEXUS: "0",
+    },
+  };
 
   const ixBin = resolveIxBinaryPath({ ixBinaryPath });
   const searchContext = { expression, corpus, threads };
