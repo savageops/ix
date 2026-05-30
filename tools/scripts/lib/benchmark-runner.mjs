@@ -1,5 +1,6 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { classifyHotspot, computeRatio, computeSpeedupPct } from "./metrics.mjs";
@@ -173,6 +174,63 @@ function parseIxReport(stdout) {
   }
 }
 
+function fileSha256(filePath) {
+  return createHash("sha256").update(readFileSync(filePath)).digest("hex");
+}
+
+function findGitRoot(startPath) {
+  let current = path.resolve(startPath);
+  if (!existsSync(current)) return null;
+  while (true) {
+    if (existsSync(path.join(current, ".git"))) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+}
+
+function gitValue(root, args) {
+  if (!root) return null;
+  try {
+    return execFileSync("git", ["-C", root, ...args], {
+      cwd: ROOT,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      windowsHide: true,
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+function binaryIdentity(binaryPath) {
+  const resolved = path.resolve(ROOT, binaryPath);
+  const gitRoot = findGitRoot(path.dirname(resolved));
+  return {
+    binaryPath: resolved,
+    sha256: existsSync(resolved) ? fileSha256(resolved) : null,
+    gitRoot,
+    gitHead: gitValue(gitRoot, ["rev-parse", "HEAD"]),
+    gitStatusShort: gitValue(gitRoot, ["status", "--short"]),
+  };
+}
+
+function compareBinaryIdentities(currentIdentity, previousIdentity) {
+  if (!currentIdentity || !previousIdentity) {
+    return "unknown";
+  }
+  if (currentIdentity.sha256 && currentIdentity.sha256 === previousIdentity.sha256) {
+    return "same_binary";
+  }
+  if (currentIdentity.gitHead && currentIdentity.gitHead === previousIdentity.gitHead) {
+    return "same_source_different_binary";
+  }
+  if (currentIdentity.gitHead && previousIdentity.gitHead) {
+    return "different_source";
+  }
+  return "different_binary_unknown_source";
+}
+
 function measureIxSearch(binaryPath, context, measureOptions) {
   const args = buildIxSearchArgs(context);
   const warmup = Math.max(0, Number(measureOptions.warmup ?? 0));
@@ -220,6 +278,83 @@ function measureIxSearch(binaryPath, context, measureOptions) {
     sampleDurationsMs: cliSamples,
     engineSampleDurationsMs: engineSamples,
     timingSource: selected.report?.stats?.timings?.total_ms ? "engine_total_ms" : "wall_clock_ms",
+  };
+}
+
+function measuredIxEntry(binaryPath, args, result, sampleIndex) {
+  const report = parseIxReport(result.stdout);
+  if (result.stdout?.trim() && !report) {
+    throw new Error(`IX-Zig benchmark output was not valid JSON for ${binaryPath}`);
+  }
+  const engineMs = report?.stats?.timings?.total_ms ?? result.durationMs;
+  return {
+    result,
+    report,
+    engineMs,
+    cliMs: result.durationMs,
+    sampleIndex,
+  };
+}
+
+function summarizeIxEntries(binaryPath, args, measuredRuns) {
+  const byEngine = [...measuredRuns].sort((left, right) => left.engineMs - right.engineMs);
+  const medianIndex = Math.floor(byEngine.length / 2);
+  const selected = byEngine[medianIndex];
+  const engineSamples = byEngine.map((run) => run.engineMs);
+  const cliSamples = [...measuredRuns].sort((left, right) => left.cliMs - right.cliMs).map((run) => run.cliMs);
+
+  return {
+    binaryPath,
+    args,
+    result: {
+      ...selected.result,
+      selectionStrategy: "median_engine_duration",
+      sampleDurationsMs: cliSamples,
+    },
+    report: selected.report,
+    engineMs: selected.engineMs,
+    cliMs: selected.cliMs,
+    processOverheadMs: Math.max(0, selected.cliMs - selected.engineMs),
+    sampleDurationsMs: cliSamples,
+    engineSampleDurationsMs: engineSamples,
+    timingSource: selected.report?.stats?.timings?.total_ms ? "engine_total_ms" : "wall_clock_ms",
+  };
+}
+
+function measurePairedIxSearch(currentBinaryPath, previousBinaryPath, context, measureOptions) {
+  const currentArgs = buildIxSearchArgs(context);
+  const previousArgs = buildIxSearchArgs(context);
+  const resolvedPreviousBinaryPath = resolveExplicitBinaryPath(previousBinaryPath);
+  const warmup = Math.max(0, Number(measureOptions.warmup ?? 0));
+  const samples = Math.max(1, Number(measureOptions.samples ?? 1));
+
+  for (let i = 0; i < warmup; i += 1) {
+    runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions);
+    runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions);
+  }
+
+  const currentRuns = [];
+  const previousRuns = [];
+  const pairOrder = [];
+  for (let i = 0; i < samples; i += 1) {
+    const currentFirst = i % 2 === 0;
+    pairOrder.push(currentFirst ? "current,previous" : "previous,current");
+    if (currentFirst) {
+      currentRuns.push(measuredIxEntry(currentBinaryPath, currentArgs, runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions), i));
+      previousRuns.push(measuredIxEntry(resolvedPreviousBinaryPath, previousArgs, runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions), i));
+    } else {
+      previousRuns.push(measuredIxEntry(resolvedPreviousBinaryPath, previousArgs, runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions), i));
+      currentRuns.push(measuredIxEntry(currentBinaryPath, currentArgs, runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions), i));
+    }
+  }
+
+  return {
+    current: summarizeIxEntries(currentBinaryPath, currentArgs, currentRuns),
+    previous: summarizeIxEntries(resolvedPreviousBinaryPath, previousArgs, previousRuns),
+    pairing: {
+      mode: "interleaved_current_previous",
+      pairOrder,
+    },
   };
 }
 
@@ -557,23 +692,7 @@ function measureIxCompetitor(context, measureOptions, binaryPath, { label, kind,
 
   try {
     const measured = measureIxSearch(resolvedBinaryPath, context, measureOptions);
-    return {
-      available: true,
-      label,
-      kind,
-      command: "ix",
-      resolvedCommand: measured.binaryPath,
-      binaryPath: measured.binaryPath,
-      args: measured.args,
-      durationMs: measured.engineMs,
-      cliDurationMs: measured.cliMs,
-      processOverheadMs: measured.processOverheadMs,
-      sampleDurationsMs: measured.sampleDurationsMs,
-      engineSampleDurationsMs: measured.engineSampleDurationsMs,
-      status: measured.result.status,
-      timingSource: measured.timingSource,
-      matchCount: measured.report?.stats?.matches_found ?? null,
-    };
+    return ixMeasurementToCompetitor(measured, { label, kind, pairing: null });
   } catch (error) {
     return {
       available: false,
@@ -592,6 +711,28 @@ function measureIxCompetitor(context, measureOptions, binaryPath, { label, kind,
       timingSource: null,
     };
   }
+}
+
+function ixMeasurementToCompetitor(measured, { label, kind, pairing }) {
+  return {
+    available: true,
+    label,
+    kind,
+    command: "ix",
+    resolvedCommand: measured.binaryPath,
+    binaryPath: measured.binaryPath,
+    binaryIdentity: binaryIdentity(measured.binaryPath),
+    args: measured.args,
+    durationMs: measured.engineMs,
+    cliDurationMs: measured.cliMs,
+    processOverheadMs: measured.processOverheadMs,
+    sampleDurationsMs: measured.sampleDurationsMs,
+    engineSampleDurationsMs: measured.engineSampleDurationsMs,
+    status: measured.result.status,
+    timingSource: measured.timingSource,
+    matchCount: measured.report?.stats?.matches_found ?? null,
+    pairing,
+  };
 }
 
 function measurePreviousIxCompetitor(context, measureOptions, previousIxBinaryPath) {
@@ -782,6 +923,7 @@ const RUN_ONE_BENCHMARK_OPTION_KEYS = new Set([
   "corpus",
   "expression",
   "ixBinaryPath",
+  "pairedPreviousInterleave",
   "previousIxBinaryPath",
   "profile",
   "regex",
@@ -815,6 +957,7 @@ export function runOneBenchmark(options = {}) {
   const write = options.write ?? true;
   const ixBinaryPath = options.ixBinaryPath;
   const previousIxBinaryPath = options.previousIxBinaryPath;
+  const pairedPreviousInterleave = options.pairedPreviousInterleave ?? false;
   const rustIxBinaryPath = options.rustIxBinaryPath;
   const threads = options.threads;
   const warmup = Number(options.warmup ?? 0);
@@ -823,10 +966,28 @@ export function runOneBenchmark(options = {}) {
 
   const ixBin = resolveIxBinaryPath({ ixBinaryPath });
   const searchContext = { expression, corpus, threads };
-  const ixMeasurement = measureIxSearch(ixBin, searchContext, measureOptions);
+  let ixMeasurement = null;
+  let previousIx = null;
+  let pairedMeasurement = null;
+  if (previousIxBinaryPath && pairedPreviousInterleave) {
+    try {
+      pairedMeasurement = measurePairedIxSearch(ixBin, previousIxBinaryPath, searchContext, measureOptions);
+      ixMeasurement = pairedMeasurement.current;
+      previousIx = ixMeasurementToCompetitor(pairedMeasurement.previous, {
+        label: "Rust IX predecessor",
+        kind: "self-history",
+        pairing: pairedMeasurement.pairing,
+      });
+    } catch {
+      ixMeasurement = measureIxSearch(ixBin, searchContext, measureOptions);
+      previousIx = measurePreviousIxCompetitor(searchContext, measureOptions, previousIxBinaryPath);
+    }
+  } else {
+    ixMeasurement = measureIxSearch(ixBin, searchContext, measureOptions);
+    previousIx = measurePreviousIxCompetitor(searchContext, measureOptions, previousIxBinaryPath);
+  }
   const ixReport = ixMeasurement.report;
   const ixEngineMs = ixMeasurement.engineMs;
-  const previousIx = measurePreviousIxCompetitor(searchContext, measureOptions, previousIxBinaryPath);
   const rustIx = measureRustIxCompetitor(searchContext, measureOptions, rustIxBinaryPath);
 
   const regex = options.regex ?? inferRegexFromExpression(expression);
@@ -868,6 +1029,8 @@ export function runOneBenchmark(options = {}) {
   const iexToRgRatio = computeRatio(ixEngineMs, rgMs);
   const speedupPct = computeSpeedupPct(ixEngineMs, rgMs);
   const previousIxMs = competitors?.iex_previous?.durationMs ?? 0;
+  const ixBinaryIdentity = binaryIdentity(ixBin);
+  const previousIxBinaryIdentity = competitors?.iex_previous?.binaryIdentity ?? null;
   const scenario = describeBenchmarkScenario({ corpus, expression, statsOnly: true });
   const reportPaths = resolveBenchmarkReportPaths({ scenarioId: scenario.id });
 
@@ -879,7 +1042,9 @@ export function runOneBenchmark(options = {}) {
     expression,
     corpus,
     ixBinaryPath: ixBin,
+    ixBinaryIdentity,
     previousIxBinaryPath: competitors?.iex_previous?.binaryPath ?? null,
+    previousIxSourceRelation: compareBinaryIdentities(ixBinaryIdentity, previousIxBinaryIdentity),
     iexMs: ixEngineMs,
     iexCliMs: ixMeasurement.cliMs,
     iexProcessOverheadMs: ixMeasurement.processOverheadMs,

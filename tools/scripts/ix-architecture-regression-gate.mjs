@@ -9,12 +9,16 @@ const REPORT_DIR = path.join(ROOT, "tools", "reports", "architecture-gate");
 
 const args = process.argv.slice(2);
 const quick = args.includes("--quick");
+const schemaSelfTest = args.includes("--schema-self-test");
 const outPath = argValue(args, "--out", path.join(REPORT_DIR, `architecture-gate-${timestampSlug()}.json`));
 const stateDir = argValue(args, "--state-dir", path.join(os.tmpdir(), `ix-architecture-gate-${process.pid}`));
 const baselineIxMs = Number(argValue(args, "--baseline-ix-ms", process.env.IX_ARCH_GATE_BASELINE_IX_MS ?? "575.3829"));
 const baselineTolerancePct = Number(argValue(args, "--baseline-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_TOLERANCE_PCT ?? "5"));
 const baselineSoftTolerancePct = Number(argValue(args, "--baseline-soft-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_SOFT_TOLERANCE_PCT ?? "2.5"));
 const ripgrepWarmupSamples = Number(argValue(args, "--ripgrep-warmup", process.env.IX_ARCH_GATE_RIPGREP_WARMUP ?? "6"));
+const previousIxBinary = argValue(args, "--previous-ix-binary", process.env.IX_PREVIOUS_BINARY ?? "");
+const pairedImprovementTolerancePct = Number(argValue(args, "--paired-improvement-tolerance-pct", process.env.IX_ARCH_GATE_PAIRED_IMPROVEMENT_TOLERANCE_PCT ?? "1.5"));
+const benchmarkControlDriftTolerancePct = Number(argValue(args, "--benchmark-control-drift-pct", process.env.IX_ARCH_GATE_CONTROL_DRIFT_PCT ?? "3"));
 const planningChainSlug = argValue(
   args,
   "--planning-chain",
@@ -49,7 +53,15 @@ function psQuote(value) {
 }
 
 function lane(id, status, evidence = {}) {
-  return { id, status, ...evidence };
+  const failures = Array.isArray(evidence.failures) ? evidence.failures : [];
+  return {
+    id,
+    status,
+    passed: status === "ok",
+    failures,
+    evidence: {},
+    ...evidence,
+  };
 }
 
 function parseCsvArg(value) {
@@ -99,12 +111,36 @@ function validateNestedEvidence(pathLabel, value, failures) {
   }
 }
 
+function ripgrepWindowFixedPass(window) {
+  return isPlainObject(window) && window.ok === true;
+}
+
+function validateRipgrepLane(entry, failures) {
+  if (entry.id !== "ripgrep_12_sample" || entry.status !== "ok") return;
+  const fixedPasses = ["primary", "confirm", "tiebreaker"].filter((key) => ripgrepWindowFixedPass(entry[key])).length;
+  if (fixedPasses === 0) {
+    failures.push("ripgrep_12_sample: ok status requires at least one fixed-baseline passing window");
+  }
+  const sameSourcePairedPass = ["primary", "confirm", "tiebreaker"].some((key) => {
+    const window = entry[key];
+    return (
+      isPlainObject(window) &&
+      window.pairedOk === true &&
+      window.metrics?.previousIxSourceRelation === "same_source_different_binary"
+    );
+  });
+  if (sameSourcePairedPass) {
+    failures.push("ripgrep_12_sample: same-source comparator artifact cannot provide paired improvement evidence");
+  }
+}
+
 function validateReport(report) {
   const failures = [];
   const expectedLaneIds = new Set([
     "worktree",
     "planning_chain",
     "diff_check",
+    "benchmark_control",
     "ripgrep_12_sample",
     "agent_real_dry_run",
     "agent_real",
@@ -115,6 +151,7 @@ function validateReport(report) {
     "runtime_state_location",
     "indexd_memory_cap",
     "process_scan",
+    "report_schema",
   ]);
   const legalStatuses = new Set(["ok", "failed", "skipped"]);
 
@@ -144,18 +181,22 @@ function validateReport(report) {
     seen.add(entry.id);
 
     if (!legalStatuses.has(entry.status)) failures.push(`${entry.id}.status: must be ok, failed, or skipped`);
+    if (typeof entry.passed !== "boolean") failures.push(`${entry.id}.passed: must be a boolean`);
+    if (entry.passed !== (entry.status === "ok")) {
+      failures.push(`${entry.id}.passed: must agree with ok status`);
+    }
+    if (!Array.isArray(entry.failures) || entry.failures.some((failure) => typeof failure !== "string")) {
+      failures.push(`${entry.id}.failures: must be an array of strings`);
+    }
+    if (!Object.hasOwn(entry, "evidence") || !isPlainObject(entry.evidence)) {
+      failures.push(`${entry.id}.evidence: must be an object`);
+    }
     if (entry.status === "skipped" && typeof entry.reason !== "string") {
       failures.push(`${entry.id}.reason: skipped lanes must explain the skip`);
     }
-    if (Object.hasOwn(entry, "failures")) {
-      if (!Array.isArray(entry.failures) || entry.failures.some((failure) => typeof failure !== "string")) {
-        failures.push(`${entry.id}.failures: must be an array of strings`);
-      }
-    }
     if (
       entry.status === "failed" &&
-      !Object.hasOwn(entry, "evidence") &&
-      !Object.hasOwn(entry, "failures") &&
+      entry.failures.length === 0 &&
       !Object.hasOwn(entry, "reason") &&
       !Object.hasOwn(entry, "primary") &&
       !Object.hasOwn(entry, "confirm")
@@ -166,13 +207,86 @@ function validateReport(report) {
     for (const key of ["primary", "confirm", "tiebreaker"]) {
       if (Object.hasOwn(entry, key)) validateNestedEvidence(`${entry.id}.${key}`, entry[key], failures);
     }
+    validateRipgrepLane(entry, failures);
   }
 
-  for (const id of expectedLaneIds) {
+  for (const id of [...expectedLaneIds].filter((expected) => expected !== "report_schema")) {
     if (!seen.has(id)) failures.push(`${id}: expected lane missing`);
   }
 
   return failures;
+}
+
+function runSchemaSelfTest() {
+  const malformedReport = {
+    status: "ok",
+    mode: "quick",
+    stateDir: stateDir,
+    reportPath: outPath,
+    lanes: [
+      {
+        id: "worktree",
+        status: "ok",
+        passed: "yes",
+        failures: "none",
+        evidence: "not-an-object",
+      },
+      {
+        id: "ripgrep_12_sample",
+        status: "ok",
+        passed: true,
+        failures: [],
+        evidence: {},
+        primary: {
+          ok: false,
+          pairedOk: true,
+          metrics: {
+            ixMs: 607.7968,
+            maxAllowedIxMs: 604.1520449999999,
+          },
+        },
+      },
+      {
+        id: "ripgrep_12_sample",
+        status: "ok",
+        passed: true,
+        failures: [],
+        evidence: {},
+        primary: {
+          ok: true,
+          pairedOk: true,
+          metrics: {
+            ixMs: 580,
+            maxAllowedIxMs: 604.1520449999999,
+            previousIxSourceRelation: "same_source_different_binary",
+          },
+        },
+      },
+    ],
+  };
+  const failures = validateReport(malformedReport);
+  const required = [
+    "worktree.passed: must be a boolean",
+    "worktree.passed: must agree with ok status",
+    "worktree.failures: must be an array of strings",
+    "worktree.evidence: must be an object",
+    "ripgrep_12_sample: ok status requires at least one fixed-baseline passing window",
+    "ripgrep_12_sample: same-source comparator artifact cannot provide paired improvement evidence",
+  ];
+  const missing = required.filter((needle) => !failures.includes(needle));
+  const report = {
+    status: missing.length === 0 ? "ok" : "failed",
+    mode: "schema-self-test",
+    checkedFailures: failures,
+    required,
+    missing,
+  };
+  console.log(JSON.stringify(report, null, 2));
+  process.exit(report.status === "ok" ? 0 : 1);
+}
+
+if (schemaSelfTest) {
+  runSchemaSelfTest();
 }
 
 function findBuiltIx() {
@@ -288,15 +402,21 @@ function agentRealLane() {
   } catch {
     return lane("agent_real", "failed", { evidence: agent, reason: "agent eval output was not JSON" });
   }
-  if (parsed.status === "ok") return lane("agent_real", "ok", { evidence: agent, statusDetail: parsed.status });
+  const score = {
+    recall: parsed.recall ?? null,
+    architectureRecall: parsed.architectureRecall ?? null,
+    toolDiscipline: parsed.toolDiscipline ?? null,
+  };
+  if (parsed.status === "ok") return lane("agent_real", "ok", { evidence: agent, statusDetail: parsed.status, score });
   if (parsed.status === "missing_config" || parsed.status === "missing_curl") {
     return lane("agent_real", "failed", {
       evidence: agent,
       statusDetail: parsed.status,
       reason: parsed.message,
+      score,
     });
   }
-  return lane("agent_real", "failed", { evidence: agent, statusDetail: parsed.status });
+  return lane("agent_real", "failed", { evidence: agent, statusDetail: parsed.status, score });
 }
 
 function buildLane() {
@@ -644,9 +764,10 @@ function ripgrepLane() {
   const latestPath = path.join(ROOT, "tools", "reports", "latest.json");
   const maxAllowed = baselineIxMs * (1 + baselineTolerancePct / 100);
   const softMaxAllowed = baselineIxMs * (1 + baselineSoftTolerancePct / 100);
+  const pairedMaxRatio = 1 - pairedImprovementTolerancePct / 100;
 
   const runWindow = (label) => {
-    const bench = run(process.execPath, [
+    const benchArgs = [
       "tools/scripts/run-once-benchmark.mjs",
       "--profile",
       "suite-linux-word",
@@ -661,7 +782,9 @@ function ripgrepLane() {
       "--samples",
       "12",
       "--quiet",
-    ]);
+    ];
+    if (previousIxBinary) benchArgs.push("--previous-ix-binary", previousIxBinary, "--paired-interleave");
+    const bench = run(process.execPath, benchArgs);
     if (bench.exitCode !== 0) return { label, ok: false, hardFailure: true, evidence: bench };
     if (!existsSync(latestPath)) {
       return {
@@ -677,13 +800,32 @@ function ripgrepLane() {
     const ixMs = Number(latest.iexMs);
     const rgMs = Number(latest.rgMs);
     const matchCount = Number(latest.matchCount);
+    const previousIxMs = Number(latest.competitors?.iex_previous?.durationMs);
+    const pairedRatio = Number(latest.iexToPreviousRatio);
+    const previousAuthority = latest.previousIexAuthority ?? null;
+    const previousMatchCountParity = latest.previousIexMatchCountParity ?? null;
+    const previousIxSourceRelation = latest.previousIxSourceRelation ?? null;
+    const previousIsHistoricalSource =
+      previousIxSourceRelation === null ||
+      previousIxSourceRelation === "unknown" ||
+      previousIxSourceRelation === "different_source";
     const regressionPct = Number.isFinite(ixMs) && baselineIxMs > 0 ? ((ixMs - baselineIxMs) / baselineIxMs) * 100 : null;
+    const pairedImprovementPct = Number.isFinite(pairedRatio) && pairedRatio > 0 ? (1 - pairedRatio) * 100 : null;
     const ok = Number.isFinite(ixMs) && ixMs <= maxAllowed;
     const softOk = Number.isFinite(ixMs) && ixMs <= softMaxAllowed;
+    const pairedOk =
+      previousIxBinary !== "" &&
+      previousIsHistoricalSource &&
+      previousAuthority === "authoritative" &&
+      previousMatchCountParity !== false &&
+      Number.isFinite(previousIxMs) &&
+      Number.isFinite(pairedRatio) &&
+      pairedRatio <= pairedMaxRatio;
     return {
       label,
       ok,
       softOk,
+      pairedOk,
       hardFailure: false,
       evidence: bench,
       metrics: {
@@ -693,8 +835,21 @@ function ripgrepLane() {
         warmup: ripgrepWarmupSamples,
         ixMs,
         rgMs,
+        previousIxMs: Number.isFinite(previousIxMs) ? previousIxMs : null,
+        ixBinaryIdentity: latest.ixBinaryIdentity ?? null,
+        previousIxBinaryIdentity: latest.competitors?.iex_previous?.binaryIdentity ?? null,
+        previousIxSourceRelation,
+        previousIsHistoricalSource,
+        pairedRatio: Number.isFinite(pairedRatio) ? pairedRatio : null,
+        pairedImprovementPct,
+        previousAuthority,
+        previousMatchCountParity,
+        pairedImprovementTolerancePct,
+        pairedMaxRatio,
         ixSampleDurationsMs: latest.iexSampleDurationsMs ?? [],
         ixEngineSampleDurationsMs: latest.iexEngineSampleDurationsMs ?? [],
+        previousIxEngineSampleDurationsMs: latest.competitors?.iex_previous?.engineSampleDurationsMs ?? [],
+        previousIxPairing: latest.competitors?.iex_previous?.pairing ?? null,
         rgSampleDurationsMs: latest.competitors?.ripgrep?.sampleDurationsMs ?? [],
         speedupPct: latest.speedupPct,
         matchCount,
@@ -730,7 +885,7 @@ function ripgrepLane() {
       tiebreaker,
       interpretation: tiebreakerAccepted
         ? "one measured window crossed the hard guard, but two independent windows stayed inside the hard regression guard"
-        : "paired benchmark windows disagreed and the tiebreaker did not produce two hard-pass windows",
+        : "benchmark windows disagreed and the tiebreaker did not produce two hard-pass windows",
     });
   }
 
@@ -739,8 +894,90 @@ function ripgrepLane() {
     primary,
     confirm,
     interpretation: accepted
-      ? "one measured window crossed the soft regression band, but the paired control stayed inside it"
-      : "paired benchmark windows crossed the regression guard; treat as performance regression until a focused run proves otherwise",
+      ? "one measured window crossed the soft regression band, but the fixed historical control stayed inside it"
+      : "benchmark windows crossed the fixed historical regression guard; paired previous-binary metrics are diagnostic only and do not override the baseline",
+  });
+}
+
+function benchmarkControlLane() {
+  const corpus = process.env.IX_BENCHSUITE_LINUX ?? "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux";
+  if (!existsSync(corpus)) return lane("benchmark_control", "skipped", { reason: "ripgrep benchsuite corpus missing", corpus });
+  if (quick) return lane("benchmark_control", "skipped", { reason: "--quick", corpus });
+  const ix = findBuiltIx();
+  if (!ix) return lane("benchmark_control", "skipped", { reason: "zig-out binary missing; run build first", corpus });
+
+  const latestPath = path.join(ROOT, "tools", "reports", "latest.json");
+  const bench = run(process.execPath, [
+    "tools/scripts/run-once-benchmark.mjs",
+    "--profile",
+    "suite-linux-word-control",
+    "--expression",
+    "re:\\bPM_RESUME\\b",
+    "--corpus",
+    corpus,
+    "--threads",
+    "32",
+    "--warmup",
+    String(ripgrepWarmupSamples),
+    "--samples",
+    "12",
+    "--ix-binary",
+    ix,
+    "--previous-ix-binary",
+    ix,
+    "--paired-interleave",
+    "--quiet",
+  ]);
+  if (bench.exitCode !== 0) return lane("benchmark_control", "failed", { corpus, evidence: bench });
+  if (!existsSync(latestPath)) {
+    return lane("benchmark_control", "failed", {
+      corpus,
+      evidence: bench,
+      reason: "benchmark completed but tools/reports/latest.json was not written",
+    });
+  }
+
+  const latest = JSON.parse(readFileSync(latestPath, "utf8"));
+  const ixMs = Number(latest.iexMs);
+  const selfMs = Number(latest.competitors?.iex_previous?.durationMs);
+  const selfRatio = Number(latest.iexToPreviousRatio);
+  const driftPct = Number.isFinite(selfRatio) && selfRatio > 0 ? Math.abs(1 - selfRatio) * 100 : null;
+  const authority = latest.previousIexAuthority ?? null;
+  const matchCountParity = latest.previousIexMatchCountParity ?? null;
+  const ok =
+    authority === "authoritative" &&
+    matchCountParity !== false &&
+    Number.isFinite(ixMs) &&
+    Number.isFinite(selfMs) &&
+    Number.isFinite(driftPct) &&
+    driftPct <= benchmarkControlDriftTolerancePct;
+
+  return lane("benchmark_control", ok ? "ok" : "failed", {
+    corpus,
+    evidence: bench,
+    reason: ok ? undefined : "same-binary control drift exceeded tolerance; benchmark window is too noisy for attribution",
+    metrics: {
+      profile: latest.profile,
+      expression: latest.expression,
+      samples: 12,
+      warmup: ripgrepWarmupSamples,
+      ixMs,
+      selfMs,
+      ixBinaryIdentity: latest.ixBinaryIdentity ?? null,
+      selfBinaryIdentity: latest.competitors?.iex_previous?.binaryIdentity ?? null,
+      selfSourceRelation: latest.previousIxSourceRelation ?? null,
+      selfRatio: Number.isFinite(selfRatio) ? selfRatio : null,
+      driftPct,
+      benchmarkControlDriftTolerancePct,
+      authority,
+      matchCountParity,
+      ixEngineSampleDurationsMs: latest.iexEngineSampleDurationsMs ?? [],
+      selfEngineSampleDurationsMs: latest.competitors?.iex_previous?.engineSampleDurationsMs ?? [],
+      selfPairing: latest.competitors?.iex_previous?.pairing ?? null,
+      rgSampleDurationsMs: latest.competitors?.ripgrep?.sampleDurationsMs ?? [],
+      matchCount: latest.matchCount ?? null,
+      phaseMs: latest.phaseMs ?? {},
+    },
   });
 }
 
@@ -748,6 +985,7 @@ const lanes = [
   worktreeLane(),
   planningLane(),
   diffCheckLane(),
+  benchmarkControlLane(),
   ripgrepLane(),
   agentDryRunLane(),
   agentRealLane(),

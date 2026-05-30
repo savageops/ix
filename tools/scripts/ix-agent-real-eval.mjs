@@ -123,6 +123,47 @@ function extractSessionId(stdout) {
   return null;
 }
 
+function analyzeJsonEvents(stdout) {
+  const toolEvents = [];
+  const nonMessageItems = [];
+  for (const line of stdout.split(/\r?\n/)) {
+    if (!line.trim().startsWith("{")) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    const item = event?.item;
+    const itemType = item?.type;
+    if (itemType && itemType !== "agent_message" && itemType !== "error") {
+      nonMessageItems.push({
+        eventType: event.type ?? null,
+        itemType,
+      });
+    }
+    const text = JSON.stringify(event).toLowerCase();
+    if (
+      itemType === "function_call" ||
+      itemType === "tool_call" ||
+      itemType === "local_shell_call" ||
+      text.includes("exec_command") ||
+      text.includes("shell_call") ||
+      text.includes("tool_call")
+    ) {
+      toolEvents.push({
+        eventType: event.type ?? null,
+        itemType: itemType ?? null,
+      });
+    }
+  }
+  return {
+    toolCallCount: toolEvents.length,
+    toolEvents,
+    nonMessageItems,
+  };
+}
+
 function runTurn(turn, index, sessionId) {
   const messagePath = outputPath(turn.id);
   rmSync(messagePath, { force: true });
@@ -152,6 +193,7 @@ function runTurn(turn, index, sessionId) {
         ];
   const result = runCodex(commandArgs);
   const assistantText = readOutput(messagePath);
+  const eventAnalysis = analyzeJsonEvents(result.stdout ?? "");
   rmSync(messagePath, { force: true });
   return {
     turn: turn.id,
@@ -161,6 +203,7 @@ function runTurn(turn, index, sessionId) {
     durationMs: result.durationMs,
     sessionId: index === 0 ? extractSessionId(result.stdout) : sessionId,
     assistantText,
+    eventAnalysis,
     stdoutTail: tail(result.stdout),
     stderrTail: tail(result.stderr),
   };
@@ -174,6 +217,31 @@ function scoreRecall(text) {
     found,
     required,
     passed: found.length === required.length,
+  };
+}
+
+function scoreArchitectureRecall(text) {
+  const required = ["search", "matches", "inspect", "canonical", "query", "owner"];
+  const lower = text.toLowerCase();
+  const found = required.filter((token) => lower.includes(token));
+  return {
+    found,
+    required,
+    passed: found.length === required.length,
+  };
+}
+
+function scoreToolDiscipline(transcript) {
+  const violations = transcript
+    .filter((turn) => (turn.eventAnalysis?.toolCallCount ?? 0) > 0)
+    .map((turn) => ({
+      turn: turn.turn,
+      toolCallCount: turn.eventAnalysis.toolCallCount,
+      toolEvents: turn.eventAnalysis.toolEvents,
+    }));
+  return {
+    violations,
+    passed: violations.length === 0,
   };
 }
 
@@ -235,12 +303,17 @@ for (let index = 0; index < scenario.length; index += 1) {
 
 const finalText = transcript.at(-1)?.assistantText ?? "";
 const recall = scoreRecall(finalText);
-const report = result(recall.passed ? "ok" : "recall_failed", {
+const architectureRecall = scoreArchitectureRecall(finalText);
+const toolDiscipline = scoreToolDiscipline(transcript);
+const passed = recall.passed && architectureRecall.passed && toolDiscipline.passed;
+const report = result(passed ? "ok" : "agent_eval_failed", {
   sessionId,
   recall,
+  architectureRecall,
+  toolDiscipline,
   transcript,
   reportPath: outPath,
 });
 writeReport(report);
 console.log(JSON.stringify(report, null, 2));
-process.exit(recall.passed ? 0 : 1);
+process.exit(passed ? 0 : 1);

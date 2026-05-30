@@ -8,6 +8,7 @@ const profile = argValue(args, "--profile", "single");
 const ixBinary = argValue(args, "--ix-binary", undefined);
 const previousIxBinary = argValue(args, "--previous-ix-binary", process.env.IX_PREVIOUS_BINARY ?? undefined);
 const rustIxBinary = argValue(args, "--rust-ix-binary", process.env.IX_RUST_BINARY ?? undefined);
+const pairedPreviousInterleave = args.includes("--paired-interleave");
 const threadsArg = argValue(args, "--threads", undefined);
 const threads = threadsArg ? Number(threadsArg) : undefined;
 const warmupArg = argValue(args, "--warmup", "1");
@@ -22,6 +23,7 @@ const run = runOneBenchmark({
   profile,
   ixBinaryPath: ixBinary,
   previousIxBinaryPath: previousIxBinary,
+  pairedPreviousInterleave,
   rustIxBinaryPath: rustIxBinary,
   threads,
   warmup,
