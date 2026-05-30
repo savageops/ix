@@ -213,6 +213,10 @@ function hostBenchmarkIssues(host) {
   return issues;
 }
 
+function hostBenchmarkClean(issues) {
+  return Array.isArray(issues) && issues.every((issue) => issue?.severity !== "warning");
+}
+
 function validateRipgrepLane(entry, failures) {
   if (entry.id !== "ripgrep_12_sample" || entry.status !== "ok") return;
   const fixedPasses = ["primary", "confirm", "tiebreaker"].filter((key) => ripgrepWindowFixedPass(entry[key])).length;
@@ -238,6 +242,17 @@ function validateRipgrepLane(entry, failures) {
   });
   if (sameSourcePairedPass) {
     failures.push("ripgrep_12_sample: same-source comparator artifact cannot provide paired improvement evidence");
+  }
+  const noisyHostPass = windowKeys.some((key) => {
+    const window = entry[key];
+    return (
+      isPlainObject(window) &&
+      (window.ok === true || window.softOk === true || window.pairedOk === true || window.patchNoRegressionOk === true) &&
+      window.metrics?.hostClean === false
+    );
+  });
+  if (noisyHostPass) {
+    failures.push("ripgrep_12_sample: ok status cannot rely on a warning-class host benchmark envelope");
   }
   const patchAccepted = entry.acceptanceMode === "same_source_patch_no_regression";
   if (patchAccepted) {
@@ -328,6 +343,9 @@ function validateReport(report) {
     for (const key of ["primary", "confirm", "tiebreaker"]) {
       if (Object.hasOwn(entry, key)) validateNestedEvidence(`${entry.id}.${key}`, entry[key], failures);
     }
+    if (entry.id === "benchmark_control" && entry.status === "ok" && entry.metrics?.hostClean === false) {
+      failures.push("benchmark_control: ok status cannot rely on a warning-class host benchmark envelope");
+    }
     validateRipgrepLane(entry, failures);
   }
 
@@ -390,8 +408,17 @@ function runSchemaSelfTest() {
             ixMs: 580,
             maxAllowedIxMs: 604.1520449999999,
             previousIxSourceRelation: "same_source_different_binary",
+            hostClean: false,
           },
         },
+      },
+      {
+        id: "benchmark_control",
+        status: "ok",
+        passed: true,
+        failures: [],
+        evidence: {},
+        metrics: { hostClean: false },
       },
     ],
   };
@@ -404,7 +431,9 @@ function runSchemaSelfTest() {
     "ripgrep_12_sample: ok status requires at least one fixed-baseline passing window",
     "ripgrep_12_sample: ok status with a hard-regression window requires two strong independent passes",
     "ripgrep_12_sample: same-source comparator artifact cannot provide paired improvement evidence",
+    "ripgrep_12_sample: ok status cannot rely on a warning-class host benchmark envelope",
     "ripgrep_12_sample: ok status requires proof classification",
+    "benchmark_control: ok status cannot rely on a warning-class host benchmark envelope",
   ];
   const missing = required.filter((needle) => !failures.includes(needle));
   const report = {
@@ -1071,6 +1100,8 @@ function ripgrepLane(controlLane = null) {
     const previousAuthority = latest.previousIexAuthority ?? null;
     const previousMatchCountParity = latest.previousIexMatchCountParity ?? null;
     const previousIxSourceRelation = latest.previousIxSourceRelation ?? null;
+    const hostIssues = hostBenchmarkIssues(latest.host ?? null);
+    const hostClean = hostBenchmarkClean(hostIssues);
     const previousIsHistoricalSource =
       previousIxSourceRelation === null ||
       previousIxSourceRelation === "unknown" ||
@@ -1080,8 +1111,8 @@ function ripgrepLane(controlLane = null) {
     const regressionPct =
       baselineComparable && Number.isFinite(ixMs) && baselineIxMs > 0 ? ((ixMs - baselineIxMs) / baselineIxMs) * 100 : null;
     const pairedImprovementPct = Number.isFinite(pairedRatio) && pairedRatio > 0 ? (1 - pairedRatio) * 100 : null;
-    const ok = baselineComparable && Number.isFinite(ixMs) && ixMs <= maxAllowed;
-    const softOk = baselineComparable && Number.isFinite(ixMs) && ixMs <= softMaxAllowed;
+    const ok = hostClean && baselineComparable && Number.isFinite(ixMs) && ixMs <= maxAllowed;
+    const softOk = hostClean && baselineComparable && Number.isFinite(ixMs) && ixMs <= softMaxAllowed;
     const patchNoRegressionMaxRatio = 1 + patchNoRegressionTolerancePct / 100;
     const pairedOk =
       previousIxBinary !== "" &&
@@ -1140,7 +1171,8 @@ function ripgrepLane(controlLane = null) {
         speedupPct: latest.speedupPct,
         matchCount,
         phaseMs: latest.phaseMs ?? {},
-        hostIssues: hostBenchmarkIssues(latest.host ?? null),
+        hostIssues,
+        hostClean,
         host: latest.host ?? null,
         baselineIxMs,
         baselineWarmupSamples,
@@ -1283,6 +1315,7 @@ function benchmarkControlLane() {
   const latest = JSON.parse(readFileSync(latestPath, "utf8"));
   const host = latest.host ?? null;
   const hostIssues = hostBenchmarkIssues(host);
+  const hostClean = hostBenchmarkClean(hostIssues);
   const ixMs = Number(latest.iexMs);
   const selfMs = Number(latest.competitors?.iex_previous?.durationMs);
   const selfRatio = Number(latest.iexToPreviousRatio);
@@ -1307,9 +1340,11 @@ function benchmarkControlLane() {
     Number.isFinite(selfMs) &&
     Number.isFinite(driftPct) &&
     driftPct <= benchmarkControlDriftTolerancePct;
-  const ok = selfOk && robustCvOk && baselineOk;
+  const ok = selfOk && robustCvOk && baselineComparable && hostClean && baselineOk;
   const reason = !selfOk
     ? "same-binary control drift exceeded tolerance; benchmark window is too noisy for attribution"
+    : !hostClean
+      ? "host benchmark envelope contains warning-class noise; rerun under a clean host before fixed-baseline attribution"
     : !robustCvOk
       ? "same-binary control sample spread exceeded robust CV tolerance; benchmark window is too noisy for fixed-baseline attribution"
     : !baselineComparable
@@ -1357,6 +1392,7 @@ function benchmarkControlLane() {
       rgSampleDurationsMs: latest.competitors?.ripgrep?.sampleDurationsMs ?? [],
       rgSampleSummary: latest.competitors?.ripgrep?.sampleSummary ?? null,
       hostIssues,
+      hostClean,
       matchCount: latest.matchCount ?? null,
       phaseMs: latest.phaseMs ?? {},
       host,
