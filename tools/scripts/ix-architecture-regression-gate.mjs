@@ -62,6 +62,116 @@ function writeReport(report) {
   writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`);
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateCommandEvidence(pathLabel, evidence, failures) {
+  if (!isPlainObject(evidence)) {
+    failures.push(`${pathLabel}: evidence must be an object`);
+    return;
+  }
+  if (Object.hasOwn(evidence, "command") && typeof evidence.command !== "string") {
+    failures.push(`${pathLabel}.command: must be a string`);
+  }
+  if (Object.hasOwn(evidence, "exitCode") && typeof evidence.exitCode !== "number") {
+    failures.push(`${pathLabel}.exitCode: must be a number`);
+  }
+  if (Object.hasOwn(evidence, "durationMs") && typeof evidence.durationMs !== "number") {
+    failures.push(`${pathLabel}.durationMs: must be a number`);
+  }
+  for (const key of ["stdout", "stderr"]) {
+    if (Object.hasOwn(evidence, key) && typeof evidence[key] !== "string") {
+      failures.push(`${pathLabel}.${key}: must be a string`);
+    }
+  }
+}
+
+function validateNestedEvidence(pathLabel, value, failures) {
+  if (!isPlainObject(value)) return;
+  if (Object.hasOwn(value, "command") || Object.hasOwn(value, "exitCode") || Object.hasOwn(value, "durationMs")) {
+    validateCommandEvidence(pathLabel, value, failures);
+  }
+  for (const [key, nested] of Object.entries(value)) {
+    if (isPlainObject(nested)) validateNestedEvidence(`${pathLabel}.${key}`, nested, failures);
+  }
+}
+
+function validateReport(report) {
+  const failures = [];
+  const expectedLaneIds = new Set([
+    "worktree",
+    "planning_chain",
+    "diff_check",
+    "ripgrep_12_sample",
+    "agent_real_dry_run",
+    "agent_real",
+    "zig_test",
+    "cold_smoke",
+    "surface_parity",
+    "warm_index_live",
+    "indexd_memory_cap",
+    "process_scan",
+  ]);
+  const legalStatuses = new Set(["ok", "failed", "skipped"]);
+
+  if (!isPlainObject(report)) failures.push("report: must be an object");
+  if (!["ok", "failed"].includes(report.status)) failures.push("report.status: must be ok or failed");
+  if (!["quick", "full"].includes(report.mode)) failures.push("report.mode: must be quick or full");
+  if (typeof report.stateDir !== "string" || report.stateDir.length === 0) failures.push("report.stateDir: must be a non-empty string");
+  if (typeof report.reportPath !== "string" || report.reportPath.length === 0) failures.push("report.reportPath: must be a non-empty string");
+  if (!Array.isArray(report.lanes)) {
+    failures.push("report.lanes: must be an array");
+    return failures;
+  }
+
+  const seen = new Set();
+  for (const [index, entry] of report.lanes.entries()) {
+    const label = `report.lanes[${index}]`;
+    if (!isPlainObject(entry)) {
+      failures.push(`${label}: must be an object`);
+      continue;
+    }
+    if (typeof entry.id !== "string" || entry.id.length === 0) {
+      failures.push(`${label}.id: must be a non-empty string`);
+      continue;
+    }
+    if (!expectedLaneIds.has(entry.id)) failures.push(`${entry.id}: unexpected lane id`);
+    if (seen.has(entry.id)) failures.push(`${entry.id}: duplicate lane id`);
+    seen.add(entry.id);
+
+    if (!legalStatuses.has(entry.status)) failures.push(`${entry.id}.status: must be ok, failed, or skipped`);
+    if (entry.status === "skipped" && typeof entry.reason !== "string") {
+      failures.push(`${entry.id}.reason: skipped lanes must explain the skip`);
+    }
+    if (Object.hasOwn(entry, "failures")) {
+      if (!Array.isArray(entry.failures) || entry.failures.some((failure) => typeof failure !== "string")) {
+        failures.push(`${entry.id}.failures: must be an array of strings`);
+      }
+    }
+    if (
+      entry.status === "failed" &&
+      !Object.hasOwn(entry, "evidence") &&
+      !Object.hasOwn(entry, "failures") &&
+      !Object.hasOwn(entry, "reason") &&
+      !Object.hasOwn(entry, "primary") &&
+      !Object.hasOwn(entry, "confirm")
+    ) {
+      failures.push(`${entry.id}: failed lanes must expose evidence, failures, reason, or benchmark windows`);
+    }
+    if (Object.hasOwn(entry, "evidence")) validateNestedEvidence(`${entry.id}.evidence`, entry.evidence, failures);
+    for (const key of ["primary", "confirm", "tiebreaker"]) {
+      if (Object.hasOwn(entry, key)) validateNestedEvidence(`${entry.id}.${key}`, entry[key], failures);
+    }
+  }
+
+  for (const id of expectedLaneIds) {
+    if (!seen.has(id)) failures.push(`${id}: expected lane missing`);
+  }
+
+  return failures;
+}
+
 function findBuiltIx() {
   const exe = process.platform === "win32" ? "ix-zig.exe" : "ix-zig";
   const candidate = path.join(ROOT, "zig-out", "bin", exe);
@@ -494,6 +604,21 @@ function ripgrepLane() {
   if (confirm.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm });
 
   const accepted = primary.ok && confirm.ok && (primary.softOk || confirm.softOk);
+  if (!primary.ok && confirm.ok && confirm.softOk) {
+    const tiebreaker = runWindow("tiebreaker");
+    if (tiebreaker.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm, tiebreaker });
+    const tiebreakerAccepted = tiebreaker.ok && tiebreaker.softOk;
+    return lane("ripgrep_12_sample", tiebreakerAccepted ? "ok" : "failed", {
+      corpus,
+      primary,
+      confirm,
+      tiebreaker,
+      interpretation: tiebreakerAccepted
+        ? "primary window crossed the hard guard, but confirm and tiebreaker windows stayed inside the soft regression band"
+        : "primary window crossed the hard guard and the tiebreaker did not prove recovery inside the soft regression band",
+    });
+  }
+
   return lane("ripgrep_12_sample", accepted ? "ok" : "failed", {
     corpus,
     primary,
@@ -528,6 +653,12 @@ const report = {
   reportPath: outPath,
 };
 
+const reportSchemaFailures = validateReport(report);
+if (reportSchemaFailures.length !== 0) {
+  report.status = "failed";
+  report.lanes.push(lane("report_schema", "failed", { failures: reportSchemaFailures }));
+}
+
 writeReport(report);
 console.log(JSON.stringify(report, null, 2));
-process.exit(failed.length === 0 ? 0 : 1);
+process.exit(report.status === "ok" ? 0 : 1);
