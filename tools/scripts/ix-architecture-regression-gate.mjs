@@ -110,6 +110,7 @@ function validateReport(report) {
     "cold_smoke",
     "surface_parity",
     "warm_index_live",
+    "runtime_state_location",
     "indexd_memory_cap",
     "process_scan",
   ]);
@@ -484,6 +485,98 @@ exit 0
   });
 }
 
+function runtimeStateLocationLane() {
+  const ix = findBuiltIx();
+  if (!ix) return lane("runtime_state_location", "skipped", { reason: "zig-out binary missing; run build first" });
+  const root = path.join(os.tmpdir(), `ix-state-location-root-${process.pid}`);
+  const localState = path.join(os.tmpdir(), `ix-state-location-state-${process.pid}`);
+  rmSync(root, { recursive: true, force: true });
+  rmSync(localState, { recursive: true, force: true });
+  mkdirSync(root, { recursive: true });
+  writeFileSync(path.join(root, "needle.zig"), "pub const needle = \"needle\";\n");
+  writeFileSync(path.join(root, "other.zig"), "pub fn main() void { _ = \"haystack\"; }\n");
+
+  const script = `
+$ErrorActionPreference = 'Continue'
+$ix = ${psQuote(ix)}
+$root = ${psQuote(root)}
+$stateDir = ${psQuote(localState)}
+$env:IX_STATE_DIR = $stateDir
+$env:IX_INDEXD_MEMORY_LIMIT_MB = '256'
+$owner = Start-Process -FilePath $ix -ArgumentList @('__ix_indexd', $root, '--foreground') -PassThru -WindowStyle Hidden
+try {
+  $live = $null
+  for ($i = 0; $i -lt 80; $i++) {
+    $live = Get-ChildItem -LiteralPath $stateDir -Recurse -Force -Filter 'index.live' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($live) { break }
+    Start-Sleep -Milliseconds 100
+  }
+  $env:IX_INDEX = '1'
+  $env:IX_NEXUS = '0'
+  $firstOut = & $ix search 'lit:needle' $root --json --max-hits 1
+  $secondOut = & $ix search 'lit:needle' $root --json --max-hits 1
+  $repair = & $ix __ix_indexd $root --foreground --once --repair
+  $rootIx = Join-Path $root '.ix'
+  $stateMarkers = @(Get-ChildItem -LiteralPath $stateDir -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -in @('index.live', 'current.ixgen', 'repair.state') } | Select-Object -ExpandProperty FullName)
+  $queryFiles = @(Get-ChildItem -LiteralPath $stateDir -Recurse -Force -Filter '*.ixq' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+  $first = $firstOut | ConvertFrom-Json
+  $second = $secondOut | ConvertFrom-Json
+  [pscustomobject]@{
+    status = 'ok'
+    rootIxExists = Test-Path -LiteralPath $rootIx
+    rootIxIndexExists = Test-Path -LiteralPath (Join-Path $rootIx 'index')
+    liveMarker = if ($live) { $live.FullName } else { $null }
+    stateMarkers = $stateMarkers
+    queryFiles = $queryFiles
+    firstRefreshStatus = $first.stats.generation_refresh.refresh_status
+    secondRefreshStatus = $second.stats.generation_refresh.refresh_status
+    secondMatchesFound = $second.stats.matches_found
+    repairExitCode = $LASTEXITCODE
+  } | ConvertTo-Json -Compress
+} finally {
+  Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($root) -and ($_.CommandLine.Contains('__ix_indexd') -or $_.Name -match '^(ix|iex|ix-zig)(\\.exe)?$') } | ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  Stop-Process -Id $owner.Id -Force -ErrorAction SilentlyContinue
+}
+exit 0
+`;
+  const probe = run("powershell", ["-NoProfile", "-Command", script]);
+  let parsed;
+  try {
+    parsed = JSON.parse(probe.stdout || "{}");
+  } catch {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(localState, { recursive: true, force: true });
+    return lane("runtime_state_location", "failed", { evidence: probe, reason: "state-location probe did not emit JSON" });
+  }
+
+  const nativeProbe = run(resolveZigExe(), ["build", "test", "--summary", "all"], {
+    env: {
+      IX_INDEX: "0",
+      IX_NEXUS: "0",
+      IX_STATE_DIR: localState,
+    },
+  });
+  const failures = [];
+  if (probe.exitCode !== 0) failures.push(`powershell exited ${probe.exitCode}`);
+  if (parsed.rootIxExists) failures.push("runtime created .ix under scanned root");
+  if (parsed.rootIxIndexExists) failures.push("runtime created .ix/index under scanned root");
+  if (!parsed.liveMarker || !String(parsed.liveMarker).startsWith(localState)) failures.push("live marker was not under IX_STATE_DIR");
+  if (!Array.isArray(parsed.stateMarkers) || parsed.stateMarkers.length === 0) failures.push("no state markers were written under IX_STATE_DIR");
+  if (!Array.isArray(parsed.queryFiles) || parsed.queryFiles.length === 0) failures.push("warm query cache was not written under IX_STATE_DIR");
+  if (parsed.secondMatchesFound !== 1) failures.push(`expected cached search to find 1 match, got ${parsed.secondMatchesFound}`);
+  if (nativeProbe.exitCode !== 0) failures.push("native root-helper test pass failed");
+
+  rmSync(root, { recursive: true, force: true });
+  rmSync(localState, { recursive: true, force: true });
+  return lane("runtime_state_location", failures.length === 0 ? "ok" : "failed", {
+    evidence: { runtime: probe, nativeProbe },
+    parsed,
+    failures,
+  });
+}
+
 function findFilesByName(root, name, found = []) {
   if (!existsSync(root)) return found;
   const entries = spawnSync("powershell", [
@@ -640,6 +733,7 @@ const lanes = [
   smokeLane(),
   surfaceParityLane(),
   warmIndexLane(),
+  runtimeStateLocationLane(),
   memoryCapLane(),
   scanIxProcesses(),
 ];
