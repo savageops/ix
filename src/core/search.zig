@@ -257,7 +257,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     };
 
     const trigram_admission = trigram.admit(plan);
-    const trigram_program = TrigramAdmissionProgram.compile(trigram_admission);
+    const trigram_program = TrigramAdmissionProgram.compile(trigram_admission, plan, request.case_insensitive);
     initTrigramStats(&report.stats.trigram_acceleration, trigram_admission, request.case_insensitive);
     report.stats.admission.enabled = !request.no_ignore;
 
@@ -2736,7 +2736,7 @@ fn scanFileMmap(
         shard.slowest_bytes = file_bytes;
     }
 
-    if (multiPredicateFileAdmissionMiss(data, plan, request.case_insensitive)) {
+    if (trigram_program.fileAdmissionMiss(data)) {
         recordEvidencePruned(shard, file_bytes);
         const file_ms = elapsedMs(io, file_started);
         shard.scan_work_ms_total += file_ms;
@@ -4144,6 +4144,13 @@ fn mergeLinuxDominantFileStats(target: *core_stats.LinuxDominantFileStats, sourc
 
 const TRIGRAM_ADMISSION_CAPACITY = 4096;
 const TRIGRAM_ADMISSION_HASH_MASK: usize = TRIGRAM_ADMISSION_CAPACITY - 1;
+const FILE_ADMISSION_MAX_NEEDLES = expr.MAX_PREDICATES;
+
+const FileAdmissionMode = enum {
+    disabled,
+    all,
+    any,
+};
 
 const TrigramAdmissionProgram = struct {
     eligible: bool = false,
@@ -4154,13 +4161,17 @@ const TrigramAdmissionProgram = struct {
     keys: [TRIGRAM_ADMISSION_CAPACITY]trigram.Trigram = @splat(0),
     group_masks: [TRIGRAM_ADMISSION_CAPACITY]u64 = @splat(0),
     occupied: [TRIGRAM_ADMISSION_CAPACITY]bool = @splat(false),
+    file_admission_mode: FileAdmissionMode = .disabled,
+    file_admission_count: usize = 0,
+    file_admission_needles: [FILE_ADMISSION_MAX_NEEDLES][]const u8 = @splat(""),
 
-    fn compile(admission: trigram.Admission) TrigramAdmissionProgram {
+    fn compile(admission: trigram.Admission, plan: expr.ExpressionPlan, case_insensitive: bool) TrigramAdmissionProgram {
         var program = TrigramAdmissionProgram{
             .eligible = admission.eligible,
             .mode = admission.mode,
             .group_count = admission.group_count,
         };
+        program.compileFileAdmission(plan, case_insensitive);
         if (!admission.eligible) return program;
 
         for (admission.groups[0..admission.group_count], 0..) |group, group_index| {
@@ -4171,6 +4182,54 @@ const TrigramAdmissionProgram = struct {
             }
         }
         return program;
+    }
+
+    fn compileFileAdmission(self: *TrigramAdmissionProgram, plan: expr.ExpressionPlan, case_insensitive: bool) void {
+        if (case_insensitive or plan.predicate_count < 2) return;
+        const predicates = plan.predicates[0..plan.predicate_count];
+        switch (plan.mode) {
+            .any => {
+                for (predicates) |predicate| {
+                    const needle = fileAdmissionNeedleRuntime(predicate) orelse {
+                        self.file_admission_mode = .disabled;
+                        self.file_admission_count = 0;
+                        return;
+                    };
+                    self.appendFileAdmissionNeedle(needle);
+                }
+                if (self.file_admission_count != 0) self.file_admission_mode = .any;
+            },
+            .all => {
+                for (predicates) |predicate| {
+                    if (fileAdmissionNeedleRuntime(predicate)) |needle| self.appendFileAdmissionNeedle(needle);
+                }
+                if (self.file_admission_count != 0) self.file_admission_mode = .all;
+            },
+        }
+    }
+
+    fn appendFileAdmissionNeedle(self: *TrigramAdmissionProgram, needle: []const u8) void {
+        if (self.file_admission_count >= self.file_admission_needles.len) return;
+        self.file_admission_needles[self.file_admission_count] = needle;
+        self.file_admission_count += 1;
+    }
+
+    fn fileAdmissionMiss(self: *const TrigramAdmissionProgram, bytes: []const u8) bool {
+        return switch (self.file_admission_mode) {
+            .disabled => false,
+            .all => {
+                for (self.file_admission_needles[0..self.file_admission_count]) |needle| {
+                    if (sz.indexOfAdmission(bytes, needle) == null) return true;
+                }
+                return false;
+            },
+            .any => {
+                for (self.file_admission_needles[0..self.file_admission_count]) |needle| {
+                    if (sz.indexOfAdmission(bytes, needle) != null) return false;
+                }
+                return self.file_admission_count != 0;
+            },
+        };
     }
 
     fn mayMatch(self: *const TrigramAdmissionProgram, bytes: []const u8) bool {
@@ -4490,30 +4549,6 @@ fn admissionProbeNeedle(needle: []const u8) ?[]const u8 {
     if (needle.len < 2) return null;
     if (needle.len <= 16) return needle;
     return needle[0..8];
-}
-
-fn multiPredicateFileAdmissionMiss(data: []const u8, plan: expr.ExpressionPlan, case_insensitive: bool) bool {
-    if (case_insensitive or plan.predicate_count < 2) return false;
-    const predicates = plan.predicates[0..plan.predicate_count];
-    return switch (plan.mode) {
-        .any => {
-            var checked: usize = 0;
-            for (predicates) |predicate| {
-                const needle = fileAdmissionNeedleRuntime(predicate) orelse return false;
-                checked += 1;
-                if (sz.indexOfAdmission(data, needle) != null) return false;
-            }
-            return checked != 0;
-        },
-        .all => {
-            for (predicates) |predicate| {
-                if (fileAdmissionNeedleRuntime(predicate)) |needle| {
-                    if (sz.indexOfAdmission(data, needle) == null) return true;
-                }
-            }
-            return false;
-        },
-    };
 }
 
 /// Extracts a mandatory literal needle suitable for chunk-level prefiltering.
@@ -5708,7 +5743,7 @@ fn firstLiteralAlternateBranchAtLeast(pattern: []const u8, min_len: usize) ?[]co
 test "trigram gate rejects impossible complete file without verifier authority" {
     const plan = try expr.parse("lit:needle");
     const admission = trigram.admit(plan);
-    const program = TrigramAdmissionProgram.compile(admission);
+    const program = TrigramAdmissionProgram.compile(admission, plan, false);
     var stats = core_stats.TrigramAccelerationStats{};
     initTrigramStats(&stats, admission, false);
     var bytes: [TRIGRAM_MIN_PRUNE_BYTES]u8 = undefined;
@@ -5724,13 +5759,57 @@ test "trigram gate rejects impossible complete file without verifier authority" 
 
 test "multi predicate file admission proves literal any absence" {
     const plan = try expr.parse("lit:PM_RESUME || lit:PM_SUSPEND");
-    try std.testing.expect(multiPredicateFileAdmissionMiss("no power-management token here", plan, false));
-    try std.testing.expect(!multiPredicateFileAdmissionMiss("calls PM_RESUME once", plan, false));
+    const admission = trigram.admit(plan);
+    const program = TrigramAdmissionProgram.compile(admission, plan, false);
+    try std.testing.expectEqual(FileAdmissionMode.any, program.file_admission_mode);
+    try std.testing.expectEqual(@as(usize, 2), program.file_admission_count);
+    try std.testing.expect(program.fileAdmissionMiss("no power-management token here"));
+    try std.testing.expect(!program.fileAdmissionMiss("calls PM_RESUME once"));
+}
+
+test "compiled file admission rejects all-mode missing mandatory needle" {
+    const plan = try expr.parse("lit:alpha && lit:omega");
+    const admission = trigram.admit(plan);
+    const program = TrigramAdmissionProgram.compile(admission, plan, false);
+    try std.testing.expectEqual(FileAdmissionMode.all, program.file_admission_mode);
+    try std.testing.expectEqual(@as(usize, 2), program.file_admission_count);
+    try std.testing.expect(program.fileAdmissionMiss("alpha only"));
+    try std.testing.expect(!program.fileAdmissionMiss("alpha and omega"));
 }
 
 test "multi predicate file admission preserves unsupported any predicates" {
     const plan = try expr.parse("lit:PM_RESUME || re:PM_.*");
-    try std.testing.expect(!multiPredicateFileAdmissionMiss("PM_SUSPEND", plan, false));
+    const admission = trigram.admit(plan);
+    const program = TrigramAdmissionProgram.compile(admission, plan, false);
+    try std.testing.expectEqual(FileAdmissionMode.disabled, program.file_admission_mode);
+    try std.testing.expect(!program.fileAdmissionMiss("PM_SUSPEND"));
+}
+
+test "compiled file admission keeps supported all-mode subset" {
+    const plan = try expr.parse("lit:PM_RESUME && re:PM_.*");
+    const admission = trigram.admit(plan);
+    const program = TrigramAdmissionProgram.compile(admission, plan, false);
+    try std.testing.expectEqual(FileAdmissionMode.all, program.file_admission_mode);
+    try std.testing.expectEqual(@as(usize, 1), program.file_admission_count);
+    try std.testing.expect(program.fileAdmissionMiss("PM_SUSPEND"));
+    try std.testing.expect(!program.fileAdmissionMiss("PM_RESUME"));
+}
+
+test "compiled file admission disables for case insensitive search" {
+    const plan = try expr.parse("lit:alpha && lit:omega");
+    const admission = trigram.admit(plan);
+    const program = TrigramAdmissionProgram.compile(admission, plan, true);
+    try std.testing.expectEqual(FileAdmissionMode.disabled, program.file_admission_mode);
+    try std.testing.expect(!program.fileAdmissionMiss("alpha only"));
+}
+
+test "compiled file admission stores long prefix probe once" {
+    const plan = try expr.parse("lit:__IX_ABSENT_SENTINEL_DO_NOT_MATCH__ && lit:omega");
+    const admission = trigram.admit(plan);
+    const program = TrigramAdmissionProgram.compile(admission, plan, false);
+    try std.testing.expectEqual(FileAdmissionMode.all, program.file_admission_mode);
+    try std.testing.expectEqualStrings("__IX_ABS", program.file_admission_needles[0]);
+    try std.testing.expect(program.fileAdmissionMiss("__IX_ABS prefix without suffix"));
 }
 
 test "long file admission uses mandatory prefix probe" {
@@ -5743,7 +5822,7 @@ test "long file admission uses mandatory prefix probe" {
 test "trigram gate admits possible file for exact verifier" {
     const plan = try expr.parse("lit:needle");
     const admission = trigram.admit(plan);
-    const program = TrigramAdmissionProgram.compile(admission);
+    const program = TrigramAdmissionProgram.compile(admission, plan, false);
     var stats = core_stats.TrigramAccelerationStats{};
     initTrigramStats(&stats, admission, false);
     var bytes: [TRIGRAM_MIN_PRUNE_BYTES]u8 = undefined;
@@ -5760,7 +5839,7 @@ test "trigram gate admits possible file for exact verifier" {
 test "trigram program requires every all-mode evidence group" {
     const plan = try expr.parse("lit:alpha && lit:omega");
     const admission = trigram.admit(plan);
-    const program = TrigramAdmissionProgram.compile(admission);
+    const program = TrigramAdmissionProgram.compile(admission, plan, false);
     var stats = core_stats.TrigramAccelerationStats{};
     initTrigramStats(&stats, admission, false);
     var bytes: [TRIGRAM_MIN_PRUNE_BYTES]u8 = undefined;
@@ -5775,7 +5854,7 @@ test "trigram program requires every all-mode evidence group" {
 test "trigram program admits any-mode satisfied branch" {
     const plan = try expr.parse("lit:alpha || lit:omega");
     const admission = trigram.admit(plan);
-    const program = TrigramAdmissionProgram.compile(admission);
+    const program = TrigramAdmissionProgram.compile(admission, plan, false);
     var stats = core_stats.TrigramAccelerationStats{};
     initTrigramStats(&stats, admission, false);
     var bytes: [TRIGRAM_MIN_PRUNE_BYTES]u8 = undefined;
