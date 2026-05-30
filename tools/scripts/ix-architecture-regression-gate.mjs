@@ -75,7 +75,7 @@ function scanIxProcesses() {
   ]);
   if (probe.exitCode !== 0) return lane("process_scan", "failed", { evidence: probe });
   const text = probe.stdout.trim();
-  return lane("process_scan", text ? "attention" : "ok", { evidence: probe, matched: text || "[]" });
+  return lane("process_scan", text ? "failed" : "ok", { evidence: probe, matched: text || "[]" });
 }
 
 function worktreeLane() {
@@ -119,7 +119,7 @@ function agentRealLane() {
   }
   if (parsed.status === "ok") return lane("agent_real", "ok", { evidence: agent, statusDetail: parsed.status });
   if (parsed.status === "missing_config" || parsed.status === "missing_curl") {
-    return lane("agent_real", "skipped", {
+    return lane("agent_real", "failed", {
       evidence: agent,
       statusDetail: parsed.status,
       reason: parsed.message,
