@@ -1125,6 +1125,7 @@ function ripgrepLane(controlLane = null) {
         speedupPct: latest.speedupPct,
         matchCount,
         phaseMs: latest.phaseMs ?? {},
+        host: latest.host ?? null,
         baselineIxMs,
         baselineWarmupSamples,
         baselineComparable,
@@ -1339,6 +1340,7 @@ function benchmarkControlLane() {
       rgSampleSummary: latest.competitors?.ripgrep?.sampleSummary ?? null,
       matchCount: latest.matchCount ?? null,
       phaseMs: latest.phaseMs ?? {},
+      host: latest.host ?? null,
     },
   });
 }

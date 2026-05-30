@@ -236,6 +236,73 @@ function sampleSummary(values) {
   return summarizeSeries(values ?? []);
 }
 
+function safeCommand(command, args) {
+  const result = spawnSync(command, args, {
+    cwd: ROOT,
+    encoding: "utf8",
+    stdio: "pipe",
+    maxBuffer: 1024 * 1024,
+    windowsHide: true,
+  });
+  if (result.error || result.status !== 0) {
+    return null;
+  }
+  return (result.stdout ?? "").toString().trim();
+}
+
+function parsePowerScheme(text) {
+  if (!text) return null;
+  const match = text.match(/Power Scheme GUID:\s+([^\s]+)\s+\(([^)]+)\)/i);
+  if (!match) return { raw: text };
+  return {
+    guid: match[1],
+    name: match[2],
+    raw: text,
+  };
+}
+
+function topProcessSnapshot() {
+  if (process.platform !== "win32") return [];
+  const json = safeCommand("powershell", [
+    "-NoProfile",
+    "-Command",
+    "Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 8 Id,ProcessName,CPU,WorkingSet64 | ConvertTo-Json -Compress",
+  ]);
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return [];
+  }
+}
+
+function hostSnapshot() {
+  const cpus = os.cpus();
+  const cpuSpeeds = cpus.map((cpu) => cpu.speed).filter((speed) => Number.isFinite(speed));
+  const powerScheme = process.platform === "win32" ? parsePowerScheme(safeCommand("powercfg", ["/getactivescheme"])) : null;
+  return {
+    timestamp: new Date().toISOString(),
+    platform: process.platform,
+    arch: process.arch,
+    release: os.release(),
+    uptimeSec: os.uptime(),
+    availableParallelism: os.availableParallelism(),
+    totalMemBytes: os.totalmem(),
+    freeMemBytes: os.freemem(),
+    loadavg: os.loadavg(),
+    cpu: {
+      model: cpus[0]?.model ?? null,
+      logicalCount: cpus.length,
+      speedMinMhz: cpuSpeeds.length ? Math.min(...cpuSpeeds) : null,
+      speedMaxMhz: cpuSpeeds.length ? Math.max(...cpuSpeeds) : null,
+      speedMeanMhz: cpuSpeeds.length ? Math.round(cpuSpeeds.reduce((sum, speed) => sum + speed, 0) / cpuSpeeds.length) : null,
+    },
+    powerScheme,
+    topProcessesByWorkingSet: topProcessSnapshot(),
+  };
+}
+
 function measureIxSearch(binaryPath, context, measureOptions) {
   const args = buildIxSearchArgs(context);
   const warmup = Math.max(0, Number(measureOptions.warmup ?? 0));
@@ -982,6 +1049,7 @@ export function runOneBenchmark(options = {}) {
       IX_NEXUS: "0",
     },
   };
+  const hostBefore = hostSnapshot();
 
   const ixBin = resolveIxBinaryPath({ ixBinaryPath });
   const searchContext = { expression, corpus, threads };
@@ -1052,6 +1120,7 @@ export function runOneBenchmark(options = {}) {
   const previousIxBinaryIdentity = competitors?.iex_previous?.binaryIdentity ?? null;
   const scenario = describeBenchmarkScenario({ corpus, expression, statsOnly: true });
   const reportPaths = resolveBenchmarkReportPaths({ scenarioId: scenario.id });
+  const hostAfter = hostSnapshot();
 
   const run = {
     runId: `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`,
@@ -1060,6 +1129,10 @@ export function runOneBenchmark(options = {}) {
     profile,
     expression,
     corpus,
+    host: {
+      before: hostBefore,
+      after: hostAfter,
+    },
     ixBinaryPath: ixBin,
     ixBinaryIdentity,
     previousIxBinaryPath: competitors?.iex_previous?.binaryPath ?? null,
