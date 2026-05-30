@@ -2981,12 +2981,83 @@ const MAX_LITERAL_ALTERNATE_BRANCHES = 32;
 
 const LiteralAlternates = struct {
     branches: [MAX_LITERAL_ALTERNATE_BRANCHES][]const u8 = undefined,
+    first_byte_mask: [4]u64 = [_]u64{0} ** 4,
+    first_byte_folded_mask: [4]u64 = [_]u64{0} ** 4,
     count: usize = 0,
 
     fn slice(self: *const LiteralAlternates) []const []const u8 {
         return self.branches[0..self.count];
     }
+
+    fn addBranch(self: *LiteralAlternates, branch: []const u8) void {
+        self.branches[self.count] = branch;
+        self.count += 1;
+        setByteMask(&self.first_byte_mask, branch[0]);
+        setByteMask(&self.first_byte_folded_mask, std.ascii.toLower(branch[0]));
+    }
+
+    fn mayContainStartByte(self: *const LiteralAlternates, line: []const u8, case_insensitive: bool) bool {
+        if (line.len == 0) return false;
+        if (case_insensitive) {
+            for (line) |byte| {
+                if (byteMaskContains(self.first_byte_folded_mask, std.ascii.toLower(byte))) return true;
+            }
+            return false;
+        }
+        for (line) |byte| {
+            if (byteMaskContains(self.first_byte_mask, byte)) return true;
+        }
+        return false;
+    }
+
+    fn column(self: *const LiteralAlternates, line: []const u8, case_insensitive: bool) ?usize {
+        if (!self.mayContainStartByte(line, case_insensitive)) return null;
+        var best: ?usize = null;
+        for (self.slice()) |branch| {
+            if (indexOfLiteral(line, branch, case_insensitive)) |index| {
+                const col = index + 1;
+                if (best == null or col < best.?) best = col;
+            }
+        }
+        return best;
+    }
+
+    fn countMatches(self: *const LiteralAlternates, line: []const u8, case_insensitive: bool) usize {
+        var total: usize = 0;
+        var cursor: usize = 0;
+        while (cursor < line.len) {
+            const remaining = line[cursor..];
+            if (!self.mayContainStartByte(remaining, case_insensitive)) break;
+
+            var best_index: ?usize = null;
+            var best_len: usize = 0;
+            for (self.slice()) |branch| {
+                if (indexOfLiteral(remaining, branch, case_insensitive)) |index| {
+                    if (best_index == null or index < best_index.?) {
+                        best_index = index;
+                        best_len = branch.len;
+                    }
+                }
+            }
+            const index = best_index orelse break;
+            total += 1;
+            cursor += index + best_len;
+        }
+        return total;
+    }
 };
+
+fn setByteMask(mask: *[4]u64, byte: u8) void {
+    const word: usize = @as(usize, byte) >> 6;
+    const bit: u6 = @intCast(byte & 63);
+    mask[word] |= @as(u64, 1) << bit;
+}
+
+fn byteMaskContains(mask: [4]u64, byte: u8) bool {
+    const word: usize = @as(usize, byte) >> 6;
+    const bit: u6 = @intCast(byte & 63);
+    return (mask[word] & (@as(u64, 1) << bit)) != 0;
+}
 
 const ByteShardJob = struct {
     io: std.Io,
@@ -5590,7 +5661,7 @@ fn countLiteralAlternatesLogicalLinesRange(buffer: []const u8, pattern: []const 
         const line_end = if (newline) |offset| cursor + offset else end;
         const raw_line = buffer[cursor..line_end];
         const line = std.mem.trimEnd(u8, raw_line, "\r");
-        counted.matches += countLiteralAlternatesParsed(line, alternates.slice(), false);
+        counted.matches += alternates.countMatches(line, false);
         if (newline) |offset| {
             cursor += offset + 1;
         } else {
@@ -5628,7 +5699,7 @@ fn isWordChar(byte: u8) bool {
 /// the earliest match column.
 fn literalAlternatesColumn(line: []const u8, pattern: []const u8, case_insensitive: bool) ?usize {
     if (parseLiteralAlternates(pattern)) |alternates| {
-        return literalAlternatesColumnParsed(line, alternates.slice(), case_insensitive);
+        return alternates.column(line, case_insensitive);
     }
 
     var best: ?usize = null;
@@ -5650,7 +5721,7 @@ fn literalAlternatesColumn(line: []const u8, pattern: []const u8, case_insensiti
 
 fn countLiteralAlternates(line: []const u8, pattern: []const u8, case_insensitive: bool) usize {
     if (parseLiteralAlternates(pattern)) |alternates| {
-        return countLiteralAlternatesParsed(line, alternates.slice(), case_insensitive);
+        return alternates.countMatches(line, case_insensitive);
     }
 
     var total: usize = 0;
@@ -5680,38 +5751,6 @@ fn countLiteralAlternates(line: []const u8, pattern: []const u8, case_insensitiv
     return total;
 }
 
-fn literalAlternatesColumnParsed(line: []const u8, branches: []const []const u8, case_insensitive: bool) ?usize {
-    var best: ?usize = null;
-    for (branches) |branch| {
-        if (indexOfLiteral(line, branch, case_insensitive)) |index| {
-            const col = index + 1;
-            if (best == null or col < best.?) best = col;
-        }
-    }
-    return best;
-}
-
-fn countLiteralAlternatesParsed(line: []const u8, branches: []const []const u8, case_insensitive: bool) usize {
-    var total: usize = 0;
-    var cursor: usize = 0;
-    while (cursor < line.len) {
-        var best_index: ?usize = null;
-        var best_len: usize = 0;
-        for (branches) |branch| {
-            if (indexOfLiteral(line[cursor..], branch, case_insensitive)) |index| {
-                if (best_index == null or index < best_index.?) {
-                    best_index = index;
-                    best_len = branch.len;
-                }
-            }
-        }
-        const index = best_index orelse break;
-        total += 1;
-        cursor += index + best_len;
-    }
-    return total;
-}
-
 fn parseLiteralAlternates(pattern: []const u8) ?LiteralAlternates {
     var alternates: LiteralAlternates = .{};
     var start: usize = 0;
@@ -5720,8 +5759,7 @@ fn parseLiteralAlternates(pattern: []const u8) ?LiteralAlternates {
         const branch = pattern[start..end];
         if (branch.len == 0) return null;
         if (alternates.count == MAX_LITERAL_ALTERNATE_BRANCHES) return null;
-        alternates.branches[alternates.count] = branch;
-        alternates.count += 1;
+        alternates.addBranch(branch);
         if (end == pattern.len) break;
         start = end + 1;
     }
@@ -6057,6 +6095,27 @@ test "literal alternates line range counts regex occurrences" {
 
     try std.testing.expectEqual(@as(?usize, 1), literalAlternatesColumn(buffer, expr.literalAlternatesBody("(Sherlock Holmes|John Watson|Irene Adler)"), false));
     try std.testing.expectEqual(@as(usize, 3), countLiteralAlternates(buffer, expr.literalAlternatesBody("(Sherlock Holmes|John Watson|Irene Adler)"), false));
+}
+
+test "literal alternates compiled start mask rejects impossible lines" {
+    const alternates = parseLiteralAlternates("Sherlock Holmes|John Watson|Irene Adler").?;
+
+    try std.testing.expect(!alternates.mayContainStartByte("plain line", false));
+    try std.testing.expectEqual(@as(?usize, null), alternates.column("plain line", false));
+    try std.testing.expectEqual(@as(usize, 0), alternates.countMatches("plain line", false));
+
+    try std.testing.expect(alternates.mayContainStartByte("John Watson", false));
+    try std.testing.expectEqual(@as(?usize, 1), alternates.column("John Watson", false));
+    try std.testing.expectEqual(@as(usize, 1), alternates.countMatches("John Watson", false));
+}
+
+test "literal alternates compiled folded start mask admits case insensitive lines" {
+    const alternates = parseLiteralAlternates("Sherlock Holmes|John Watson|Irene Adler").?;
+
+    try std.testing.expect(!alternates.mayContainStartByte("sherlock holmes", false));
+    try std.testing.expect(alternates.mayContainStartByte("sherlock holmes", true));
+    try std.testing.expectEqual(@as(?usize, 1), alternates.column("sherlock holmes", true));
+    try std.testing.expectEqual(@as(usize, 2), alternates.countMatches("sherlock holmes and irene adler", true));
 }
 
 test "large literal alternates range may use pcre count path" {
