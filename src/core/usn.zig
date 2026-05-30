@@ -3,6 +3,7 @@ const std = @import("std");
 const catalog = @import("catalog.zig");
 const generation = @import("generation.zig");
 const postings = @import("postings.zig");
+const state_dir = @import("state_dir.zig");
 const windows = std.os.windows;
 
 pub const CURSOR_MAGIC: [8]u8 = .{ 'I', 'X', 'U', 'S', 'N', '0', '0', '1' };
@@ -369,7 +370,15 @@ pub fn readBatchRequest(cursor: JournalCursor, timeout_ms: DWORDLONG, bytes_to_w
 }
 
 pub fn buildJournalPaths(allocator: std.mem.Allocator, root: []const u8) !JournalPaths {
-    const journals_dir = try std.fs.path.join(allocator, &.{ root, ".ix", "index", "journals" });
+    const identity = try catalog.identifyRoot(allocator, root);
+    defer identity.deinit(allocator);
+    const state = try state_dir.buildRootIndexState(allocator, identity.fingerprint);
+    defer state.deinit(allocator);
+    return buildJournalPathsInIndexDir(allocator, state.index_dir);
+}
+
+pub fn buildJournalPathsInIndexDir(allocator: std.mem.Allocator, index_dir: []const u8) !JournalPaths {
+    const journals_dir = try std.fs.path.join(allocator, &.{ index_dir, "journals" });
     errdefer allocator.free(journals_dir);
     const cursor_path = try std.fs.path.join(allocator, &.{ journals_dir, "ntfs-usn.cursor" });
     errdefer allocator.free(cursor_path);
@@ -1016,7 +1025,7 @@ test "journal cursor publishes atomically under journals directory" {
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
-    const paths = try buildJournalPaths(std.testing.allocator, root);
+    const paths = try buildJournalPathsInIndexDir(std.testing.allocator, root);
     defer paths.deinit(std.testing.allocator);
     const volume = VolumeIdentity{
         .root_fingerprint = 0x7777,
@@ -1034,6 +1043,16 @@ test "journal cursor publishes atomically under journals directory" {
     const loaded = (try tryLoadJournalCursor(std.testing.io, std.testing.allocator, paths.cursor_path, volume)).?;
     try std.testing.expectEqual(@as(USN, 55), loaded.next_usn);
     try std.testing.expectEqual(@as(DWORDLONG, 11), loaded.usn_journal_id);
+}
+
+test "journal root helper uses canonical state directory outside scanned root" {
+    const paths = try buildJournalPaths(std.testing.allocator, ".zig-cache\\ix-usn-canonical-root-test");
+    defer paths.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, paths.journals_dir, ".ix\\index") == null);
+    try std.testing.expect(std.mem.indexOf(u8, paths.journals_dir, ".ix/index") == null);
+    try std.testing.expect(std.mem.indexOf(u8, paths.journals_dir, "roots") != null);
+    try std.testing.expect(std.mem.endsWith(u8, paths.journals_dir, "journals"));
 }
 
 test "journal availability classifies usable inaccessible and unsupported states" {
@@ -1493,7 +1512,7 @@ test "usn delta generation publish writes refreshed catalog postings and manifes
     try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
     const root_identity = try catalog.identifyRoot(std.testing.allocator, root);
     defer root_identity.deinit(std.testing.allocator);
-    const paths = try generation.buildGenerationPaths(std.testing.allocator, root, 7);
+    const paths = try generation.buildGenerationPathsInIndexDir(std.testing.allocator, root, 7);
     defer paths.deinit(std.testing.allocator);
     const catalog_files = [_]catalog.CatalogFileInput{
         .{

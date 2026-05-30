@@ -1,5 +1,6 @@
 const std = @import("std");
 const catalog = @import("catalog.zig");
+const state_dir = @import("state_dir.zig");
 
 pub const MAGIC: [8]u8 = .{ 'I', 'X', 'G', 'E', 'N', '0', '0', '1' };
 pub const FORMAT_VERSION: u16 = 1;
@@ -243,9 +244,11 @@ pub fn makeManifest(root_fingerprint: RootFingerprint, epoch: Epoch, parent_epoc
 }
 
 pub fn buildGenerationPaths(allocator: std.mem.Allocator, root: []const u8, epoch: Epoch) !GenerationPaths {
-    const index_dir = try std.fs.path.join(allocator, &.{ root, ".ix", "index" });
-    defer allocator.free(index_dir);
-    return buildGenerationPathsInIndexDir(allocator, index_dir, epoch);
+    const identity = try catalog.identifyRoot(allocator, root);
+    defer identity.deinit(allocator);
+    const state = try state_dir.buildRootIndexState(allocator, identity.fingerprint);
+    defer state.deinit(allocator);
+    return buildGenerationPathsInIndexDir(allocator, state.index_dir, epoch);
 }
 
 pub fn buildGenerationPathsInIndexDir(allocator: std.mem.Allocator, index_root: []const u8, epoch: Epoch) !GenerationPaths {
@@ -640,10 +643,10 @@ test "generation manifest fails closed for incomplete or partial shapes" {
 }
 
 test "generation storage paths isolate tmp and visible epoch directories" {
-    const paths = try buildGenerationPaths(std.testing.allocator, ".zig-cache\\ix-generation-layout-test", 42);
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, ".zig-cache\\ix-generation-layout-test", 42);
     defer paths.deinit(std.testing.allocator);
 
-    try std.testing.expect(std.mem.endsWith(u8, paths.index_dir, ".ix\\index") or std.mem.endsWith(u8, paths.index_dir, ".ix/index"));
+    try std.testing.expect(std.mem.endsWith(u8, paths.index_dir, "ix-generation-layout-test"));
     try std.testing.expect(std.mem.indexOf(u8, paths.generation_dir, "generations") != null);
     try std.testing.expect(std.mem.endsWith(u8, paths.generation_dir, "42"));
     try std.testing.expect(std.mem.indexOf(u8, paths.tmp_dir, "tmp") != null);
@@ -653,7 +656,16 @@ test "generation storage paths isolate tmp and visible epoch directories" {
 }
 
 test "generation storage paths reject invalid visible epoch" {
-    try std.testing.expectError(error.InvalidGenerationEpoch, buildGenerationPaths(std.testing.allocator, ".", INVALID_EPOCH));
+    try std.testing.expectError(error.InvalidGenerationEpoch, buildGenerationPathsInIndexDir(std.testing.allocator, ".", INVALID_EPOCH));
+}
+
+test "generation root helper uses canonical state directory outside scanned root" {
+    const paths = try buildGenerationPaths(std.testing.allocator, ".zig-cache\\ix-generation-canonical-root-test", 43);
+    defer paths.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, paths.index_dir, ".ix\\index") == null);
+    try std.testing.expect(std.mem.indexOf(u8, paths.index_dir, ".ix/index") == null);
+    try std.testing.expect(std.mem.indexOf(u8, paths.index_dir, "roots") != null);
 }
 
 test "generation manifest publish exposes only replaced visible manifest" {
@@ -661,7 +673,7 @@ test "generation manifest publish exposes only replaced visible manifest" {
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
-    const paths = try buildGenerationPaths(std.testing.allocator, root, 9);
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 9);
     defer paths.deinit(std.testing.allocator);
 
     try publishManifestBytes(std.testing.io, paths, "IXGEN-A");
@@ -673,7 +685,7 @@ test "generation manifest publish exposes only replaced visible manifest" {
 }
 
 test "generation manifest publish rejects empty manifest body" {
-    const paths = try buildGenerationPaths(std.testing.allocator, ".zig-cache\\ix-generation-empty-publish-test", 1);
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, ".zig-cache\\ix-generation-empty-publish-test", 1);
     defer paths.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.EmptyGenerationManifest, publishManifestBytes(std.testing.io, paths, ""));
@@ -782,7 +794,7 @@ test "generation payload publish writes catalog postings and manifest through ep
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
-    const paths = try buildGenerationPaths(std.testing.allocator, root, 13);
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 13);
     defer paths.deinit(std.testing.allocator);
 
     const payloads = [_]SegmentPayload{
@@ -812,7 +824,7 @@ test "generation compacted publish writes canonical catalog and postings payload
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
-    const paths = try buildGenerationPaths(std.testing.allocator, root, 14);
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 14);
     defer paths.deinit(std.testing.allocator);
     const pin = try publishCompactedGeneration(std.testing.io, std.testing.allocator, paths, .{
         .root_fingerprint = 0xface,
@@ -832,7 +844,7 @@ test "generation compacted publish writes canonical catalog and postings payload
 }
 
 test "generation compacted publish rejects missing segment payloads" {
-    const paths = try buildGenerationPaths(std.testing.allocator, ".zig-cache\\unused-generation-compacted-empty-test", 15);
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, ".zig-cache\\unused-generation-compacted-empty-test", 15);
     defer paths.deinit(std.testing.allocator);
     try std.testing.expectError(error.EmptyGenerationSegment, publishCompactedGeneration(std.testing.io, std.testing.allocator, paths, .{
         .root_fingerprint = 0xbeef,
@@ -847,9 +859,9 @@ test "generation publish retains prior reader pinned epoch" {
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
-    const first_paths = try buildGenerationPaths(std.testing.allocator, root, 21);
+    const first_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 21);
     defer first_paths.deinit(std.testing.allocator);
-    const second_paths = try buildGenerationPaths(std.testing.allocator, root, 22);
+    const second_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 22);
     defer second_paths.deinit(std.testing.allocator);
 
     const first_payloads = [_]SegmentPayload{
@@ -874,9 +886,9 @@ test "failed generation publish leaves prior generation active" {
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
-    const first_paths = try buildGenerationPaths(std.testing.allocator, root, 31);
+    const first_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 31);
     defer first_paths.deinit(std.testing.allocator);
-    const second_paths = try buildGenerationPaths(std.testing.allocator, root, 32);
+    const second_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 32);
     defer second_paths.deinit(std.testing.allocator);
 
     const first_payloads = [_]SegmentPayload{
@@ -901,7 +913,7 @@ test "search adoption guard pins complete current generation or falls back" {
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
-    const paths = try buildGenerationPaths(std.testing.allocator, root, 41);
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 41);
     defer paths.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(?ReaderPin, null), tryPinCurrentGeneration(std.testing.io, std.testing.allocator, paths.manifest_path, 0xcccc));
@@ -924,9 +936,9 @@ test "current generation pin survives refresh while new epoch publishes" {
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
 
-    const first_paths = try buildGenerationPaths(std.testing.allocator, root, 51);
+    const first_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 51);
     defer first_paths.deinit(std.testing.allocator);
-    const second_paths = try buildGenerationPaths(std.testing.allocator, root, 52);
+    const second_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 52);
     defer second_paths.deinit(std.testing.allocator);
 
     const first_payloads = [_]SegmentPayload{

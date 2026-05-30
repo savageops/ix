@@ -9,6 +9,12 @@ const WindowsApi = if (builtin.os.tag == .windows) struct {
         lpFilename: [*]u16,
         nSize: windows.DWORD,
     ) callconv(.winapi) windows.DWORD;
+
+    extern "kernel32" fn GetEnvironmentVariableW(
+        lpName: windows.LPCWSTR,
+        lpBuffer: ?[*]u16,
+        nSize: windows.DWORD,
+    ) callconv(.winapi) windows.DWORD;
 } else struct {};
 
 pub const STATE_ENV = "IX_STATE_DIR";
@@ -125,10 +131,30 @@ fn pathStartsWithDirectory(path: []const u8, maybe_prefix: ?[]const u8) bool {
 }
 
 fn getenvOwned(allocator: std.mem.Allocator, comptime name: []const u8) ?[]const u8 {
-    const value_ptr = std.c.getenv(name ++ "\x00") orelse return null;
+    const value = if (builtin.os.tag == .windows) getenvOwnedWindows(allocator, name) catch return null else getenvOwnedLibc(allocator, name) catch return null;
+    if (value.len == 0) {
+        allocator.free(value);
+        return null;
+    }
+    return value;
+}
+
+fn getenvOwnedWindows(allocator: std.mem.Allocator, comptime name: []const u8) ![]u8 {
+    const wide_name = std.unicode.utf8ToUtf16LeStringLiteral(name);
+    const required = WindowsApi.GetEnvironmentVariableW(wide_name, null, 0);
+    if (required == 0) return error.EnvironmentVariableNotFound;
+
+    const buffer = try allocator.alloc(u16, required);
+    defer allocator.free(buffer);
+    const written = WindowsApi.GetEnvironmentVariableW(wide_name, buffer.ptr, required);
+    if (written == 0 or written >= required) return error.EnvironmentVariableNotFound;
+    return std.unicode.utf16LeToUtf8Alloc(allocator, buffer[0..written]);
+}
+
+fn getenvOwnedLibc(allocator: std.mem.Allocator, comptime name: []const u8) ![]u8 {
+    const value_ptr = std.c.getenv(name ++ "\x00") orelse return error.EnvironmentVariableNotFound;
     const value = std.mem.span(value_ptr);
-    if (value.len == 0) return null;
-    return allocator.dupe(u8, value) catch null;
+    return allocator.dupe(u8, value);
 }
 
 test "root index state partitions by fingerprint outside scanned-root .ix" {
