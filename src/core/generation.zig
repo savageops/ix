@@ -243,12 +243,18 @@ pub fn makeManifest(root_fingerprint: RootFingerprint, epoch: Epoch, parent_epoc
 }
 
 pub fn buildGenerationPaths(allocator: std.mem.Allocator, root: []const u8, epoch: Epoch) !GenerationPaths {
+    const index_dir = try std.fs.path.join(allocator, &.{ root, ".ix", "index" });
+    defer allocator.free(index_dir);
+    return buildGenerationPathsInIndexDir(allocator, index_dir, epoch);
+}
+
+pub fn buildGenerationPathsInIndexDir(allocator: std.mem.Allocator, index_root: []const u8, epoch: Epoch) !GenerationPaths {
     if (epoch == INVALID_EPOCH) return error.InvalidGenerationEpoch;
 
     const epoch_text = try std.fmt.allocPrint(allocator, "{d}", .{epoch});
     defer allocator.free(epoch_text);
 
-    const index_dir = try std.fs.path.join(allocator, &.{ root, ".ix", "index" });
+    const index_dir = try allocator.dupe(u8, index_root);
     errdefer allocator.free(index_dir);
     const generations_dir = try std.fs.path.join(allocator, &.{ index_dir, "generations" });
     errdefer allocator.free(generations_dir);

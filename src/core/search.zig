@@ -8,6 +8,7 @@ const generation = @import("generation.zig");
 const regex = @import("regex.zig");
 const pcre_regex = @import("pcre_regex.zig");
 const postings = @import("postings.zig");
+const state_dir = @import("state_dir.zig");
 const core_stats = @import("stats.zig");
 const trigram = @import("trigram.zig");
 // Pure Zig SIMD search kernels — same VPCMPEQB/VPMOVMSKB/TZCNT instructions
@@ -462,14 +463,16 @@ fn prepareWarmIndexFrontier(
     const root = request.paths[0];
     const root_identity = catalog.identifyRoot(allocator, root) catch return warmIndexFallback(report, "root_identity_failed");
     defer root_identity.deinit(allocator);
+    const root_state = state_dir.buildRootIndexState(allocator, root_identity.fingerprint) catch return warmIndexFallback(report, "state_dir_failed");
+    defer root_state.deinit(allocator);
 
-    const marker_path = std.fs.path.join(allocator, &.{ root, ".ix", "index", WARM_INDEX_LIVE_MARKER_NAME }) catch return warmIndexFallback(report, "marker_path_failed");
+    const marker_path = std.fs.path.join(allocator, &.{ root_state.index_dir, WARM_INDEX_LIVE_MARKER_NAME }) catch return warmIndexFallback(report, "marker_path_failed");
     defer allocator.free(marker_path);
     const marker_bytes = std.Io.Dir.cwd().readFileAlloc(io, marker_path, allocator, .limited(WARM_INDEX_LIVE_READ_LIMIT)) catch return warmIndexFallback(report, "no_live_owner");
     defer allocator.free(marker_bytes);
     if (!validateWarmIndexLiveMarker(marker_bytes, root)) return warmIndexFallback(report, "invalid_live_owner");
 
-    const current_paths = generation.buildGenerationPaths(allocator, root, 1) catch return warmIndexFallback(report, "paths_failed");
+    const current_paths = generation.buildGenerationPathsInIndexDir(allocator, root_state.index_dir, 1) catch return warmIndexFallback(report, "paths_failed");
     defer current_paths.deinit(allocator);
     const pin = (generation.tryPinCurrentGeneration(io, allocator, current_paths.current_manifest_path, root_identity.fingerprint) catch return warmIndexFallback(report, "pin_failed")) orelse return warmIndexFallback(report, "no_current_generation");
 
@@ -478,21 +481,21 @@ fn prepareWarmIndexFrontier(
 
     var known_matches: ?usize = null;
     if (request.stats_only) {
-        if (loadWarmQueryStatsResult(io, allocator, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
+        if (loadWarmQueryStatsResult(io, allocator, root_state.index_dir, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
             return cached;
         }
     } else {
-        if (loadWarmQueryHitResult(io, allocator, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
+        if (loadWarmQueryHitResult(io, allocator, root_state.index_dir, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
             return cached;
         }
         if (request.max_hits != null) {
-            if (loadWarmQueryStatsCount(io, allocator, root, root_identity.fingerprint, pin.epoch, request)) |record| {
+            if (loadWarmQueryStatsCount(io, allocator, root_state.index_dir, root_identity.fingerprint, pin.epoch, request)) |record| {
                 known_matches = record.matches;
             }
         }
     }
 
-    if (loadWarmQueryFrontier(io, allocator, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
+    if (loadWarmQueryFrontier(io, allocator, root_state.index_dir, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
         return .{
             .active_files = cached,
             .root = root,
@@ -504,7 +507,7 @@ fn prepareWarmIndexFrontier(
         };
     }
 
-    const paths = generation.buildGenerationPaths(allocator, root, pin.epoch) catch return warmIndexFallback(report, "generation_paths_failed");
+    const paths = generation.buildGenerationPathsInIndexDir(allocator, root_state.index_dir, pin.epoch) catch return warmIndexFallback(report, "generation_paths_failed");
     defer paths.deinit(allocator);
     const catalog_path = std.fs.path.join(allocator, &.{ paths.generation_dir, "catalog.ixcat" }) catch return warmIndexFallback(report, "catalog_path_failed");
     defer allocator.free(catalog_path);
@@ -557,7 +560,7 @@ fn prepareWarmIndexFrontier(
     report.stats.postings_index.verified_files = active.items.len;
     report.stats.postings_index.fallback_reason = "";
     const owned = active.toOwnedSlice(allocator) catch return warmIndexFallback(report, "candidate_finalize_failed");
-    writeWarmQueryFrontier(io, allocator, root, root_identity.fingerprint, pin.epoch, request, snapshot.entries.len, owned);
+    writeWarmQueryFrontier(io, allocator, root_state.index_dir, root_identity.fingerprint, pin.epoch, request, snapshot.entries.len, owned);
     return .{
         .active_files = owned,
         .root = root,
@@ -600,7 +603,9 @@ fn prepareEmptyWarmIndexFrontier(
     report.stats.postings_index.pruned_files = @intCast(header.file_count);
     report.stats.postings_index.verified_files = 0;
     report.stats.postings_index.fallback_reason = "empty_postings";
-    writeWarmQueryFrontier(io, allocator, root, root_fingerprint, epoch, request, @intCast(header.file_count), active);
+    const root_state = state_dir.buildRootIndexState(allocator, root_fingerprint) catch return warmIndexFallback(report, "empty_state_dir_failed");
+    defer root_state.deinit(allocator);
+    writeWarmQueryFrontier(io, allocator, root_state.index_dir, root_fingerprint, epoch, request, @intCast(header.file_count), active);
     return .{
         .active_files = active,
         .root = root,
@@ -674,13 +679,13 @@ fn warmIndexRelativePath(root: []const u8, path: []const u8) []const u8 {
 fn loadWarmQueryFrontier(
     io: std.Io,
     allocator: std.mem.Allocator,
-    root: []const u8,
+    index_dir: []const u8,
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
     request: cli.SearchRequest,
     report: *SearchReport,
 ) ?[]DiscoveredFile {
-    const cache_path = warmQueryCachePath(allocator, root, root_fingerprint, epoch, request.expression) catch return null;
+    const cache_path = warmQueryCachePath(allocator, index_dir, root_fingerprint, epoch, request.expression) catch return null;
     defer allocator.free(cache_path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, cache_path, allocator, .limited(WARM_QUERY_CACHE_READ_LIMIT)) catch return null;
     defer allocator.free(bytes);
@@ -736,12 +741,12 @@ const WarmQueryStatsCacheRecord = struct {
 fn loadWarmQueryStatsCount(
     io: std.Io,
     allocator: std.mem.Allocator,
-    root: []const u8,
+    index_dir: []const u8,
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
     request: cli.SearchRequest,
 ) ?WarmQueryStatsCacheRecord {
-    const cache_path = warmQueryStatsCachePath(allocator, root, root_fingerprint, epoch, request.expression) catch return null;
+    const cache_path = warmQueryStatsCachePath(allocator, index_dir, root_fingerprint, epoch, request.expression) catch return null;
     defer allocator.free(cache_path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, cache_path, allocator, .limited(1024)) catch return null;
     defer allocator.free(bytes);
@@ -768,13 +773,14 @@ fn loadWarmQueryStatsCount(
 fn loadWarmQueryStatsResult(
     io: std.Io,
     allocator: std.mem.Allocator,
+    index_dir: []const u8,
     root: []const u8,
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
     request: cli.SearchRequest,
     report: *SearchReport,
 ) ?WarmIndexFrontier {
-    const record = loadWarmQueryStatsCount(io, allocator, root, root_fingerprint, epoch, request) orelse return null;
+    const record = loadWarmQueryStatsCount(io, allocator, index_dir, root_fingerprint, epoch, request) orelse return null;
 
     report.discover_ms = 0;
     report.files_discovered = record.discovered;
@@ -812,17 +818,18 @@ fn loadWarmQueryStatsResult(
 fn loadWarmQueryHitResult(
     io: std.Io,
     allocator: std.mem.Allocator,
+    index_dir: []const u8,
     root: []const u8,
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
     request: cli.SearchRequest,
     report: *SearchReport,
 ) ?WarmIndexFrontier {
-    if (loadWarmQueryHitResultFromCache(io, allocator, root, root_fingerprint, epoch, request, report, request.max_hits)) |cached| {
+    if (loadWarmQueryHitResultFromCache(io, allocator, index_dir, root, root_fingerprint, epoch, request, report, request.max_hits)) |cached| {
         return cached;
     }
     if (request.max_hits != null) {
-        return loadWarmQueryHitResultFromCache(io, allocator, root, root_fingerprint, epoch, request, report, null);
+        return loadWarmQueryHitResultFromCache(io, allocator, index_dir, root, root_fingerprint, epoch, request, report, null);
     }
     return null;
 }
@@ -830,6 +837,7 @@ fn loadWarmQueryHitResult(
 fn loadWarmQueryHitResultFromCache(
     io: std.Io,
     allocator: std.mem.Allocator,
+    index_dir: []const u8,
     root: []const u8,
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
@@ -837,7 +845,7 @@ fn loadWarmQueryHitResultFromCache(
     report: *SearchReport,
     cache_max_hits: ?usize,
 ) ?WarmIndexFrontier {
-    const cache_path = warmQueryHitsCachePath(allocator, root, root_fingerprint, epoch, report.expression, cache_max_hits) catch return null;
+    const cache_path = warmQueryHitsCachePath(allocator, index_dir, root_fingerprint, epoch, report.expression, cache_max_hits) catch return null;
     defer allocator.free(cache_path);
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, cache_path, allocator, .limited(WARM_QUERY_CACHE_READ_LIMIT)) catch return null;
     defer allocator.free(bytes);
@@ -919,17 +927,17 @@ fn loadWarmQueryHitResultFromCache(
 fn writeWarmQueryFrontier(
     io: std.Io,
     allocator: std.mem.Allocator,
-    root: []const u8,
+    index_dir: []const u8,
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
     request: cli.SearchRequest,
     discovered: usize,
     active: []const DiscoveredFile,
 ) void {
-    const query_dir = std.fs.path.join(allocator, &.{ root, ".ix", "index", "query" }) catch return;
+    const query_dir = state_dir.queryDir(allocator, index_dir) catch return;
     defer allocator.free(query_dir);
     std.Io.Dir.cwd().createDirPath(io, query_dir) catch return;
-    const cache_path = warmQueryCachePath(allocator, root, root_fingerprint, epoch, request.expression) catch return;
+    const cache_path = warmQueryCachePath(allocator, index_dir, root_fingerprint, epoch, request.expression) catch return;
     defer allocator.free(cache_path);
     var file = std.Io.Dir.cwd().createFile(io, cache_path, .{ .truncate = true }) catch return;
     defer file.close(io);
@@ -948,10 +956,12 @@ fn writeWarmQueryHitResult(
     report: SearchReport,
 ) void {
     if (request.stats_only) return;
-    const query_dir = std.fs.path.join(allocator, &.{ prepared.root, ".ix", "index", "query" }) catch return;
+    const prepared_state = state_dir.buildRootIndexState(allocator, prepared.root_fingerprint) catch return;
+    defer prepared_state.deinit(allocator);
+    const query_dir = state_dir.queryDir(allocator, prepared_state.index_dir) catch return;
     defer allocator.free(query_dir);
     std.Io.Dir.cwd().createDirPath(io, query_dir) catch return;
-    const cache_path = warmQueryHitsCachePath(allocator, prepared.root, prepared.root_fingerprint, prepared.epoch, request.expression, request.max_hits) catch return;
+    const cache_path = warmQueryHitsCachePath(allocator, prepared_state.index_dir, prepared.root_fingerprint, prepared.epoch, request.expression, request.max_hits) catch return;
     defer allocator.free(cache_path);
     var file = std.Io.Dir.cwd().createFile(io, cache_path, .{ .truncate = true }) catch return;
     defer file.close(io);
@@ -982,10 +992,12 @@ fn writeWarmQueryStatsResult(
     request: cli.SearchRequest,
     report: SearchReport,
 ) void {
-    const query_dir = std.fs.path.join(allocator, &.{ prepared.root, ".ix", "index", "query" }) catch return;
+    const prepared_state = state_dir.buildRootIndexState(allocator, prepared.root_fingerprint) catch return;
+    defer prepared_state.deinit(allocator);
+    const query_dir = state_dir.queryDir(allocator, prepared_state.index_dir) catch return;
     defer allocator.free(query_dir);
     std.Io.Dir.cwd().createDirPath(io, query_dir) catch return;
-    const cache_path = warmQueryStatsCachePath(allocator, prepared.root, prepared.root_fingerprint, prepared.epoch, request.expression) catch return;
+    const cache_path = warmQueryStatsCachePath(allocator, prepared_state.index_dir, prepared.root_fingerprint, prepared.epoch, request.expression) catch return;
     defer allocator.free(cache_path);
     var file = std.Io.Dir.cwd().createFile(io, cache_path, .{ .truncate = true }) catch return;
     defer file.close(io);
@@ -1003,7 +1015,7 @@ fn writeWarmQueryStatsResult(
 
 fn warmQueryCachePath(
     allocator: std.mem.Allocator,
-    root: []const u8,
+    index_dir: []const u8,
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
     expression: []const u8,
@@ -1011,12 +1023,12 @@ fn warmQueryCachePath(
     const hash = warmQueryHash(root_fingerprint, epoch, expression);
     const file_name = try std.fmt.allocPrint(allocator, "{x}.ixq", .{hash});
     defer allocator.free(file_name);
-    return std.fs.path.join(allocator, &.{ root, ".ix", "index", "query", file_name });
+    return std.fs.path.join(allocator, &.{ index_dir, "query", file_name });
 }
 
 fn warmQueryStatsCachePath(
     allocator: std.mem.Allocator,
-    root: []const u8,
+    index_dir: []const u8,
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
     expression: []const u8,
@@ -1024,12 +1036,12 @@ fn warmQueryStatsCachePath(
     const hash = warmQueryHash(root_fingerprint, epoch, expression) ^ 0x535441545331;
     const file_name = try std.fmt.allocPrint(allocator, "{x}.ixqs", .{hash});
     defer allocator.free(file_name);
-    return std.fs.path.join(allocator, &.{ root, ".ix", "index", "query", file_name });
+    return std.fs.path.join(allocator, &.{ index_dir, "query", file_name });
 }
 
 fn warmQueryHitsCachePath(
     allocator: std.mem.Allocator,
-    root: []const u8,
+    index_dir: []const u8,
     root_fingerprint: catalog.RootFingerprint,
     epoch: generation.Epoch,
     expression: []const u8,
@@ -1041,7 +1053,7 @@ fn warmQueryHitsCachePath(
     }
     const file_name = try std.fmt.allocPrint(allocator, "{x}.ixqh", .{hash});
     defer allocator.free(file_name);
-    return std.fs.path.join(allocator, &.{ root, ".ix", "index", "query", file_name });
+    return std.fs.path.join(allocator, &.{ index_dir, "query", file_name });
 }
 
 fn warmQueryHash(root_fingerprint: catalog.RootFingerprint, epoch: generation.Epoch, expression: []const u8) u64 {
@@ -1166,7 +1178,7 @@ fn prepareLiveEvidenceFrontier(
     if (request.nexus_disabled) return null;
     if (!evidenceFrontierEligible(request, plan, admission)) return null;
     const key = evidenceFrontierKey(request, plan);
-    const cache_path = std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key}) catch return null;
+    const cache_path = state_dir.evidenceCachePath(allocator, key) catch return null;
     const live_path = evidenceFrontierLivePath(allocator, cache_path) catch return null;
     if (!loadEvidenceFrontierLive(io, allocator, live_path, key)) return null;
     const cache = loadEvidenceFrontierCacheFast(io, allocator, cache_path, key) orelse return null;
@@ -1191,7 +1203,7 @@ pub fn tryClaimEvidenceFrontierBuild(
     const admission = trigram.admit(plan);
     if (!evidenceFrontierEligible(request, plan, admission)) return false;
     const key = evidenceFrontierKey(request, plan);
-    const cache_path = std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key}) catch return false;
+    const cache_path = state_dir.evidenceCachePath(allocator, key) catch return false;
     defer allocator.free(cache_path);
     const live_path = evidenceFrontierLivePath(allocator, cache_path) catch return false;
     defer allocator.free(live_path);
@@ -1199,6 +1211,7 @@ pub fn tryClaimEvidenceFrontierBuild(
     const build_path = evidenceFrontierBuildPath(allocator, cache_path) catch return false;
     defer allocator.free(build_path);
     if (evidenceFrontierBuildClaimFresh(io, build_path)) return false;
+    ensureParentDir(io, build_path) catch return false;
     var file = std.Io.Dir.cwd().createFile(io, build_path, .{ .truncate = false, .exclusive = true }) catch return false;
     defer file.close(io);
     var buffer: [256]u8 = undefined;
@@ -1226,7 +1239,7 @@ fn prepareEvidenceFrontier(
     if (!request.nexus_build) return .{};
     const signature = computeDiscoveredSignature(io, files) catch return .{};
     const key = evidenceFrontierKey(request, plan);
-    const cache_path = std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key}) catch return .{};
+    const cache_path = state_dir.evidenceCachePath(allocator, key) catch return .{};
 
     if (loadEvidenceFrontierCache(io, allocator, cache_path, key, signature, files)) |cache| {
         var evidence_files: std.ArrayList(DiscoveredFile) = .empty;
@@ -1409,9 +1422,9 @@ fn warmStatsResultCachePath(
     create_dir: bool,
 ) ![]const u8 {
     const root = request.paths[0];
+    const cache_dir = try state_dir.statsDir(allocator);
+    defer allocator.free(cache_dir);
     if (create_dir) {
-        const cache_dir = try std.fs.path.join(allocator, &.{ ".ix", "stats" });
-        defer allocator.free(cache_dir);
         try std.Io.Dir.cwd().createDirPath(io, cache_dir);
     }
     var hasher = std.hash.Wyhash.init(0x4958_5354_4154_5352);
@@ -1422,7 +1435,7 @@ fn warmStatsResultCachePath(
     hashU64(&hasher, if (request.no_ignore) 1 else 0);
     const file_name = try std.fmt.allocPrint(allocator, "{x}.ixstats", .{hasher.final()});
     defer allocator.free(file_name);
-    return std.fs.path.join(allocator, &.{ ".ix", "stats", file_name });
+    return std.fs.path.join(allocator, &.{ cache_dir, file_name });
 }
 
 fn writeEvidenceFrontierCacheFromShards(
@@ -1566,6 +1579,7 @@ fn loadEvidenceFrontierLive(io: std.Io, allocator: std.mem.Allocator, path: []co
 fn writeEvidenceFrontierLive(io: std.Io, cache_path: []const u8, key: u64) void {
     var live_buf: [1024]u8 = undefined;
     const live_path = std.fmt.bufPrint(&live_buf, "{s}.live", .{cache_path}) catch return;
+    ensureParentDir(io, live_path) catch return;
     var file = std.Io.Dir.cwd().createFile(io, live_path, .{ .truncate = true }) catch return;
     defer file.close(io);
     var buffer: [512]u8 = undefined;
@@ -1598,7 +1612,7 @@ pub fn holdEvidenceFrontierLive(io: std.Io, allocator: std.mem.Allocator, reques
     if (!evidenceFrontierEligible(request, plan, admission)) return;
     if (request.path_count == 0) return;
     const key = evidenceFrontierKey(request, plan);
-    const cache_path = std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key}) catch return;
+    const cache_path = state_dir.evidenceCachePath(allocator, key) catch return;
     const live_path = evidenceFrontierLivePath(allocator, cache_path) catch return;
     std.Io.Dir.cwd().access(io, live_path, .{}) catch return;
     defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
@@ -1642,6 +1656,7 @@ fn writeEvidenceFrontierCache(
     file_count: usize,
     built: EvidenceFrontierBuild,
 ) void {
+    ensureParentDir(io, path) catch return;
     var file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return;
     defer file.close(io);
     var buffer: [8192]u8 = undefined;
@@ -1665,6 +1680,12 @@ fn writeEvidenceFrontierCache(
         std.Io.Dir.cwd().deleteFile(io, build_path) catch {};
     }
     writeEvidenceFrontierLive(io, path, key);
+}
+
+fn ensureParentDir(io: std.Io, path: []const u8) !void {
+    if (std.fs.path.dirname(path)) |dir| {
+        try std.Io.Dir.cwd().createDirPath(io, dir);
+    }
 }
 
 fn parseCacheU64(line: []const u8, prefix: []const u8) u64 {
@@ -5536,6 +5557,14 @@ test "warm index live marker rejects dead Windows owner" {
     try std.testing.expect(!validateWarmIndexLiveMarkerWithOwnerCheck(marker, "C:/repo", true));
 }
 
+fn testRootIndexDir(allocator: std.mem.Allocator, root: []const u8) ![]const u8 {
+    const root_identity = try catalog.identifyRoot(allocator, root);
+    defer root_identity.deinit(allocator);
+    const state = try state_dir.buildRootIndexState(allocator, root_identity.fingerprint);
+    defer allocator.free(state.state_dir);
+    return state.index_dir;
+}
+
 test "warm foreground marker validation is generation-pin gated" {
     const marker = try std.fmt.allocPrint(std.testing.allocator, "IXINDEX_LIVE1\npid={}\nroot=C:/repo\n", .{currentProcessId()});
     defer std.testing.allocator.free(marker);
@@ -5556,7 +5585,7 @@ test "warm index rejects dead owner before trusting generation" {
     try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\n" });
     const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
-    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
     const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid=999999\nroot={s}\n", .{root_path});
@@ -5973,7 +6002,7 @@ test "evidence frontier prepare narrows active files and accounts cached prunes"
     var candidates = [_]DiscoveredFile{files[1]};
     const signature = try computeDiscoveredSignature(io, &files);
     const key = evidenceFrontierKey(request, plan);
-    const cache_path = try std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key});
+    const cache_path = try state_dir.evidenceCachePath(allocator, key);
     defer std.Io.Dir.cwd().deleteFile(io, cache_path) catch {};
     const live_path = try evidenceFrontierLivePath(allocator, cache_path);
     defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
@@ -6043,7 +6072,7 @@ test "search run consumes evidence frontier and scans only retained candidates" 
     const request = testSearchRequest("lit:needle", root_path);
     const plan = try expr.parse(request.expression);
     const key = evidenceFrontierKey(request, plan);
-    const cache_path = try std.fmt.allocPrint(allocator, ".ix-evidence-{x}.cache", .{key});
+    const cache_path = try state_dir.evidenceCachePath(allocator, key);
     defer std.Io.Dir.cwd().deleteFile(io, cache_path) catch {};
     const live_path = try evidenceFrontierLivePath(allocator, cache_path);
     defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
@@ -6087,7 +6116,7 @@ test "search run consumes live warm postings and scans only candidate files" {
     try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
     const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
-    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
     const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
@@ -6144,7 +6173,7 @@ test "stats-only live warm postings return empty frontier without catalog scan" 
     try tmp.dir.writeFile(io, .{ .sub_path = "b.txt", .data = "other\n" });
     const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
-    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
     const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
@@ -6180,7 +6209,7 @@ test "capped warm query hit cache reuses capped-first result" {
     try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
     const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
-    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
     const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
@@ -6222,7 +6251,7 @@ test "stats-only warm query cache reuses exact pinned-generation count" {
     try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
     const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
-    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
     const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
@@ -6240,7 +6269,8 @@ test "stats-only warm query cache reuses exact pinned-generation count" {
 
     const root_identity = try catalog.identifyRoot(allocator, root_path);
     defer root_identity.deinit(allocator);
-    const stale_cache_path = try warmQueryStatsCachePath(allocator, root_path, root_identity.fingerprint, first.stats.generation_refresh.epoch.?, request.expression);
+    const stale_index_dir = try testRootIndexDir(allocator, root_path);
+    const stale_cache_path = try warmQueryStatsCachePath(allocator, stale_index_dir, root_identity.fingerprint, first.stats.generation_refresh.epoch.?, request.expression);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = stale_cache_path, .data = "IXQUERY_STATS1\nepoch=1\ndiscovered=2\ncandidates=1\nmatches=999\n" });
     const stale_rejected = try run(io, allocator, request, plan);
     try std.testing.expectEqual(@as(usize, 2), stale_rejected.matches_found);
@@ -6315,7 +6345,7 @@ test "capped warm hit query uses stats cache for exact count and prefix scan" {
     try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
     const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
-    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
     const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });
@@ -6360,7 +6390,7 @@ test "warm hit query seeds exact stats cache for stats-only reuse" {
     try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
     const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
     _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
-    const index_dir = try std.fs.path.join(allocator, &.{ root_path, ".ix", "index" });
+    const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
     const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid={}\nroot={s}\n", .{ currentProcessId(), root_path });

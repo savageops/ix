@@ -4,6 +4,7 @@ const windows = std.os.windows;
 const catalog = @import("catalog.zig");
 const generation = @import("generation.zig");
 const postings = @import("postings.zig");
+const state_dir = @import("state_dir.zig");
 const usn = @import("usn.zig");
 
 extern "kernel32" fn ReadDirectoryChangesW(
@@ -116,11 +117,6 @@ pub const IndexDiagnostics = struct {
 
 pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResult {
     const config = try buildConfig(allocator, request);
-    if (config.mode == .background_watch and !isManagedRoot(config.root)) {
-        return .{
-            .config = config,
-        };
-    }
     try std.Io.Dir.cwd().createDirPath(io, config.root);
     var lock = try acquireRootLock(io, allocator, config);
     defer lock.release(io, allocator);
@@ -190,9 +186,13 @@ pub fn formatIndexDiagnostics(allocator: std.mem.Allocator, diagnostics: IndexDi
 }
 
 pub fn buildConfig(allocator: std.mem.Allocator, request: Request) !Config {
+    const root_identity = try catalog.identifyRoot(allocator, request.root);
+    defer root_identity.deinit(allocator);
+    const state = try state_dir.buildRootIndexState(allocator, root_identity.fingerprint);
+    defer allocator.free(state.state_dir);
     return .{
         .root = request.root,
-        .index_dir = try std.fs.path.join(allocator, &.{ request.root, ".ix", "index" }),
+        .index_dir = state.index_dir,
         .mode = modeFor(request),
         .foreground = request.foreground,
         .once = request.once,
@@ -332,7 +332,9 @@ pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []c
     const postings_bytes = try postings.serializePostingsSegment(allocator, segment);
     defer allocator.free(postings_bytes);
 
-    const paths = try generation.buildGenerationPaths(allocator, root, epoch);
+    const state = try state_dir.buildRootIndexState(allocator, root_identity.fingerprint);
+    defer state.deinit(allocator);
+    const paths = try generation.buildGenerationPathsInIndexDir(allocator, state.index_dir, epoch);
     defer paths.deinit(allocator);
     const payloads = [_]generation.SegmentPayload{
         .{ .kind = .catalog, .relative_path = "catalog.ixcat", .bytes = catalog_bytes },
@@ -793,20 +795,22 @@ test "indexd managed root admission rejects dependency generated and hidden path
     try std.testing.expect(!isManagedRoot("src/.ix"));
 }
 
-test "indexd background watch no-ops for unmanaged dependency roots" {
+test "indexd background config uses central state for generated-looking roots" {
     const root = ".zig-cache\\ix-indexd-unmanaged-root\\node_modules\\convex\\dist";
     const top = ".zig-cache\\ix-indexd-unmanaged-root";
     std.Io.Dir.cwd().deleteTree(std.testing.io, top) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, top) catch {};
 
-    const result = try run(std.testing.io, std.testing.allocator, .{ .root = root });
-    defer result.deinit(std.testing.allocator);
+    const config = try buildConfig(std.testing.allocator, .{ .root = root });
+    defer config.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(Mode.background_watch, result.config.mode);
+    try std.testing.expectEqual(Mode.background_watch, config.mode);
+    try std.testing.expect(std.mem.indexOf(u8, config.index_dir, "index") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config.index_dir, "roots") != null);
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, root, .{}));
 }
 
-test "indexd config owns repo-local index directory" {
+test "indexd config owns IX state index directory" {
     const config = try buildConfig(std.testing.allocator, .{
         .root = "E:\\Workspaces\\ix-zig",
         .repair = true,
@@ -814,7 +818,8 @@ test "indexd config owns repo-local index directory" {
     defer config.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(Mode.foreground_repair, config.mode);
-    try std.testing.expect(std.mem.endsWith(u8, config.index_dir, ".ix\\index") or std.mem.endsWith(u8, config.index_dir, ".ix/index"));
+    try std.testing.expect(std.mem.indexOf(u8, config.index_dir, "roots") != null);
+    try std.testing.expect(std.mem.indexOf(u8, config.index_dir, ".ix\\index") == null);
 }
 
 test "indexd root lock prevents overlapping mutation owner" {
@@ -967,7 +972,7 @@ test "indexd foreground once publishes catalog postings generation" {
     const current_path = try std.fs.path.join(std.testing.allocator, &.{ result.config.index_dir, "current.ixgen" });
     defer std.testing.allocator.free(current_path);
     const pin = (try generation.tryPinCurrentGeneration(std.testing.io, std.testing.allocator, current_path, root_identity.fingerprint)) orelse return error.TestExpectedCurrentGeneration;
-    const paths = try generation.buildGenerationPaths(std.testing.allocator, root, pin.epoch);
+    const paths = try generation.buildGenerationPathsInIndexDir(std.testing.allocator, result.config.index_dir, pin.epoch);
     defer paths.deinit(std.testing.allocator);
 
     var buffer: [32]u8 = undefined;
@@ -1016,7 +1021,7 @@ test "indexd default traversal indexes dotfiles but skips dot directories" {
     const current_path = try std.fs.path.join(std.testing.allocator, &.{ result.config.index_dir, "current.ixgen" });
     defer std.testing.allocator.free(current_path);
     const pin = (try generation.tryPinCurrentGeneration(std.testing.io, std.testing.allocator, current_path, root_identity.fingerprint)) orelse return error.TestExpectedCurrentGeneration;
-    const paths = try generation.buildGenerationPaths(std.testing.allocator, root, pin.epoch);
+    const paths = try generation.buildGenerationPathsInIndexDir(std.testing.allocator, result.config.index_dir, pin.epoch);
     defer paths.deinit(std.testing.allocator);
     const catalog_path = try std.fs.path.join(std.testing.allocator, &.{ paths.generation_dir, "catalog.ixcat" });
     defer std.testing.allocator.free(catalog_path);

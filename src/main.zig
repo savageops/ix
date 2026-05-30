@@ -260,7 +260,6 @@ fn shouldLaunchIndexdSidecar(enabled: bool, request: cli.SearchRequest, report: 
     if (request.case_insensitive) return false;
     if (request.hidden) return false;
     if (request.path_count != 1) return false;
-    if (!indexd.isManagedRoot(request.paths[0])) return false;
     return report.files_discovered > 0;
 }
 
@@ -416,7 +415,7 @@ test "indexd sidecar launch is default-on single root and workload gated" {
     try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
 }
 
-test "indexd sidecar launch refuses generated dependency roots" {
+test "indexd sidecar launch allows generated-looking roots after central state split" {
     var request = testSearchRequestForSidecar(false);
     var report = testSearchReportForSidecar(0);
     report.files_discovered = 12;
@@ -425,13 +424,13 @@ test "indexd sidecar launch refuses generated dependency roots" {
     try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
 
     request.paths[0] = "apps/backend/node_modules/convex/dist";
-    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
+    try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
 
     request.paths[0] = ".docs/reports/subzero";
-    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
+    try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
 
     request.paths[0] = "zig-out/bin";
-    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
+    try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
 }
 
 test "background sidecar environment gate is explicit opt in" {
