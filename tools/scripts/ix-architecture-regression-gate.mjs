@@ -283,6 +283,7 @@ function validateReport(report) {
     "zig_test",
     "cold_smoke",
     "surface_parity",
+    "agent_path_contract",
     "warm_cold_parity",
     "warm_index_live",
     "runtime_state_location",
@@ -436,6 +437,7 @@ function runSchemaSelfTest() {
     "ripgrep_12_sample: ok status cannot rely on a warning-class host benchmark envelope",
     "ripgrep_12_sample: ok status requires proof classification",
     "benchmark_host_preflight: expected lane missing",
+    "agent_path_contract: expected lane missing",
     "benchmark_control: ok status cannot rely on a warning-class host benchmark envelope",
   ];
   const missing = required.filter((needle) => !failures.includes(needle));
@@ -679,6 +681,93 @@ function surfaceParityLane() {
       matchesFound: searchValue.stats?.matches_found ?? null,
     },
     failures: parityFailures,
+  });
+}
+
+function parseTextSentinel(stdout, marker) {
+  const prefix = `-- ${marker} `;
+  const line = String(stdout ?? "")
+    .split(/\r?\n/)
+    .find((entry) => entry.startsWith(prefix) && entry.endsWith(" --"));
+  if (!line) return { ok: false, reason: `${marker} sentinel missing` };
+  try {
+    return { ok: true, value: JSON.parse(line.slice(prefix.length, -" --".length)) };
+  } catch {
+    return { ok: false, reason: `${marker} sentinel did not contain valid JSON`, line };
+  }
+}
+
+function agentPathContractLane() {
+  const ix = findBuiltIx();
+  if (!ix) return lane("agent_path_contract", "skipped", { reason: "zig-out binary missing; run build first" });
+  const root = path.join(os.tmpdir(), `ix-agent-path-contract-root-${process.pid}`);
+  const localState = path.join(os.tmpdir(), `ix-agent-path-contract-state-${process.pid}`);
+  rmSync(root, { recursive: true, force: true });
+  rmSync(localState, { recursive: true, force: true });
+
+  const spacedDir = path.join(root, "dir with spaces");
+  const searchFixture = path.join(spacedDir, "target file.txt");
+  const inspectFixture = path.join(spacedDir, "window file.txt");
+  mkdirSync(spacedDir, { recursive: true });
+  writeFileSync(searchFixture, "alpha needle beta\n");
+  writeFileSync(inspectFixture, "line one\nline two needle\nline three\nline four\nline five\n");
+
+  const sharedEnv = {
+    IX_INDEX: "0",
+    IX_NEXUS: "0",
+    IX_STATE_DIR: localState,
+  };
+
+  const search = run(ix, ["search", "lit:needle", root, "--max-hits", "5"], { env: sharedEnv });
+  const inspect = run(ix, ["inspect", inspectFixture, "--limit", "2"], { env: sharedEnv });
+  const parsedSearch = parseTextSentinel(search.stdout, "ix.result.v1");
+  const parsedInspect = parseTextSentinel(inspect.stdout, "ix.next.v1");
+  const failures = [];
+  const checks = {
+    searchFixture,
+    inspectFixture,
+    searchExitCode: search.exitCode,
+    inspectExitCode: inspect.exitCode,
+    searchSentinel: parsedSearch.ok,
+    inspectNextSentinel: parsedInspect.ok,
+    hitAbsolutePath: null,
+    hitAbsolutePathExists: false,
+    inspectArgvPath: null,
+    inspectArgvPathExists: false,
+  };
+
+  if (search.exitCode !== 0) failures.push(`search exited ${search.exitCode}`);
+  if (inspect.exitCode !== 0) failures.push(`inspect exited ${inspect.exitCode}`);
+  if (!parsedSearch.ok) failures.push(parsedSearch.reason);
+  if (!parsedInspect.ok) failures.push(parsedInspect.reason);
+
+  if (parsedSearch.ok) {
+    const hit = Array.isArray(parsedSearch.value.hits) ? parsedSearch.value.hits[0] : null;
+    checks.hitAbsolutePath = hit?.absolute_path ?? null;
+    checks.hitAbsolutePathExists = typeof checks.hitAbsolutePath === "string" && existsSync(checks.hitAbsolutePath);
+    if (parsedSearch.value.status !== "ok") failures.push("search sentinel status is not ok");
+    if ((parsedSearch.value.matches ?? 0) <= 0) failures.push("search sentinel did not report positive matches");
+    if (!hit) failures.push("search sentinel emitted no hit records");
+    if (!checks.hitAbsolutePath) failures.push("search hit missing absolute_path");
+    if (checks.hitAbsolutePath && !checks.hitAbsolutePathExists) failures.push("search hit absolute_path does not exist");
+  }
+
+  if (parsedInspect.ok) {
+    const argv = Array.isArray(parsedInspect.value.argv) ? parsedInspect.value.argv : [];
+    checks.inspectArgvPath = typeof argv[2] === "string" ? argv[2] : null;
+    checks.inspectArgvPathExists = typeof checks.inspectArgvPath === "string" && existsSync(checks.inspectArgvPath);
+    if (parsedInspect.value.cmd !== "inspect") failures.push("inspect next sentinel command is not inspect");
+    if (!checks.inspectArgvPath) failures.push("inspect next sentinel missing argv path");
+    if (checks.inspectArgvPath && !checks.inspectArgvPathExists) failures.push("inspect next argv path does not exist");
+  }
+
+  rmSync(root, { recursive: true, force: true });
+  rmSync(localState, { recursive: true, force: true });
+
+  return lane("agent_path_contract", failures.length === 0 ? "ok" : "failed", {
+    evidence: { search, inspect },
+    checks,
+    failures,
   });
 }
 
@@ -1445,6 +1534,7 @@ const lanes = [
   buildLane(),
   smokeLane(),
   surfaceParityLane(),
+  agentPathContractLane(),
   warmColdParityLane(),
   warmIndexLane(),
   runtimeStateLocationLane(),
