@@ -36,9 +36,13 @@ const planningChainState = argValue(args, "--planning-state", process.env.IX_ARC
 
 function run(command, commandArgs, options = {}) {
   const started = process.hrtime.bigint();
+  const env = { ...process.env, ...(options.env ?? {}) };
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete env[key];
+  }
   const result = spawnSync(command, commandArgs, {
-    cwd: ROOT,
-    env: { ...process.env, ...(options.env ?? {}) },
+    cwd: options.cwd ?? ROOT,
+    env,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
     windowsHide: true,
@@ -298,6 +302,7 @@ function validateReport(report) {
     "agent_path_contract",
     "warm_cold_parity",
     "warm_index_live",
+    "default_state_location",
     "runtime_state_location",
     "indexd_memory_cap",
     "process_scan",
@@ -1106,6 +1111,53 @@ exit 0
   });
 }
 
+function defaultStateLocationLane() {
+  const ix = findBuiltIx();
+  if (!ix) return lane("default_state_location", "skipped", { reason: "zig-out binary missing; run build first" });
+  if (process.platform !== "win32") {
+    return lane("default_state_location", "skipped", { reason: "default AppData state probe is currently implemented for Windows only" });
+  }
+
+  const base = path.join(os.tmpdir(), `ix-default-state-location-${process.pid}`);
+  const localAppData = path.join(base, "localappdata");
+  const rootA = path.join(base, "root-a");
+  const rootB = path.join(base, "root-b");
+  const cwdA = path.join(base, "cwd-a");
+  const cwdB = path.join(base, "cwd-b");
+  rmSync(base, { recursive: true, force: true });
+  for (const dir of [localAppData, rootA, rootB, cwdA, cwdB]) mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(rootA, "a.txt"), "needle a\n");
+  writeFileSync(path.join(rootB, "b.txt"), "needle b\n");
+
+  const env = {
+    LOCALAPPDATA: localAppData,
+    IX_STATE_DIR: undefined,
+    IX_INDEXD_MEMORY_LIMIT_MB: "256",
+  };
+  const first = run(ix, ["__ix_indexd", rootA, "--foreground", "--once"], { cwd: cwdA, env });
+  const second = run(ix, ["__ix_indexd", rootB, "--foreground", "--once"], { cwd: cwdB, env });
+  const stateRoot = path.join(localAppData, "iEx", "ix");
+  const currentMarkers = findFilesByName(stateRoot, "current.ixgen");
+  const failures = [];
+  if (first.exitCode !== 0) failures.push(`first default-state indexd exited ${first.exitCode}`);
+  if (second.exitCode !== 0) failures.push(`second default-state indexd exited ${second.exitCode}`);
+  if (!existsSync(stateRoot)) failures.push("default state root was not created under LOCALAPPDATA/iEx/ix");
+  if (currentMarkers.length < 2) failures.push(`expected at least 2 current.ixgen markers under default state root, got ${currentMarkers.length}`);
+  if (existsSync(path.join(rootA, ".ix"))) failures.push("first scanned root received .ix state");
+  if (existsSync(path.join(rootB, ".ix"))) failures.push("second scanned root received .ix state");
+  if (currentMarkers.some((marker) => !marker.startsWith(stateRoot))) failures.push("default markers escaped the resolved state root");
+
+  rmSync(base, { recursive: true, force: true });
+  return lane("default_state_location", failures.length === 0 ? "ok" : "failed", {
+    evidence: { first, second },
+    stateRoot,
+    currentMarkers,
+    cwdA,
+    cwdB,
+    failures,
+  });
+}
+
 function findFilesByName(root, name, found = []) {
   if (!existsSync(root)) return found;
   const entries = spawnSync("powershell", [
@@ -1551,6 +1603,7 @@ const lanes = [
   agentPathContractLane(),
   warmColdParityLane(),
   warmIndexLane(),
+  defaultStateLocationLane(),
   runtimeStateLocationLane(),
   memoryCapLane(),
   scanIxProcesses(),

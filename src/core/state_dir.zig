@@ -32,14 +32,50 @@ pub const RootIndexState = struct {
 pub fn resolveStateDir(allocator: std.mem.Allocator) ![]const u8 {
     if (getenvOwned(allocator, STATE_ENV)) |override| return override;
 
+    const local_appdata = if (builtin.os.tag == .windows) getenvOwned(allocator, "LOCALAPPDATA") else null;
+    defer if (local_appdata) |value| allocator.free(value);
+    const appdata = if (builtin.os.tag == .windows) getenvOwned(allocator, "APPDATA") else null;
+    defer if (appdata) |value| allocator.free(value);
+    const xdg_state_home = if (builtin.os.tag != .windows) getenvOwned(allocator, "XDG_STATE_HOME") else null;
+    defer if (xdg_state_home) |value| allocator.free(value);
+    const home = if (builtin.os.tag != .windows) getenvOwned(allocator, "HOME") else null;
+    defer if (home) |value| allocator.free(value);
+
     if (builtin.os.tag == .windows) {
-        if (windowsInstalledExecutableStateDir(allocator)) |dir| return dir else |_| {}
+        const exe_path = windowsExecutablePath(allocator) catch null;
+        defer if (exe_path) |value| allocator.free(value);
+        return resolveDefaultStateDir(allocator, .{
+            .exe_path = exe_path,
+            .local_appdata = local_appdata,
+            .appdata = appdata,
+        });
     }
 
-    if (builtinStateBase(allocator)) |base| {
-        defer allocator.free(base);
-        return std.fs.path.join(allocator, &.{ base, "iEx", "ix" });
-    } else |_| {}
+    return resolveDefaultStateDir(allocator, .{
+        .xdg_state_home = xdg_state_home,
+        .home = home,
+    });
+}
+
+pub const DefaultStateDirInput = struct {
+    exe_path: ?[]const u8 = null,
+    local_appdata: ?[]const u8 = null,
+    appdata: ?[]const u8 = null,
+    xdg_state_home: ?[]const u8 = null,
+    home: ?[]const u8 = null,
+};
+
+pub fn resolveDefaultStateDir(allocator: std.mem.Allocator, input: DefaultStateDirInput) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        if (input.exe_path) |exe_path| {
+            if (try windowsStateDirFromExecutablePath(allocator, exe_path, input.local_appdata, input.appdata)) |dir| return dir;
+        }
+        if (input.local_appdata) |base| return std.fs.path.join(allocator, &.{ base, "iEx", "ix" });
+        if (input.appdata) |base| return std.fs.path.join(allocator, &.{ base, "iEx", "ix" });
+    } else {
+        if (input.xdg_state_home) |base| return std.fs.path.join(allocator, &.{ base, "iEx", "ix" });
+        if (input.home) |home| return std.fs.path.join(allocator, &.{ home, ".local", "state", "iEx", "ix" });
+    }
 
     return std.fs.path.join(allocator, &.{ ".ix-state" });
 }
@@ -76,29 +112,6 @@ pub fn evidenceCachePath(allocator: std.mem.Allocator, key: u64) ![]const u8 {
 
 pub fn rootFingerprintDirName(allocator: std.mem.Allocator, root_fingerprint: catalog.RootFingerprint) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{x:0>32}", .{root_fingerprint});
-}
-
-fn builtinStateBase(allocator: std.mem.Allocator) ![]const u8 {
-    if (builtin.os.tag == .windows) {
-        if (getenvOwned(allocator, "LOCALAPPDATA")) |value| return value;
-        if (getenvOwned(allocator, "APPDATA")) |value| return value;
-    }
-    if (getenvOwned(allocator, "XDG_STATE_HOME")) |value| return value;
-    if (getenvOwned(allocator, "HOME")) |home| {
-        defer allocator.free(home);
-        return std.fs.path.join(allocator, &.{ home, ".local", "state" });
-    }
-    return error.NoStateBase;
-}
-
-fn windowsInstalledExecutableStateDir(allocator: std.mem.Allocator) ![]const u8 {
-    const exe_path = try windowsExecutablePath(allocator);
-    defer allocator.free(exe_path);
-    const local_appdata = getenvOwned(allocator, "LOCALAPPDATA");
-    defer if (local_appdata) |value| allocator.free(value);
-    const appdata = getenvOwned(allocator, "APPDATA");
-    defer if (appdata) |value| allocator.free(value);
-    return (try windowsStateDirFromExecutablePath(allocator, exe_path, local_appdata, appdata)) orelse error.ExecutableOutsideAppData;
 }
 
 fn windowsExecutablePath(allocator: std.mem.Allocator) ![]const u8 {
@@ -196,15 +209,27 @@ test "cache paths live under IX-owned state directory" {
 test "Windows state dir anchors to executable directory under AppData" {
     const allocator = std.testing.allocator;
 
-    const state = (try windowsStateDirFromExecutablePath(
-        allocator,
-        "C:\\Users\\Savage\\AppData\\Local\\Programs\\iEx\\bin\\ix.exe",
-        "C:\\Users\\Savage\\AppData\\Local",
-        null,
-    )).?;
+    const state = try resolveDefaultStateDir(allocator, .{
+        .exe_path = "C:\\Users\\Savage\\AppData\\Local\\Programs\\iEx\\bin\\ix.exe",
+        .local_appdata = "C:\\Users\\Savage\\AppData\\Local",
+    });
     defer allocator.free(state);
 
     try std.testing.expectEqualStrings("C:\\Users\\Savage\\AppData\\Local\\Programs\\iEx\\bin\\.ix", state);
+}
+
+test "Windows state dir falls back to AppData owner for repository executable" {
+    const allocator = std.testing.allocator;
+
+    const state = try resolveDefaultStateDir(allocator, .{
+        .exe_path = "E:\\Workspaces\\01_Projects\\01_Github\\ix-zig\\zig-out\\bin\\ix-zig.exe",
+        .local_appdata = "C:\\Users\\Savage\\AppData\\Local",
+    });
+    defer allocator.free(state);
+
+    try std.testing.expectEqualStrings("C:\\Users\\Savage\\AppData\\Local\\iEx\\ix", state);
+    try std.testing.expect(std.mem.indexOf(u8, state, "ix-zig") == null);
+    try std.testing.expect(std.mem.indexOf(u8, state, ".ix-state") == null);
 }
 
 test "Windows state dir rejects repository executable outside AppData" {
@@ -215,4 +240,22 @@ test "Windows state dir rejects repository executable outside AppData" {
         null,
     );
     try std.testing.expect(state == null);
+}
+
+test "default state dir does not depend on current working directory" {
+    const allocator = std.testing.allocator;
+
+    const first = try resolveDefaultStateDir(allocator, .{
+        .exe_path = "E:\\a\\ix-zig.exe",
+        .local_appdata = "C:\\Users\\Savage\\AppData\\Local",
+    });
+    defer allocator.free(first);
+    const second = try resolveDefaultStateDir(allocator, .{
+        .exe_path = "E:\\b\\ix-zig.exe",
+        .local_appdata = "C:\\Users\\Savage\\AppData\\Local",
+    });
+    defer allocator.free(second);
+
+    try std.testing.expectEqualStrings(first, second);
+    try std.testing.expect(std.mem.indexOf(u8, first, ".ix-state") == null);
 }
