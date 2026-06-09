@@ -15,15 +15,15 @@ const schemaSelfTest = args.includes("--schema-self-test");
 const outPath = argValue(args, "--out", path.join(REPORT_DIR, `architecture-gate-${timestampSlug()}.json`));
 const stateDir = argValue(args, "--state-dir", path.join(os.tmpdir(), `ix-architecture-gate-${process.pid}`));
 const baselineIxMs = Number(argValue(args, "--baseline-ix-ms", process.env.IX_ARCH_GATE_BASELINE_IX_MS ?? "575.3829"));
-const baselineTolerancePct = Number(argValue(args, "--baseline-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_TOLERANCE_PCT ?? "5"));
-const baselineSoftTolerancePct = Number(argValue(args, "--baseline-soft-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_SOFT_TOLERANCE_PCT ?? "2.5"));
+const baselineTolerancePct = Number(argValue(args, "--baseline-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_TOLERANCE_PCT ?? "-5"));
+const baselineSoftTolerancePct = Number(argValue(args, "--baseline-soft-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_SOFT_TOLERANCE_PCT ?? "-5"));
 const ripgrepWarmupSamples = Number(argValue(args, "--ripgrep-warmup", process.env.IX_ARCH_GATE_RIPGREP_WARMUP ?? "2"));
 const baselineWarmupSamples = Number(
   argValue(args, "--baseline-warmup", process.env.IX_ARCH_GATE_BASELINE_WARMUP ?? "2"),
 );
 const previousIxBinary = argValue(args, "--previous-ix-binary", process.env.IX_PREVIOUS_BINARY ?? "");
 const pairedImprovementTolerancePct = Number(argValue(args, "--paired-improvement-tolerance-pct", process.env.IX_ARCH_GATE_PAIRED_IMPROVEMENT_TOLERANCE_PCT ?? "1.5"));
-const patchNoRegressionTolerancePct = Number(argValue(args, "--patch-no-regression-tolerance-pct", process.env.IX_ARCH_GATE_PATCH_NO_REGRESSION_TOLERANCE_PCT ?? "1.5"));
+const patchNoRegressionTolerancePct = Number(argValue(args, "--patch-no-regression-tolerance-pct", process.env.IX_ARCH_GATE_PATCH_NO_REGRESSION_TOLERANCE_PCT ?? "0"));
 const benchmarkControlDriftTolerancePct = Number(argValue(args, "--benchmark-control-drift-pct", process.env.IX_ARCH_GATE_CONTROL_DRIFT_PCT ?? "3"));
 const benchmarkControlRobustCvPct = Number(argValue(args, "--benchmark-control-robust-cv-pct", process.env.IX_ARCH_GATE_CONTROL_ROBUST_CV_PCT ?? "8"));
 const planningChainSlug = argValue(
@@ -141,7 +141,8 @@ function ripgrepWindowFixedPass(window) {
 function ripgrepWindowStrongPass(window) {
   return (
     isPlainObject(window) &&
-    ((window.ok === true && (window.softOk === true || window.pairedOk === true)) || window.patchNoRegressionOk === true)
+    window.ok === true &&
+    (window.softOk === true || window.pairedOk === true)
   );
 }
 
@@ -197,9 +198,9 @@ function ripgrepProofSummary(windows) {
 function ripgrepProofInterpretation(summary) {
   switch (summary.proofKind) {
     case "fixed_baseline_improved":
-      return "all measured windows stayed inside the fixed baseline soft band; this is speed improvement evidence";
+      return "all measured windows beat the fixed baseline improvement floor; this is speed improvement evidence";
     case "fixed_baseline_no_regression":
-      return "fixed-baseline windows passed, but at least one window missed the soft improvement band; this is no-regression evidence, not speed progress";
+      return "fixed-baseline windows passed, but at least one window missed the stronger improvement band; this is not enough speed progress";
     case "historical_paired_improvement":
       return "paired historical-source windows improved while fixed-baseline evidence stayed partially healthy";
     case "same_source_patch_no_regression":
@@ -1586,33 +1587,14 @@ function ripgrepLane(controlLane = null) {
   const strongPasses = (ripgrepWindowStrongPass(primary) ? 1 : 0) + (ripgrepWindowStrongPass(confirm) ? 1 : 0);
   const patchNoRegressionPasses = (primary.patchNoRegressionOk ? 1 : 0) + (confirm.patchNoRegressionOk ? 1 : 0);
   const accepted = hardPasses === 2 && strongPasses >= 1;
-  if (hardPasses === 0 && patchNoRegressionPasses > 0 && patchNoRegressionPasses < 2) {
-    const tiebreaker = runWindow("tiebreaker");
-    if (tiebreaker.hardFailure) return lane("ripgrep_12_sample", "failed", { corpus, primary, confirm, tiebreaker });
-    const tiebreakerPatchPasses = patchNoRegressionPasses + (tiebreaker.patchNoRegressionOk ? 1 : 0);
-    const tiebreakerAccepted = tiebreakerPatchPasses >= 2;
-    const proof = ripgrepProofSummary([primary, confirm, tiebreaker]);
-    return lane("ripgrep_12_sample", tiebreakerAccepted ? "ok" : "failed", {
-      corpus,
-      primary,
-      confirm,
-      tiebreaker,
-      acceptanceMode: tiebreakerAccepted ? "same_source_patch_no_regression" : "failed",
-      proof,
-      interpretation: tiebreakerAccepted
-        ? ripgrepProofInterpretation(proof)
-        : "benchmark windows crossed the fixed historical guard and did not produce two same-source patch no-regression passes",
-    });
-  }
-  if (hardPasses === 0 && patchNoRegressionPasses >= 2) {
+  if (hardPasses === 0) {
     const proof = ripgrepProofSummary([primary, confirm]);
-    return lane("ripgrep_12_sample", "ok", {
+    return lane("ripgrep_12_sample", "failed", {
       corpus,
       primary,
       confirm,
-      acceptanceMode: "same_source_patch_no_regression",
       proof,
-      interpretation: ripgrepProofInterpretation(proof),
+      interpretation: "benchmark windows missed the fixed historical improvement floor; same-source patch metrics are diagnostic only and do not override the baseline",
     });
   }
   if (hardPasses === 1) {
@@ -1642,7 +1624,7 @@ function ripgrepLane(controlLane = null) {
     proof,
     interpretation: accepted
       ? ripgrepProofInterpretation(proof)
-      : "benchmark windows crossed the fixed historical regression guard; paired previous-binary metrics are diagnostic only and do not override the baseline",
+      : "benchmark windows missed the fixed historical improvement floor; paired previous-binary metrics are diagnostic only and do not override the baseline",
   });
 }
 
@@ -1745,7 +1727,7 @@ function benchmarkControlLane(hostPreflight = null) {
     : !baselineComparable
       ? "control benchmark warmup does not match the fixed baseline; rerun with the baseline warmup or provide a matching baseline"
       : !baselineOk
-        ? "control benchmark crossed the fixed baseline guard; benchmark window cannot prove speed improvement"
+        ? "control benchmark missed the fixed baseline improvement floor; benchmark window cannot prove speed improvement"
         : undefined;
 
   return lane("benchmark_control", ok ? "ok" : "failed", {
