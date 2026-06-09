@@ -302,6 +302,7 @@ function validateReport(report) {
     "agent_path_contract",
     "warm_cold_parity",
     "warm_index_live",
+    "generation_recovery",
     "default_state_location",
     "runtime_state_location",
     "indexd_memory_cap",
@@ -1053,6 +1054,185 @@ exit 0
   });
 }
 
+function generationRecoveryLane() {
+  const ix = findBuiltIx();
+  if (!ix) return lane("generation_recovery", "skipped", { reason: "zig-out binary missing; run build first" });
+  const root = path.join(os.tmpdir(), `ix-generation-recovery-root-${process.pid}`);
+  const localState = path.join(os.tmpdir(), `ix-generation-recovery-state-${process.pid}`);
+  rmSync(root, { recursive: true, force: true });
+  rmSync(localState, { recursive: true, force: true });
+  mkdirSync(root, { recursive: true });
+  writeFileSync(path.join(root, "needle.zig"), "pub const token = \"needle\";\n");
+  writeFileSync(path.join(root, "other.zig"), "pub fn main() void { _ = \"haystack\"; }\n");
+
+  const script = `
+$ErrorActionPreference = 'Continue'
+$ix = ${psQuote(ix)}
+$root = ${psQuote(root)}
+$stateDir = ${psQuote(localState)}
+$env:IX_STATE_DIR = $stateDir
+$env:IX_INDEXD_MEMORY_LIMIT_MB = '256'
+$env:IX_INDEX = '1'
+$env:IX_NEXUS = '0'
+$owner = $null
+
+function Publish-Generation {
+  & $ix @('__ix_indexd', $root, '--foreground', '--once') | Out-Null
+  if ($LASTEXITCODE -ne 0) { throw "publish exited $LASTEXITCODE" }
+}
+
+function Stop-Owner {
+  if ($owner -and -not $owner.HasExited) {
+    Stop-Process -Id $owner.Id -Force -ErrorAction SilentlyContinue
+    Wait-Process -Id $owner.Id -Timeout 2 -ErrorAction SilentlyContinue
+  }
+  Get-ChildItem -LiteralPath $stateDir -Recurse -Force -Filter 'index.live' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+  $script:owner = $null
+}
+
+function Start-Owner {
+  Stop-Owner
+  $script:owner = Start-Process -FilePath $ix -ArgumentList @('__ix_indexd', $root, '--foreground') -PassThru -WindowStyle Hidden
+  for ($i = 0; $i -lt 120; $i++) {
+    $live = Get-ChildItem -LiteralPath $stateDir -Recurse -Force -Filter 'index.live' -ErrorAction SilentlyContinue | Where-Object {
+      (Get-Content -LiteralPath $_.FullName -Raw -ErrorAction SilentlyContinue) -match "pid=$($script:owner.Id)"
+    } | Select-Object -First 1
+    $current = Get-ChildItem -LiteralPath $stateDir -Recurse -Force -Filter 'current.ixgen' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($live -and $current) { return }
+    if ($script:owner.HasExited) { throw "owner exited $($script:owner.ExitCode)" }
+    Start-Sleep -Milliseconds 100
+  }
+  throw 'owner did not publish live generation'
+}
+
+function Current-Generation-Files {
+  $current = Get-ChildItem -LiteralPath $stateDir -Recurse -Force -Filter 'current.ixgen' -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+  if (-not $current) { throw 'missing current.ixgen' }
+  $indexDir = Split-Path -Parent $current.FullName
+  $generationDir = Get-ChildItem -LiteralPath (Join-Path $indexDir 'generations') -Directory -Force -ErrorAction SilentlyContinue | Sort-Object { [UInt64]$_.Name } -Descending | Select-Object -First 1
+  if (-not $generationDir) { throw 'missing generation payload directory' }
+  [pscustomobject]@{
+    current = $current.FullName
+    indexDir = $indexDir
+    generationDir = $generationDir.FullName
+    catalog = Join-Path $generationDir.FullName 'catalog.ixcat'
+    postings = Join-Path $generationDir.FullName 'postings.ixpost'
+  }
+}
+
+function Search-Needle {
+  $out = & $ix search 'lit:needle' $root --json --stats-only
+  $json = $out | ConvertFrom-Json
+  [pscustomobject]@{
+    status = $json.status
+    matches = $json.stats.matches_found
+    filesScanned = $json.stats.files_scanned
+    refreshStatus = $json.stats.generation_refresh.refresh_status
+    refreshAvailable = $json.stats.generation_refresh.available
+    fallbackReason = $json.stats.generation_refresh.fallback_reason
+  }
+}
+
+try {
+  Start-Owner
+  $initial = Search-Needle
+
+  $files = Current-Generation-Files
+  [System.IO.File]::WriteAllText($files.current, 'bad')
+  $corruptManifest = Search-Needle
+
+  Stop-Owner
+  Publish-Generation
+  Start-Owner
+  $afterManifestRepair = Search-Needle
+
+  $files = Current-Generation-Files
+  Remove-Item -LiteralPath $files.postings -Force
+  $missingSegment = Search-Needle
+
+  Stop-Owner
+  Publish-Generation
+  Start-Owner
+  $afterMissingRepair = Search-Needle
+
+  $files = Current-Generation-Files
+  $catalogBytes = [System.IO.File]::ReadAllBytes($files.catalog)
+  if ($catalogBytes.Length -lt 1) { throw 'empty catalog fixture' }
+  $catalogBytes[0] = $catalogBytes[0] -bxor 1
+  [System.IO.File]::WriteAllBytes($files.catalog, $catalogBytes)
+  $checksumMismatch = Search-Needle
+
+  Stop-Owner
+  Publish-Generation
+  Start-Owner
+  $final = Search-Needle
+
+  [pscustomobject]@{
+    status = 'ok'
+    initial = $initial
+    corruptManifest = $corruptManifest
+    afterManifestRepair = $afterManifestRepair
+    missingSegment = $missingSegment
+    afterMissingRepair = $afterMissingRepair
+    checksumMismatch = $checksumMismatch
+    final = $final
+  } | ConvertTo-Json -Compress -Depth 20
+} catch {
+  [pscustomobject]@{ status = 'error'; message = $_.Exception.Message } | ConvertTo-Json -Compress
+  exit 2
+} finally {
+  Stop-Owner
+  Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($root) -and ($_.CommandLine.Contains('__ix_indexd') -or $_.Name -match '^(ix|iex|ix-zig)(\\.exe)?$') } | ForEach-Object {
+    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+}
+exit 0
+`;
+  const probe = run("powershell", ["-NoProfile", "-Command", script]);
+  rmSync(root, { recursive: true, force: true });
+  rmSync(localState, { recursive: true, force: true });
+
+  let parsed;
+  try {
+    parsed = JSON.parse(probe.stdout || "{}");
+  } catch {
+    return lane("generation_recovery", "failed", { evidence: probe, reason: "generation recovery probe did not emit JSON" });
+  }
+
+  const failures = [];
+  const expectWarmOk = (name, value) => {
+    if (value?.status !== "ok") failures.push(`${name}.status expected ok`);
+    if (value?.matches !== 1) failures.push(`${name}.matches expected 1, got ${value?.matches}`);
+    if (value?.refreshAvailable !== true) failures.push(`${name}.refreshAvailable expected true`);
+    if (!["live_pinned", "live_query_stats_cache"].includes(value?.refreshStatus)) {
+      failures.push(`${name}.refreshStatus expected live_pinned/live_query_stats_cache, got ${value?.refreshStatus}`);
+    }
+  };
+  const expectFallback = (name, value, reason) => {
+    if (value?.status !== "ok") failures.push(`${name}.status expected ok`);
+    if (value?.matches !== 1) failures.push(`${name}.matches expected cold fallback 1, got ${value?.matches}`);
+    if (value?.refreshAvailable !== false) failures.push(`${name}.refreshAvailable expected false`);
+    if (value?.refreshStatus !== "fallback") failures.push(`${name}.refreshStatus expected fallback, got ${value?.refreshStatus}`);
+    if (value?.fallbackReason !== reason) failures.push(`${name}.fallbackReason expected ${reason}, got ${value?.fallbackReason}`);
+  };
+
+  if (probe.exitCode !== 0) failures.push(`powershell exited ${probe.exitCode}`);
+  if (parsed.status !== "ok") failures.push(parsed.message ?? parsed.status ?? "probe status not ok");
+  expectWarmOk("initial", parsed.initial);
+  expectFallback("corruptManifest", parsed.corruptManifest, "TruncatedGenerationManifest");
+  expectWarmOk("afterManifestRepair", parsed.afterManifestRepair);
+  expectFallback("missingSegment", parsed.missingSegment, "MissingGenerationSegment");
+  expectWarmOk("afterMissingRepair", parsed.afterMissingRepair);
+  expectFallback("checksumMismatch", parsed.checksumMismatch, "GenerationSegmentChecksumMismatch");
+  expectWarmOk("final", parsed.final);
+
+  return lane("generation_recovery", failures.length === 0 ? "ok" : "failed", {
+    evidence: probe,
+    parsed,
+    failures,
+  });
+}
+
 function runtimeStateLocationLane() {
   const ix = findBuiltIx();
   if (!ix) return lane("runtime_state_location", "skipped", { reason: "zig-out binary missing; run build first" });
@@ -1637,6 +1817,7 @@ const lanes = [
   agentPathContractLane(),
   warmColdParityLane(),
   warmIndexLane(),
+  generationRecoveryLane(),
   defaultStateLocationLane(),
   runtimeStateLocationLane(),
   memoryCapLane(),
