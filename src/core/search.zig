@@ -6901,6 +6901,44 @@ test "warm hidden filter preserves dotfile parity with cold default traversal" {
     try std.testing.expect(isHiddenDirectoryPath("src/.git/config"));
 }
 
+test "warm index preserves cold parity for source-bearing directory names" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "build");
+    try tmp.dir.createDirPath(io, "dist");
+    try tmp.dir.createDirPath(io, "target");
+    try tmp.dir.createDirPath(io, "vendor");
+    try tmp.dir.writeFile(io, .{ .sub_path = "build/frontier.zig", .data = "const marker = \"needle\";\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "dist/frontier.ts", .data = "export const marker = 'needle';\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "target/frontier.rs", .data = "const MARKER: &str = \"needle\";\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "vendor/frontier.c", .data = "const char *marker = \"needle\";\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "visible.txt", .data = "needle\n" });
+
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = try @import("indexd.zig").publishRootGeneration(io, allocator, root_path);
+    const index_dir = try testRootIndexDir(allocator, root_path);
+    try std.Io.Dir.cwd().createDirPath(io, index_dir);
+    const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    const live_marker = try testLiveMarker(allocator, root_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
+
+    var request = testSearchRequest("lit:needle", root_path);
+    request.index_enabled = true;
+    request.nexus_disabled = true;
+    const plan = try expr.parse(request.expression);
+    const warm_report = try run(io, allocator, request, plan);
+
+    try std.testing.expectEqualStrings("live_pinned", warm_report.stats.generation_refresh.refresh_status);
+    try std.testing.expectEqual(@as(usize, 5), warm_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 5), warm_report.hit_count);
+    try std.testing.expectEqual(@as(usize, 5), warm_report.files_scanned);
+}
+
 test "capped warm hit query uses stats cache for exact count and prefix scan" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);

@@ -770,10 +770,6 @@ fn isExcludedIndexEntry(name: []const u8) bool {
 
 fn isDependencyOrGeneratedIndexEntry(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "node_modules") or
-        std.ascii.eqlIgnoreCase(name, "vendor") or
-        std.ascii.eqlIgnoreCase(name, "dist") or
-        std.ascii.eqlIgnoreCase(name, "build") or
-        std.ascii.eqlIgnoreCase(name, "target") or
         std.ascii.eqlIgnoreCase(name, "zig-cache") or
         std.ascii.eqlIgnoreCase(name, "zig-out") or
         std.ascii.eqlIgnoreCase(name, "tmp") or
@@ -907,6 +903,10 @@ test "indexd managed root admission rejects dependency generated and hidden path
     try std.testing.expect(isManagedRoot("."));
     try std.testing.expect(isManagedRoot("src"));
     try std.testing.expect(isManagedRoot("apps/backend/convex"));
+    try std.testing.expect(isManagedRoot("vendor/embedded-src"));
+    try std.testing.expect(isManagedRoot("build/scripts"));
+    try std.testing.expect(isManagedRoot("dist/types"));
+    try std.testing.expect(isManagedRoot("target/generated-bindings"));
     try std.testing.expect(!isManagedRoot("apps/backend/node_modules/convex/dist"));
     try std.testing.expect(!isManagedRoot(".docs/reports/subzero"));
     try std.testing.expect(!isManagedRoot("tmp/warm-owner-bench-current"));
