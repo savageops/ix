@@ -493,7 +493,7 @@ function scanIxProcesses() {
   const probe = run("powershell", [
     "-NoProfile",
     "-Command",
-    "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and ($_.Name -match '^(ix|iex|ix-zig|__ix_indexd|__ix_nexus)(\\.exe)?$' -or ($_.CommandLine -and $_.CommandLine -match '(ix|iex|ix-zig)(\\.exe)?[^\\r\\n]*__(ix_indexd|ix_nexus)')) } | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress",
+    "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.Name -match '^(ix|iex|ix-zig|__ix_indexd|__ix_nexus)(\\.exe)?$' } | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress",
   ]);
   if (probe.exitCode !== 0) return lane("process_scan", "failed", { evidence: probe });
   const text = probe.stdout.trim();
