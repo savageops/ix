@@ -6,6 +6,7 @@ pub const MAGIC: [8]u8 = .{ 'I', 'X', 'G', 'E', 'N', '0', '0', '1' };
 pub const FORMAT_VERSION: u16 = 1;
 pub const INVALID_EPOCH: Epoch = 0;
 pub const MANIFEST_READ_LIMIT: usize = 4 * 1024 * 1024;
+const SEGMENT_VALIDATION_CHUNK_SIZE: usize = 64 * 1024;
 
 pub const Epoch = u64;
 pub const RootFingerprint = catalog.RootFingerprint;
@@ -514,14 +515,36 @@ fn validatePublishedSegmentPayload(
     if (segment.byte_len > std.math.maxInt(usize) - 1) return error.GenerationSegmentTooLarge;
     const segment_path = try std.fs.path.join(allocator, &.{ generation_dir, segment.relative_path });
     defer allocator.free(segment_path);
-    const read_limit: usize = @intCast(segment.byte_len + 1);
-    const payload = std.Io.Dir.cwd().readFileAlloc(io, segment_path, allocator, .limited(read_limit)) catch |err| switch (err) {
+    try validatePublishedSegmentPayloadFromFile(io, segment_path, segment);
+}
+
+fn validatePublishedSegmentPayloadFromFile(
+    io: std.Io,
+    segment_path: []const u8,
+    segment: GenerationSegment,
+) !void {
+    var file = std.Io.Dir.cwd().openFile(io, segment_path, .{ .allow_directory = false }) catch |err| switch (err) {
         error.FileNotFound => return error.MissingGenerationSegment,
         else => return err,
     };
-    defer allocator.free(payload);
-    if (payload.len != segment.byte_len) return error.GenerationSegmentLengthMismatch;
-    if (std.hash.Wyhash.hash(0, payload) != segment.checksum) return error.GenerationSegmentChecksumMismatch;
+    defer file.close(io);
+
+    var hasher = std.hash.Wyhash.init(0);
+    var buffer: [SEGMENT_VALIDATION_CHUNK_SIZE]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < segment.byte_len) {
+        const remaining = segment.byte_len - offset;
+        const target_len: usize = @intCast(@min(@as(u64, buffer.len), remaining));
+        const read_len = try file.readPositionalAll(io, buffer[0..target_len], offset);
+        if (read_len != target_len) return error.GenerationSegmentLengthMismatch;
+        hasher.update(buffer[0..read_len]);
+        offset += read_len;
+    }
+
+    var extra: [1]u8 = undefined;
+    const extra_len = try file.readPositionalAll(io, &extra, segment.byte_len);
+    if (extra_len != 0) return error.GenerationSegmentLengthMismatch;
+    if (hasher.final() != segment.checksum) return error.GenerationSegmentChecksumMismatch;
 }
 
 fn writeHeader(bytes: *std.ArrayList(u8), allocator: std.mem.Allocator, header: GenerationManifestHeader) !void {
@@ -950,6 +973,43 @@ test "generation payload validation rejects checksum mismatch" {
     try std.testing.expectError(error.GenerationSegmentChecksumMismatch, pinManifestBytesAndPayloadsForRoot(std.testing.io, std.testing.allocator, paths.index_dir, manifest_bytes, 0x6262));
     try std.testing.expectError(error.GenerationSegmentChecksumMismatch, pinCurrentGenerationWithPayloads(std.testing.io, std.testing.allocator, paths.index_dir, paths.current_manifest_path, 0x6262));
     try std.testing.expectEqual(@as(?ReaderPin, null), tryPinCurrentGenerationWithPayloads(std.testing.io, std.testing.allocator, paths.index_dir, paths.current_manifest_path, 0x6262));
+}
+
+test "generation payload validation streams segment bytes without whole payload allocation" {
+    const root = ".zig-cache\\ix-generation-stream-validation-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 63);
+    defer paths.deinit(std.testing.allocator);
+
+    var large_catalog: [16 * 1024]u8 = undefined;
+    @memset(&large_catalog, 'C');
+    large_catalog[0] = 'I';
+    large_catalog[large_catalog.len - 1] = 'X';
+
+    const payloads = [_]SegmentPayload{
+        .{ .kind = .catalog, .relative_path = "catalog.ixcat", .bytes = &large_catalog },
+        .{ .kind = .postings, .relative_path = "postings.ixpost", .bytes = "POSTINGS-63" },
+    };
+    _ = try publishGenerationPayloads(std.testing.io, std.testing.allocator, paths, 0x6363, 63, null, &payloads);
+
+    const catalog_path = try std.fs.path.join(std.testing.allocator, &.{ paths.generation_dir, "catalog.ixcat" });
+    defer std.testing.allocator.free(catalog_path);
+
+    var budget_bytes: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&budget_bytes);
+    try std.testing.expectError(
+        error.OutOfMemory,
+        std.Io.Dir.cwd().readFileAlloc(std.testing.io, catalog_path, fixed.allocator(), .limited(128 * 1024)),
+    );
+
+    fixed.reset();
+    var manifest_buffer: [1024]u8 = undefined;
+    const manifest_bytes = try std.Io.Dir.cwd().readFile(std.testing.io, paths.current_manifest_path, &manifest_buffer);
+    const pin = try pinManifestBytesAndPayloadsForRoot(std.testing.io, fixed.allocator(), paths.index_dir, manifest_bytes, 0x6363);
+    try std.testing.expectEqual(@as(Epoch, 63), pin.epoch);
+    try std.testing.expectEqual(@as(usize, 2), pin.segment_count);
 }
 
 test "generation compacted publish writes canonical catalog and postings payloads" {
