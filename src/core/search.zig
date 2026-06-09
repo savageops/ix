@@ -5,6 +5,7 @@ const cli = @import("../cli/args.zig");
 const catalog = @import("catalog.zig");
 const expr = @import("expr.zig");
 const generation = @import("generation.zig");
+const indexd = @import("indexd.zig");
 const regex = @import("regex.zig");
 const pcre_regex = @import("pcre_regex.zig");
 const postings = @import("postings.zig");
@@ -472,6 +473,7 @@ fn prepareWarmIndexFrontier(
     if (request.path_count != 1) return warmIndexFallback(report, "multi_root");
 
     const root = request.paths[0];
+    if (rootHasWarmIndexCoverageGap(io, allocator, root)) return warmIndexFallback(report, "unindexed_coverage_gap");
     const root_identity = catalog.identifyRoot(allocator, root) catch return warmIndexFallback(report, "root_identity_failed");
     defer root_identity.deinit(allocator);
     const root_state = state_dir.buildRootIndexState(allocator, root_identity.fingerprint) catch return warmIndexFallback(report, "state_dir_failed");
@@ -1180,6 +1182,28 @@ fn warmPathStillReadable(io: std.Io, path: []const u8) bool {
     const file = openFileNt(io, path) catch return false;
     file.close(io);
     return true;
+}
+
+fn rootHasWarmIndexCoverageGap(io: std.Io, allocator: std.mem.Allocator, root: []const u8) bool {
+    return directoryContainsWarmIndexCoverageGap(io, allocator, root);
+}
+
+fn directoryContainsWarmIndexCoverageGap(io: std.Io, allocator: std.mem.Allocator, path: []const u8) bool {
+    const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return true;
+    defer dir.close(io);
+    var iterator = dir.iterate();
+    while (true) {
+        const maybe_entry = iterator.next(io) catch return true;
+        const entry = maybe_entry orelse break;
+        if (entry.kind != .directory) continue;
+        if (indexd.isIndexCoverageExcludedDirectoryName(entry.name)) return true;
+        if (isHiddenDirectoryEntry(entry.name, true) or isGeneratedSourceIndexEntry(entry.name, true)) continue;
+        const child_path = joinPathForward(allocator, path, entry.name) catch return true;
+        const has_gap = directoryContainsWarmIndexCoverageGap(io, allocator, child_path);
+        allocator.free(child_path);
+        if (has_gap) return true;
+    }
+    return false;
 }
 
 fn writeWarmQueryFrontier(
@@ -6937,6 +6961,40 @@ test "warm index preserves cold parity for source-bearing directory names" {
     try std.testing.expectEqual(@as(usize, 5), warm_report.matches_found);
     try std.testing.expectEqual(@as(usize, 5), warm_report.hit_count);
     try std.testing.expectEqual(@as(usize, 5), warm_report.files_scanned);
+}
+
+test "warm index falls back when root contains unindexed coverage directories" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "node_modules/pkg");
+    try tmp.dir.writeFile(io, .{ .sub_path = "node_modules/pkg/index.js", .data = "const marker = 'needle';\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "visible.txt", .data = "needle\n" });
+
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    _ = try indexd.publishRootGeneration(io, allocator, root_path);
+    const index_dir = try testRootIndexDir(allocator, root_path);
+    try std.Io.Dir.cwd().createDirPath(io, index_dir);
+    const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    const live_marker = try testLiveMarker(allocator, root_path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
+
+    var request = testSearchRequest("lit:needle", root_path);
+    request.index_enabled = true;
+    request.nexus_disabled = true;
+    request.no_ignore = true;
+    const plan = try expr.parse(request.expression);
+    const report = try run(io, allocator, request, plan);
+
+    try std.testing.expectEqualStrings("fallback", report.stats.generation_refresh.refresh_status);
+    try std.testing.expectEqualStrings("unindexed_coverage_gap", report.stats.generation_refresh.fallback_reason);
+    try std.testing.expectEqual(@as(usize, 2), report.matches_found);
+    try std.testing.expectEqual(@as(usize, 2), report.hit_count);
+    try std.testing.expectEqual(@as(usize, 2), report.files_scanned);
 }
 
 test "capped warm hit query uses stats cache for exact count and prefix scan" {

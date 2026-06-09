@@ -768,13 +768,16 @@ fn isExcludedIndexEntry(name: []const u8) bool {
     return isDefaultHiddenEntry(name) or isDependencyOrGeneratedIndexEntry(name);
 }
 
-fn isDependencyOrGeneratedIndexEntry(name: []const u8) bool {
+pub fn isIndexCoverageExcludedDirectoryName(name: []const u8) bool {
     return std.ascii.eqlIgnoreCase(name, "node_modules") or
         std.ascii.eqlIgnoreCase(name, "zig-cache") or
         std.ascii.eqlIgnoreCase(name, "zig-out") or
         std.ascii.eqlIgnoreCase(name, "tmp") or
-        std.ascii.eqlIgnoreCase(name, "temp") or
-        isGeneratedSourceIndexEntry(name);
+        std.ascii.eqlIgnoreCase(name, "temp");
+}
+
+fn isDependencyOrGeneratedIndexEntry(name: []const u8) bool {
+    return isIndexCoverageExcludedDirectoryName(name) or isGeneratedSourceIndexEntry(name);
 }
 
 fn isGeneratedSourceIndexEntry(name: []const u8) bool {
@@ -907,6 +910,10 @@ test "indexd managed root admission rejects dependency generated and hidden path
     try std.testing.expect(isManagedRoot("build/scripts"));
     try std.testing.expect(isManagedRoot("dist/types"));
     try std.testing.expect(isManagedRoot("target/generated-bindings"));
+    try std.testing.expect(isIndexCoverageExcludedDirectoryName("node_modules"));
+    try std.testing.expect(isIndexCoverageExcludedDirectoryName("zig-cache"));
+    try std.testing.expect(!isIndexCoverageExcludedDirectoryName("vendor"));
+    try std.testing.expect(!isIndexCoverageExcludedDirectoryName("tags"));
     try std.testing.expect(!isManagedRoot("apps/backend/node_modules/convex/dist"));
     try std.testing.expect(!isManagedRoot(".docs/reports/subzero"));
     try std.testing.expect(!isManagedRoot("tmp/warm-owner-bench-current"));
