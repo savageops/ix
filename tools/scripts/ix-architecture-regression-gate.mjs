@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
@@ -31,9 +31,7 @@ const planningChainSlug = argValue(
   "--planning-chain",
   process.env.IX_ARCH_GATE_PLANNING_CHAIN ?? "149-nextgen-architecture-validation-spine",
 );
-const planningChainPhases = parseCsvArg(
-  argValue(args, "--planning-phases", process.env.IX_ARCH_GATE_PLANNING_PHASES ?? "a,b,c,d"),
-);
+const planningChainPhasesArg = argValue(args, "--planning-phases", process.env.IX_ARCH_GATE_PLANNING_PHASES ?? "auto");
 const planningChainState = argValue(args, "--planning-state", process.env.IX_ARCH_GATE_PLANNING_STATE ?? "archived");
 
 function run(command, commandArgs, options = {}) {
@@ -76,6 +74,20 @@ function parseCsvArg(value) {
     .split(",")
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+function discoverPlanningPhases(chainRoot, prefix, suffix) {
+  const absoluteRoot = path.join(ROOT, chainRoot);
+  if (!existsSync(absoluteRoot)) return [];
+  const pattern = new RegExp(`^${prefix}([a-z]+)-${escapeRegExp(suffix)}\\.md$`);
+  return readdirSync(absoluteRoot)
+    .map((entry) => entry.match(pattern)?.[1])
+    .filter((phase) => typeof phase === "string" && phase.length > 0)
+    .sort((left, right) => left.localeCompare(right, "en", { numeric: true }));
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function writeReport(report) {
@@ -481,7 +493,7 @@ function scanIxProcesses() {
   const probe = run("powershell", [
     "-NoProfile",
     "-Command",
-    "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and ($_.Name -match '^(ix|iex|ix-zig|__ix_indexd|__ix_nexus)(\\.exe)?$' -or $_.CommandLine -match '__ix_indexd|__ix_nexus') } | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress",
+    "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and ($_.Name -match '^(ix|iex|ix-zig|__ix_indexd|__ix_nexus)(\\.exe)?$' -or ($_.CommandLine -and $_.CommandLine -match '(ix|iex|ix-zig)(\\.exe)?[^\\r\\n]*__(ix_indexd|ix_nexus)')) } | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress",
   ]);
   if (probe.exitCode !== 0) return lane("process_scan", "failed", { evidence: probe });
   const text = probe.stdout.trim();
@@ -504,7 +516,6 @@ function planningLane() {
   const match = planningChainSlug.match(/^(\d+)-(.+)$/);
   const chainConfigFailures = [];
   if (!match) chainConfigFailures.push(`planning chain slug must start with a numeric prefix: ${planningChainSlug}`);
-  if (planningChainPhases.length === 0) chainConfigFailures.push("planning chain phases must not be empty");
   if (!["archived", "pending"].includes(planningChainState)) {
     chainConfigFailures.push(`planning state must be archived or pending: ${planningChainState}`);
   }
@@ -512,6 +523,9 @@ function planningLane() {
   const suffix = match?.[2] ?? planningChainSlug;
   const chainRoot = planningChainState === "pending" ? ".docs/todo/pending" : ".docs/todo/changelog";
   const oppositeRoot = planningChainState === "pending" ? ".docs/todo/changelog" : ".docs/todo/pending";
+  const planningChainPhases =
+    planningChainPhasesArg === "auto" ? discoverPlanningPhases(chainRoot, prefix, suffix) : parseCsvArg(planningChainPhasesArg);
+  if (planningChainPhases.length === 0) chainConfigFailures.push("planning chain phases must not be empty");
   const required = match
     ? [
         `${chainRoot}/${planningChainSlug}.md`,
