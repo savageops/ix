@@ -334,6 +334,7 @@ test "inspect context materializes from search hits across roots" {
 
     var report = search.SearchReport{
         .expression = "lit:needle",
+        .cwd = ".",
         .input_roots = 1,
         .effective_roots = 1,
         .pruned_roots = 0,

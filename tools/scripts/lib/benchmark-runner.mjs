@@ -326,7 +326,7 @@ function classifyHostForBenchmark(snapshot) {
   };
 }
 
-function hostSnapshot() {
+export function hostSnapshot() {
   const cpus = os.cpus();
   const cpuSpeeds = cpus.map((cpu) => cpu.speed).filter((speed) => Number.isFinite(speed));
   const powerScheme = process.platform === "win32" ? parsePowerScheme(safeCommand("powercfg", ["/getactivescheme"])) : null;

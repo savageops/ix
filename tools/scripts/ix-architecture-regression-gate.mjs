@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
 
 const ROOT = process.cwd();
@@ -274,6 +275,7 @@ function validateReport(report) {
     "worktree",
     "planning_chain",
     "diff_check",
+    "benchmark_host_preflight",
     "benchmark_control",
     "ripgrep_12_sample",
     "agent_real_dry_run",
@@ -433,6 +435,7 @@ function runSchemaSelfTest() {
     "ripgrep_12_sample: same-source comparator artifact cannot provide paired improvement evidence",
     "ripgrep_12_sample: ok status cannot rely on a warning-class host benchmark envelope",
     "ripgrep_12_sample: ok status requires proof classification",
+    "benchmark_host_preflight: expected lane missing",
     "benchmark_control: ok status cannot rely on a warning-class host benchmark envelope",
   ];
   const missing = required.filter((needle) => !failures.includes(needle));
@@ -1048,10 +1051,10 @@ function ripgrepLane(controlLane = null) {
   const corpus = process.env.IX_BENCHSUITE_LINUX ?? "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux";
   if (!existsSync(corpus)) return lane("ripgrep_12_sample", "skipped", { reason: "ripgrep benchsuite corpus missing", corpus });
   if (quick) return lane("ripgrep_12_sample", "skipped", { reason: "--quick", corpus });
-  if (controlLane?.status === "failed") {
+  if (controlLane?.status === "failed" || controlLane?.status === "skipped") {
     return lane("ripgrep_12_sample", "skipped", {
       corpus,
-      reason: "benchmark control failed; skipping source-regression attribution until the control window is valid",
+      reason: "benchmark control did not pass; skipping source-regression attribution until the control window is valid",
       controlReason: controlLane.reason ?? null,
       controlMetrics: controlLane.metrics ?? null,
     });
@@ -1274,10 +1277,33 @@ function ripgrepLane(controlLane = null) {
   });
 }
 
-function benchmarkControlLane() {
+function benchmarkHostPreflightLane() {
+  if (quick) return lane("benchmark_host_preflight", "skipped", { reason: "--quick" });
+  const snapshot = hostSnapshot();
+  const host = { before: snapshot, after: snapshot };
+  const hostIssues = hostBenchmarkIssues(host);
+  const hostClean = hostBenchmarkClean(hostIssues);
+  return lane("benchmark_host_preflight", hostClean ? "ok" : "failed", {
+    reason: hostClean ? undefined : "host benchmark envelope contains warning-class noise; speed attribution is disabled before corpus sampling",
+    metrics: {
+      hostClean,
+      hostIssues,
+      host,
+    },
+  });
+}
+
+function benchmarkControlLane(hostPreflight = null) {
   const corpus = process.env.IX_BENCHSUITE_LINUX ?? "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux";
   if (!existsSync(corpus)) return lane("benchmark_control", "skipped", { reason: "ripgrep benchsuite corpus missing", corpus });
   if (quick) return lane("benchmark_control", "skipped", { reason: "--quick", corpus });
+  if (hostPreflight?.status === "failed") {
+    return lane("benchmark_control", "skipped", {
+      corpus,
+      reason: "benchmark host preflight failed; skipping same-binary control until host envelope is clean",
+      hostPreflight: hostPreflight.metrics ?? null,
+    });
+  }
   const ix = findBuiltIx();
   if (!ix) return lane("benchmark_control", "skipped", { reason: "zig-out binary missing; run build first", corpus });
 
@@ -1403,13 +1429,15 @@ function benchmarkControlLane() {
 const worktree = worktreeLane();
 const planning = planningLane();
 const diffCheck = diffCheckLane();
-const benchmarkControl = benchmarkControlLane();
+const benchmarkHostPreflight = benchmarkHostPreflightLane();
+const benchmarkControl = benchmarkControlLane(benchmarkHostPreflight);
 const ripgrep = ripgrepLane(benchmarkControl);
 
 const lanes = [
   worktree,
   planning,
   diffCheck,
+  benchmarkHostPreflight,
   benchmarkControl,
   ripgrep,
   agentDryRunLane(),

@@ -489,6 +489,7 @@ test "indexd command uses freeing allocator for watch lifecycle" {
 fn testSearchReportForSidecar(pruned_files: usize) search.SearchReport {
     var report = search.SearchReport{
         .expression = "lit:needle",
+        .cwd = ".",
         .input_roots = 1,
         .effective_roots = 1,
         .pruned_roots = 0,

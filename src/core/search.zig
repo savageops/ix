@@ -176,6 +176,7 @@ pub const SearchHit = struct {
 
 pub const SearchReport = struct {
     expression: []const u8,
+    cwd: []const u8,
     input_roots: usize,
     effective_roots: usize,
     pruned_roots: usize,
@@ -225,6 +226,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     const roots = try prepareRoots(io, allocator, request);
     var report = SearchReport{
         .expression = request.expression,
+        .cwd = try currentWorkingDirectory(io, allocator),
         .input_roots = if (request.path_count == 0) 1 else request.path_count,
         .effective_roots = roots.count,
         .pruned_roots = roots.duplicate_count + roots.overlap_pruned_count,
@@ -566,6 +568,7 @@ fn prepareWarmIndexFrontier(
     }
     var verify_required_count: usize = 0;
     appendWarmVerificationFrontier(allocator, root, request, snapshot, candidate_ids, &active, &verify_required_count) catch return warmIndexFallback(report, "verify_required_append_failed");
+    if (!warmFrontierPathsStillReadable(io, active.items)) return warmIndexFallback(report, "stale_candidate_path");
 
     report.discover_ms = 0;
     report.files_discovered = snapshot.entries.len;
@@ -733,6 +736,7 @@ fn prepareDeltaWarmIndexFrontier(
     var verify_required_count: usize = 0;
     appendWarmVerificationFrontierWithDelta(allocator, root, request, parent_snapshot, parent_lookup.candidates, delta_snapshot, &active, &verify_required_count) catch return warmIndexFallback(report, "parent_verify_required_append_failed");
     appendDeltaVerificationFrontier(allocator, root, request, delta_snapshot, delta_lookup.candidates, &active, &verify_required_count) catch return warmIndexFallback(report, "delta_verify_required_append_failed");
+    if (!warmFrontierPathsStillReadable(io, active.items)) return warmIndexFallback(report, "stale_candidate_path");
 
     const tombstone_count = countDeltaTombstones(delta_snapshot);
     const logical_count = logicalDeltaPathCount(parent_snapshot, delta_snapshot, tombstone_count);
@@ -949,6 +953,7 @@ fn loadWarmQueryFrontier(
         active.append(allocator, .{ .path = allocator.dupe(u8, line) catch return null }) catch return null;
     }
     if (active.items.len != candidate_count) return null;
+    if (!warmFrontierPathsStillReadable(io, active.items)) return null;
 
     report.discover_ms = 0;
     report.files_discovered = discovered;
@@ -1119,9 +1124,11 @@ fn loadWarmQueryHitResultFromCache(
         const path_encoded = fields.next() orelse return null;
         const preview_encoded = fields.next() orelse return null;
         if (fields.next() != null) return null;
+        const path = unescapeWarmQueryField(allocator, path_encoded) catch return null;
+        if (!warmPathStillReadable(io, path)) return null;
         if (loaded < retained_hit_count) {
             report.hits[loaded] = .{
-                .path = unescapeWarmQueryField(allocator, path_encoded) catch return null,
+                .path = path,
                 .line = hit_line,
                 .column = hit_column,
                 .preview = unescapeWarmQueryField(allocator, preview_encoded) catch return null,
@@ -1160,6 +1167,19 @@ fn loadWarmQueryHitResultFromCache(
         .candidate_count = candidates,
         .hit_result_cache_hit = true,
     };
+}
+
+fn warmFrontierPathsStillReadable(io: std.Io, active: []const DiscoveredFile) bool {
+    for (active) |entry| {
+        if (!warmPathStillReadable(io, entry.path)) return false;
+    }
+    return true;
+}
+
+fn warmPathStillReadable(io: std.Io, path: []const u8) bool {
+    const file = openFileNt(io, path) catch return false;
+    file.close(io);
+    return true;
 }
 
 fn writeWarmQueryFrontier(
@@ -4965,6 +4985,12 @@ fn elapsedMs(io: std.Io, start: std.Io.Timestamp) f64 {
     return @as(f64, @floatFromInt(elapsed.nanoseconds)) / 1_000_000.0;
 }
 
+fn currentWorkingDirectory(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try std.process.currentPath(io, &buffer);
+    return normalizeDisplayPath(allocator, buffer[0..len]);
+}
+
 fn normalizeDisplayPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
     const normalized = try allocator.dupe(u8, path);
     for (normalized) |*byte| {
@@ -6612,6 +6638,17 @@ test "search run consumes live warm postings and scans only candidate files" {
     try std.testing.expectEqual(report.hits[0].line, capped_report.hits[0].line);
     try std.testing.expectEqual(report.hits[0].column, capped_report.hits[0].column);
     try std.testing.expectEqualStrings(report.hits[0].preview, capped_report.hits[0].preview);
+
+    try tmp.dir.deleteFile(io, "candidate.txt");
+    try tmp.dir.writeFile(io, .{ .sub_path = "renamed.txt", .data = "needle\nneedle\n" });
+
+    const stale_report = try run(io, allocator, request, plan);
+    try std.testing.expect(!std.mem.eql(u8, stale_report.stats.generation_refresh.refresh_status, "live_query_hits_cache"));
+    try std.testing.expectEqualStrings("stale_candidate_path", stale_report.stats.generation_refresh.fallback_reason);
+    try std.testing.expect(stale_report.files_scanned > 0);
+    try std.testing.expectEqual(@as(usize, 2), stale_report.matches_found);
+    try std.testing.expectEqual(@as(usize, 2), stale_report.hit_count);
+    try std.testing.expect(std.mem.endsWith(u8, stale_report.hits[0].path, "renamed.txt"));
 }
 
 test "warm delta generation overlays parent postings without stale base matches" {
@@ -7038,6 +7075,7 @@ fn testSearchRequest(expression: []const u8, path: []const u8) cli.SearchRequest
 fn testSearchReport(expression_source: []const u8, plan: expr.ExpressionPlan) SearchReport {
     return .{
         .expression = expression_source,
+        .cwd = ".",
         .input_roots = 1,
         .effective_roots = 1,
         .pruned_roots = 0,

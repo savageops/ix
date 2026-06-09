@@ -265,14 +265,12 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
     try writer.writeAll("{\"expression\":");
     try writeJsonString(writer, report.expression);
     try writer.print(",\"status\":\"{s}\"", .{searchStatus(report)});
+    try writer.writeAll(",\"cwd\":");
+    try writeJsonString(writer, report.cwd);
     try writer.writeAll(",\"hits\":[");
     for (report.hits[0..report.hit_count], 0..) |hit, index| {
         if (index > 0) try writer.writeAll(",");
-        try writer.writeAll("{\"path\":");
-        try writeJsonString(writer, hit.path);
-        try writer.print(",\"line\":{},\"column\":{},\"preview\":", .{ hit.line, hit.column });
-        try writeJsonString(writer, hit.preview);
-        try writer.writeAll("}");
+        try writeSearchHitJson(writer, report, hit);
     }
     try writer.print(
         "],\"stats\":{{\"input_roots\":{},\"effective_roots\":{},\"pruned_roots\":{},\"overlap_pruned_roots\":{},\"discovered_duplicate_paths\":{},\"acceleration_bailouts\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped\":{},\"matches_found\":{},\"bytes_scanned\":{},",
@@ -429,13 +427,43 @@ pub fn writeMatchesJsonHits(writer: anytype, report: search.SearchReport) !void 
     try writer.writeAll("{\"hits\":[");
     for (report.hits[0..report.hit_count], 0..) |hit, index| {
         if (index > 0) try writer.writeAll(",");
-        try writer.writeAll("{\"path\":");
-        try writeJsonString(writer, hit.path);
-        try writer.print(",\"line\":{},\"column\":{},\"preview\":", .{ hit.line, hit.column });
-        try writeJsonString(writer, hit.preview);
-        try writer.writeAll("}");
+        try writeSearchHitJson(writer, report, hit);
     }
     try writer.writeAll("]}\n");
+}
+
+fn writeSearchHitJson(writer: anytype, report: search.SearchReport, hit: search.SearchHit) !void {
+    try writer.writeAll("{\"path\":");
+    try writeJsonString(writer, hit.path);
+    try writer.writeAll(",\"absolute_path\":");
+    try writeAbsoluteHitPath(writer, report.cwd, hit.path);
+    try writer.print(",\"line\":{},\"column\":{},\"preview\":", .{ hit.line, hit.column });
+    try writeJsonString(writer, hit.preview);
+    try writer.writeAll("}");
+}
+
+fn writeAbsoluteHitPath(writer: anytype, cwd: []const u8, path: []const u8) !void {
+    if (isAbsolutePath(path) or cwd.len == 0 or std.mem.eql(u8, cwd, ".")) {
+        return writeJsonString(writer, path);
+    }
+    try writer.writeByte('"');
+    try writeJsonStringContents(writer, cwd);
+    if (!endsWithSeparator(cwd) and path.len > 0 and !startsWithSeparator(path)) try writer.writeByte('/');
+    try writeJsonStringContents(writer, path);
+    try writer.writeByte('"');
+}
+
+fn isAbsolutePath(path: []const u8) bool {
+    if (path.len >= 1 and (path[0] == '/' or path[0] == '\\')) return true;
+    return path.len >= 3 and path[1] == ':' and (path[2] == '/' or path[2] == '\\') and std.ascii.isAlphabetic(path[0]);
+}
+
+fn startsWithSeparator(path: []const u8) bool {
+    return path.len > 0 and (path[0] == '/' or path[0] == '\\');
+}
+
+fn endsWithSeparator(path: []const u8) bool {
+    return path.len > 0 and (path[path.len - 1] == '/' or path[path.len - 1] == '\\');
 }
 
 pub fn writeInspectWindow(writer: anytype, window: inspect.InspectWindow) !void {
@@ -572,6 +600,11 @@ fn boolText(value: bool) []const u8 {
 
 fn writeJsonString(writer: anytype, value: []const u8) !void {
     try writer.writeByte('"');
+    try writeJsonStringContents(writer, value);
+    try writer.writeByte('"');
+}
+
+fn writeJsonStringContents(writer: anytype, value: []const u8) !void {
     for (value) |byte| {
         switch (byte) {
             '\\' => try writer.writeAll("\\\\"),
@@ -582,7 +615,6 @@ fn writeJsonString(writer: anytype, value: []const u8) !void {
             else => try writer.writeByte(byte),
         }
     }
-    try writer.writeByte('"');
 }
 
 test "error sentinel is versioned" {
@@ -595,6 +627,7 @@ test "error sentinel is versioned" {
 test "matches json emits hit records only" {
     var report = search.SearchReport{
         .expression = "lit:needle",
+        .cwd = "C:/repo",
         .input_roots = 1,
         .effective_roots = 1,
         .pruned_roots = 0,
@@ -634,6 +667,7 @@ test "matches json emits hit records only" {
 
     try std.testing.expect(std.mem.indexOf(u8, out, "\"hits\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"path\":\"fixture.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"absolute_path\":\"C:/repo/fixture.txt\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"line\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"stats\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"matches_found\"") == null);
