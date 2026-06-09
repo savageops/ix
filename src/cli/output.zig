@@ -415,6 +415,14 @@ fn writeGenerationRefreshJson(writer: anytype, generation_refresh: core_stats.Ge
         generation_refresh.delta_entries,
         generation_refresh.delta_tombstones,
     });
+    try writer.print(",\"base_candidate_files\":{},\"delta_candidate_files\":{},\"delta_overlay_pruned\":{},\"delta_tombstone_pruned\":{}", .{
+        generation_refresh.base_candidate_files,
+        generation_refresh.delta_candidate_files,
+        generation_refresh.delta_overlay_pruned,
+        generation_refresh.delta_tombstone_pruned,
+    });
+    try writer.writeAll(",\"overlay_route\":");
+    try writeJsonString(writer, generation_refresh.overlay_route);
     try writer.writeAll(",\"refresh_status\":");
     try writeJsonString(writer, generation_refresh.refresh_status);
     try writer.writeAll(",\"fallback_reason\":");
@@ -830,12 +838,20 @@ test "postings index json exposes candidate pruning counters" {
 }
 
 test "generation refresh json exposes epoch status and fallback" {
-    var buffer: [512]u8 = undefined;
+    var buffer: [1024]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     try writeGenerationRefreshJson(&writer, .{
         .enabled = true,
         .available = true,
         .epoch = 42,
+        .parent_epoch = 40,
+        .delta_entries = 3,
+        .delta_tombstones = 1,
+        .base_candidate_files = 2,
+        .delta_candidate_files = 1,
+        .delta_overlay_pruned = 1,
+        .delta_tombstone_pruned = 1,
+        .overlay_route = "base_plus_delta",
         .refresh_status = "pinned",
         .fallback_reason = "",
     });
@@ -845,6 +861,14 @@ test "generation refresh json exposes epoch status and fallback" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"enabled\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"available\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"epoch\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"parent_epoch\":40") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"delta_entries\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"delta_tombstones\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"base_candidate_files\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"delta_candidate_files\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"delta_overlay_pruned\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"delta_tombstone_pruned\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"overlay_route\":\"base_plus_delta\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"refresh_status\":\"pinned\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"fallback_reason\":\"\"") != null);
 }

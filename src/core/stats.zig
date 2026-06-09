@@ -155,6 +155,11 @@ pub const GenerationRefreshStats = struct {
     parent_epoch: ?u64 = null,
     delta_entries: usize = 0,
     delta_tombstones: usize = 0,
+    base_candidate_files: usize = 0,
+    delta_candidate_files: usize = 0,
+    delta_overlay_pruned: usize = 0,
+    delta_tombstone_pruned: usize = 0,
+    overlay_route: []const u8 = "fallback",
     refresh_status: []const u8 = "not_wired",
     fallback_reason: []const u8 = "not_wired",
 };

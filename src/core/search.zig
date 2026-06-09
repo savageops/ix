@@ -718,20 +718,34 @@ fn prepareDeltaWarmIndexFrontier(
     defer allocator.free(parent_selected);
     const delta_selected = postings.selectCatalogEntriesForCandidates(allocator, delta_snapshot, delta_lookup.candidates) catch return warmIndexFallback(report, "delta_candidate_select_failed");
     defer allocator.free(delta_selected);
+    const tombstone_count = countDeltaTombstones(delta_snapshot);
 
     var active = std.ArrayList(DiscoveredFile).empty;
     errdefer active.deinit(allocator);
+    var base_candidate_files: usize = 0;
+    var delta_candidate_files: usize = 0;
+    var delta_overlay_pruned: usize = 0;
+    var delta_tombstone_pruned: usize = 0;
     for (parent_selected) |entry| {
         const path = parent_snapshot.path(entry);
-        if (deltaSnapshotContainsPath(delta_snapshot, path)) continue;
+        if (deltaSnapshotContainsPath(delta_snapshot, path)) {
+            delta_overlay_pruned += 1;
+            continue;
+        }
         if (!request.hidden and isHiddenDirectoryPath(warmIndexRelativePath(root, path))) continue;
+        base_candidate_files += 1;
         active.append(allocator, .{ .path = allocator.dupe(u8, path) catch return warmIndexFallback(report, "parent_candidate_path_alloc_failed") }) catch return warmIndexFallback(report, "parent_candidate_append_failed");
     }
     for (delta_selected) |entry| {
         const delta_index = catalogEntryIndex(delta_snapshot, entry) orelse return warmIndexFallback(report, "delta_candidate_index_failed");
-        if (catalog.metaIsTombstone(delta_snapshot.metas[delta_index])) continue;
+        if (catalog.metaIsTombstone(delta_snapshot.metas[delta_index])) {
+            delta_overlay_pruned += 1;
+            delta_tombstone_pruned += 1;
+            continue;
+        }
         const path = delta_snapshot.path(entry);
         if (!request.hidden and isHiddenDirectoryPath(warmIndexRelativePath(root, path))) continue;
+        delta_candidate_files += 1;
         active.append(allocator, .{ .path = allocator.dupe(u8, path) catch return warmIndexFallback(report, "delta_candidate_path_alloc_failed") }) catch return warmIndexFallback(report, "delta_candidate_append_failed");
     }
 
@@ -740,7 +754,6 @@ fn prepareDeltaWarmIndexFrontier(
     appendDeltaVerificationFrontier(allocator, root, request, delta_snapshot, delta_lookup.candidates, &active, &verify_required_count) catch return warmIndexFallback(report, "delta_verify_required_append_failed");
     if (!warmFrontierPathsStillReadable(io, active.items)) return warmIndexFallback(report, "stale_candidate_path");
 
-    const tombstone_count = countDeltaTombstones(delta_snapshot);
     const logical_count = logicalDeltaPathCount(parent_snapshot, delta_snapshot, tombstone_count);
     report.discover_ms = 0;
     report.files_discovered = logical_count;
@@ -749,6 +762,11 @@ fn prepareDeltaWarmIndexFrontier(
     report.stats.generation_refresh.parent_epoch = parent_epoch;
     report.stats.generation_refresh.delta_entries = delta_snapshot.entries.len;
     report.stats.generation_refresh.delta_tombstones = tombstone_count;
+    report.stats.generation_refresh.base_candidate_files = base_candidate_files;
+    report.stats.generation_refresh.delta_candidate_files = delta_candidate_files;
+    report.stats.generation_refresh.delta_overlay_pruned = delta_overlay_pruned;
+    report.stats.generation_refresh.delta_tombstone_pruned = delta_tombstone_pruned;
+    report.stats.generation_refresh.overlay_route = deltaOverlayRoute(base_candidate_files, delta_candidate_files, delta_overlay_pruned, delta_tombstone_pruned);
     report.stats.generation_refresh.refresh_status = "live_delta_pinned";
     report.stats.generation_refresh.fallback_reason = "";
     report.stats.catalog_index.available = true;
@@ -858,7 +876,14 @@ fn countDeltaTombstones(snapshot: catalog.CatalogSnapshot) usize {
     return count;
 }
 
-fn logicalDeltaPathCount(parent_snapshot: catalog.CatalogSnapshot, delta_snapshot: catalog.CatalogSnapshot, _: usize) usize {
+fn deltaOverlayRoute(base_candidate_files: usize, delta_candidate_files: usize, delta_overlay_pruned: usize, delta_tombstone_pruned: usize) []const u8 {
+    if (base_candidate_files > 0 and delta_candidate_files > 0) return "base_plus_delta";
+    if (delta_candidate_files > 0) return "delta_only";
+    if (base_candidate_files > 0) return if (delta_overlay_pruned > 0 or delta_tombstone_pruned > 0) "delta_tombstone_pruned" else "base_only";
+    return if (delta_overlay_pruned > 0 or delta_tombstone_pruned > 0) "delta_tombstone_pruned" else "fallback";
+}
+
+fn logicalDeltaPathCount(parent_snapshot: catalog.CatalogSnapshot, delta_snapshot: catalog.CatalogSnapshot, tombstone_count: usize) usize {
     var overridden_existing: usize = 0;
     var added_live: usize = 0;
     for (delta_snapshot.entries, 0..) |entry, index| {
@@ -871,7 +896,9 @@ fn logicalDeltaPathCount(parent_snapshot: catalog.CatalogSnapshot, delta_snapsho
             added_live += 1;
         }
     }
-    return parent_snapshot.entries.len - @min(parent_snapshot.entries.len, overridden_existing) + added_live;
+    const computed = parent_snapshot.entries.len - @min(parent_snapshot.entries.len, overridden_existing) + added_live;
+    const live_delta_entries = delta_snapshot.entries.len - @min(delta_snapshot.entries.len, tombstone_count);
+    return @max(computed, live_delta_entries);
 }
 
 fn warmIndexFallback(report: *SearchReport, reason: []const u8) ?WarmIndexFrontier {
@@ -6677,6 +6704,7 @@ test "search run consumes live warm postings and scans only candidate files" {
 
 test "warm delta generation overlays parent postings without stale base matches" {
     const io = std.testing.io;
+    var checked: usize = 0;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -6742,16 +6770,74 @@ test "warm delta generation overlays parent postings without stale base matches"
     const report = try run(io, allocator, request, plan);
 
     try std.testing.expect(report.stats.catalog_index.available);
+    checked += 1;
     try std.testing.expect(report.stats.postings_index.available);
+    checked += 1;
     try std.testing.expectEqualStrings("live_delta_pinned", report.stats.generation_refresh.refresh_status);
+    checked += 1;
+    try std.testing.expectEqualStrings("", report.stats.generation_refresh.fallback_reason);
+    checked += 1;
     try std.testing.expectEqual(base_pin.epoch, report.stats.generation_refresh.parent_epoch.?);
+    checked += 1;
     try std.testing.expectEqual(delta_epoch, report.stats.generation_refresh.epoch.?);
+    checked += 1;
     try std.testing.expectEqual(@as(usize, 3), report.stats.generation_refresh.delta_entries);
+    checked += 1;
     try std.testing.expectEqual(@as(usize, 1), report.stats.generation_refresh.delta_tombstones);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 0), report.stats.generation_refresh.base_candidate_files);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 1), report.stats.generation_refresh.delta_candidate_files);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 2), report.stats.generation_refresh.delta_overlay_pruned);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 0), report.stats.generation_refresh.delta_tombstone_pruned);
+    checked += 1;
+    try std.testing.expectEqualStrings("delta_only", report.stats.generation_refresh.overlay_route);
+    checked += 1;
+    try std.testing.expectEqual(delta_epoch, report.stats.catalog_index.generation.?);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 2), report.stats.catalog_index.path_count);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 2), report.stats.catalog_index.meta_count);
+    checked += 1;
+    try std.testing.expectEqualStrings("", report.stats.catalog_index.fallback_reason);
+    checked += 1;
+    try std.testing.expectEqual(delta_epoch, report.stats.postings_index.generation.?);
+    checked += 1;
+    try std.testing.expect(report.stats.postings_index.trigram_count > 0);
+    checked += 1;
+    try std.testing.expect(report.stats.postings_index.postings_count > 0);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 2), report.stats.postings_index.file_count);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 3), report.stats.postings_index.candidate_files);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 1), report.stats.postings_index.pruned_files);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 1), report.stats.postings_index.verified_files);
+    checked += 1;
+    try std.testing.expectEqualStrings("", report.stats.postings_index.fallback_reason);
+    checked += 1;
     try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
+    checked += 1;
     try std.testing.expectEqual(@as(usize, 1), report.matches_found);
+    checked += 1;
     try std.testing.expectEqual(@as(usize, 1), report.hit_count);
+    checked += 1;
     try std.testing.expectEqualStrings(fresh_path, report.hits[0].path);
+    checked += 1;
+    try std.testing.expect(!std.mem.eql(u8, candidate_path, report.hits[0].path));
+    checked += 1;
+    try std.testing.expect(!std.mem.eql(u8, dead_path, report.hits[0].path));
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 2), report.files_discovered);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 0), report.files_skipped);
+    checked += 1;
+    try std.testing.expect(report.stats.generation_refresh.available);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 34), checked);
 }
 
 test "stats-only live warm postings return empty frontier without catalog scan" {
