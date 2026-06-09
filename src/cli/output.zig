@@ -258,7 +258,12 @@ pub fn writeSearchReport(writer: anytype, report: search.SearchReport) !void {
         .{ report.stats.access_errors.total, report.stats.access_errors.access_denied, report.files_discovered, report.files_scanned, report.files_skipped, report.matches_found, report.aggregate_ms, report.discover_ms, report.scan_ms, report.total_ms, report.slowest_bytes, report.slowest_ms },
     );
     try writeJsonString(writer, report.slowest_path);
-    try writer.print("}},\"status\":\"{s}\"}} --\n", .{searchStatus(report)});
+    try writer.writeAll("},\"hits\":[");
+    for (report.hits[0..report.hit_count], 0..) |hit, index| {
+        if (index > 0) try writer.writeAll(",");
+        try writeSearchHitJson(writer, report, hit);
+    }
+    try writer.print("],\"status\":\"{s}\"}} --\n", .{searchStatus(report)});
 }
 
 pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void {
@@ -480,14 +485,35 @@ pub fn writeInspectWindow(writer: anytype, window: inspect.InspectWindow) !void 
         if (window.requested_end_line) |requested_end| {
             const span = requested_end - window.start_line + 1;
             if (window.line_count >= span) {
-                try writer.print("-- ix.next.v1 {{\"argv\":[\"ix\",\"inspect\",\"{s}\",\"--range\",\"{}:{}\"],\"cmd\":\"inspect\"}} --\n", .{ window.path, window.end_line + 1, window.end_line + span });
+                try writeInspectNextRange(writer, window.path, window.end_line + 1, window.end_line + span);
             }
         } else if (window.limit) |limit| {
             if (limit > 0 and window.line_count >= limit) {
-                try writer.print("-- ix.next.v1 {{\"argv\":[\"ix\",\"inspect\",\"{s}\",\"--start-line\",\"{}\",\"--limit\",\"{}\"],\"cmd\":\"inspect\"}} --\n", .{ window.path, window.end_line + 1, limit });
+                try writeInspectNextStartLimit(writer, window.path, window.end_line + 1, limit);
             }
         }
     }
+}
+
+fn writeInspectNextRange(writer: anytype, path: []const u8, start_line: usize, end_line: usize) !void {
+    try writer.writeAll("-- ix.next.v1 {\"argv\":[\"ix\",\"inspect\",");
+    try writeJsonString(writer, path);
+    try writer.writeAll(",\"--range\",");
+    try writer.writeByte('"');
+    try writer.print("{}:{}", .{ start_line, end_line });
+    try writer.writeAll("\"],\"cmd\":\"inspect\"} --\n");
+}
+
+fn writeInspectNextStartLimit(writer: anytype, path: []const u8, start_line: usize, limit: usize) !void {
+    try writer.writeAll("-- ix.next.v1 {\"argv\":[\"ix\",\"inspect\",");
+    try writeJsonString(writer, path);
+    try writer.writeAll(",\"--start-line\",");
+    try writer.writeByte('"');
+    try writer.print("{}", .{start_line});
+    try writer.writeAll("\",\"--limit\",");
+    try writer.writeByte('"');
+    try writer.print("{}", .{limit});
+    try writer.writeAll("\"],\"cmd\":\"inspect\"} --\n");
 }
 
 pub fn writeInspectWindowJsonReports(writer: anytype, windows: []const inspect.InspectWindow) !void {
@@ -671,6 +697,83 @@ test "matches json emits hit records only" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"line\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"stats\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"matches_found\"") == null);
+}
+
+test "search result sentinel includes agent-safe absolute hit paths" {
+    var report = search.SearchReport{
+        .expression = "lit:needle",
+        .cwd = "C:/repo",
+        .input_roots = 1,
+        .effective_roots = 1,
+        .pruned_roots = 0,
+        .overlap_pruned_roots = 0,
+        .discovered_duplicate_paths = 0,
+        .collect_hits = true,
+        .stats = .{},
+        .bytes_scanned = 128,
+        .files_discovered = 1,
+        .files_scanned = 1,
+        .files_skipped = 0,
+        .matches_found = 1,
+        .truncated = false,
+        .slowest_path = "src/fixture.txt",
+        .slowest_bytes = 128,
+        .slowest_ms = 0,
+        .discover_ms = 0,
+        .scan_ms = 0,
+        .aggregate_ms = 0,
+        .total_ms = 0,
+        .scan_work_ms_total = 0,
+        .matcher_strategy_supported = true,
+        .outer_parallel_shard_safe = true,
+        .uses_single_literal_counter = true,
+        .fast_count_range_overlap = null,
+        .available_threads = 1,
+        .outer_scan_threads = 1,
+        .hits = undefined,
+        .hit_count = 1,
+    };
+    report.hits[0] = .{ .path = "src/fixture.txt", .line = 7, .column = 3, .preview = "a needle" };
+
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeSearchReport(&writer, report);
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "ix.result.v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"hits\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "}},\"hits\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"path\":\"src/fixture.txt\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"absolute_path\":\"C:/repo/src/fixture.txt\"") != null);
+}
+
+test "inspect next sentinel json escapes path argv" {
+    var window = inspect.InspectWindow{
+        .path = "C:\\repo\\quote\"dir\\file.zig",
+        .request_label = "range",
+        .start_line = 1,
+        .limit = null,
+        .skip = 0,
+        .allow_full = false,
+        .requested_end_line = 2,
+        .end_line = 2,
+        .has_more = true,
+        .eof = false,
+        .total_lines = null,
+        .lines = undefined,
+        .line_count = 2,
+    };
+    window.lines[0] = .{ .number = 1, .text = "one" };
+    window.lines[1] = .{ .number = 2, .text = "two" };
+
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeInspectWindow(&writer, window);
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "ix.next.v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"C:\\\\repo\\\\quote\\\"dir\\\\file.zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"--range\",\"3:4\"") != null);
 }
 
 test "access error json exposes partial-search diagnostics" {
