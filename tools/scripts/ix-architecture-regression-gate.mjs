@@ -808,6 +808,10 @@ function sortHitsForParity(hits) {
   );
 }
 
+function hitSignature(hit) {
+  return `${hit.path}:${hit.line}:${hit.column}:${hit.preview}`;
+}
+
 function warmColdParityLane() {
   const ix = findBuiltIx();
   if (!ix) return lane("warm_cold_parity", "skipped", { reason: "zig-out binary missing; run build first" });
@@ -818,6 +822,9 @@ function warmColdParityLane() {
   mkdirSync(root, { recursive: true });
   writeFileSync(path.join(root, "alpha.zig"), "pub const needle = \"needle\";\r\npub const edge = \"line-boundary\";\r\n");
   writeFileSync(path.join(root, "nested.txt"), "haystack\nneedle\nneedle suffix\n");
+  writeFileSync(path.join(root, "final-no-newline.txt"), "final needle");
+  writeFileSync(path.join(root, "modified.txt"), "needle before mutation\n");
+  writeFileSync(path.join(root, "deleted.txt"), "needle before deletion\n");
   writeFileSync(path.join(root, "binary-like.bin"), Buffer.from([0, 1, 2, 3, 0, 110, 101, 101, 100, 108, 101, 0]));
   writeFileSync(path.join(root, ".hidden.zig"), "pub const needle = \"hidden\";\n");
 
@@ -840,21 +847,27 @@ try {
     [pscustomobject]@{ status = 'no_live_marker'; ownerPid = $owner.Id } | ConvertTo-Json -Compress
     exit 2
   }
+  Remove-Item -LiteralPath (Join-Path $root 'deleted.txt') -Force
+  Set-Content -LiteralPath (Join-Path $root 'modified.txt') -Value 'mutated away' -NoNewline
   $env:IX_NEXUS = '0'
   $env:IX_INDEX = '0'
   $coldStatsOut = & $ix search 'lit:needle' $root --json --stats-only
   $coldHitsOut = & $ix search 'lit:needle' $root --json --max-hits 20
+  $coldCaseStatsOut = & $ix search 'lit:NEEDLE' $root --json --stats-only --ignore-case
   $env:IX_INDEX = '1'
   $warmStatsOut = & $ix search 'lit:needle' $root --json --stats-only
   $warmHitsOut = & $ix search 'lit:needle' $root --json --max-hits 20
+  $warmCaseStatsOut = & $ix search 'lit:NEEDLE' $root --json --stats-only --ignore-case
   [pscustomobject]@{
     status = 'ok'
     ownerPid = $owner.Id
     liveMarker = $live.FullName
     coldStats = ($coldStatsOut | ConvertFrom-Json)
     coldHits = ($coldHitsOut | ConvertFrom-Json)
+    coldCaseStats = ($coldCaseStatsOut | ConvertFrom-Json)
     warmStats = ($warmStatsOut | ConvertFrom-Json)
     warmHits = ($warmHitsOut | ConvertFrom-Json)
+    warmCaseStats = ($warmCaseStatsOut | ConvertFrom-Json)
   } | ConvertTo-Json -Compress -Depth 30
 } finally {
   Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and $_.CommandLine.Contains($root) -and ($_.CommandLine.Contains('__ix_indexd') -or $_.Name -match '^(ix|iex|ix-zig)(\\.exe)?$') } | ForEach-Object {
@@ -879,6 +892,8 @@ exit 0
   if (parsed.status !== "ok") failures.push(parsed.status ?? `powershell exited ${probe.exitCode}`);
   const coldStats = parsed.coldStats ?? {};
   const warmStats = parsed.warmStats ?? {};
+  const coldCaseStats = parsed.coldCaseStats ?? {};
+  const warmCaseStats = parsed.warmCaseStats ?? {};
   const coldHits = Array.isArray(parsed.coldHits?.hits) ? parsed.coldHits.hits.map((hit) => normalizeHit(hit, root)) : [];
   const warmHits = Array.isArray(parsed.warmHits?.hits) ? parsed.warmHits.hits.map((hit) => normalizeHit(hit, root)) : [];
   const coldHitsSorted = sortHitsForParity(coldHits);
@@ -886,12 +901,27 @@ exit 0
   const sameHitOrder = JSON.stringify(coldHits) === JSON.stringify(warmHits);
   const coldMatches = coldStats.stats?.matches_found ?? null;
   const warmMatches = warmStats.stats?.matches_found ?? null;
-  if (coldStats.status !== "ok") failures.push("cold stats status is not ok");
-  if (warmStats.status !== "ok") failures.push("warm stats status is not ok");
-  if (coldMatches !== warmMatches) failures.push(`stats matches diverged cold=${coldMatches} warm=${warmMatches}`);
-  if (JSON.stringify(coldHitsSorted) !== JSON.stringify(warmHitsSorted)) failures.push("hit records diverged between cold and warm paths");
-  if (coldMatches !== 5) failures.push(`expected 5 text matches including default dotfile traversal, got ${coldMatches}`);
-  if (coldHits.some((hit) => hit.path.includes("binary-like.bin"))) failures.push("binary-like fixture leaked into hit records");
+  const coldCaseMatches = coldCaseStats.stats?.matches_found ?? null;
+  const warmCaseMatches = warmCaseStats.stats?.matches_found ?? null;
+  const coldSignatures = coldHitsSorted.map(hitSignature);
+  const warmSignatures = warmHitsSorted.map(hitSignature);
+  const signatureCounts = new Map();
+  for (const signature of warmSignatures) signatureCounts.set(signature, (signatureCounts.get(signature) ?? 0) + 1);
+  if (coldStats.status !== "ok") failures.push("lit:needle.stats.status cold is not ok");
+  if (warmStats.status !== "ok") failures.push("lit:needle.stats.status warm is not ok");
+  if (coldMatches !== warmMatches) failures.push(`lit:needle.stats.matches_found diverged cold=${coldMatches} warm=${warmMatches}`);
+  if (JSON.stringify(coldHitsSorted) !== JSON.stringify(warmHitsSorted)) failures.push("lit:needle.hits.records diverged between cold and warm paths");
+  if (coldMatches !== 6) failures.push(`lit:needle.fixture_count expected 6 text matches after stale mutations, got ${coldMatches}`);
+  if (!coldSignatures.some((signature) => signature.includes("final-no-newline.txt:1:7:final needle"))) failures.push("final-no-newline fixture missing from cold hits");
+  if (warmSignatures.some((signature) => signature.includes("deleted.txt"))) failures.push("deleted stale-index fixture leaked into warm hits");
+  if (warmSignatures.some((signature) => signature.includes("modified.txt"))) failures.push("modified stale-index fixture leaked into warm hits");
+  if (warmSignatures.some((signature) => (signatureCounts.get(signature) ?? 0) > 1)) failures.push("warm hit records contain duplicate contract signatures");
+  if (coldHits.some((hit) => hit.path.includes("binary-like.bin")) || warmHits.some((hit) => hit.path.includes("binary-like.bin"))) failures.push("binary-like fixture leaked into hit records");
+  if (coldCaseStats.status !== "ok") failures.push("case_policy.stats.status cold is not ok");
+  if (warmCaseStats.status !== "ok") failures.push("case_policy.stats.status warm is not ok");
+  if (coldCaseMatches !== warmCaseMatches) failures.push(`case_policy.stats.matches_found diverged cold=${coldCaseMatches} warm=${warmCaseMatches}`);
+  if (warmCaseStats.stats?.generation_refresh?.refresh_status !== "fallback") failures.push("case_policy warm path did not report fallback");
+  if (warmCaseStats.stats?.generation_refresh?.fallback_reason !== "case_insensitive") failures.push("case_policy warm fallback reason is not case_insensitive");
 
   return lane("warm_cold_parity", failures.length === 0 ? "ok" : "failed", {
     evidence: probe,
@@ -900,6 +930,8 @@ exit 0
       warmMatches,
       coldHitCount: coldHits.length,
       warmHitCount: warmHits.length,
+      coldCaseMatches,
+      warmCaseMatches,
       sameHitOrder,
       coldHits,
       warmHits,
@@ -907,6 +939,8 @@ exit 0
       warmHitsSorted,
       warmRefreshStatus: warmStats.stats?.generation_refresh?.refresh_status ?? null,
       warmRefreshAvailable: warmStats.stats?.generation_refresh?.available ?? null,
+      warmCaseRefreshStatus: warmCaseStats.stats?.generation_refresh?.refresh_status ?? null,
+      warmCaseFallbackReason: warmCaseStats.stats?.generation_refresh?.fallback_reason ?? null,
     },
     failures,
   });
