@@ -260,6 +260,47 @@ pub const DeltaApplyPlan = struct {
     }
 };
 
+pub const DeltaOverlayState = enum {
+    clean,
+    upsert_pending,
+    delete_pending,
+    tombstone,
+    root_reconcile_required,
+};
+
+pub const DeltaOverlayEntry = struct {
+    state: DeltaOverlayState,
+    file_id: ?catalog.FileId = null,
+    resolution: ?RecordPathResolution = null,
+    reason: windows.DWORD = 0,
+
+    pub fn blocksBaseCandidate(self: DeltaOverlayEntry, candidate_file_id: catalog.FileId) bool {
+        return self.file_id != null and
+            self.file_id.? == candidate_file_id and
+            (self.state == .delete_pending or self.state == .tombstone or self.state == .root_reconcile_required);
+    }
+};
+
+pub const DeltaOverlayPlan = struct {
+    base_epoch: generation.Epoch,
+    delta_epoch: generation.Epoch,
+    entries: []DeltaOverlayEntry = &.{},
+    reconcile_required: bool = false,
+    fallback_reason: []const u8 = "",
+    upsert_count: usize = 0,
+    tombstone_count: usize = 0,
+
+    pub fn deinit(self: DeltaOverlayPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.entries);
+    }
+
+    pub fn pinsConsistentView(self: DeltaOverlayPlan) bool {
+        return self.base_epoch != generation.INVALID_EPOCH and
+            self.delta_epoch != generation.INVALID_EPOCH and
+            self.delta_epoch >= self.base_epoch;
+    }
+};
+
 pub const DeltaGenerationInput = struct {
     root: []const u8,
     root_fingerprint: catalog.RootFingerprint,
@@ -625,6 +666,89 @@ pub fn planDeltaApplyWithPolicy(tasks: []const DeltaTask, policy: DeltaApplyPoli
         }
     }
     return plan;
+}
+
+pub fn planDeltaOverlay(
+    allocator: std.mem.Allocator,
+    base_epoch: generation.Epoch,
+    delta_epoch: generation.Epoch,
+    tasks: []const DeltaTask,
+    policy: DeltaApplyPolicy,
+) !DeltaOverlayPlan {
+    if (base_epoch == generation.INVALID_EPOCH or delta_epoch == generation.INVALID_EPOCH or delta_epoch < base_epoch) {
+        return error.InvalidDeltaEpoch;
+    }
+
+    if (!policy.admits(tasks.len)) {
+        return .{
+            .base_epoch = base_epoch,
+            .delta_epoch = delta_epoch,
+            .reconcile_required = true,
+            .fallback_reason = "root_reconcile_required",
+        };
+    }
+
+    var entries = std.ArrayList(DeltaOverlayEntry).empty;
+    errdefer entries.deinit(allocator);
+    var upsert_count: usize = 0;
+    var tombstone_count: usize = 0;
+    for (tasks) |task| {
+        if (task.kind == .reconcile_root) {
+            entries.deinit(allocator);
+            return .{
+                .base_epoch = base_epoch,
+                .delta_epoch = delta_epoch,
+                .reconcile_required = true,
+                .fallback_reason = "root_reconcile_required",
+            };
+        }
+        const resolution = task.resolution orelse {
+            entries.deinit(allocator);
+            return .{
+                .base_epoch = base_epoch,
+                .delta_epoch = delta_epoch,
+                .reconcile_required = true,
+                .fallback_reason = "unresolved_delta_task",
+            };
+        };
+        const file_id = switch (resolution) {
+            .catalog_file_id => |id| id,
+            .pending_path_lookup => {
+                entries.deinit(allocator);
+                return .{
+                    .base_epoch = base_epoch,
+                    .delta_epoch = delta_epoch,
+                    .reconcile_required = true,
+                    .fallback_reason = "pending_path_lookup",
+                };
+            },
+        };
+        const state: DeltaOverlayState = switch (task.kind) {
+            .upsert_file => .upsert_pending,
+            .delete_file => .tombstone,
+            .reconcile_root => .root_reconcile_required,
+        };
+        switch (state) {
+            .upsert_pending => upsert_count += 1,
+            .tombstone => tombstone_count += 1,
+            .clean, .delete_pending, .root_reconcile_required => {},
+        }
+        try entries.append(allocator, .{
+            .state = state,
+            .file_id = file_id,
+            .resolution = resolution,
+            .reason = task.reason,
+        });
+    }
+
+    return .{
+        .base_epoch = base_epoch,
+        .delta_epoch = delta_epoch,
+        .entries = try entries.toOwnedSlice(allocator),
+        .reconcile_required = false,
+        .upsert_count = upsert_count,
+        .tombstone_count = tombstone_count,
+    };
 }
 
 pub fn publishDeltaGeneration(
@@ -1502,6 +1626,138 @@ test "usn delta apply policy caps churn before overlay publish" {
     try std.testing.expect(overflow.reconcile_required);
     try std.testing.expectEqual(@as(usize, 1), overflow.upsert_count);
     try std.testing.expectEqual(@as(usize, 1), overflow.delete_count);
+}
+
+test "usn delta overlay model covers file mutation pressure and tombstone semantics" {
+    var checked: usize = 0;
+    const upsert_one = DeltaTask{ .kind = .upsert_file, .reason = USN_REASON_DATA_EXTEND, .resolution = .{ .catalog_file_id = 1 } };
+    const delete_two = DeltaTask{ .kind = .delete_file, .reason = USN_REASON_FILE_DELETE, .resolution = .{ .catalog_file_id = 2 } };
+    const upsert_three = DeltaTask{ .kind = .upsert_file, .reason = USN_REASON_DATA_OVERWRITE, .resolution = .{ .catalog_file_id = 3 } };
+    const pending_lookup = RecordPathResolution{ .pending_path_lookup = .{
+        .file_reference = .{ .v2 = 33 },
+        .parent_reference = .{ .v2 = 3 },
+        .file_name_offset = 60,
+        .file_name_length = 20,
+    } };
+
+    try std.testing.expectError(error.InvalidDeltaEpoch, planDeltaOverlay(std.testing.allocator, generation.INVALID_EPOCH, 2, &.{}, .{}));
+    checked += 1;
+    try std.testing.expectError(error.InvalidDeltaEpoch, planDeltaOverlay(std.testing.allocator, 2, generation.INVALID_EPOCH, &.{}, .{}));
+    checked += 1;
+    try std.testing.expectError(error.InvalidDeltaEpoch, planDeltaOverlay(std.testing.allocator, 4, 3, &.{}, .{}));
+    checked += 1;
+
+    var empty = try planDeltaOverlay(std.testing.allocator, 10, 10, &.{}, .{});
+    defer empty.deinit(std.testing.allocator);
+    try std.testing.expect(empty.pinsConsistentView());
+    checked += 1;
+    try std.testing.expect(!empty.reconcile_required);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 0), empty.entries.len);
+    checked += 1;
+
+    var upsert_plan = try planDeltaOverlay(std.testing.allocator, 10, 11, &.{upsert_one}, .{});
+    defer upsert_plan.deinit(std.testing.allocator);
+    try std.testing.expect(upsert_plan.pinsConsistentView());
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 1), upsert_plan.entries.len);
+    checked += 1;
+    try std.testing.expectEqual(DeltaOverlayState.upsert_pending, upsert_plan.entries[0].state);
+    checked += 1;
+    try std.testing.expectEqual(@as(?catalog.FileId, 1), upsert_plan.entries[0].file_id);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 1), upsert_plan.upsert_count);
+    checked += 1;
+    try std.testing.expect(!upsert_plan.entries[0].blocksBaseCandidate(1));
+    checked += 1;
+
+    var delete_plan = try planDeltaOverlay(std.testing.allocator, 10, 12, &.{delete_two}, .{});
+    defer delete_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), delete_plan.entries.len);
+    checked += 1;
+    try std.testing.expectEqual(DeltaOverlayState.tombstone, delete_plan.entries[0].state);
+    checked += 1;
+    try std.testing.expectEqual(@as(?catalog.FileId, 2), delete_plan.entries[0].file_id);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 1), delete_plan.tombstone_count);
+    checked += 1;
+    try std.testing.expect(delete_plan.entries[0].blocksBaseCandidate(2));
+    checked += 1;
+    try std.testing.expect(!delete_plan.entries[0].blocksBaseCandidate(3));
+    checked += 1;
+
+    const mixed = [_]DeltaTask{ upsert_one, delete_two, upsert_three };
+    var mixed_plan = try planDeltaOverlay(std.testing.allocator, 10, 13, &mixed, .{ .max_delta_tasks = 3 });
+    defer mixed_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 3), mixed_plan.entries.len);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 2), mixed_plan.upsert_count);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 1), mixed_plan.tombstone_count);
+    checked += 1;
+    try std.testing.expect(!mixed_plan.reconcile_required);
+    checked += 1;
+
+    var overflow = try planDeltaOverlay(std.testing.allocator, 10, 14, &mixed, .{ .max_delta_tasks = 2 });
+    defer overflow.deinit(std.testing.allocator);
+    try std.testing.expect(overflow.reconcile_required);
+    checked += 1;
+    try std.testing.expectEqualStrings("root_reconcile_required", overflow.fallback_reason);
+    checked += 1;
+    try std.testing.expectEqual(@as(usize, 0), overflow.entries.len);
+    checked += 1;
+
+    const unresolved = DeltaTask{ .kind = .upsert_file, .reason = USN_REASON_FILE_CREATE, .resolution = pending_lookup };
+    var unresolved_plan = try planDeltaOverlay(std.testing.allocator, 10, 15, &.{unresolved}, .{});
+    defer unresolved_plan.deinit(std.testing.allocator);
+    try std.testing.expect(unresolved_plan.reconcile_required);
+    checked += 1;
+    try std.testing.expectEqualStrings("pending_path_lookup", unresolved_plan.fallback_reason);
+    checked += 1;
+
+    const null_resolution = DeltaTask{ .kind = .delete_file, .reason = USN_REASON_FILE_DELETE, .resolution = null };
+    var null_plan = try planDeltaOverlay(std.testing.allocator, 10, 16, &.{null_resolution}, .{});
+    defer null_plan.deinit(std.testing.allocator);
+    try std.testing.expect(null_plan.reconcile_required);
+    checked += 1;
+    try std.testing.expectEqualStrings("unresolved_delta_task", null_plan.fallback_reason);
+    checked += 1;
+
+    const reconcile_task = DeltaTask{ .kind = .reconcile_root, .reason = USN_REASON_CLOSE, .resolution = null };
+    var reconcile_plan = try planDeltaOverlay(std.testing.allocator, 10, 17, &.{reconcile_task}, .{});
+    defer reconcile_plan.deinit(std.testing.allocator);
+    try std.testing.expect(reconcile_plan.reconcile_required);
+    checked += 1;
+    try std.testing.expectEqualStrings("root_reconcile_required", reconcile_plan.fallback_reason);
+    checked += 1;
+
+    const delete_after_upsert = [_]DeltaTask{
+        .{ .kind = .upsert_file, .reason = USN_REASON_FILE_CREATE, .resolution = .{ .catalog_file_id = 44 } },
+        .{ .kind = .delete_file, .reason = USN_REASON_FILE_DELETE, .resolution = .{ .catalog_file_id = 44 } },
+    };
+    const coalesced_delete = try coalesceDeltaTasks(std.testing.allocator, &delete_after_upsert);
+    defer std.testing.allocator.free(coalesced_delete);
+    var coalesced_delete_plan = try planDeltaOverlay(std.testing.allocator, 10, 18, coalesced_delete, .{});
+    defer coalesced_delete_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(DeltaOverlayState.tombstone, coalesced_delete_plan.entries[0].state);
+    checked += 1;
+    try std.testing.expect(coalesced_delete_plan.entries[0].blocksBaseCandidate(44));
+    checked += 1;
+
+    const upsert_after_delete = [_]DeltaTask{
+        .{ .kind = .delete_file, .reason = USN_REASON_RENAME_OLD_NAME, .resolution = .{ .catalog_file_id = 45 } },
+        .{ .kind = .upsert_file, .reason = USN_REASON_RENAME_NEW_NAME, .resolution = .{ .catalog_file_id = 45 } },
+    };
+    const coalesced_upsert = try coalesceDeltaTasks(std.testing.allocator, &upsert_after_delete);
+    defer std.testing.allocator.free(coalesced_upsert);
+    var coalesced_upsert_plan = try planDeltaOverlay(std.testing.allocator, 10, 19, coalesced_upsert, .{});
+    defer coalesced_upsert_plan.deinit(std.testing.allocator);
+    try std.testing.expectEqual(DeltaOverlayState.upsert_pending, coalesced_upsert_plan.entries[0].state);
+    checked += 1;
+    try std.testing.expect(!coalesced_upsert_plan.entries[0].blocksBaseCandidate(45));
+    checked += 1;
+
+    try std.testing.expectEqual(@as(usize, 35), checked);
 }
 
 test "usn delta generation publish writes refreshed catalog postings and manifest" {
