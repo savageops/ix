@@ -166,7 +166,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
                 while (true) {
                     holdLiveUntilRootMutation(io, config.root);
                     settleRootMutationBurst(io);
-                    _ = publishRootGenerationForConfig(io, allocator, config) catch |err| {
+                    _ = compactCurrentRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes) catch |err| {
                         try recordPublishFailure(io, allocator, config, err);
                         return err;
                     };
@@ -390,6 +390,29 @@ fn publishRootGenerationForConfig(io: std.Io, allocator: std.mem.Allocator, conf
 }
 
 pub fn publishRootGenerationWithBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, memory_limit_bytes: usize) !generation.ReaderPin {
+    return publishRootGenerationWithParentBudget(io, allocator, root, null, memory_limit_bytes);
+}
+
+pub fn publishCompactedRootGenerationWithBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, parent_epoch: generation.Epoch, memory_limit_bytes: usize) !generation.ReaderPin {
+    if (parent_epoch == generation.INVALID_EPOCH) return error.InvalidParentGeneration;
+    return publishRootGenerationWithParentBudget(io, allocator, root, parent_epoch, memory_limit_bytes);
+}
+
+pub fn compactCurrentRootGenerationWithBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, memory_limit_bytes: usize) !generation.ReaderPin {
+    const root_identity = try catalog.identifyRoot(allocator, root);
+    defer root_identity.deinit(allocator);
+    const state = try state_dir.buildRootIndexState(allocator, root_identity.fingerprint);
+    defer state.deinit(allocator);
+    const current_path = try std.fs.path.join(allocator, &.{ state.index_dir, "current.ixgen" });
+    defer allocator.free(current_path);
+    const current_pin = generation.pinCurrentGenerationWithPayloads(io, allocator, state.index_dir, current_path, root_identity.fingerprint) catch |err| switch (err) {
+        error.NoCurrentGeneration => return publishRootGenerationWithBudget(io, allocator, root, memory_limit_bytes),
+        else => return err,
+    };
+    return publishCompactedRootGenerationWithBudget(io, allocator, root, current_pin.epoch, memory_limit_bytes);
+}
+
+fn publishRootGenerationWithParentBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, parent_epoch: ?generation.Epoch, memory_limit_bytes: usize) !generation.ReaderPin {
     try enforceMemoryBudget(memory_limit_bytes);
     var files = std.ArrayList(IndexedFile).empty;
     defer {
@@ -401,7 +424,7 @@ pub fn publishRootGenerationWithBudget(io: std.Io, allocator: std.mem.Allocator,
     try enforceMemoryBudget(memory_limit_bytes);
     std.mem.sort(IndexedFile, files.items, {}, lessThanIndexedFilePath);
 
-    const epoch = currentEpoch(io);
+    const epoch = try currentEpochAfterParent(io, parent_epoch);
     const root_identity = try catalog.identifyRoot(allocator, root);
     defer root_identity.deinit(allocator);
 
@@ -448,7 +471,7 @@ pub fn publishRootGenerationWithBudget(io: std.Io, allocator: std.mem.Allocator,
         .{ .kind = .catalog, .relative_path = "catalog.ixcat", .bytes = catalog_bytes },
         .{ .kind = .postings, .relative_path = "postings.ixpost", .bytes = postings_bytes },
     };
-    return generation.publishGenerationPayloads(io, allocator, paths, root_identity.fingerprint, epoch, null, &payloads);
+    return generation.publishGenerationPayloads(io, allocator, paths, root_identity.fingerprint, epoch, parent_epoch, &payloads);
 }
 
 fn recordPublishFailure(io: std.Io, allocator: std.mem.Allocator, config: Config, err: anyerror) !void {
@@ -796,6 +819,14 @@ fn currentEpoch(io: std.Io) generation.Epoch {
     return @intCast(now);
 }
 
+fn currentEpochAfterParent(io: std.Io, parent_epoch: ?generation.Epoch) !generation.Epoch {
+    const epoch = currentEpoch(io);
+    const parent = parent_epoch orelse return epoch;
+    if (epoch > parent) return epoch;
+    if (parent == std.math.maxInt(generation.Epoch)) return error.InvalidParentGeneration;
+    return parent + 1;
+}
+
 fn holdLiveUntilRootMutation(io: std.Io, root_path: []const u8) void {
     if (builtin.os.tag == .windows) {
         holdLiveUntilRootMutationWindows(io, root_path);
@@ -1084,6 +1115,11 @@ test "indexd foreground once publishes catalog postings generation" {
     std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
     try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const cleanup_identity = try catalog.identifyRoot(std.testing.allocator, root);
+    const cleanup_state = try state_dir.buildRootIndexState(std.testing.allocator, cleanup_identity.fingerprint);
+    std.Io.Dir.cwd().deleteTree(std.testing.io, cleanup_state.index_dir) catch {};
+    cleanup_state.deinit(std.testing.allocator);
+    cleanup_identity.deinit(std.testing.allocator);
     const sample_path = try std.fs.path.join(std.testing.allocator, &.{ root, "sample.txt" });
     defer std.testing.allocator.free(sample_path);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sample_path, .data = "needle\n" });
@@ -1111,6 +1147,135 @@ test "indexd foreground once publishes catalog postings generation" {
     const postings_path = try std.fs.path.join(std.testing.allocator, &.{ paths.generation_dir, "postings.ixpost" });
     defer std.testing.allocator.free(postings_path);
     _ = try std.Io.Dir.cwd().readFile(std.testing.io, postings_path, &buffer);
+}
+
+test "indexd compacted root generation keeps old epoch readable until current swap" {
+    const root = ".zig-cache\\ix-indexd-compacted-generation-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const cleanup_identity = try catalog.identifyRoot(std.testing.allocator, root);
+    const cleanup_state = try state_dir.buildRootIndexState(std.testing.allocator, cleanup_identity.fingerprint);
+    std.Io.Dir.cwd().deleteTree(std.testing.io, cleanup_state.index_dir) catch {};
+    cleanup_state.deinit(std.testing.allocator);
+    cleanup_identity.deinit(std.testing.allocator);
+
+    const keep_path = try std.fs.path.join(std.testing.allocator, &.{ root, "keep.txt" });
+    defer std.testing.allocator.free(keep_path);
+    const changed_path = try std.fs.path.join(std.testing.allocator, &.{ root, "changed.txt" });
+    defer std.testing.allocator.free(changed_path);
+    const deleted_path = try std.fs.path.join(std.testing.allocator, &.{ root, "deleted.txt" });
+    defer std.testing.allocator.free(deleted_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = keep_path, .data = "stable needle\n" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = changed_path, .data = "old needle\n" });
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = deleted_path, .data = "deleted needle\n" });
+
+    const base_pin = try publishRootGenerationWithBudget(std.testing.io, std.testing.allocator, root, 0);
+    try std.testing.expectEqual(@as(?generation.Epoch, null), base_pin.parent_epoch);
+
+    const root_identity = try catalog.identifyRoot(std.testing.allocator, root);
+    defer root_identity.deinit(std.testing.allocator);
+    const state = try state_dir.buildRootIndexState(std.testing.allocator, root_identity.fingerprint);
+    defer state.deinit(std.testing.allocator);
+    const base_paths = try generation.buildGenerationPathsInIndexDir(std.testing.allocator, state.index_dir, base_pin.epoch);
+    defer base_paths.deinit(std.testing.allocator);
+    const base_catalog_path = try std.fs.path.join(std.testing.allocator, &.{ base_paths.generation_dir, "catalog.ixcat" });
+    defer std.testing.allocator.free(base_catalog_path);
+
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = changed_path, .data = "new needle compacted\n" });
+    try std.Io.Dir.cwd().deleteFile(std.testing.io, deleted_path);
+
+    const compacted_pin = try compactCurrentRootGenerationWithBudget(std.testing.io, std.testing.allocator, root, 0);
+    try std.testing.expect(compacted_pin.epoch >= base_pin.epoch);
+    try std.testing.expectEqual(@as(?generation.Epoch, base_pin.epoch), compacted_pin.parent_epoch);
+    try std.testing.expectEqual(@as(usize, 2), compacted_pin.segment_count);
+
+    var small_buffer: [64]u8 = undefined;
+    _ = try std.Io.Dir.cwd().readFile(std.testing.io, base_paths.manifest_path, &small_buffer);
+    _ = try std.Io.Dir.cwd().readFile(std.testing.io, base_catalog_path, &small_buffer);
+
+    const current_pin = (try generation.tryPinCurrentGenerationWithPayloads(std.testing.io, std.testing.allocator, state.index_dir, base_paths.current_manifest_path, root_identity.fingerprint)) orelse return error.TestExpectedCurrentGeneration;
+    try std.testing.expectEqual(compacted_pin.epoch, current_pin.epoch);
+    try std.testing.expectEqual(@as(?generation.Epoch, base_pin.epoch), current_pin.parent_epoch);
+
+    const compacted_paths = try generation.buildGenerationPathsInIndexDir(std.testing.allocator, state.index_dir, compacted_pin.epoch);
+    defer compacted_paths.deinit(std.testing.allocator);
+    const compacted_catalog_path = try std.fs.path.join(std.testing.allocator, &.{ compacted_paths.generation_dir, "catalog.ixcat" });
+    defer std.testing.allocator.free(compacted_catalog_path);
+    const compacted_catalog_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, compacted_catalog_path, std.testing.allocator, .limited(64 * 1024));
+    defer std.testing.allocator.free(compacted_catalog_bytes);
+    const snapshot = try catalog.parseCatalogForRoot(std.testing.allocator, compacted_catalog_bytes, root_identity.fingerprint);
+    defer snapshot.deinit(std.testing.allocator);
+
+    var saw_keep = false;
+    var saw_changed = false;
+    var saw_deleted = false;
+    for (snapshot.entries, 0..) |entry, index| {
+        const path = snapshot.path(entry);
+        if (std.mem.endsWith(u8, path, "keep.txt")) {
+            saw_keep = true;
+            try std.testing.expectEqual(@as(u64, "stable needle\n".len), snapshot.metas[index].size);
+        }
+        if (std.mem.endsWith(u8, path, "changed.txt")) {
+            saw_changed = true;
+            try std.testing.expectEqual(@as(u64, "new needle compacted\n".len), snapshot.metas[index].size);
+        }
+        if (std.mem.endsWith(u8, path, "deleted.txt")) saw_deleted = true;
+    }
+    try std.testing.expect(saw_keep);
+    try std.testing.expect(saw_changed);
+    try std.testing.expect(!saw_deleted);
+}
+
+test "indexd compact current generation falls back to initial publish when no current exists" {
+    const root = ".zig-cache\\ix-indexd-compaction-initial-publish-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const cleanup_identity = try catalog.identifyRoot(std.testing.allocator, root);
+    const cleanup_state = try state_dir.buildRootIndexState(std.testing.allocator, cleanup_identity.fingerprint);
+    std.Io.Dir.cwd().deleteTree(std.testing.io, cleanup_state.index_dir) catch {};
+    cleanup_state.deinit(std.testing.allocator);
+    cleanup_identity.deinit(std.testing.allocator);
+    const sample_path = try std.fs.path.join(std.testing.allocator, &.{ root, "sample.txt" });
+    defer std.testing.allocator.free(sample_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sample_path, .data = "initial compact publish\n" });
+
+    const pin = try compactCurrentRootGenerationWithBudget(std.testing.io, std.testing.allocator, root, 0);
+    try std.testing.expectEqual(@as(?generation.Epoch, null), pin.parent_epoch);
+    try std.testing.expectEqual(@as(usize, 2), pin.segment_count);
+
+    const root_identity = try catalog.identifyRoot(std.testing.allocator, root);
+    defer root_identity.deinit(std.testing.allocator);
+    const state = try state_dir.buildRootIndexState(std.testing.allocator, root_identity.fingerprint);
+    defer state.deinit(std.testing.allocator);
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ state.index_dir, "current.ixgen" });
+    defer std.testing.allocator.free(current_path);
+    const current_pin = (try generation.tryPinCurrentGenerationWithPayloads(std.testing.io, std.testing.allocator, state.index_dir, current_path, root_identity.fingerprint)) orelse return error.TestExpectedCurrentGeneration;
+    try std.testing.expectEqual(pin.epoch, current_pin.epoch);
+    try std.testing.expectEqual(@as(?generation.Epoch, null), current_pin.parent_epoch);
+}
+
+test "indexd compact current generation rejects corrupt current manifest" {
+    const root = ".zig-cache\\ix-indexd-compaction-corrupt-current-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const sample_path = try std.fs.path.join(std.testing.allocator, &.{ root, "sample.txt" });
+    defer std.testing.allocator.free(sample_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sample_path, .data = "corrupt current guard\n" });
+
+    _ = try publishRootGenerationWithBudget(std.testing.io, std.testing.allocator, root, 0);
+
+    const root_identity = try catalog.identifyRoot(std.testing.allocator, root);
+    defer root_identity.deinit(std.testing.allocator);
+    const state = try state_dir.buildRootIndexState(std.testing.allocator, root_identity.fingerprint);
+    defer state.deinit(std.testing.allocator);
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ state.index_dir, "current.ixgen" });
+    defer std.testing.allocator.free(current_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = current_path, .data = "not an ix generation manifest\n" });
+
+    try std.testing.expectError(error.TruncatedGenerationManifest, compactCurrentRootGenerationWithBudget(std.testing.io, std.testing.allocator, root, 0));
 }
 
 test "indexd default traversal indexes dotfiles but skips dot directories" {
