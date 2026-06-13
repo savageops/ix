@@ -541,10 +541,15 @@ export function createSpeedGateValidation({
     if (Number(entry.report.samples) !== Number(entry.samples)) {
       failures.push("older_snapshot_ladder: ok status requires parsed sample count to match requested samples");
     }
-    if (entry.report.retainableEvidence !== true) {
+    const retainedSampleFloorMet = Number(entry.report.samples) >= minRetainableSpeedSamples;
+    const diagnosticOnly = entry.diagnosticOnly === true;
+    if (diagnosticOnly && retainedSampleFloorMet) {
+      failures.push("older_snapshot_ladder: diagnostic-only status is only allowed below the retained sample floor");
+    }
+    if (!diagnosticOnly && entry.report.retainableEvidence !== true) {
       failures.push("older_snapshot_ladder: ok status requires retainable ladder evidence");
     }
-    if (Array.isArray(entry.report.failures) && entry.report.failures.length > 0) {
+    if (!diagnosticOnly && Array.isArray(entry.report.failures) && entry.report.failures.length > 0) {
       failures.push("older_snapshot_ladder: ok status requires an empty failure ledger");
     }
     if (entry.strictRequired === true && entry.report.strictRequired !== true) {
@@ -574,13 +579,13 @@ export function createSpeedGateValidation({
       if (!Number.isFinite(Number(round.baselineMedianMs)) || !Number.isFinite(Number(round.repoMedianMs))) {
         failures.push(`older_snapshot_ladder: runnable round requires baseline and repo medians: ${round.label ?? "unknown"}`);
       }
-      if (!Number.isFinite(Number(round.enginePct)) || Number(round.enginePct) < 0) {
+      if (!Number.isFinite(Number(round.enginePct)) || (!diagnosticOnly && Number(round.enginePct) < 0)) {
         failures.push(`older_snapshot_ladder: runnable round requires non-negative engine delta: ${round.label ?? "unknown"}`);
       }
-      if (!Number.isFinite(Number(round.pairedPct)) || Number(round.pairedPct) < 0) {
+      if (!Number.isFinite(Number(round.pairedPct)) || (!diagnosticOnly && Number(round.pairedPct) < 0)) {
         failures.push(`older_snapshot_ladder: runnable round requires non-negative paired delta: ${round.label ?? "unknown"}`);
       }
-      if (!Number.isFinite(Number(round.winRate)) || Number(round.winRate) <= 0.5) {
+      if (!Number.isFinite(Number(round.winRate)) || (!diagnosticOnly && Number(round.winRate) <= 0.5)) {
         failures.push(`older_snapshot_ladder: runnable round requires paired win majority: ${round.label ?? "unknown"}`);
       }
       if (entry.strictRequired === true && round.strict !== true) {

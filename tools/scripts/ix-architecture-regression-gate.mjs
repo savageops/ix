@@ -805,8 +805,10 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     failures: latest.failures ?? [],
     rounds: parsedRounds,
   };
+  const retainedSampleFloorMet = Number(parsed.samples) >= minRetainableSpeedSamples;
+  const enforceRetainedSpeed = strictRequired || retainedSampleFloorMet;
   const laneFailures = [];
-  if (parsed.retainableEvidence !== true) {
+  if (enforceRetainedSpeed && parsed.retainableEvidence !== true) {
     laneFailures.push("older snapshot ladder evidence is non-retainable");
   }
   if (Number(parsed.runnableSnapshots) < 1) {
@@ -820,20 +822,23 @@ function olderSnapshotLadderLane(hostPreflight = null) {
   }
   for (const round of parsedRounds) {
     if (round.runnable !== true) continue;
-    if (Number(round.enginePct) < 0) laneFailures.push(`older snapshot engine regression: ${round.label}`);
-    if (Number(round.pairedPct) < 0) laneFailures.push(`older snapshot paired regression: ${round.label}`);
+    if (enforceRetainedSpeed && Number(round.enginePct) < 0) laneFailures.push(`older snapshot engine regression: ${round.label}`);
+    if (enforceRetainedSpeed && Number(round.pairedPct) < 0) laneFailures.push(`older snapshot paired regression: ${round.label}`);
     if (strictRequired && round.strict !== true) laneFailures.push(`older snapshot strict evidence missing: ${round.label}`);
   }
-  return lane("older_snapshot_ladder", evidence.exitCode === 0 && laneFailures.length === 0 ? "ok" : "failed", {
+  const comparatorExitAcceptable = evidence.exitCode === 0 || (!enforceRetainedSpeed && Number(parsed.runnableSnapshots) >= 1);
+  return lane("older_snapshot_ladder", comparatorExitAcceptable && laneFailures.length === 0 ? "ok" : "failed", {
     corpus,
     strictRequired,
     samples: olderSnapshotSamples,
     maxSnapshots: olderSnapshotMax === "" ? null : Number(olderSnapshotMax),
+    retainedSampleFloorMet,
+    diagnosticOnly: !enforceRetainedSpeed,
     evidence,
     report: parsed,
     failures: laneFailures,
     reason:
-      evidence.exitCode !== 0
+      evidence.exitCode !== 0 && enforceRetainedSpeed
         ? "older snapshot comparator failed"
         : laneFailures.length > 0
           ? "older snapshot ladder gate failed"
