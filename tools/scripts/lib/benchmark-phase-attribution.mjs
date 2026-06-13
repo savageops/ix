@@ -1,5 +1,8 @@
 function finiteNumbers(values) {
-  return values.map(Number).filter(Number.isFinite);
+  return values
+    .filter((value) => value != null)
+    .map(Number)
+    .filter(Number.isFinite);
 }
 
 function summary(values) {
@@ -140,6 +143,10 @@ export function pairedEngineStats(baselineSamples, candidateSamples, { baselineL
 
 export function pairedAttributionLedgerFields(pairedEngine) {
   const metric = (key) => pairedEngine?.attribution?.[key] ?? {};
+  const deltaMedian = (key, scale = 1) => {
+    const value = Number(metric(key)?.deltaSummary?.median);
+    return Number.isFinite(value) ? value * scale : null;
+  };
   const improvementMedian = (key) => {
     const value = Number(metric(key)?.candidateImprovementPctSummary?.median);
     return Number.isFinite(value) ? value : null;
@@ -155,40 +162,48 @@ export function pairedAttributionLedgerFields(pairedEngine) {
   return {
     pairedCandidateDiscoverImprovementMedianPct: improvementMedian("discover"),
     pairedCandidateDiscoverImprovementMeanPct: improvementMean("discover"),
+    pairedCandidateDiscoverDeltaMedianMs: deltaMedian("discover"),
     pairedCandidateDiscoverWinRate: winRate("discover"),
     pairedCandidateScanImprovementMedianPct: improvementMedian("scan"),
     pairedCandidateScanImprovementMeanPct: improvementMean("scan"),
+    pairedCandidateScanDeltaMedianMs: deltaMedian("scan"),
     pairedCandidateScanWinRate: winRate("scan"),
     pairedCandidateAggregateImprovementMedianPct: improvementMedian("aggregate"),
     pairedCandidateAggregateImprovementMeanPct: improvementMean("aggregate"),
+    pairedCandidateAggregateDeltaMedianMs: deltaMedian("aggregate"),
     pairedCandidateAggregateWinRate: winRate("aggregate"),
     pairedCandidateEngineResidualImprovementMedianPct: improvementMedian("engineResidual"),
     pairedCandidateEngineResidualImprovementMeanPct: improvementMean("engineResidual"),
+    pairedCandidateEngineResidualDeltaMedianMs: deltaMedian("engineResidual"),
     pairedCandidateEngineResidualWinRate: winRate("engineResidual"),
     pairedCandidateScanWorkImprovementMedianPct: improvementMedian("scanWork"),
     pairedCandidateScanWorkImprovementMeanPct: improvementMean("scanWork"),
+    pairedCandidateScanWorkDeltaMedianMs: deltaMedian("scanWork"),
     pairedCandidateScanWorkWinRate: winRate("scanWork"),
     pairedCandidateScanOpenImprovementMedianPct: improvementMedian("scanOpen"),
     pairedCandidateScanOpenImprovementMeanPct: improvementMean("scanOpen"),
+    pairedCandidateScanOpenDeltaMedianMs: deltaMedian("scanOpen"),
     pairedCandidateScanOpenWinRate: winRate("scanOpen"),
     pairedCandidateScanFileImprovementMedianPct: improvementMedian("scanFile"),
     pairedCandidateScanFileImprovementMeanPct: improvementMean("scanFile"),
+    pairedCandidateScanFileDeltaMedianMs: deltaMedian("scanFile"),
     pairedCandidateScanFileWinRate: winRate("scanFile"),
     pairedCandidateTeddyRangeImprovementMedianPct: improvementMedian("teddyRangeNs"),
     pairedCandidateTeddyRangeImprovementMeanPct: improvementMean("teddyRangeNs"),
+    pairedCandidateTeddyRangeDeltaMedianMs: deltaMedian("teddyRangeNs", 1 / 1_000_000),
     pairedCandidateTeddyRangeWinRate: winRate("teddyRangeNs"),
   };
 }
 
 const PHASE_LEAK_FIELDS = [
-  ["discover", "pairedCandidateDiscoverImprovementMedianPct"],
-  ["scan", "pairedCandidateScanImprovementMedianPct"],
-  ["aggregate", "pairedCandidateAggregateImprovementMedianPct"],
-  ["engineResidual", "pairedCandidateEngineResidualImprovementMedianPct"],
-  ["scanWork", "pairedCandidateScanWorkImprovementMedianPct"],
-  ["scanOpen", "pairedCandidateScanOpenImprovementMedianPct"],
-  ["scanFile", "pairedCandidateScanFileImprovementMedianPct"],
-  ["teddyRange", "pairedCandidateTeddyRangeImprovementMedianPct"],
+  ["discover", "pairedCandidateDiscoverImprovementMedianPct", "pairedCandidateDiscoverDeltaMedianMs"],
+  ["scan", "pairedCandidateScanImprovementMedianPct", "pairedCandidateScanDeltaMedianMs"],
+  ["aggregate", "pairedCandidateAggregateImprovementMedianPct", "pairedCandidateAggregateDeltaMedianMs"],
+  ["engineResidual", "pairedCandidateEngineResidualImprovementMedianPct", "pairedCandidateEngineResidualDeltaMedianMs"],
+  ["scanWork", "pairedCandidateScanWorkImprovementMedianPct", "pairedCandidateScanWorkDeltaMedianMs"],
+  ["scanOpen", "pairedCandidateScanOpenImprovementMedianPct", "pairedCandidateScanOpenDeltaMedianMs"],
+  ["scanFile", "pairedCandidateScanFileImprovementMedianPct", "pairedCandidateScanFileDeltaMedianMs"],
+  ["teddyRange", "pairedCandidateTeddyRangeImprovementMedianPct", "pairedCandidateTeddyRangeDeltaMedianMs"],
 ];
 
 export function phaseLeakSummaryFromRounds(rounds) {
@@ -196,19 +211,41 @@ export function phaseLeakSummaryFromRounds(rounds) {
   const averages = Object.fromEntries(
     PHASE_LEAK_FIELDS.map(([name, key]) => [name, average(usableRounds.map((round) => round?.[key]))]),
   );
+  const deltaMsAverages = Object.fromEntries(
+    PHASE_LEAK_FIELDS.map(([name, , deltaKey]) => [name, average(usableRounds.map((round) => round?.[deltaKey]))]),
+  );
   const leakingPhaseCounts = Object.fromEntries(PHASE_LEAK_FIELDS.map(([name]) => [name, 0]));
   const negativeAverages = Object.entries(averages)
     .filter(([, value]) => Number.isFinite(Number(value)) && Number(value) < 0)
     .sort((left, right) => Number(left[1]) - Number(right[1]))
-    .map(([name, pairedMedianPct]) => ({ name, pairedMedianPct }));
+    .map(([name, pairedMedianPct]) => ({
+      name,
+      pairedMedianPct,
+      pairedDeltaMedianMs: Number.isFinite(Number(deltaMsAverages[name])) ? Number(deltaMsAverages[name]) : null,
+      pairedDeltaMagnitudeMs: Number.isFinite(Number(deltaMsAverages[name])) ? Math.abs(Number(deltaMsAverages[name])) : null,
+    }));
   const roundsWithLeaks = usableRounds.map((round) => {
-    const phases = Object.fromEntries(PHASE_LEAK_FIELDS.map(([name, key]) => [name, Number(round?.[key])]));
+    const phases = Object.fromEntries(PHASE_LEAK_FIELDS.map(([name, key, deltaKey]) => [
+      name,
+      {
+        pairedMedianPct: Number(round?.[key]),
+        pairedDeltaMedianMs: Number(round?.[deltaKey]),
+      },
+    ]));
     const negativePhases = Object.entries(phases)
-      .filter(([, value]) => Number.isFinite(value) && value < 0)
-      .sort((left, right) => left[1] - right[1])
-      .map(([name, pairedMedianPct]) => {
+      .filter(([, value]) => Number.isFinite(value.pairedMedianPct) && value.pairedMedianPct < 0)
+      .sort((left, right) =>
+        Math.abs(Number(right[1].pairedDeltaMedianMs ?? 0)) - Math.abs(Number(left[1].pairedDeltaMedianMs ?? 0)) ||
+        left[1].pairedMedianPct - right[1].pairedMedianPct
+      )
+      .map(([name, value]) => {
         leakingPhaseCounts[name] += 1;
-        return { name, pairedMedianPct };
+        return {
+          name,
+          pairedMedianPct: value.pairedMedianPct,
+          pairedDeltaMedianMs: Number.isFinite(value.pairedDeltaMedianMs) ? value.pairedDeltaMedianMs : null,
+          pairedDeltaMagnitudeMs: Number.isFinite(value.pairedDeltaMedianMs) ? Math.abs(value.pairedDeltaMedianMs) : null,
+        };
       });
     return {
       roundIndex: round?.roundIndex ?? null,
@@ -236,7 +273,10 @@ export function phaseLeakSummaryFromRounds(rounds) {
   const repairTargets = negativeAverages.map((entry) => ({
     ...entry,
     leakingRounds: leakingPhaseCounts[entry.name] ?? 0,
-  }));
+  })).sort((left, right) =>
+    Number(right.pairedDeltaMagnitudeMs ?? 0) - Number(left.pairedDeltaMagnitudeMs ?? 0) ||
+    Number(left.pairedMedianPct) - Number(right.pairedMedianPct)
+  );
   if (
     shouldRepairLeak &&
     repairTargets.length === 0 &&
@@ -254,6 +294,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
     : repairTargets[0]?.name ?? worstRoundRepairTarget;
   return {
     averages,
+    deltaMsAverages,
     negativeAverages,
     repairTargets,
     leakingPhaseCounts,
