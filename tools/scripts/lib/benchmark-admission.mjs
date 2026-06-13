@@ -308,7 +308,7 @@ export function createBenchmarkAdmission({
       if (!seenVerifications.has("speed_regression:latest-report-summary")) {
         verificationCommands.push({
           issueId: "speed_regression",
-          command: "node -e \"const fs=require('fs'); for (const dir of ['tools/reports/architecture-gate','tools/reports/manual-speed-compare','tools/reports/historical-speed']) { const files=fs.existsSync(dir)?fs.readdirSync(dir).filter(f=>f.endsWith('.json')).map(f=>dir+'/'+f).sort((a,b)=>fs.statSync(b).mtimeMs-fs.statSync(a).mtimeMs):[]; if (files[0]) console.log(files[0]); }\"",
+          command: "node -e \"const fs=require('fs'); for (const dir of ['tools/reports/architecture-gate','tools/reports/manual-speed-compare','tools/reports/historical-speed','tools/reports/older-snapshot-ladder']) { const files=fs.existsSync(dir)?fs.readdirSync(dir).filter(f=>f.endsWith('.json')).map(f=>dir+'/'+f).sort((a,b)=>fs.statSync(b).mtimeMs-fs.statSync(a).mtimeMs):[]; if (files[0]) console.log(files[0]); }\"",
           reason: "Lists the newest speed evidence reports to inspect before retaining or reverting a performance change.",
           mutates: false,
           requiresAdmin: false,
@@ -500,7 +500,11 @@ export function createBenchmarkAdmission({
             controlRemediation,
             ...speedLanes.map((entry) => entry?.remediation),
           ],
-          { includeSpeedDiagnostics: speedLanes.some((entry) => entry?.status === "failed") },
+          {
+            includeSpeedDiagnostics:
+              benchmarkControl?.status === "failed" ||
+              speedLanes.some((entry) => entry?.status === "failed"),
+          },
         );
     const privilege = benchmarkPrivilegeSummary(hostPreflight, remediation);
     return lane("benchmark_readiness", admissible ? "ok" : "failed", {
