@@ -749,7 +749,7 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     return lane("older_snapshot_ladder", "skipped", { reason: "zig-out binary missing; run build first", corpus, strictRequired });
   }
 
-  const latestPath = path.join(ROOT, "tools", "reports", "older-snapshot-ladder", "latest-older-snapshot-ladder.json");
+  const latestPath = path.join(ROOT, "tools", "reports", "older-snapshot-ladder", "latest-architecture-gate-older-snapshot-ladder.json");
   rmSync(latestPath, { force: true });
   const commandArgs = [
     "tools/scripts/compare-older-snapshots.mjs",
@@ -757,6 +757,8 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     String(olderSnapshotSamples),
     "--identity-control-samples",
     String(Math.min(12, olderSnapshotSamples)),
+    "--latest-path",
+    latestPath,
     "--quiet",
   ];
   if (olderSnapshotMax !== "") commandArgs.push("--max-snapshots", olderSnapshotMax);

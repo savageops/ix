@@ -10,6 +10,7 @@
     "bench:older-snapshots": "node tools/scripts/compare-older-snapshots.mjs",
     "gate:architecture": "node tools/scripts/ix-architecture-regression-gate.mjs",
     "eval:agent": "node tools/scripts/ix-agent-real-eval.mjs",
+    "install:native": "node tools/scripts/sync-native-install.mjs",
     "dashboard": "node tools/scripts/dashboard-server.mjs"
   }
 }

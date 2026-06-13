@@ -21,6 +21,8 @@ Options:
   --samples <n>                   Samples per snapshot. Default: 12.
   --identity-control-samples <n>  Same-binary control samples. Default: min(12, samples).
   --max-snapshots <n>             Limit snapshots after mtime sort. Default: all.
+  --latest-path <path>            Path for latest-report pointer. Default:
+                                  tools/reports/older-snapshot-ladder/latest-older-snapshot-ladder.json.
   --newest-first                  Sort snapshots newest to oldest. Default: oldest first.
   --require-strict                Exit non-zero if any runnable snapshot lacks strict evidence.
   --dry-run                       Print selected snapshots and write no benchmark report.
@@ -35,6 +37,7 @@ const samples = Number(argValue(args, "--samples", "12"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
 const maxSnapshotsRaw = argValue(args, "--max-snapshots", "");
 const maxSnapshots = maxSnapshotsRaw === "" ? Infinity : Number(maxSnapshotsRaw);
+const latestPath = path.resolve(argValue(args, "--latest-path", path.join(REPORT_DIR, "latest-older-snapshot-ladder.json")));
 const newestFirst = args.includes("--newest-first");
 const requireStrict = args.includes("--require-strict");
 const dryRun = args.includes("--dry-run");
@@ -166,8 +169,8 @@ const report = {
 };
 
 const reportPath = path.join(REPORT_DIR, `${report.runId}.json`);
-const latestPath = path.join(REPORT_DIR, "latest-older-snapshot-ladder.json");
 writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+mkdirSync(path.dirname(latestPath), { recursive: true });
 writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`);
 
 if (!quiet) {
