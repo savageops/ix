@@ -70,9 +70,11 @@ function snapshotCandidates() {
 function readLatestInstalledSummary() {
   const reportPath = path.join(ROOT, "tools", "reports", "manual-speed-compare", "latest-installed-speed.json");
   const report = JSON.parse(readFileSync(reportPath, "utf8").replace(/^\uFEFF/, ""));
+  const sourceReportPath = path.join(ROOT, "tools", "reports", "manual-speed-compare", `${report.runId}.json`);
   const round = report.ledgerSummary?.rounds?.[0] ?? {};
   return {
     runId: report.runId,
+    sourceReportPath: existsSync(sourceReportPath) ? sourceReportPath : null,
     strict: report.retainableStrictEvidence,
     promotion: report.promotionQualified,
     status: round.status ?? null,
@@ -83,6 +85,37 @@ function readLatestInstalledSummary() {
     winRate: round.pairedCandidateWinRate ?? null,
     failures: report.strictEvidenceFailures ?? [],
     promotionFailures: report.promotionFailures ?? [],
+    identityControl: report.identityControl
+      ? {
+          samples: report.identityControl.samples ?? null,
+          medianDeltaPct: report.identityControl.medianDeltaPct ?? null,
+          pairedWinRate: report.identityControl.pairedEngine?.candidateWinRate ?? null,
+          matchParity: report.identityControl.matchParity ?? null,
+          routeParity: report.identityControl.routeParity ?? null,
+          firstEngineMedianMs: report.identityControl.first?.engineSummary?.median ?? null,
+          secondEngineMedianMs: report.identityControl.second?.engineSummary?.median ?? null,
+          firstEngineRobustCvPct: report.identityControl.first?.engineSummary?.robustCvPct ?? null,
+          secondEngineRobustCvPct: report.identityControl.second?.engineSummary?.robustCvPct ?? null,
+        }
+      : null,
+    processScan: {
+      beforeMatched: report.processScan?.before?.matched?.length ?? null,
+      afterMatched: report.processScan?.after?.matched?.length ?? null,
+      beforeFailures: report.processScan?.before?.failures ?? [],
+      afterFailures: report.processScan?.after?.failures ?? [],
+    },
+    routeParityStatus: report.installedRepoComparison?.routeParityStatus ?? null,
+    matchParity: report.installedRepoComparison?.matchParity ?? null,
+    pairOrderSummary: report.installedRepoComparison?.pairOrderSummary ?? null,
+    pairedEngine: report.installedRepoComparison?.pairedEngine
+      ? {
+          count: report.installedRepoComparison.pairedEngine.count ?? null,
+          candidateWinRate: report.installedRepoComparison.pairedEngine.candidateWinRate ?? null,
+          candidateImprovementPctSummary:
+            report.installedRepoComparison.pairedEngine.candidateImprovementPctSummary ?? null,
+          attribution: report.installedRepoComparison.pairedEngine.attribution ?? null,
+        }
+      : null,
   };
 }
 

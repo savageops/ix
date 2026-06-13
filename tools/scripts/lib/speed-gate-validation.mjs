@@ -588,6 +588,21 @@ export function createSpeedGateValidation({
       if (!Number.isFinite(Number(round.winRate)) || (!diagnosticOnly && Number(round.winRate) <= 0.5)) {
         failures.push(`older_snapshot_ladder: runnable round requires paired win majority: ${round.label ?? "unknown"}`);
       }
+      if (typeof round.sourceReportPath !== "string" || round.sourceReportPath.length === 0) {
+        failures.push(`older_snapshot_ladder: runnable round requires source report path: ${round.label ?? "unknown"}`);
+      }
+      if (!isPlainObject(round.identityControl) || !Number.isFinite(Number(round.identityControl.medianDeltaPct))) {
+        failures.push(`older_snapshot_ladder: runnable round requires same-binary noise diagnostics: ${round.label ?? "unknown"}`);
+      }
+      if (!isPlainObject(round.processScan) || Number(round.processScan.beforeMatched) !== 0 || Number(round.processScan.afterMatched) !== 0) {
+        failures.push(`older_snapshot_ladder: runnable round requires clean process diagnostics: ${round.label ?? "unknown"}`);
+      }
+      if (round.matchParity !== true) {
+        failures.push(`older_snapshot_ladder: runnable round requires match parity diagnostics: ${round.label ?? "unknown"}`);
+      }
+      if (!pairOrderSummaryIsBalanced(round.pairOrderSummary, round.pairedEngine?.count ?? entry.report.samples)) {
+        failures.push(`older_snapshot_ladder: runnable round requires balanced pair-order diagnostics: ${round.label ?? "unknown"}`);
+      }
       if (entry.strictRequired === true && round.strict !== true) {
         failures.push(`older_snapshot_ladder: strict ok status requires strict evidence for ${round.label ?? "unknown"}`);
       }

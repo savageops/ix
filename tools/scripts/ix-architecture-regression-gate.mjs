@@ -779,6 +779,7 @@ function olderSnapshotLadderLane(hostPreflight = null) {
         index: round.index ?? null,
         label: round.label ?? null,
         path: round.path ?? null,
+        sourceReportPath: round.sourceReportPath ?? null,
         runnable: round.runnable === true,
         strict: round.strict === true,
         status: round.status ?? null,
@@ -789,6 +790,12 @@ function olderSnapshotLadderLane(hostPreflight = null) {
         winRate: round.winRate ?? null,
         failures: round.failures ?? [],
         promotionFailures: round.promotionFailures ?? [],
+        identityControl: round.identityControl ?? null,
+        processScan: round.processScan ?? null,
+        routeParityStatus: round.routeParityStatus ?? null,
+        matchParity: round.matchParity ?? null,
+        pairOrderSummary: round.pairOrderSummary ?? null,
+        pairedEngine: round.pairedEngine ?? null,
         error: round.error ?? null,
       }))
     : [];
