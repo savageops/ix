@@ -90,6 +90,7 @@ function readLatestInstalledSummary() {
       ? {
           samples: report.identityControl.samples ?? null,
           medianDeltaPct: report.identityControl.medianDeltaPct ?? null,
+          diagnostics: report.identityControl.diagnostics ?? null,
           pairedWinRate: report.identityControl.pairedEngine?.candidateWinRate ?? null,
           matchParity: report.identityControl.matchParity ?? null,
           routeParity: report.identityControl.routeParity ?? null,

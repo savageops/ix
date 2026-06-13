@@ -3,7 +3,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } 
 import os from "node:os";
 import path from "node:path";
 import { pairedAttributionLedgerFields, pairedEngineStats, phaseTimingResidualMs } from "./benchmark-phase-attribution.mjs";
+import { identityNoiseDiagnostics } from "./benchmark-noise-diagnostics.mjs";
 export { pairedAttributionLedgerFields, pairedEngineStats, phaseLeakSummaryFromRounds, phaseTimingResidualMs } from "./benchmark-phase-attribution.mjs";
+export { identityNoiseDiagnostics } from "./benchmark-noise-diagnostics.mjs";
 
 export const DEFAULT_ALTERNATES_EXPR = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)";
 const DEFAULT_BENCHMARK_LOCK_DIR = path.join(os.tmpdir(), "ix-zig-benchmark.lock");
@@ -1031,7 +1033,7 @@ export function measureSameBinaryIdentityControl({
   const medianDeltaPct = first.engineSummary.median === 0
     ? null
     : ((second.engineSummary.median - first.engineSummary.median) / first.engineSummary.median) * 100;
-  return {
+  const identityControl = {
     enabled: true,
     samples,
     binary: { path: binaryPath, sha256: first.sha256 },
@@ -1053,6 +1055,8 @@ export function measureSameBinaryIdentityControl({
       JSON.stringify(first.alternatePcreRangeCalls) === JSON.stringify(second.alternatePcreRangeCalls) &&
       JSON.stringify(first.alternateCompiledRangeCalls) === JSON.stringify(second.alternateCompiledRangeCalls),
   };
+  identityControl.diagnostics = identityNoiseDiagnostics(identityControl);
+  return identityControl;
 }
 
 export function identityControlFailures({
