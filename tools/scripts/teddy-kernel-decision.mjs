@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
+import { evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
 import { phaseLeakSummaryFromRounds } from "./lib/speed-compare-utils.mjs";
 
@@ -217,15 +218,7 @@ function researchBasis() {
 }
 
 function evidenceQuality(historical) {
-  const failures = Array.isArray(historical?.strictEvidenceFailures) ? historical.strictEvidenceFailures : [];
-  const hostFailures = failures.filter((failure) => String(failure).startsWith("host:"));
-  const identityFailures = failures.filter((failure) => String(failure).startsWith("identity_control"));
-  return {
-    usableForRuntimeMove: hostFailures.length === 0 && identityFailures.length === 0,
-    hostFailures,
-    identityFailures,
-    failures,
-  };
+  return historical?.evidenceQuality ?? evidenceQualityFromFailures(historical?.strictEvidenceFailures ?? []);
 }
 
 function candidateMoves(summary, leakSummary, quality) {
@@ -252,8 +245,8 @@ function candidateMoves(summary, leakSummary, quality) {
       owner: "tools/scripts/compare-historical-speed.mjs host preflight plus benchmark environment",
       reason: quality.usableForRuntimeMove
         ? "Latest historical evidence has no host or identity-control noise blocker."
-        : `Latest report is not suitable for a runtime code decision: hostFailures=${quality.hostFailures.length}, identityFailures=${quality.identityFailures.length}. Preserve the current runtime slice, rerun under a clean host, and only then act on sub-percent scanWork deltas.`,
-      expectedGainScore: quality.usableForRuntimeMove ? 0 : 10 + quality.hostFailures.length + quality.identityFailures.length,
+        : `Latest report is not suitable for a runtime code decision: hostFailures=${quality.hostFailures.length}, identityFailures=${quality.identityFailures.length}, processFailures=${quality.processFailures?.length ?? 0}. Preserve the current runtime slice, rerun under a clean host, and only then act on sub-percent scanWork deltas.`,
+      expectedGainScore: quality.usableForRuntimeMove ? 0 : 10 + quality.hostFailures.length + quality.identityFailures.length + (quality.processFailures?.length ?? 0),
       proofCommand: "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 6 --max-backups 4 --quiet",
     },
     {
@@ -268,7 +261,7 @@ function candidateMoves(summary, leakSummary, quality) {
     },
     {
       id: "packed_nibble_shuffle_teddy_kernel",
-      status: teddyGainNeedsLeakRepair ? "allowed_after_whole_engine_leak_attribution" : "allowed_next",
+      status: !quality.usableForRuntimeMove ? "blocked_by_benchmark_noise" : (teddyGainNeedsLeakRepair ? "allowed_after_whole_engine_leak_attribution" : "allowed_next"),
       owner: "src/core/search.zig::nextTeddyLiteralAlternatesCandidate or a narrow src/core/simd.zig helper",
       reason: `${teddyReason} Current Teddy path still compares each branch vector independently; research and contract require a packed SIMD/Shufti-style candidate extractor.`,
       expectedGainScore: teddyGainNeedsLeakRepair ? 1 : 2.5 + negativePressure,

@@ -2,8 +2,9 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
+import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, effectiveImprovementTargetPct, fileHash, identityControlFailures, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
@@ -92,50 +93,27 @@ function measurePairedIx() {
 }
 
 function strictEvidenceFailures(host, processScan, identityControl) {
-  const failures = [];
-  if (samples < minRetainableSamples) failures.push(`underpowered_samples:${samples}<${minRetainableSamples}`);
-  const hostIssues = [
-    ...(host.before?.benchmarkEnvironment?.issues ?? []),
-    ...(host.after?.benchmarkEnvironment?.issues ?? []),
-  ].filter((issue) => issue?.severity === "warning");
-  for (const issue of hostIssues) {
-    failures.push(`host:${issue.id}:${issue.detail}`);
-  }
-  if (!processScan.before.ok) failures.push("process_scan_before_failed");
-  if (!processScan.after.ok) failures.push("process_scan_after_failed");
-  for (const failure of processScan.before.failures ?? []) failures.push(`process_scan_before:${failure}`);
-  for (const failure of processScan.after.failures ?? []) failures.push(`process_scan_after:${failure}`);
-  if (processScan.before.matched.length > 0) failures.push(`stale_processes_before:${processScan.before.matched.length}`);
-  if (processScan.after.matched.length > 0) failures.push(`stale_processes_after:${processScan.after.matched.length}`);
-  failures.push(...identityControlFailures({
+  return benchmarkEvidenceFailures({
+    samples,
+    minRetainableSamples,
+    host,
+    processScan,
     identityControl,
-    enabled: identityControlEnabled,
-    requiredSamples: Math.min(12, samples),
-  }));
-  return failures;
+    identityControlEnabled,
+    requiredIdentitySamples: Math.min(12, samples),
+  });
 }
 
 function promotionFailures(host, processScan, installedHash, repoHash, installedRepoComparison, identityControl) {
-  const failures = [];
-  if (samples < minRetainableSamples) failures.push(`underpowered_samples:${samples}<${minRetainableSamples}`);
-  const hostIssues = [
-    ...(host.before?.benchmarkEnvironment?.issues ?? []),
-    ...(host.after?.benchmarkEnvironment?.issues ?? []),
-  ].filter((issue) => issue?.severity === "warning");
-  for (const issue of hostIssues) {
-    failures.push(`host:${issue.id}:${issue.detail}`);
-  }
-  if (!processScan.before.ok) failures.push("process_scan_before_failed");
-  if (!processScan.after.ok) failures.push("process_scan_after_failed");
-  for (const failure of processScan.before.failures ?? []) failures.push(`process_scan_before:${failure}`);
-  for (const failure of processScan.after.failures ?? []) failures.push(`process_scan_after:${failure}`);
-  if (processScan.before.matched.length > 0) failures.push(`stale_processes_before:${processScan.before.matched.length}`);
-  if (processScan.after.matched.length > 0) failures.push(`stale_processes_after:${processScan.after.matched.length}`);
-  failures.push(...identityControlFailures({
+  const failures = benchmarkEvidenceFailures({
+    samples,
+    minRetainableSamples,
+    host,
+    processScan,
     identityControl,
-    enabled: identityControlEnabled,
-    requiredSamples: Math.min(12, samples),
-  }));
+    identityControlEnabled,
+    requiredIdentitySamples: Math.min(12, samples),
+  });
   if (!installedRepoComparison.matchParity) failures.push("match_parity_failed");
   if (installedRepoComparison.routeParityAcceptable !== true) {
     failures.push(`route_parity_failed:${installedRepoComparison.routeParityStatus ?? "unknown"}`);
@@ -206,6 +184,7 @@ const processScan = { before: processBefore, after: processAfter };
 const installedHash = fileHash(installedIx);
 const repoHash = fileHash(repoIx);
 const strictFailures = strictEvidenceFailures(host, processScan, identityControl);
+const strictEvidenceQuality = evidenceQualityFromFailures(strictFailures);
 const installedRepoEngineDeltaPct =
   ((paired.installed.engineSummary.median - paired.repo.engineSummary.median) /
     paired.installed.engineSummary.median) *
@@ -316,6 +295,7 @@ const report = {
   processScan,
   retainableStrictEvidence: strictFailures.length === 0,
   strictEvidenceFailures: strictFailures,
+  evidenceQuality: strictEvidenceQuality,
   binaries,
   lanes: {
     ripgrep,
@@ -366,7 +346,7 @@ if (!quiet) {
     pairedWinRate: report.lanes.identityControl.pairedEngine.candidateWinRate,
     matchParity: report.lanes.identityControl.matchParity,
     routeParity: report.lanes.identityControl.routeParity,
-  } : null, installedRepoComparison: report.installedRepoComparison, scorecard: report.scorecard, roundLedger: report.roundLedger, ledgerSummary: report.ledgerSummary, strictEvidenceFailures: report.strictEvidenceFailures, promotionFailures: report.promotionFailures, requiredGateFailures: report.requiredGateFailures, staleProcessesBefore: report.processScan.before.matched.length, staleProcessesAfter: report.processScan.after.matched.length, deltasPct: report.deltasPct }, null, 2));
+  } : null, evidenceQuality: report.evidenceQuality, installedRepoComparison: report.installedRepoComparison, scorecard: report.scorecard, roundLedger: report.roundLedger, ledgerSummary: report.ledgerSummary, strictEvidenceFailures: report.strictEvidenceFailures, promotionFailures: report.promotionFailures, requiredGateFailures: report.requiredGateFailures, staleProcessesBefore: report.processScan.before.matched.length, staleProcessesAfter: report.processScan.after.matched.length, deltasPct: report.deltasPct }, null, 2));
 }
 
 if (report.requiredGateFailures.length > 0) {

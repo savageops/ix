@@ -85,6 +85,7 @@ function readLatestInstalledSummary() {
     winRate: round.pairedCandidateWinRate ?? null,
     failures: report.strictEvidenceFailures ?? [],
     promotionFailures: report.promotionFailures ?? [],
+    evidenceQuality: report.evidenceQuality ?? null,
     identityControl: report.identityControl
       ? {
           samples: report.identityControl.samples ?? null,
