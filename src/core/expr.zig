@@ -273,6 +273,16 @@ pub fn literalAlternatesBody(pattern: []const u8) []const u8 {
     return singleLiteralAlternationGroupBody(body) orelse body;
 }
 
+/// Strip `\b` anchors from both ends of a word-boundary pattern.
+/// E.g. `\bsession\b` -> `session`. Caller has already verified
+/// the pattern is classified as regex_word_boundary_literal.
+pub fn stripWordBoundaryAnchors(pattern: []const u8) []const u8 {
+    var body = pattern;
+    if (body.len >= 2 and body[0] == '\\' and body[1] == 'b') body = body[2..];
+    if (body.len >= 2 and body[body.len - 2] == '\\' and body[body.len - 1] == 'b') body = body[0 .. body.len - 2];
+    return body;
+}
+
 fn classifyRegexDecomposition(pattern: []const u8) bool {
     const body = if (std.mem.startsWith(u8, pattern, "(?i)")) pattern[4..] else pattern;
     return regexDecompositionLiteralCandidate(body) != null;

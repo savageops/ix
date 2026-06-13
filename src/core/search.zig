@@ -14,6 +14,7 @@ const pcre_regex = @import("pcre_regex.zig");
 const postings = @import("postings.zig");
 const protected_paths = @import("protected_paths.zig");
 const scan_timing = @import("scan_timing.zig");
+const search_admission = @import("search_admission.zig");
 const state_dir = @import("state_dir.zig");
 const core_stats = @import("stats.zig");
 const literal_alternates = @import("literal_alternates.zig");
@@ -27,6 +28,7 @@ const simd = @import("simd.zig");
 const sz = @import("sz.zig");
 
 const windows = std.os.windows;
+const TrigramAdmissionProgram = search_admission.TrigramAdmissionProgram;
 const WARM_INDEX_LIVE_MARKER_NAME = "index.live";
 const WARM_INDEX_LIVE_MARKER_MAGIC = "IXINDEX_LIVE1";
 const WARM_INDEX_LIVE_READ_LIMIT = 4096;
@@ -1508,7 +1510,7 @@ fn prepareEvidenceFrontier(
 
 fn evidenceFrontierEligible(request: cli.SearchRequest, plan: expr.ExpressionPlan, admission: trigram.Admission) bool {
     if (request.case_insensitive) return false;
-    if (!admission.eligible and !(plan.predicate_count == 1 and fileAdmissionNeedleRuntime(plan.predicates[0]) != null)) return false;
+    if (!admission.eligible and !(plan.predicate_count == 1 and search_admission.fileAdmissionNeedleRuntime(plan.predicates[0]) != null)) return false;
     if (request.path_count > 1) return false;
     return true;
 }
@@ -2748,7 +2750,7 @@ fn scanFileMmap(
 
     var literal_admission_satisfied = false;
     if (mono) |m| {
-        if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
+        if (search_admission.fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
             if (!request.case_insensitive and sz.indexOfAdmission(data, needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
@@ -3374,7 +3376,7 @@ fn scanOpenFileIntoShardImpl(
     }
     var literal_admission_satisfied = false;
     if (mono) |m| {
-        if (fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
+        if (search_admission.fileAdmissionNeedle(m.kind, m.strategy, plan.predicates[0])) |needle| {
             if (!request.case_insensitive and sz.indexOfAdmission(read_buffer[0..first_read], needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
@@ -4144,171 +4146,6 @@ fn mergeLinuxDominantFileStats(target: *core_stats.LinuxDominantFileStats, sourc
     target.max_chunk_bytes = @max(target.max_chunk_bytes, source.max_chunk_bytes);
 }
 
-const TRIGRAM_ADMISSION_CAPACITY = 4096;
-const TRIGRAM_ADMISSION_HASH_MASK: usize = TRIGRAM_ADMISSION_CAPACITY - 1;
-const FILE_ADMISSION_MAX_NEEDLES = expr.MAX_PREDICATES;
-
-const FileAdmissionMode = enum {
-    disabled,
-    all,
-    any,
-};
-
-const TrigramAdmissionProgram = struct {
-    eligible: bool = false,
-    mode: trigram.AdmissionMode = .all,
-    group_count: usize = 0,
-    group_complete_mask: u64 = 0,
-    required_counts: [trigram.MAX_GROUPS]u8 = @splat(0),
-    keys: [TRIGRAM_ADMISSION_CAPACITY]trigram.Trigram = @splat(0),
-    group_masks: [TRIGRAM_ADMISSION_CAPACITY]u64 = @splat(0),
-    occupied: [TRIGRAM_ADMISSION_CAPACITY]bool = @splat(false),
-    file_admission_mode: FileAdmissionMode = .disabled,
-    file_admission_count: usize = 0,
-    file_admission_needles: [FILE_ADMISSION_MAX_NEEDLES][]const u8 = @splat(""),
-
-    fn compile(admission: trigram.Admission, plan: expr.ExpressionPlan, case_insensitive: bool) TrigramAdmissionProgram {
-        var program = TrigramAdmissionProgram{
-            .eligible = admission.eligible,
-            .mode = admission.mode,
-            .group_count = admission.group_count,
-        };
-        program.compileFileAdmission(plan, case_insensitive);
-        if (!admission.eligible) return program;
-
-        for (admission.groups[0..admission.group_count], 0..) |group, group_index| {
-            program.required_counts[group_index] = @intCast(group.trigram_count);
-            program.group_complete_mask |= groupBit(group_index);
-            for (group.trigrams[0..group.trigram_count]) |needle| {
-                program.insert(needle, group_index);
-            }
-        }
-        return program;
-    }
-
-    fn compileFileAdmission(self: *TrigramAdmissionProgram, plan: expr.ExpressionPlan, case_insensitive: bool) void {
-        if (case_insensitive or plan.predicate_count < 2) return;
-        const predicates = plan.predicates[0..plan.predicate_count];
-        switch (plan.mode) {
-            .any => {
-                for (predicates) |predicate| {
-                    const needle = fileAdmissionNeedleRuntime(predicate) orelse {
-                        self.file_admission_mode = .disabled;
-                        self.file_admission_count = 0;
-                        return;
-                    };
-                    self.appendFileAdmissionNeedle(needle);
-                }
-                if (self.file_admission_count != 0) self.file_admission_mode = .any;
-            },
-            .all => {
-                for (predicates) |predicate| {
-                    if (fileAdmissionNeedleRuntime(predicate)) |needle| self.appendFileAdmissionNeedle(needle);
-                }
-                if (self.file_admission_count != 0) self.file_admission_mode = .all;
-            },
-        }
-    }
-
-    fn appendFileAdmissionNeedle(self: *TrigramAdmissionProgram, needle: []const u8) void {
-        if (self.file_admission_count >= self.file_admission_needles.len) return;
-        self.file_admission_needles[self.file_admission_count] = needle;
-        self.file_admission_count += 1;
-    }
-
-    fn fileAdmissionMiss(self: *const TrigramAdmissionProgram, bytes: []const u8) bool {
-        return switch (self.file_admission_mode) {
-            .disabled => false,
-            .all => {
-                for (self.file_admission_needles[0..self.file_admission_count]) |needle| {
-                    if (sz.indexOfAdmission(bytes, needle) == null) return true;
-                }
-                return false;
-            },
-            .any => {
-                for (self.file_admission_needles[0..self.file_admission_count]) |needle| {
-                    if (sz.indexOfAdmission(bytes, needle) != null) return false;
-                }
-                return self.file_admission_count != 0;
-            },
-        };
-    }
-
-    fn mayMatch(self: *const TrigramAdmissionProgram, bytes: []const u8) bool {
-        if (!self.eligible) return true;
-        if (bytes.len < 3) return false;
-
-        var seen_slots: [TRIGRAM_ADMISSION_CAPACITY]bool = @splat(false);
-        var group_seen_counts: [trigram.MAX_GROUPS]u8 = @splat(0);
-        var satisfied_groups: u64 = 0;
-        var rolling: trigram.Trigram = trigram.key(bytes[0..3]);
-        if (self.recordTrigram(rolling, &seen_slots, &group_seen_counts, &satisfied_groups)) return true;
-
-        var index: usize = 3;
-        while (index < bytes.len) : (index += 1) {
-            rolling = ((rolling & 0xffff) << 8) | bytes[index];
-            if (self.recordTrigram(rolling, &seen_slots, &group_seen_counts, &satisfied_groups)) return true;
-        }
-        return false;
-    }
-
-    fn insert(self: *TrigramAdmissionProgram, needle: trigram.Trigram, group_index: usize) void {
-        var slot = hashTrigram(needle);
-        while (self.occupied[slot]) : (slot = (slot + 1) & TRIGRAM_ADMISSION_HASH_MASK) {
-            if (self.keys[slot] == needle) {
-                self.group_masks[slot] |= groupBit(group_index);
-                return;
-            }
-        }
-        self.occupied[slot] = true;
-        self.keys[slot] = needle;
-        self.group_masks[slot] = groupBit(group_index);
-    }
-
-    fn findSlot(self: *const TrigramAdmissionProgram, needle: trigram.Trigram) ?usize {
-        var slot = hashTrigram(needle);
-        while (self.occupied[slot]) : (slot = (slot + 1) & TRIGRAM_ADMISSION_HASH_MASK) {
-            if (self.keys[slot] == needle) return slot;
-        }
-        return null;
-    }
-
-    fn recordTrigram(
-        self: *const TrigramAdmissionProgram,
-        needle: trigram.Trigram,
-        seen_slots: *[TRIGRAM_ADMISSION_CAPACITY]bool,
-        group_seen_counts: *[trigram.MAX_GROUPS]u8,
-        satisfied_groups: *u64,
-    ) bool {
-        const slot = self.findSlot(needle) orelse return false;
-        if (seen_slots[slot]) return false;
-        seen_slots[slot] = true;
-
-        var mask = self.group_masks[slot];
-        while (mask != 0) {
-            const group_index: usize = @intCast(@ctz(mask));
-            group_seen_counts[group_index] += 1;
-            if (group_seen_counts[group_index] == self.required_counts[group_index]) {
-                satisfied_groups.* |= groupBit(group_index);
-                if (self.mode == .any) return true;
-                if ((satisfied_groups.* & self.group_complete_mask) == self.group_complete_mask) return true;
-            }
-            mask &= mask - 1;
-        }
-        return false;
-    }
-};
-
-fn groupBit(group_index: usize) u64 {
-    return @as(u64, 1) << @as(u6, @intCast(group_index));
-}
-
-fn hashTrigram(needle: trigram.Trigram) usize {
-    var value = needle *% 0x9E3779B1;
-    value ^= value >> 16;
-    return @as(usize, value) & TRIGRAM_ADMISSION_HASH_MASK;
-}
-
 fn tryTrigramPruneFile(
     bytes: []const u8,
     program: *const TrigramAdmissionProgram,
@@ -4511,56 +4348,6 @@ fn recordLine(
     }
 }
 
-/// Extracts only contract-safe whole-file admission needles.
-/// These needles are mandatory substrings for the predicate shape, so absence
-/// from the file proves absence of a match without invoking the line verifier.
-fn fileAdmissionNeedle(comptime kind: expr.PredicateKind, comptime strategy: expr.MatcherStrategy, predicate: expr.Predicate) ?[]const u8 {
-    switch (kind) {
-        .literal, .prefix, .suffix => return admissionProbeNeedle(predicate.value),
-        .regex => switch (strategy) {
-            .regex_plain_literal => {
-                if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null and predicate.value.len >= 2)
-                    return admissionProbeNeedle(predicate.value);
-                return null;
-            },
-            .regex_word_boundary_literal => {
-                const body = stripWordBoundaryAnchors(predicate.value);
-                return admissionProbeNeedle(body);
-            },
-            else => return null,
-        },
-    }
-}
-
-fn fileAdmissionNeedleRuntimeForPlan(plan: expr.ExpressionPlan) ?[]const u8 {
-    if (plan.predicate_count != 1) return null;
-    return fileAdmissionNeedleRuntime(plan.predicates[0]);
-}
-
-fn fileAdmissionNeedleRuntime(predicate: expr.Predicate) ?[]const u8 {
-    switch (predicate.kind) {
-        .literal, .prefix, .suffix => return admissionProbeNeedle(predicate.value),
-        .regex => switch (predicate.strategy) {
-            .regex_plain_literal => {
-                if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null and predicate.value.len >= 2)
-                    return admissionProbeNeedle(predicate.value);
-                return null;
-            },
-            .regex_word_boundary_literal => {
-                const body = stripWordBoundaryAnchors(predicate.value);
-                return admissionProbeNeedle(body);
-            },
-            else => return null,
-        },
-    }
-}
-
-fn admissionProbeNeedle(needle: []const u8) ?[]const u8 {
-    if (needle.len < 2) return null;
-    if (needle.len <= 16) return needle;
-    return needle[0..8];
-}
-
 /// Extracts a mandatory literal needle suitable for chunk-level prefiltering.
 /// Returns null when the predicate cannot be reduced to a simple substring
 /// test (case-insensitive, character classes, alternation, etc.).
@@ -4580,7 +4367,7 @@ fn chunkPrefilterNeedle(comptime kind: expr.PredicateKind, comptime strategy: ex
                     return null;
                 },
                 .regex_word_boundary_literal => {
-                    const body = stripWordBoundaryAnchors(predicate.value);
+                    const body = expr.stripWordBoundaryAnchors(predicate.value);
                     return if (body.len >= 2) body else null;
                 },
                 .regex_full, .regex_fixed_width_bytes, .regex_decomposition_candidate_lines => {
@@ -4642,12 +4429,12 @@ fn wholeBufferRegexCount(buffer: []const u8, predicate: expr.Predicate, case_ins
         },
         .regex_word_boundary_literal => blk: {
             if (case_insensitive) break :blk null;
-            break :blk countWordBoundaryLiteralLines(buffer, stripWordBoundaryAnchors(predicate.value));
+            break :blk countWordBoundaryLiteralLines(buffer, expr.stripWordBoundaryAnchors(predicate.value));
         },
         .regex_ascii_casefold_word_boundary_literal => blk: {
             if (!chunk_casefolded) break :blk null;
             const after_flag = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
-            break :blk countWordBoundaryLiteralLines(buffer, stripWordBoundaryAnchors(after_flag));
+            break :blk countWordBoundaryLiteralLines(buffer, expr.stripWordBoundaryAnchors(after_flag));
         },
         .regex_literal_alternates => blk: {
             const effective_ci = if (chunk_casefolded) false else case_insensitive or std.mem.startsWith(u8, predicate.value, "(?i)");
@@ -4793,11 +4580,11 @@ fn predicateMatchCountByStrategyMono(comptime strategy: expr.MatcherStrategy, li
             }
             break :blk countRegexLiteral(line, body, effective_ci);
         },
-        .regex_word_boundary_literal => if (wordBoundaryLiteralColumn(line, stripWordBoundaryAnchors(predicate.value), case_insensitive) != null) 1 else 0,
+        .regex_word_boundary_literal => if (wordBoundaryLiteralColumn(line, expr.stripWordBoundaryAnchors(predicate.value), case_insensitive) != null) 1 else 0,
         .regex_ascii_casefold_word_boundary_literal => blk: {
             const after_flag = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
             const effective_ci = if (chunk_casefolded) false else true;
-            break :blk if (wordBoundaryLiteralColumn(line, stripWordBoundaryAnchors(after_flag), effective_ci) != null) 1 else 0;
+            break :blk if (wordBoundaryLiteralColumn(line, expr.stripWordBoundaryAnchors(after_flag), effective_ci) != null) 1 else 0;
         },
         .regex_literal_alternates => blk: {
             const effective_ci = if (chunk_casefolded) false else case_insensitive or std.mem.startsWith(u8, predicate.value, "(?i)");
@@ -5001,12 +4788,12 @@ fn regexColumnByStrategyMono(comptime strategy: expr.MatcherStrategy, line: []co
             return index + 1;
         },
         .regex_word_boundary_literal => {
-            const body = stripWordBoundaryAnchors(predicate.value);
+            const body = expr.stripWordBoundaryAnchors(predicate.value);
             return wordBoundaryLiteralColumn(line, body, case_insensitive);
         },
         .regex_ascii_casefold_word_boundary_literal => {
             const after_flag = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
-            const body = stripWordBoundaryAnchors(after_flag);
+            const body = expr.stripWordBoundaryAnchors(after_flag);
             return wordBoundaryLiteralColumn(line, body, true);
         },
         .regex_literal_alternates => {
@@ -5469,16 +5256,6 @@ fn byteEquals(left: u8, right: u8, case_insensitive: bool) bool {
     return std.ascii.toLower(left) == std.ascii.toLower(right);
 }
 
-/// Strip `\b` anchors from both ends of a word-boundary pattern.
-/// E.g. `\bsession\b` -> `session`. Caller has already verified
-/// the pattern is classified as regex_word_boundary_literal.
-fn stripWordBoundaryAnchors(pattern: []const u8) []const u8 {
-    var body = pattern;
-    if (body.len >= 2 and body[0] == '\\' and body[1] == 'b') body = body[2..];
-    if (body.len >= 2 and body[body.len - 2] == '\\' and body[body.len - 1] == 'b') body = body[0 .. body.len - 2];
-    return body;
-}
-
 /// Search for a literal at a word boundary. Finds the literal via
 /// indexOfLiteral, then verifies that both edges sit at word boundaries
 /// (transition between \w and \W or string edge). Returns 1-based column.
@@ -5600,68 +5377,6 @@ test "trigram gate rejects impossible complete file without verifier authority" 
     try std.testing.expectEqual(@as(usize, 0), stats.verified_files);
 }
 
-test "multi predicate file admission proves literal any absence" {
-    const plan = try expr.parse("lit:PM_RESUME || lit:PM_SUSPEND");
-    const admission = trigram.admit(plan);
-    const program = TrigramAdmissionProgram.compile(admission, plan, false);
-    try std.testing.expectEqual(FileAdmissionMode.any, program.file_admission_mode);
-    try std.testing.expectEqual(@as(usize, 2), program.file_admission_count);
-    try std.testing.expect(program.fileAdmissionMiss("no power-management token here"));
-    try std.testing.expect(!program.fileAdmissionMiss("calls PM_RESUME once"));
-}
-
-test "compiled file admission rejects all-mode missing mandatory needle" {
-    const plan = try expr.parse("lit:alpha && lit:omega");
-    const admission = trigram.admit(plan);
-    const program = TrigramAdmissionProgram.compile(admission, plan, false);
-    try std.testing.expectEqual(FileAdmissionMode.all, program.file_admission_mode);
-    try std.testing.expectEqual(@as(usize, 2), program.file_admission_count);
-    try std.testing.expect(program.fileAdmissionMiss("alpha only"));
-    try std.testing.expect(!program.fileAdmissionMiss("alpha and omega"));
-}
-
-test "multi predicate file admission preserves unsupported any predicates" {
-    const plan = try expr.parse("lit:PM_RESUME || re:PM_.*");
-    const admission = trigram.admit(plan);
-    const program = TrigramAdmissionProgram.compile(admission, plan, false);
-    try std.testing.expectEqual(FileAdmissionMode.disabled, program.file_admission_mode);
-    try std.testing.expect(!program.fileAdmissionMiss("PM_SUSPEND"));
-}
-
-test "compiled file admission keeps supported all-mode subset" {
-    const plan = try expr.parse("lit:PM_RESUME && re:PM_.*");
-    const admission = trigram.admit(plan);
-    const program = TrigramAdmissionProgram.compile(admission, plan, false);
-    try std.testing.expectEqual(FileAdmissionMode.all, program.file_admission_mode);
-    try std.testing.expectEqual(@as(usize, 1), program.file_admission_count);
-    try std.testing.expect(program.fileAdmissionMiss("PM_SUSPEND"));
-    try std.testing.expect(!program.fileAdmissionMiss("PM_RESUME"));
-}
-
-test "compiled file admission disables for case insensitive search" {
-    const plan = try expr.parse("lit:alpha && lit:omega");
-    const admission = trigram.admit(plan);
-    const program = TrigramAdmissionProgram.compile(admission, plan, true);
-    try std.testing.expectEqual(FileAdmissionMode.disabled, program.file_admission_mode);
-    try std.testing.expect(!program.fileAdmissionMiss("alpha only"));
-}
-
-test "compiled file admission stores long prefix probe once" {
-    const plan = try expr.parse("lit:__IX_ABSENT_SENTINEL_DO_NOT_MATCH__ && lit:omega");
-    const admission = trigram.admit(plan);
-    const program = TrigramAdmissionProgram.compile(admission, plan, false);
-    try std.testing.expectEqual(FileAdmissionMode.all, program.file_admission_mode);
-    try std.testing.expectEqualStrings("__IX_ABS", program.file_admission_needles[0]);
-    try std.testing.expect(program.fileAdmissionMiss("__IX_ABS prefix without suffix"));
-}
-
-test "long file admission uses mandatory prefix probe" {
-    const probe = admissionProbeNeedle("__IX_ABSENT_SENTINEL_DO_NOT_MATCH__") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("__IX_ABS", probe);
-    try std.testing.expectEqualStrings("static", admissionProbeNeedle("static").?);
-    try std.testing.expect(admissionProbeNeedle("x") == null);
-}
-
 test "trigram gate admits possible file for exact verifier" {
     const plan = try expr.parse("lit:needle");
     const admission = trigram.admit(plan);
@@ -5705,17 +5420,6 @@ test "trigram program admits any-mode satisfied branch" {
     @memcpy(bytes[96..101], "omega");
 
     try std.testing.expect(!tryTrigramPruneFile(bytes[0..], &program, &stats));
-}
-
-test "file admission needle lowers only contract-safe predicate shapes" {
-    const word_plan = try expr.parse("re:\\bPM_RESUME\\b");
-    try std.testing.expectEqualStrings(
-        "PM_RESUME",
-        fileAdmissionNeedle(.regex, .regex_word_boundary_literal, word_plan.predicates[0]).?,
-    );
-
-    const full_plan = try expr.parse("re:PM_.*RESUME");
-    try std.testing.expect(fileAdmissionNeedle(.regex, .regex_full, full_plan.predicates[0]) == null);
 }
 
 test "warm index live marker validates magic pid and root" {
