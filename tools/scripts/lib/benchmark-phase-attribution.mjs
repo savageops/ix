@@ -167,9 +167,10 @@ export function phaseLeakSummaryFromRounds(rounds) {
   const worstRound = roundsWithLeaks
     .filter((round) => Number.isFinite(Number(round.pairedEngineMedianPct)))
     .sort((left, right) => Number(left.pairedEngineMedianPct) - Number(right.pairedEngineMedianPct))[0] ?? null;
+  const averageEnginePairedMedianPct = average(usableRounds.map((round) => round?.pairedCandidateImprovementMedianPct));
   const teddyWinningEngineLeaking =
     Number(averages.teddyRange) > 0 &&
-    average(usableRounds.map((round) => round?.pairedCandidateImprovementMedianPct)) < 0;
+    Number(averageEnginePairedMedianPct) < 0;
   const roundLevelTeddyWinningEngineLeaking = roundsWithLeaks.some((round) =>
     Number(round.teddyRangeMedianPct) > 0 &&
     Number(round.pairedEngineMedianPct) < 0 &&
@@ -182,6 +183,18 @@ export function phaseLeakSummaryFromRounds(rounds) {
     ...entry,
     leakingRounds: leakingPhaseCounts[entry.name] ?? 0,
   }));
+  if (
+    shouldRepairLeak &&
+    repairTargets.length === 0 &&
+    Number.isFinite(Number(averageEnginePairedMedianPct)) &&
+    Number(averageEnginePairedMedianPct) < 0
+  ) {
+    repairTargets.push({
+      name: "unattributedEngine",
+      pairedMedianPct: averageEnginePairedMedianPct,
+      leakingRounds: roundsWithLeaks.filter((round) => Number(round.pairedEngineMedianPct) < 0).length,
+    });
+  }
   const nextRepairTarget = roundLevelTeddyWinningEngineLeaking
     ? worstRoundRepairTarget ?? repairTargets[0]?.name ?? null
     : repairTargets[0]?.name ?? worstRoundRepairTarget;

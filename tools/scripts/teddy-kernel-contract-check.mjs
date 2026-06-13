@@ -90,7 +90,7 @@ const requiredProofCommands = [
   "zig build test --summary all",
   "zig build -Doptimize=ReleaseFast --summary all",
   "alternates-decision-table.mjs --branch-counts 4 --samples 12",
-  "compare-historical-speed.mjs --samples 12 --identity-control-samples 6 --max-backups 4",
+  "compare-historical-speed.mjs --samples 12",
   "teddy-kernel-decision.mjs --quiet",
   "teddy-kernel-contract-check.mjs",
   "ix-architecture-regression-gate.mjs --quick",

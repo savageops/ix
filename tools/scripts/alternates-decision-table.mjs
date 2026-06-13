@@ -24,7 +24,7 @@ guidance for candidate regressions.
 Options:
   --samples <n>                       Samples per branch. Default: 5.
   --threads <n>                       IX thread count. Default: 32.
-  --identity-control-samples <n>      Same-binary control pairs per branch. Default: min(6, samples).
+  --identity-control-samples <n>      Same-binary control pairs per branch. Default: min(12, samples).
   --no-identity-control               Disable same-binary noise control.
   --max-branches <n>                  Highest branch count when --branch-counts is omitted. Default: 8.
   --branch-counts <csv>               Explicit branch counts, e.g. 2,4,8.
@@ -47,7 +47,7 @@ const ixBinary = argValue(args, "--ix-binary", DEFAULT_IX);
 const baselineIxBinary = argValue(args, "--baseline-ix", "");
 const samples = Number(argValue(args, "--samples", "5"));
 const threads = Number(argValue(args, "--threads", "32"));
-const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(6, samples))));
+const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
 const identityControlEnabled = !args.includes("--no-identity-control");
 const maxBranches = Number(argValue(args, "--max-branches", "8"));
 const branchCountsArg = argValue(args, "--branch-counts", "");

@@ -64,6 +64,12 @@ function validateTeddyDecision(decision, evidence) {
   if (!String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-historical-speed.mjs")) {
     failures.push("teddy kernel next move requires historical speed proof command");
   }
+  if (
+    String(decision.nextAllowedMove?.proofCommand ?? "").includes("--samples 12") &&
+    !String(decision.nextAllowedMove?.proofCommand ?? "").includes("--identity-control-samples 12")
+  ) {
+    failures.push("teddy kernel next move requires 12 same-binary identity-control samples for 12-sample historical proof");
+  }
   if (preserveTeddyWin) {
     if (decision.preservationPolicy?.preserveTeddyGain !== true) {
       failures.push("teddy kernel decision must explicitly preserve the positive Teddy gain");
