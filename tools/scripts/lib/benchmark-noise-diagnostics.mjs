@@ -1,11 +1,11 @@
 const PHASES = [
-  ["engine", null],
-  ["discover", "discover"],
-  ["scan", "scan"],
-  ["aggregate", "aggregate"],
-  ["engineResidual", "engineResidual"],
-  ["scanWork", "scanWork"],
-  ["teddyRangeNs", "teddyRangeNs"],
+  ["engine", null, 1],
+  ["discover", "discover", 1],
+  ["scan", "scan", 1],
+  ["aggregate", "aggregate", 1],
+  ["engineResidual", "engineResidual", 1],
+  ["scanWork", "scanWork", 1],
+  ["teddyRangeNs", "teddyRangeNs", 1 / 1_000_000],
 ];
 
 function finiteNumber(value) {
@@ -18,15 +18,19 @@ function absFinite(value) {
   return number == null ? null : Math.abs(number);
 }
 
-function phaseEntry(pairedEngine, name, attributionKey) {
+function phaseEntry(pairedEngine, name, attributionKey, deltaMsScale) {
   const source = attributionKey == null ? pairedEngine : pairedEngine?.attribution?.[attributionKey];
   const medianImprovementPct = finiteNumber(source?.candidateImprovementPctSummary?.median);
-  const medianDeltaMs = finiteNumber(source?.deltaSummary?.median);
+  const medianDeltaRaw = finiteNumber(source?.deltaSummary?.median);
+  const medianDeltaMs = medianDeltaRaw == null ? null : medianDeltaRaw * deltaMsScale;
   const absMedianDeltaMs = absFinite(medianDeltaMs);
   return {
     name,
+    medianDeltaRaw,
     medianDeltaMs,
     absMedianDeltaMs,
+    deltaUnit: deltaMsScale === 1 ? "ms" : "ns",
+    normalizedDeltaUnit: "ms",
     medianImprovementPct,
     absMedianImprovementPct: absFinite(medianImprovementPct),
     candidateWinRate: finiteNumber(source?.candidateWinRate),
@@ -36,7 +40,7 @@ function phaseEntry(pairedEngine, name, attributionKey) {
 
 function dominantPhaseDrift(pairedEngine) {
   const phases = PHASES
-    .map(([name, attributionKey]) => phaseEntry(pairedEngine, name, attributionKey))
+    .map(([name, attributionKey, deltaMsScale]) => phaseEntry(pairedEngine, name, attributionKey, deltaMsScale))
     .filter((entry) => entry.absMedianDeltaMs != null || entry.absMedianImprovementPct != null)
     .sort((left, right) =>
       (right.absMedianDeltaMs ?? -1) - (left.absMedianDeltaMs ?? -1) ||
