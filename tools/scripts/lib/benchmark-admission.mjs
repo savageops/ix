@@ -150,6 +150,7 @@ export function createBenchmarkAdmission({
         "ripgrep_12_sample",
         "installed_speed_compare",
         "historical_speed_compare",
+        "older_snapshot_ladder",
         "alternates_decision",
       ],
     };
@@ -168,9 +169,14 @@ export function createBenchmarkAdmission({
           "--speed-only",
           "--strict-installed-speed",
           "--strict-historical-speed",
+          "--older-snapshots",
           "--installed-speed-samples",
           "1",
           "--historical-speed-samples",
+          "1",
+          "--older-snapshot-samples",
+          "1",
+          "--older-snapshot-max",
           "1",
           "--min-retainable-speed-samples",
           "1",
@@ -185,9 +191,12 @@ export function createBenchmarkAdmission({
           "--speed-only",
           "--strict-installed-speed",
           "--strict-historical-speed",
+          "--older-snapshots",
           "--installed-speed-samples",
           sampleArg,
           "--historical-speed-samples",
+          sampleArg,
+          "--older-snapshot-samples",
           sampleArg,
           "--min-retainable-speed-samples",
           sampleArg,
@@ -441,6 +450,7 @@ export function createBenchmarkAdmission({
           "ripgrep_12_sample",
           "installed_speed_compare",
           "historical_speed_compare",
+          "older_snapshot_ladder",
           "alternates_decision",
         ],
       });
@@ -450,7 +460,13 @@ export function createBenchmarkAdmission({
         id: "benchmark_control",
         lane: "benchmark_control",
         reason: benchmarkControl.reason ?? "same-binary benchmark control failed",
-        affectedLanes: ["ripgrep_12_sample", "installed_speed_compare", "historical_speed_compare", "alternates_decision"],
+        affectedLanes: [
+          "ripgrep_12_sample",
+          "installed_speed_compare",
+          "historical_speed_compare",
+          "older_snapshot_ladder",
+          "alternates_decision",
+        ],
       });
     }
     for (const speedLane of speedLanes) {
@@ -722,8 +738,11 @@ export function createBenchmarkAdmission({
         !hostSmoke.includes("--speed-only") ||
         !hostSmoke.includes("--strict-installed-speed") ||
         !hostSmoke.includes("--strict-historical-speed") ||
+        !hostSmoke.includes("--older-snapshots") ||
         !hostSmoke.includes("--installed-speed-samples 1") ||
         !hostSmoke.includes("--historical-speed-samples 1") ||
+        !hostSmoke.includes("--older-snapshot-samples 1") ||
+        !hostSmoke.includes("--older-snapshot-max 1") ||
         !hostSmoke.includes("--min-retainable-speed-samples 1")
       ) {
         failures.push("benchmark_readiness: host preflight smoke command must run strict one-sample speed gates");
@@ -733,8 +752,10 @@ export function createBenchmarkAdmission({
         !retained.includes("--speed-only") ||
         !retained.includes("--strict-installed-speed") ||
         !retained.includes("--strict-historical-speed") ||
+        !retained.includes("--older-snapshots") ||
         !retained.includes("--installed-speed-samples 12") ||
         !retained.includes("--historical-speed-samples 12") ||
+        !retained.includes("--older-snapshot-samples 12") ||
         !retained.includes("--min-retainable-speed-samples 12")
       ) {
         failures.push("benchmark_readiness: retained installed/historical command must run strict retained sample gates");

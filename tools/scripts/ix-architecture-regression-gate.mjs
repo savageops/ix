@@ -48,11 +48,15 @@ Options:
   --strict-installed-speed                 Require installed speed strict evidence.
   --historical-speed                       Include previous-build speed lane.
   --strict-historical-speed                Require historical speed strict evidence.
+  --older-snapshots                        Include older snapshot ladder speed lane.
+  --strict-older-snapshots                 Require older snapshot strict evidence.
   --alternates-decision                    Include literal-alternates decision lane.
   --out <path>                             Report output path.
   --state-dir <path>                       Temporary state directory.
   --installed-speed-samples <n>            Installed speed samples. Default: 12.
   --historical-speed-samples <n>           Historical speed samples. Default: 12.
+  --older-snapshot-samples <n>             Older snapshot samples. Default: 12.
+  --older-snapshot-max <n>                 Older snapshot cap for smoke runs.
   --alternates-decision-samples <n>        Alternates samples. Default: 12.
   --alternates-decision-max-branches <n>   Alternates max branch count. Default: 8.
   --alternates-decision-branch-counts <csv>
@@ -75,6 +79,8 @@ const installedSpeed = args.includes("--installed-speed");
 const strictInstalledSpeed = args.includes("--strict-installed-speed");
 const historicalSpeed = args.includes("--historical-speed");
 const strictHistoricalSpeed = args.includes("--strict-historical-speed");
+const olderSnapshots = args.includes("--older-snapshots");
+const strictOlderSnapshots = args.includes("--strict-older-snapshots");
 const alternatesDecision = args.includes("--alternates-decision");
 const outPath = argValue(args, "--out", path.join(REPORT_DIR, `architecture-gate-${timestampSlug()}.json`));
 const stateDir = argValue(args, "--state-dir", path.join(os.tmpdir(), `ix-architecture-gate-${process.pid}`));
@@ -83,6 +89,10 @@ const installedSpeedSamples = Number(argValue(args, "--installed-speed-samples",
 const historicalSpeedSamples = Number(
   argValue(args, "--historical-speed-samples", process.env.IX_HISTORICAL_SPEED_SAMPLES ?? "12"),
 );
+const olderSnapshotSamples = Number(
+  argValue(args, "--older-snapshot-samples", process.env.IX_OLDER_SNAPSHOT_SAMPLES ?? "12"),
+);
+const olderSnapshotMax = argValue(args, "--older-snapshot-max", process.env.IX_OLDER_SNAPSHOT_MAX ?? "");
 const alternatesDecisionSamples = Number(
   argValue(args, "--alternates-decision-samples", process.env.IX_ALTERNATES_DECISION_SAMPLES ?? "12"),
 );
@@ -154,6 +164,7 @@ const {
   installedScoreMatchesRaw,
   validateHistoricalSpeedLane,
   validateInstalledSpeedLane,
+  validateOlderSnapshotLane,
 } = speedGateValidation;
 const { validateAlternatesDecisionLane } = createAlternatesGateValidation({
   minRetainableSpeedSamples,
@@ -166,6 +177,7 @@ const { validateReport } = createReportSchemaValidation({
   validateBenchmarkReadinessLane,
   validateHistoricalSpeedLane,
   validateInstalledSpeedLane,
+  validateOlderSnapshotLane,
   validateNativeInstallIdentityLane,
   validateRipgrepLane,
 });
@@ -712,6 +724,121 @@ function historicalSpeedLane(hostPreflight = null) {
   });
 }
 
+function olderSnapshotLadderLane(hostPreflight = null) {
+  const corpus = benchmarkCorpus;
+  const strictRequired = strictOlderSnapshots;
+  if (quick) return lane("older_snapshot_ladder", "skipped", { reason: "--quick", strictRequired });
+  if (!olderSnapshots && !strictOlderSnapshots) {
+    return lane("older_snapshot_ladder", "skipped", {
+      reason: "enable with --older-snapshots or --strict-older-snapshots",
+      strictRequired,
+    });
+  }
+  if (hostPreflight?.status === "failed") {
+    return speedHostPreflightSkipLane("older_snapshot_ladder", hostPreflight, {
+      corpus,
+      samples: olderSnapshotSamples,
+      strictRequired,
+    });
+  }
+  if (!existsSync(corpus)) {
+    return lane("older_snapshot_ladder", "skipped", { reason: "ripgrep benchsuite corpus missing", corpus, strictRequired });
+  }
+  const ix = findBuiltIx();
+  if (!ix) {
+    return lane("older_snapshot_ladder", "skipped", { reason: "zig-out binary missing; run build first", corpus, strictRequired });
+  }
+
+  const latestPath = path.join(ROOT, "tools", "reports", "older-snapshot-ladder", "latest-older-snapshot-ladder.json");
+  rmSync(latestPath, { force: true });
+  const commandArgs = [
+    "tools/scripts/compare-older-snapshots.mjs",
+    "--samples",
+    String(olderSnapshotSamples),
+    "--identity-control-samples",
+    String(Math.min(12, olderSnapshotSamples)),
+    "--quiet",
+  ];
+  if (olderSnapshotMax !== "") commandArgs.push("--max-snapshots", olderSnapshotMax);
+  if (strictRequired) commandArgs.push("--require-strict");
+  const evidence = run(process.execPath, commandArgs);
+  if (!existsSync(latestPath)) {
+    return lane("older_snapshot_ladder", "failed", {
+      corpus,
+      strictRequired,
+      evidence,
+      reason: "older snapshot comparator did not write latest-older-snapshot-ladder.json",
+    });
+  }
+
+  const latest = JSON.parse(readFileSync(latestPath, "utf8"));
+  const parsedRounds = Array.isArray(latest.rounds)
+    ? latest.rounds.map((round) => ({
+        index: round.index ?? null,
+        label: round.label ?? null,
+        path: round.path ?? null,
+        runnable: round.runnable === true,
+        strict: round.strict === true,
+        status: round.status ?? null,
+        baselineMedianMs: round.baselineMedianMs ?? null,
+        repoMedianMs: round.repoMedianMs ?? null,
+        enginePct: round.enginePct ?? null,
+        pairedPct: round.pairedPct ?? null,
+        winRate: round.winRate ?? null,
+        failures: round.failures ?? [],
+        promotionFailures: round.promotionFailures ?? [],
+        error: round.error ?? null,
+      }))
+    : [];
+  const parsed = {
+    runId: latest.runId ?? null,
+    baselineDir: latest.baselineDir ?? null,
+    samples: latest.samples ?? null,
+    identityControlSamples: latest.identityControlSamples ?? null,
+    sort: latest.sort ?? null,
+    runnableSnapshots: latest.runnableSnapshots ?? null,
+    skippedSnapshots: latest.skippedSnapshots ?? null,
+    strictRequired: latest.strictRequired === true,
+    retainableEvidence: latest.retainableEvidence === true,
+    failures: latest.failures ?? [],
+    rounds: parsedRounds,
+  };
+  const laneFailures = [];
+  if (parsed.retainableEvidence !== true) {
+    laneFailures.push("older snapshot ladder evidence is non-retainable");
+  }
+  if (Number(parsed.runnableSnapshots) < 1) {
+    laneFailures.push("older snapshot ladder requires at least one runnable snapshot");
+  }
+  if (strictRequired && Number(parsed.samples) < minRetainableSpeedSamples) {
+    laneFailures.push(`strict older snapshot evidence requires at least ${minRetainableSpeedSamples} samples`);
+  }
+  if (strictRequired && parsed.strictRequired !== true) {
+    laneFailures.push("strict older snapshot lane must run comparator in strict mode");
+  }
+  for (const round of parsedRounds) {
+    if (round.runnable !== true) continue;
+    if (Number(round.enginePct) < 0) laneFailures.push(`older snapshot engine regression: ${round.label}`);
+    if (Number(round.pairedPct) < 0) laneFailures.push(`older snapshot paired regression: ${round.label}`);
+    if (strictRequired && round.strict !== true) laneFailures.push(`older snapshot strict evidence missing: ${round.label}`);
+  }
+  return lane("older_snapshot_ladder", evidence.exitCode === 0 && laneFailures.length === 0 ? "ok" : "failed", {
+    corpus,
+    strictRequired,
+    samples: olderSnapshotSamples,
+    maxSnapshots: olderSnapshotMax === "" ? null : Number(olderSnapshotMax),
+    evidence,
+    report: parsed,
+    failures: laneFailures,
+    reason:
+      evidence.exitCode !== 0
+        ? "older snapshot comparator failed"
+        : laneFailures.length > 0
+          ? "older snapshot ladder gate failed"
+          : undefined,
+  });
+}
+
 const { alternatesDecisionLane } = createAlternatesDecisionGateLane({
   root: ROOT,
   benchmarkCorpus,
@@ -976,9 +1103,11 @@ const benchmarkHostPreflight = benchmarkHostPreflightLane();
 const benchmarkControl = benchmarkControlLane(benchmarkHostPreflight);
 const installedSpeedCompare = installedSpeedLane(benchmarkHostPreflight);
 const historicalSpeedCompare = historicalSpeedLane(benchmarkHostPreflight);
+const olderSnapshotLadder = olderSnapshotLadderLane(benchmarkHostPreflight);
 const benchmarkReadiness = benchmarkReadinessLane(benchmarkHostPreflight, benchmarkControl, [
   installedSpeedCompare,
   historicalSpeedCompare,
+  olderSnapshotLadder,
 ]);
 const ripgrep = ripgrepLane(benchmarkControl);
 const teddyKernelDecision = teddyKernelDecisionLane();
@@ -998,6 +1127,7 @@ const lanes = [
   nativeInstallIdentity,
   installedSpeedCompare,
   historicalSpeedCompare,
+  olderSnapshotLadder,
   teddyKernelContract,
   alternatesDecisionLane(benchmarkHostPreflight),
   agentDryRunLane(),

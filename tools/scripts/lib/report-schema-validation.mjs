@@ -40,6 +40,7 @@ export function createReportSchemaValidation({
   validateBenchmarkReadinessLane,
   validateHistoricalSpeedLane,
   validateInstalledSpeedLane,
+  validateOlderSnapshotLane,
   validateNativeInstallIdentityLane,
   validateRipgrepLane,
 }) {
@@ -57,6 +58,7 @@ export function createReportSchemaValidation({
       "native_install_identity",
       "installed_speed_compare",
       "historical_speed_compare",
+      "older_snapshot_ladder",
       "teddy_kernel_decision",
       "teddy_kernel_contract",
       "alternates_decision",
@@ -140,6 +142,7 @@ export function createReportSchemaValidation({
       validateNativeInstallIdentityLane(entry, failures);
       validateInstalledSpeedLane(entry, failures);
       validateHistoricalSpeedLane(entry, failures);
+      validateOlderSnapshotLane(entry, failures);
       validateAlternatesDecisionLane(entry, failures);
     }
 

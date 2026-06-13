@@ -525,10 +525,80 @@ export function createSpeedGateValidation({
     }
   }
 
+  function validateOlderSnapshotLane(entry, failures) {
+    if (entry.id !== "older_snapshot_ladder") return;
+    validateHostPreflightSkipRemediation(
+      entry,
+      failures,
+      "older_snapshot_ladder",
+      "benchmark host preflight failed; skipping speed comparison until host envelope is clean",
+    );
+    if (entry.status !== "ok") return;
+    if (!isPlainObject(entry.report)) {
+      failures.push("older_snapshot_ladder: ok status requires parsed ladder report");
+      return;
+    }
+    if (Number(entry.report.samples) !== Number(entry.samples)) {
+      failures.push("older_snapshot_ladder: ok status requires parsed sample count to match requested samples");
+    }
+    if (entry.report.retainableEvidence !== true) {
+      failures.push("older_snapshot_ladder: ok status requires retainable ladder evidence");
+    }
+    if (Array.isArray(entry.report.failures) && entry.report.failures.length > 0) {
+      failures.push("older_snapshot_ladder: ok status requires an empty failure ledger");
+    }
+    if (entry.strictRequired === true && entry.report.strictRequired !== true) {
+      failures.push("older_snapshot_ladder: strict ok status requires strict comparator mode");
+    }
+    if (entry.strictRequired === true && Number(entry.report.samples) < minRetainableSpeedSamples) {
+      failures.push("older_snapshot_ladder: strict ok status requires the retained sample floor");
+    }
+    if (!Number.isInteger(Number(entry.report.runnableSnapshots)) || Number(entry.report.runnableSnapshots) < 1) {
+      failures.push("older_snapshot_ladder: ok status requires at least one runnable older snapshot");
+    }
+    if (!Array.isArray(entry.report.rounds) || entry.report.rounds.length === 0) {
+      failures.push("older_snapshot_ladder: ok status requires per-snapshot rounds");
+      return;
+    }
+    const runnableRounds = entry.report.rounds.filter((round) => round?.runnable === true);
+    if (runnableRounds.length !== Number(entry.report.runnableSnapshots)) {
+      failures.push("older_snapshot_ladder: runnable snapshot count must match runnable rounds");
+    }
+    for (const round of runnableRounds) {
+      if (typeof round.label !== "string" || round.label.length === 0) {
+        failures.push("older_snapshot_ladder: runnable rounds require snapshot labels");
+      }
+      if (entry.strictRequired === true && round.status !== "net_positive") {
+        failures.push(`older_snapshot_ladder: strict runnable round must be net_positive: ${round.label ?? "unknown"}`);
+      }
+      if (!Number.isFinite(Number(round.baselineMedianMs)) || !Number.isFinite(Number(round.repoMedianMs))) {
+        failures.push(`older_snapshot_ladder: runnable round requires baseline and repo medians: ${round.label ?? "unknown"}`);
+      }
+      if (!Number.isFinite(Number(round.enginePct)) || Number(round.enginePct) < 0) {
+        failures.push(`older_snapshot_ladder: runnable round requires non-negative engine delta: ${round.label ?? "unknown"}`);
+      }
+      if (!Number.isFinite(Number(round.pairedPct)) || Number(round.pairedPct) < 0) {
+        failures.push(`older_snapshot_ladder: runnable round requires non-negative paired delta: ${round.label ?? "unknown"}`);
+      }
+      if (!Number.isFinite(Number(round.winRate)) || Number(round.winRate) <= 0.5) {
+        failures.push(`older_snapshot_ladder: runnable round requires paired win majority: ${round.label ?? "unknown"}`);
+      }
+      if (entry.strictRequired === true && round.strict !== true) {
+        failures.push(`older_snapshot_ladder: strict ok status requires strict evidence for ${round.label ?? "unknown"}`);
+      }
+    }
+    for (const round of entry.report.rounds.filter((item) => item?.runnable !== true)) {
+      if (round.status !== "skipped" || typeof round.error !== "string" || round.error.length === 0) {
+        failures.push(`older_snapshot_ladder: skipped rounds require status and error evidence: ${round.label ?? "unknown"}`);
+      }
+    }
+  }
+
   return {
     historicalScoreMatchesRaw,
     installedScoreMatchesRaw,
     validateHistoricalSpeedLane,
     validateInstalledSpeedLane,
+    validateOlderSnapshotLane,
   };
 }
