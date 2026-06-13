@@ -2,8 +2,8 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { pairedEngineStats } from "./benchmark-phase-attribution.mjs";
-export { pairedEngineStats, phaseLeakSummaryFromRounds } from "./benchmark-phase-attribution.mjs";
+import { pairedAttributionLedgerFields, pairedEngineStats, phaseTimingResidualMs } from "./benchmark-phase-attribution.mjs";
+export { pairedAttributionLedgerFields, pairedEngineStats, phaseLeakSummaryFromRounds, phaseTimingResidualMs } from "./benchmark-phase-attribution.mjs";
 
 export const DEFAULT_ALTERNATES_EXPR = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)";
 const DEFAULT_BENCHMARK_LOCK_DIR = path.join(os.tmpdir(), "ix-zig-benchmark.lock");
@@ -298,6 +298,8 @@ function stageTimingMedianFields(baseline, candidate) {
     candidateScanMedianMs: candidate?.scanSummary?.median ?? null,
     baselineAggregateMedianMs: baseline?.aggregateSummary?.median ?? null,
     candidateAggregateMedianMs: candidate?.aggregateSummary?.median ?? null,
+    baselineEngineResidualMedianMs: baseline?.engineResidualSummary?.median ?? null,
+    candidateEngineResidualMedianMs: candidate?.engineResidualSummary?.median ?? null,
     baselineScanWorkMedianMs: baseline?.scanWorkSummary?.median ?? null,
     candidateScanWorkMedianMs: candidate?.scanWorkSummary?.median ?? null,
     baselineScanOpenMedianMs: baseline?.scanOpenSummary?.median ?? null,
@@ -314,42 +316,6 @@ function stageTimingMedianFields(baseline, candidate) {
     candidateAggregateMergeMedianMs: candidate?.aggregateMergeSummary?.median ?? null,
     baselineAggregateFinalizeMedianMs: baseline?.aggregateFinalizeSummary?.median ?? null,
     candidateAggregateFinalizeMedianMs: candidate?.aggregateFinalizeSummary?.median ?? null,
-  };
-}
-
-function pairedAttributionLedgerFields(pairedEngine) {
-  const metric = (key) => pairedEngine?.attribution?.[key] ?? {};
-  const improvementMedian = (key) => {
-    const value = Number(metric(key)?.candidateImprovementPctSummary?.median);
-    return Number.isFinite(value) ? value : null;
-  };
-  const improvementMean = (key) => {
-    const value = Number(metric(key)?.candidateImprovementPctSummary?.mean);
-    return Number.isFinite(value) ? value : null;
-  };
-  const winRate = (key) => {
-    const value = Number(metric(key)?.candidateWinRate);
-    return Number.isFinite(value) ? value : null;
-  };
-  return {
-    pairedCandidateDiscoverImprovementMedianPct: improvementMedian("discover"),
-    pairedCandidateDiscoverImprovementMeanPct: improvementMean("discover"),
-    pairedCandidateDiscoverWinRate: winRate("discover"),
-    pairedCandidateScanImprovementMedianPct: improvementMedian("scan"),
-    pairedCandidateScanImprovementMeanPct: improvementMean("scan"),
-    pairedCandidateScanWinRate: winRate("scan"),
-    pairedCandidateScanWorkImprovementMedianPct: improvementMedian("scanWork"),
-    pairedCandidateScanWorkImprovementMeanPct: improvementMean("scanWork"),
-    pairedCandidateScanWorkWinRate: winRate("scanWork"),
-    pairedCandidateScanOpenImprovementMedianPct: improvementMedian("scanOpen"),
-    pairedCandidateScanOpenImprovementMeanPct: improvementMean("scanOpen"),
-    pairedCandidateScanOpenWinRate: winRate("scanOpen"),
-    pairedCandidateScanFileImprovementMedianPct: improvementMedian("scanFile"),
-    pairedCandidateScanFileImprovementMeanPct: improvementMean("scanFile"),
-    pairedCandidateScanFileWinRate: winRate("scanFile"),
-    pairedCandidateTeddyRangeImprovementMedianPct: improvementMedian("teddyRangeNs"),
-    pairedCandidateTeddyRangeImprovementMeanPct: improvementMean("teddyRangeNs"),
-    pairedCandidateTeddyRangeWinRate: winRate("teddyRangeNs"),
   };
 }
 
@@ -406,6 +372,8 @@ export function buildInstalledComparisonScore({
     repoScanMedianMs: comparison?.repoScanMedianMs ?? null,
     installedAggregateMedianMs: comparison?.installedAggregateMedianMs ?? null,
     repoAggregateMedianMs: comparison?.repoAggregateMedianMs ?? null,
+    installedEngineResidualMedianMs: comparison?.installedEngineResidualMedianMs ?? null,
+    repoEngineResidualMedianMs: comparison?.repoEngineResidualMedianMs ?? null,
     installedScanWorkMedianMs: comparison?.installedScanWorkMedianMs ?? null,
     repoScanWorkMedianMs: comparison?.repoScanWorkMedianMs ?? null,
     installedScanOpenMedianMs: comparison?.installedScanOpenMedianMs ?? null,
@@ -492,6 +460,8 @@ export function buildInstalledScorecard({ score, binaryRelation } = {}) {
             repoScanMedianMs: score?.repoScanMedianMs,
             installedAggregateMedianMs: score?.installedAggregateMedianMs,
             repoAggregateMedianMs: score?.repoAggregateMedianMs,
+            installedEngineResidualMedianMs: score?.installedEngineResidualMedianMs,
+            repoEngineResidualMedianMs: score?.repoEngineResidualMedianMs,
             installedScanWorkMedianMs: score?.installedScanWorkMedianMs,
             repoScanWorkMedianMs: score?.repoScanWorkMedianMs,
             installedScanOpenMedianMs: score?.installedScanOpenMedianMs,
@@ -512,6 +482,9 @@ export function buildInstalledScorecard({ score, binaryRelation } = {}) {
             pairedCandidateTeddyRangeImprovementMedianPct: score?.pairedCandidateTeddyRangeImprovementMedianPct,
             pairedCandidateTeddyRangeImprovementMeanPct: score?.pairedCandidateTeddyRangeImprovementMeanPct,
             pairedCandidateTeddyRangeWinRate: score?.pairedCandidateTeddyRangeWinRate,
+            pairedCandidateEngineResidualImprovementMedianPct: score?.pairedCandidateEngineResidualImprovementMedianPct,
+            pairedCandidateEngineResidualImprovementMeanPct: score?.pairedCandidateEngineResidualImprovementMeanPct,
+            pairedCandidateEngineResidualWinRate: score?.pairedCandidateEngineResidualWinRate,
             teddyRouteObserved: score?.teddyRouteObserved,
             teddyRouteNetPositive: score?.teddyRouteNetPositive,
             requiredImprovementPct: score?.requiredImprovementPct,
@@ -732,6 +705,12 @@ export function buildHistoricalRoundLedger(comparisons) {
     pairedCandidateScanImprovementMedianPct: comparison.score?.pairedCandidateScanImprovementMedianPct,
     pairedCandidateScanImprovementMeanPct: comparison.score?.pairedCandidateScanImprovementMeanPct,
     pairedCandidateScanWinRate: comparison.score?.pairedCandidateScanWinRate,
+    pairedCandidateAggregateImprovementMedianPct: comparison.score?.pairedCandidateAggregateImprovementMedianPct,
+    pairedCandidateAggregateImprovementMeanPct: comparison.score?.pairedCandidateAggregateImprovementMeanPct,
+    pairedCandidateAggregateWinRate: comparison.score?.pairedCandidateAggregateWinRate,
+    pairedCandidateEngineResidualImprovementMedianPct: comparison.score?.pairedCandidateEngineResidualImprovementMedianPct,
+    pairedCandidateEngineResidualImprovementMeanPct: comparison.score?.pairedCandidateEngineResidualImprovementMeanPct,
+    pairedCandidateEngineResidualWinRate: comparison.score?.pairedCandidateEngineResidualWinRate,
     pairedCandidateScanWorkImprovementMedianPct: comparison.score?.pairedCandidateScanWorkImprovementMedianPct,
     pairedCandidateScanWorkImprovementMeanPct: comparison.score?.pairedCandidateScanWorkImprovementMeanPct,
     pairedCandidateScanWorkWinRate: comparison.score?.pairedCandidateScanWorkWinRate,
@@ -779,6 +758,12 @@ export function buildHistoricalScorecard(comparisons) {
       pairedCandidateScanImprovementMedianPct: comparison.score?.pairedCandidateScanImprovementMedianPct,
       pairedCandidateScanImprovementMeanPct: comparison.score?.pairedCandidateScanImprovementMeanPct,
       pairedCandidateScanWinRate: comparison.score?.pairedCandidateScanWinRate,
+      pairedCandidateAggregateImprovementMedianPct: comparison.score?.pairedCandidateAggregateImprovementMedianPct,
+      pairedCandidateAggregateImprovementMeanPct: comparison.score?.pairedCandidateAggregateImprovementMeanPct,
+      pairedCandidateAggregateWinRate: comparison.score?.pairedCandidateAggregateWinRate,
+      pairedCandidateEngineResidualImprovementMedianPct: comparison.score?.pairedCandidateEngineResidualImprovementMedianPct,
+      pairedCandidateEngineResidualImprovementMeanPct: comparison.score?.pairedCandidateEngineResidualImprovementMeanPct,
+      pairedCandidateEngineResidualWinRate: comparison.score?.pairedCandidateEngineResidualWinRate,
       pairedCandidateScanWorkImprovementMedianPct: comparison.score?.pairedCandidateScanWorkImprovementMedianPct,
       pairedCandidateScanWorkImprovementMeanPct: comparison.score?.pairedCandidateScanWorkImprovementMeanPct,
       pairedCandidateScanWorkWinRate: comparison.score?.pairedCandidateScanWorkWinRate,
@@ -1284,13 +1269,15 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
   const alternateTeddyRangeElapsedNsMax = derivedRouteTiming && alternateTeddyRangeCalls > 0 ? byteShardRangeElapsedNsMax : Number(density.alternate_teddy_range_elapsed_ns_max ?? 0);
   const alternateCompiledRangeElapsedNsTotal = derivedRouteTiming && alternateCompiledRangeCalls > 0 ? byteShardRangeElapsedNsTotal : Number(density.alternate_compiled_range_elapsed_ns_total ?? 0);
   const alternateCompiledRangeElapsedNsMax = derivedRouteTiming && alternateCompiledRangeCalls > 0 ? byteShardRangeElapsedNsMax : Number(density.alternate_compiled_range_elapsed_ns_max ?? 0);
+  const engineMs = Number(report.stats?.timings?.total_ms ?? result.durationMs);
   return {
     sample,
     cliMs: result.durationMs,
-    engineMs: Number(report.stats?.timings?.total_ms ?? result.durationMs),
+    engineMs,
     discoverMs: Number(timings.discover_ms ?? 0),
     scanMs: Number(timings.scan_ms ?? 0),
     aggregateMs: Number(timings.aggregate_ms ?? 0),
+    engineResidualMs: phaseTimingResidualMs(timings, engineMs),
     scanWorkMsTotal: Number(timings.scan_work_ms_total ?? 0),
     scanOpenMsTotal: optionalNumber(timings.scan_open_ms_total),
     scanFileMsTotal: optionalNumber(timings.scan_file_ms_total),
@@ -1335,6 +1322,7 @@ export function summarizeIxRuns(binaryPath, label, runs) {
     discoverSummary: summary(runs.map((entry) => entry.discoverMs)),
     scanSummary: summary(runs.map((entry) => entry.scanMs)),
     aggregateSummary: summary(runs.map((entry) => entry.aggregateMs)),
+    engineResidualSummary: summary(runs.map((entry) => entry.engineResidualMs)),
     scanWorkSummary: summary(runs.map((entry) => entry.scanWorkMsTotal)),
     scanOpenSummary: summary(runs.map((entry) => entry.scanOpenMsTotal)),
     scanFileSummary: summary(runs.map((entry) => entry.scanFileMsTotal)),

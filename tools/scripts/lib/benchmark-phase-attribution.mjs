@@ -32,10 +32,20 @@ function optionalNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+export function phaseTimingResidualMs(timings, engineMs) {
+  const discover = Number(timings?.discover_ms ?? 0);
+  const scan = Number(timings?.scan_ms ?? 0);
+  const aggregate = Number(timings?.aggregate_ms ?? 0);
+  const total = Number(engineMs);
+  if (![discover, scan, aggregate, total].every(Number.isFinite)) return null;
+  return total - discover - scan - aggregate;
+}
+
 const PAIRED_ATTRIBUTION_METRICS = [
   { key: "discover", sampleField: "discoverMs" },
   { key: "scan", sampleField: "scanMs" },
   { key: "aggregate", sampleField: "aggregateMs" },
+  { key: "engineResidual", sampleField: "engineResidualMs" },
   { key: "scanWork", sampleField: "scanWorkMsTotal" },
   { key: "scanOpen", sampleField: "scanOpenMsTotal" },
   { key: "scanFile", sampleField: "scanFileMsTotal" },
@@ -128,9 +138,53 @@ export function pairedEngineStats(baselineSamples, candidateSamples, { baselineL
   };
 }
 
+export function pairedAttributionLedgerFields(pairedEngine) {
+  const metric = (key) => pairedEngine?.attribution?.[key] ?? {};
+  const improvementMedian = (key) => {
+    const value = Number(metric(key)?.candidateImprovementPctSummary?.median);
+    return Number.isFinite(value) ? value : null;
+  };
+  const improvementMean = (key) => {
+    const value = Number(metric(key)?.candidateImprovementPctSummary?.mean);
+    return Number.isFinite(value) ? value : null;
+  };
+  const winRate = (key) => {
+    const value = Number(metric(key)?.candidateWinRate);
+    return Number.isFinite(value) ? value : null;
+  };
+  return {
+    pairedCandidateDiscoverImprovementMedianPct: improvementMedian("discover"),
+    pairedCandidateDiscoverImprovementMeanPct: improvementMean("discover"),
+    pairedCandidateDiscoverWinRate: winRate("discover"),
+    pairedCandidateScanImprovementMedianPct: improvementMedian("scan"),
+    pairedCandidateScanImprovementMeanPct: improvementMean("scan"),
+    pairedCandidateScanWinRate: winRate("scan"),
+    pairedCandidateAggregateImprovementMedianPct: improvementMedian("aggregate"),
+    pairedCandidateAggregateImprovementMeanPct: improvementMean("aggregate"),
+    pairedCandidateAggregateWinRate: winRate("aggregate"),
+    pairedCandidateEngineResidualImprovementMedianPct: improvementMedian("engineResidual"),
+    pairedCandidateEngineResidualImprovementMeanPct: improvementMean("engineResidual"),
+    pairedCandidateEngineResidualWinRate: winRate("engineResidual"),
+    pairedCandidateScanWorkImprovementMedianPct: improvementMedian("scanWork"),
+    pairedCandidateScanWorkImprovementMeanPct: improvementMean("scanWork"),
+    pairedCandidateScanWorkWinRate: winRate("scanWork"),
+    pairedCandidateScanOpenImprovementMedianPct: improvementMedian("scanOpen"),
+    pairedCandidateScanOpenImprovementMeanPct: improvementMean("scanOpen"),
+    pairedCandidateScanOpenWinRate: winRate("scanOpen"),
+    pairedCandidateScanFileImprovementMedianPct: improvementMedian("scanFile"),
+    pairedCandidateScanFileImprovementMeanPct: improvementMean("scanFile"),
+    pairedCandidateScanFileWinRate: winRate("scanFile"),
+    pairedCandidateTeddyRangeImprovementMedianPct: improvementMedian("teddyRangeNs"),
+    pairedCandidateTeddyRangeImprovementMeanPct: improvementMean("teddyRangeNs"),
+    pairedCandidateTeddyRangeWinRate: winRate("teddyRangeNs"),
+  };
+}
+
 const PHASE_LEAK_FIELDS = [
   ["discover", "pairedCandidateDiscoverImprovementMedianPct"],
   ["scan", "pairedCandidateScanImprovementMedianPct"],
+  ["aggregate", "pairedCandidateAggregateImprovementMedianPct"],
+  ["engineResidual", "pairedCandidateEngineResidualImprovementMedianPct"],
   ["scanWork", "pairedCandidateScanWorkImprovementMedianPct"],
   ["scanOpen", "pairedCandidateScanOpenImprovementMedianPct"],
   ["scanFile", "pairedCandidateScanFileImprovementMedianPct"],

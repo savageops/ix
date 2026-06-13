@@ -203,6 +203,8 @@ const installedRepoComparison = {
   repoScanMedianMs: paired.repo.scanSummary.median,
   installedAggregateMedianMs: paired.installed.aggregateSummary.median,
   repoAggregateMedianMs: paired.repo.aggregateSummary.median,
+  installedEngineResidualMedianMs: paired.installed.engineResidualSummary.median,
+  repoEngineResidualMedianMs: paired.repo.engineResidualSummary.median,
   installedScanWorkMedianMs: paired.installed.scanWorkSummary.median,
   repoScanWorkMedianMs: paired.repo.scanWorkSummary.median,
   installedScanOpenMedianMs: paired.installed.scanOpenSummary.median,
