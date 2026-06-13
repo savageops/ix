@@ -1,19 +1,25 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const path_admission = @import("admission.zig");
+const byte_shard = @import("byte_shard.zig");
 const cli = @import("../cli/args.zig");
 const catalog = @import("catalog.zig");
+const discovered_files = @import("discovered_files.zig");
 const expr = @import("expr.zig");
 const generation = @import("generation.zig");
 const indexd = @import("indexd.zig");
+const nt_open = @import("nt_open.zig");
 const regex = @import("regex.zig");
 const pcre_regex = @import("pcre_regex.zig");
 const postings = @import("postings.zig");
+const protected_paths = @import("protected_paths.zig");
+const scan_timing = @import("scan_timing.zig");
 const state_dir = @import("state_dir.zig");
 const core_stats = @import("stats.zig");
+const literal_alternates = @import("literal_alternates.zig");
 const trigram = @import("trigram.zig");
 const usn = @import("usn.zig");
-// Pure Zig SIMD search kernels — same VPCMPEQB/VPMOVMSKB/TZCNT instructions
+// Pure Zig SIMD search kernels -- same VPCMPEQB/VPMOVMSKB/TZCNT instructions
 // as StringZilla but inlineable (no FFI call overhead). Eliminates ~5 ns/call
 // FFI overhead across ~600K calls per search (~3 ms total). Used on the hottest
 // paths: newline scanning, binary sniffing, and literal matching.
@@ -25,12 +31,12 @@ const WARM_INDEX_LIVE_MARKER_NAME = "index.live";
 const WARM_INDEX_LIVE_MARKER_MAGIC = "IXINDEX_LIVE1";
 const WARM_INDEX_LIVE_READ_LIMIT = 4096;
 const WARM_INDEX_SEGMENT_READ_LIMIT: usize = 128 * 1024 * 1024;
+const BLOCK_PRUNING_PROOF_ENV = "IX_BLOCK_PRUNING_PROOF";
 const WARM_QUERY_CACHE_MAGIC = "IXQUERY_FRONTIER1";
 const WARM_QUERY_STATS_CACHE_MAGIC = "IXQUERY_STATS2";
 const WARM_QUERY_HITS_CACHE_MAGIC = "IXQUERY_HITS1";
 const WARM_QUERY_CACHE_READ_LIMIT: usize = 4 * 1024 * 1024;
 const BINARY_SNIFF_BYTES: usize = 4 * 1024;
-const REGEX_DECOMPOSITION_MIN_LITERAL_LEN: usize = 3;
 const REGEX_DECOMPOSITION_MAX_CANDIDATE_LINES: usize = 4096;
 
 extern "kernel32" fn ReadDirectoryChangesW(
@@ -60,80 +66,6 @@ extern "kernel32" fn GetProcessTimes(
     lpUserTime: *windows.FILETIME,
 ) callconv(.winapi) windows.BOOL;
 
-// ---------------------------------------------------------------------------
-// NT Object Path Bypass (Windows)
-//
-// Standard file open on Windows routes through RtlGetFullPathName_U which
-// acquires the process-global PEB lock (RTL_CRITICAL_SECTION) to canonicalize
-// paths. At 32 threads × 79K files, this single mutex serializes all file
-// opens: per-file overhead inflates 13.6× from 66 μs (1 thread) to 897 μs
-// (32 threads), collapsing parallelism from 32× theoretical to 1.6× measured.
-//
-// Fix: construct NT object paths (\??\E:\path\to\file) before calling openFile.
-// The stdlib's wToPrefixedFileW checks hasCommonNtPrefix first — if the \??\
-// prefix is present, it memcpys the path directly. No RtlGetFullPathName_U,
-// no PEB lock, no contention. NtCreateFile receives the absolute NT path with
-// RootDirectory=null and resolves it independently per thread.
-// ---------------------------------------------------------------------------
-
-/// NT CWD prefix: \??\E:\path\to\cwd\ (backslash-terminated UTF-8).
-/// Resolved once on the main thread in run(), read-only during parallel scan.
-var g_nt_cwd_prefix: [1024]u8 = undefined;
-var g_nt_cwd_prefix_len: usize = 0;
-
-/// Resolves CWD into NT object path prefix. Single-threaded, called once.
-fn initNtCwdPrefix(io: std.Io) void {
-    if (comptime builtin.os.tag != .windows) return;
-    const nt_hdr = "\\??\\";
-    @memcpy(g_nt_cwd_prefix[0..nt_hdr.len], nt_hdr);
-    const cwd_len = std.process.currentPath(io, g_nt_cwd_prefix[nt_hdr.len .. g_nt_cwd_prefix.len - 1]) catch return;
-    var total = nt_hdr.len + cwd_len;
-    // CWD from RtlGetCurrentDirectory_U uses backslashes; normalize any stray forward slashes.
-    for (g_nt_cwd_prefix[nt_hdr.len..total]) |*b| {
-        if (b.* == '/') b.* = '\\';
-    }
-    if (total == 0 or g_nt_cwd_prefix[total - 1] != '\\') {
-        g_nt_cwd_prefix[total] = '\\';
-        total += 1;
-    }
-    g_nt_cwd_prefix_len = total;
-}
-
-/// Opens a file using NT object path to bypass RtlGetFullPathName_U PEB lock.
-/// Constructs \??\{CWD}\{path} on the stack with / → \ conversion.
-/// Falls back to standard openFile for non-Windows, unresolved CWD, or overflow.
-fn openFileNt(io: std.Io, display_path: []const u8) !std.Io.File {
-    if (comptime builtin.os.tag != .windows)
-        return std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false });
-    if (g_nt_cwd_prefix_len == 0)
-        return std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false });
-
-    // Absolute paths (drive letter) get \??\ prefix; relative paths get \??\{CWD}\.
-    const nt_hdr: []const u8 = "\\??\\";
-    const is_abs = display_path.len >= 2 and display_path[1] == ':' and
-        ((display_path[0] >= 'A' and display_path[0] <= 'Z') or
-            (display_path[0] >= 'a' and display_path[0] <= 'z'));
-    const prefix = if (is_abs) nt_hdr else g_nt_cwd_prefix[0..g_nt_cwd_prefix_len];
-    const total_len = prefix.len + display_path.len;
-
-    var nt_buf: [1280]u8 = undefined;
-    if (total_len > nt_buf.len)
-        return std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false });
-
-    @memcpy(nt_buf[0..prefix.len], prefix);
-    @memcpy(nt_buf[prefix.len..][0..display_path.len], display_path);
-    // NT namespace requires backslash separators. Collapse consecutive separators
-    // in one pass — NT Object Manager rejects adjacent backslashes (STATUS_OBJECT_NAME_INVALID).
-    // This handles root paths with trailing slash producing "dir//file" via joinPathForward.
-    var write_pos: usize = 0;
-    for (nt_buf[0..total_len]) |b| {
-        const c = if (b == '/') @as(u8, '\\') else b;
-        if (write_pos > 0 and c == '\\' and nt_buf[write_pos - 1] == '\\') continue;
-        nt_buf[write_pos] = c;
-        write_pos += 1;
-    }
-    return std.Io.Dir.cwd().openFile(io, nt_buf[0..write_pos], .{ .allow_directory = false });
-}
 
 /// Maximum hit records retained in the report. Beyond this count, matches
 /// are still counted for stats but individual hit records are not stored.
@@ -146,7 +78,8 @@ const BYTE_SHARD_MIN_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const BYTE_SHARD_WORD_BOUNDARY_MIN_FILE_BYTES: usize = 1 * 1024 * 1024;
 const BYTE_SHARD_WORD_BOUNDARY_MIN_RANGE_BYTES: usize = 2 * 1024 * 1024;
 const BYTE_SHARD_DEFAULT_MAX_RANGES: usize = 64;
-const BYTE_SHARD_LINE_BOUNDARY_SEARCH_LIMIT: usize = 1024 * 1024;
+const LINUX_DOMINANT_ATTRIBUTION_ENV = "IX_LINUX_DOMINANT_ATTRIBUTION";
+const DISCOVERY_SKIP_BYTES_ENV = "IX_DISCOVERY_SKIP_BYTES";
 const EVIDENCE_FRONTIER_CACHE_MAGIC = "IXEVIDENCE2";
 const EVIDENCE_FRONTIER_LIVE_MAGIC = "IXEVIDENCELIVE1";
 const EVIDENCE_FRONTIER_CACHE_READ_LIMIT = 64 * 1024 * 1024;
@@ -157,10 +90,14 @@ const EVIDENCE_FRONTIER_BUILD_TTL_NS: i128 = 120 * std.time.ns_per_s;
 const WARM_STATS_RESULT_CACHE_MAGIC = "IXWARMSTATS2";
 const WARM_STATS_RESULT_CACHE_READ_LIMIT = 4096;
 const WARM_STATS_RESULT_CACHE_MAX_FILES = 4096;
+const CONTENT_SIGNATURE_SAMPLE_BYTES: usize = 4096;
+const DiscoveredFile = discovered_files.DiscoveredFile;
+const FileList = discovered_files.FileList;
+const DiscoveryShardReport = discovered_files.DiscoveryShardReport;
 
 /// Comptime predicate specialization for single-predicate plans. When passed to
 /// scanOpenFileIntoShardImpl / recordLineIntoShardImpl, the per-line match
-/// dispatch collapses to a direct call at compile time — zero runtime switches.
+/// dispatch collapses to a direct call at compile time -- zero runtime switches.
 const MonoSpec = struct {
     kind: expr.PredicateKind,
     strategy: expr.MatcherStrategy,
@@ -199,6 +136,11 @@ pub const SearchReport = struct {
     aggregate_ms: f64,
     total_ms: f64,
     scan_work_ms_total: f64,
+    scan_open_ms_total: f64,
+    scan_file_ms_total: f64,
+    capture_scan_open_timing: bool,
+    capture_linux_dominant_attribution: bool,
+    capture_discovery_skip_bytes: bool,
     matcher_strategy_supported: bool,
     outer_parallel_shard_safe: bool,
     uses_single_literal_counter: bool,
@@ -249,6 +191,11 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         .aggregate_ms = 0,
         .total_ms = 0,
         .scan_work_ms_total = 0,
+        .scan_open_ms_total = 0,
+        .scan_file_ms_total = 0,
+        .capture_scan_open_timing = scan_timing.captureOpenTiming(),
+        .capture_linux_dominant_attribution = linuxDominantAttributionEnabled(),
+        .capture_discovery_skip_bytes = discoverySkipBytesEnabled(),
         .matcher_strategy_supported = plan.supportsLargeDirectoryStreamingSelector(),
         .outer_parallel_shard_safe = plan.supportsOuterParallelShardFastCount(),
         .uses_single_literal_counter = plan.usesSingleLiteralCounter(),
@@ -310,11 +257,11 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     }
     report.discover_ms = elapsedMs(io, discover_started);
 
-    // Resolve CWD → NT object path prefix once, before spawning scan threads.
-    // All workers read g_nt_cwd_prefix without contention (immutable after init).
-    initNtCwdPrefix(io);
+    // Resolve CWD -> NT object path prefix once, before spawning scan threads.
+    // All workers read the NT CWD prefix without contention (immutable after init).
+    nt_open.initCwdPrefix(io);
 
-    // Phase 2: Scan files — thread count adapts to corpus size after discovery.
+    // Phase 2: Scan files -- thread count adapts to corpus size after discovery.
     const scan_started = std.Io.Timestamp.now(io, .awake);
     const discovered_mut = file_list.mutableItems();
     const evidence_prepared = prepareEvidenceFrontier(io, allocator, request, plan, trigram_admission, discovered_mut, &report);
@@ -333,12 +280,12 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
 
     // Shuffle file list to distribute NTFS directory lock contention across threads.
     // Without shuffle, depth-first ordering causes all threads to contend on the same
-    // directory's FCB lock in NtCreateFile — overhead inflates 13.6× at 32 threads.
+    // directory's FCB lock in NtCreateFile -- overhead inflates 13.6x at 32 threads.
     // Only for parallel mode: single-threaded benefits from sequential FS locality.
     if (thread_count > 1) shuffleFiles(active_files);
     const discovered: []const DiscoveredFile = active_files;
     if (discovered.len == 0) {
-        // No files discovered — nothing to scan.
+        // No files discovered -- nothing to scan.
     } else if (thread_count <= 1 or discovered.len < 4) {
         // Serial path: single thread or too few files to justify workers.
         for (discovered) |entry| {
@@ -368,7 +315,7 @@ fn scanPreparedFiles(
     trigram_program: *const TrigramAdmissionProgram,
     report: *SearchReport,
 ) !void {
-    initNtCwdPrefix(io);
+    nt_open.initCwdPrefix(io);
     const scan_started = std.Io.Timestamp.now(io, .awake);
     const thread_count = effectiveThreadCount(request, active_files.len);
     report.outer_scan_threads = thread_count;
@@ -399,7 +346,7 @@ fn scanPreparedHitPrefixFiles(
     trigram_program: *const TrigramAdmissionProgram,
     report: *SearchReport,
 ) !void {
-    initNtCwdPrefix(io);
+    nt_open.initCwdPrefix(io);
     const scan_started = std.Io.Timestamp.now(io, .awake);
     report.outer_scan_threads = 1;
     const retained_limit = request.max_hits orelse MAX_RETAINED_HITS;
@@ -414,15 +361,15 @@ fn scanPreparedHitPrefixFiles(
 
 /// Adaptive thread count scaling based on file count.
 ///
-/// Each thread spawn costs ~100 μs on Windows (CreateThread + stack alloc).
-/// Spawning 32 threads for 100 files adds ~3 ms to a 12 ms search — 25%
+/// Each thread spawn costs ~100 us on Windows (CreateThread + stack alloc).
+/// Spawning 32 threads for 100 files adds ~3 ms to a 12 ms search -- 25%
 /// overhead with no throughput gain since one large file dominates.
 ///
 /// sqrt(file_count) grows sub-linearly, clamped to [4, cpu_count]:
-///   100 files → 10 threads
-///   600 files → 24 threads
-///  1000 files → 31 threads
-///  5000 files → capped at cpu count
+///   100 files -> 10 threads
+///   600 files -> 24 threads
+///  1000 files -> 31 threads
+///  5000 files -> capped at cpu count
 fn effectiveThreadCount(request: cli.SearchRequest, file_count: usize) usize {
     if (request.threads) |threads| return @max(threads, 1);
     const cpus = availableThreads();
@@ -434,12 +381,8 @@ fn effectiveThreadCount(request: cli.SearchRequest, file_count: usize) usize {
     return @max(scaled, 4);
 }
 
-/// A discovered file entry — path is arena-allocated and lives for the
+/// A discovered file entry -- path is arena-allocated and lives for the
 /// process lifetime.
-const DiscoveredFile = struct {
-    path: []const u8,
-};
-
 const WarmIndexFrontier = struct {
     active_files: []DiscoveredFile,
     root: []const u8,
@@ -549,6 +492,7 @@ fn prepareWarmIndexFrontier(
     const lookup_result = postings.evaluateLookupPlanFromFile(io, allocator, postings_path, root_identity.fingerprint, pin.epoch, lookup) catch |err| return warmIndexFallback(report, @errorName(err));
     defer lookup_result.deinit(allocator);
     const candidate_ids = lookup_result.candidates;
+    recordBlockPruningProof(io, allocator, postings_path, root_identity.fingerprint, pin.epoch, candidate_ids, report);
     if (candidate_ids.len == 0 and lookup_result.header.verify_required_count == 0) {
         return prepareEmptyWarmIndexFrontier(io, allocator, root, root_identity.fingerprint, pin.epoch, lookup_result.header, request, report);
     }
@@ -648,6 +592,34 @@ fn prepareEmptyWarmIndexFrontier(
         .candidate_count = 0,
         .known_matches = if (request.stats_only) 0 else null,
     };
+}
+
+fn recordBlockPruningProof(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    postings_path: []const u8,
+    root_fingerprint: catalog.RootFingerprint,
+    epoch: generation.Epoch,
+    candidate_ids: []const catalog.FileId,
+    report: *SearchReport,
+) void {
+    if (!blockPruningProofEnabled()) return;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, postings_path, allocator, .limited(WARM_INDEX_SEGMENT_READ_LIMIT)) catch return;
+    defer allocator.free(bytes);
+    const segment = postings.parsePostingsSegmentForRootGeneration(allocator, bytes, root_fingerprint, epoch) catch return;
+    defer segment.deinit(allocator);
+    const proof = postings.proveBlockPruning(allocator, segment, candidate_ids, postings.DEFAULT_BLOCK_TARGET_POSTINGS) catch return;
+    report.stats.postings_index.block_proof_enabled = true;
+    report.stats.postings_index.block_count = proof.block_count;
+    report.stats.postings_index.block_prune_candidate_blocks = proof.candidate_prunable_blocks;
+    report.stats.postings_index.block_prune_candidate_postings = proof.candidate_prunable_postings;
+    report.stats.postings_index.block_prune_candidate_compressed_bytes = proof.candidate_prunable_compressed_bytes;
+}
+
+fn blockPruningProofEnabled() bool {
+    const value_ptr = std.c.getenv(BLOCK_PRUNING_PROOF_ENV) orelse return false;
+    const value = std.mem.span(value_ptr);
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "yes");
 }
 
 fn appendWarmVerificationFrontier(
@@ -1206,7 +1178,7 @@ fn warmFrontierPathsStillReadable(io: std.Io, active: []const DiscoveredFile) bo
 }
 
 fn warmPathStillReadable(io: std.Io, path: []const u8) bool {
-    const file = openFileNt(io, path) catch return false;
+    const file = nt_open.openFile(io, path) catch return false;
     file.close(io);
     return true;
 }
@@ -1225,7 +1197,7 @@ fn directoryContainsWarmIndexCoverageGap(io: std.Io, allocator: std.mem.Allocato
         if (entry.kind != .directory) continue;
         if (indexd.isIndexCoverageExcludedDirectoryName(entry.name)) return true;
         if (isHiddenDirectoryEntry(entry.name, true) or isGeneratedSourceIndexEntry(entry.name, true)) continue;
-        const child_path = joinPathForward(allocator, path, entry.name) catch return true;
+        const child_path = discovered_files.joinPathForward(allocator, path, entry.name) catch return true;
         const has_gap = directoryContainsWarmIndexCoverageGap(io, allocator, child_path);
         allocator.free(child_path);
         if (has_gap) return true;
@@ -1371,44 +1343,6 @@ fn warmQueryHash(root_fingerprint: catalog.RootFingerprint, epoch: generation.Ep
     return seed;
 }
 
-/// Growable list of discovered files. Uses a flat array with doubling growth.
-const FileList = struct {
-    buffer: ?[*]DiscoveredFile,
-    len: usize,
-    capacity: usize,
-
-    const empty: FileList = .{ .buffer = null, .len = 0, .capacity = 0 };
-
-    fn initWithCapacity(allocator: std.mem.Allocator, cap: usize) !FileList {
-        const buf = try allocator.alloc(DiscoveredFile, cap);
-        return .{ .buffer = buf.ptr, .len = 0, .capacity = cap };
-    }
-
-    fn append(self: *FileList, allocator: std.mem.Allocator, entry: DiscoveredFile) !void {
-        if (self.len == self.capacity) {
-            const new_cap = if (self.capacity == 0) 64 else self.capacity * 2;
-            const new_buf = try allocator.alloc(DiscoveredFile, new_cap);
-            if (self.buffer) |old| {
-                @memcpy(new_buf[0..self.len], old[0..self.len]);
-            }
-            self.buffer = new_buf.ptr;
-            self.capacity = new_cap;
-        }
-        self.buffer.?[self.len] = entry;
-        self.len += 1;
-    }
-
-    fn items(self: *const FileList, _: std.mem.Allocator) []const DiscoveredFile {
-        if (self.buffer) |buf| return buf[0..self.len];
-        return &[_]DiscoveredFile{};
-    }
-
-    fn mutableItems(self: *FileList) []DiscoveredFile {
-        if (self.buffer) |buf| return buf[0..self.len];
-        return &[_]DiscoveredFile{};
-    }
-};
-
 /// Shuffle file list to distribute kernel-level NTFS directory lock contention.
 ///
 /// Discovery walks depth-first, so adjacent files share the same parent directory.
@@ -1416,7 +1350,7 @@ const FileList = struct {
 /// lock in NtCreateFile. Shuffling interleaves files from different directories,
 /// spreading concurrent opens across independent kernel locks.
 ///
-/// Uses XorShift64 with fixed seed — deterministic, no allocation, O(n).
+/// Uses XorShift64 with fixed seed -- deterministic, no allocation, O(n).
 fn shuffleFiles(files: []DiscoveredFile) void {
     if (files.len <= 1) return;
     var rng: u64 = 0x12345678_9ABCDEF0;
@@ -1610,7 +1544,7 @@ fn computeContentSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
     var xor_acc: u64 = 0;
     var sum_acc: u64 = 0;
     for (files) |entry| {
-        var file = try openFileNt(io, entry.path);
+        var file = try nt_open.openFile(io, entry.path);
         defer file.close(io);
         const stat = try file.stat(io);
         var item = std.hash.Wyhash.init(0x4556_4944_4649_4c45);
@@ -1618,6 +1552,7 @@ fn computeContentSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
         hashU64(&item, stat.size);
         hashU64(&item, @bitCast(stat.inode));
         hashTimestamp(&item, stat.mtime);
+        try hashFileContentSample(io, &file, stat.size, &item);
         const item_hash = item.final();
         xor_acc ^= item_hash;
         sum_acc +%= item_hash;
@@ -1627,6 +1562,24 @@ fn computeContentSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
     hashU64(&hasher, xor_acc);
     hashU64(&hasher, sum_acc);
     return hasher.final();
+}
+
+fn hashFileContentSample(io: std.Io, file: *std.Io.File, size: u64, hasher: *std.hash.Wyhash) !void {
+    var buffer: [CONTENT_SIGNATURE_SAMPLE_BYTES]u8 = undefined;
+    const first_len: usize = @intCast(@min(size, CONTENT_SIGNATURE_SAMPLE_BYTES));
+    if (first_len == 0) {
+        hashU64(hasher, 0);
+        return;
+    }
+    const first_read = try file.readPositionalAll(io, buffer[0..first_len], 0);
+    hashU64(hasher, first_read);
+    hasher.update(buffer[0..first_read]);
+    if (size <= CONTENT_SIGNATURE_SAMPLE_BYTES) return;
+
+    const tail_offset = size - CONTENT_SIGNATURE_SAMPLE_BYTES;
+    const tail_read = try file.readPositionalAll(io, &buffer, tail_offset);
+    hashU64(hasher, tail_read);
+    hasher.update(buffer[0..tail_read]);
 }
 
 fn tryLoadWarmStatsResultCache(
@@ -2051,7 +2004,7 @@ fn hashTimestamp(hasher: *std.hash.Wyhash, timestamp: std.Io.Timestamp) void {
 }
 
 /// Phase 1: Recursively walk a root path and collect all scannable file paths.
-/// This is fast — only readdir syscalls, no file content reads. Hidden files
+/// This is fast -- only readdir syscalls, no file content reads. Hidden files
 /// are filtered here, and files_discovered/files_skipped are counted on the
 /// main report (single-threaded, no contention).
 fn discoverFiles(
@@ -2084,7 +2037,7 @@ fn discoverFiles(
     file.close(io);
     report.files_discovered += 1;
     report.stats.admission.explicit_files_included += 1;
-    const display_path = try normalizeDisplayPath(allocator, path);
+    const display_path = try discovered_files.normalizeDisplayPath(allocator, path);
     try file_list.append(allocator, .{ .path = display_path });
 }
 
@@ -2118,7 +2071,7 @@ fn discoverDirectory(
             recordDiscoveryAdmissionSkip(io, report, path, entry.name, entry.kind == .file, "hidden");
             continue;
         }
-        const child_path = try joinPathForward(allocator, path, entry.name);
+        const child_path = try discovered_files.joinPathForward(allocator, path, entry.name);
         if (admission_engine.decide(child_path, entry.kind == .directory) == .ignore) {
             report.files_skipped += 1;
             recordDiscoveryAdmissionSkipPath(io, report, child_path, entry.kind == .file, "ignored");
@@ -2155,7 +2108,7 @@ fn recordDiscoveryAdmissionSkip(
     reason: []const u8,
 ) void {
     var path_buf: [4096]u8 = undefined;
-    const path = joinPathForwardBounded(parent, name, &path_buf) orelse return recordAdmissionSkip(report, reason, 0);
+    const path = discovered_files.joinPathForwardBounded(parent, name, &path_buf) orelse return recordAdmissionSkip(report, reason, 0);
     recordDiscoveryAdmissionSkipPath(io, report, path, is_file, reason);
 }
 
@@ -2166,7 +2119,7 @@ fn recordDiscoveryAdmissionSkipPath(
     is_file: bool,
     reason: []const u8,
 ) void {
-    const bytes = if (is_file) skippedFileBytes(io, path) else 0;
+    const bytes = if (report.capture_discovery_skip_bytes and is_file) skippedFileBytes(io, path) else 0;
     recordAdmissionSkip(report, reason, bytes);
 }
 
@@ -2185,40 +2138,6 @@ fn skippedFileBytes(io: std.Io, path: []const u8) usize {
     defer file.close(io);
     return @intCast(file.length(io) catch return 0);
 }
-
-fn joinPathForwardBounded(left: []const u8, right: []const u8, out: []u8) ?[]const u8 {
-    if (left.len == 0 or std.mem.eql(u8, left, ".")) {
-        if (right.len > out.len) return null;
-        for (right, 0..) |byte, index| out[index] = if (byte == '\\') '/' else byte;
-        return out[0..right.len];
-    }
-
-    var n: usize = 0;
-    for (left) |byte| {
-        if (n >= out.len) return null;
-        out[n] = if (byte == '\\') '/' else byte;
-        n += 1;
-    }
-    if (n > 0 and out[n - 1] != '/') {
-        if (n >= out.len) return null;
-        out[n] = '/';
-        n += 1;
-    }
-    for (right) |byte| {
-        if (n >= out.len) return null;
-        out[n] = if (byte == '\\') '/' else byte;
-        n += 1;
-    }
-    return out[0..n];
-}
-
-const DiscoveryShardReport = struct {
-    file_list: FileList,
-    files_discovered: usize = 0,
-    files_skipped: usize = 0,
-    access_errors: core_stats.AccessErrorStats = .{},
-    had_error: bool = false,
-};
 
 fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) bool {
     if (request.max_hits != null and !request.stats_only) return false;
@@ -2240,7 +2159,7 @@ fn rootsAllProtectedWindows(roots: PreparedRoots) bool {
     if (comptime builtin.os.tag != .windows) return false;
     if (roots.count == 0) return false;
     for (roots.items[0..roots.count]) |root| {
-        if (!isProtectedWindowsPath(root.original)) return false;
+        if (!protected_paths.isWindowsPath(root.original)) return false;
     }
     return true;
 }
@@ -2339,7 +2258,7 @@ fn discoverRootTopLevel(
             report.files_skipped += 1;
             continue;
         }
-        const child_path = try joinPathForward(allocator, path, entry.name);
+        const child_path = try discovered_files.joinPathForward(allocator, path, entry.name);
         if (admission_engine.decide(child_path, entry.kind == .directory) == .ignore) {
             report.files_skipped += 1;
             continue;
@@ -2406,7 +2325,7 @@ fn discoverDirectoryShard(
             shard.files_skipped += 1;
             continue;
         }
-        const child_path = try joinPathForward(allocator, path, entry.name);
+        const child_path = try discovered_files.joinPathForward(allocator, path, entry.name);
         if (admission_engine.decide(child_path, entry.kind == .directory) == .ignore) {
             shard.files_skipped += 1;
             continue;
@@ -2426,6 +2345,41 @@ fn recordReportAccessError(report: *SearchReport, phase: []const u8, operation: 
     report.stats.access_errors.record(phase, operation, path, err);
 }
 
+fn recordReportScanOpenMs(report: *SearchReport, ms: f64) void {
+    report.scan_open_ms_total += ms;
+}
+
+fn recordReportScanFileMs(report: *SearchReport, ms: f64) void {
+    report.scan_work_ms_total += ms;
+}
+
+fn recordShardScanOpenMs(shard: *ShardReport, ms: f64) void {
+    shard.scan_open_ms_total += ms;
+}
+
+fn recordShardScanFileMs(shard: *ShardReport, ms: f64) void {
+    shard.scan_work_ms_total += ms;
+}
+
+fn linuxDominantAttributionEnabled() bool {
+    return truthyEnvEnabled(LINUX_DOMINANT_ATTRIBUTION_ENV);
+}
+
+fn discoverySkipBytesEnabled() bool {
+    return truthyEnvEnabled(DISCOVERY_SKIP_BYTES_ENV);
+}
+
+fn truthyEnvEnabled(name: [:0]const u8) bool {
+    const value_ptr = std.c.getenv(name) orelse return false;
+    const value = std.mem.span(value_ptr);
+    if (value.len == 0) return false;
+    if (std.mem.eql(u8, value, "0")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "false")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "off")) return false;
+    if (std.ascii.eqlIgnoreCase(value, "no")) return false;
+    return true;
+}
+
 fn isRecoverableScanAccessError(err: anyerror) bool {
     return switch (err) {
         error.AccessDenied,
@@ -2441,68 +2395,7 @@ fn isRecoverableScanAccessError(err: anyerror) bool {
 }
 
 fn shouldSkipProtectedBinaryContainer(request: cli.SearchRequest, path: []const u8) bool {
-    if (comptime builtin.os.tag != .windows) return false;
-    if (!isProtectedWindowsPath(path)) return false;
-    if (isProtectedVolatileSystemStore(path)) return true;
-    const ext = pathExtension(path) orelse return false;
-    if (!request.stats_only) return hasProtectedBinaryContainerExtension(ext);
-    return !hasProtectedTextExtension(ext);
-}
-
-fn isProtectedWindowsPath(path: []const u8) bool {
-    if (path.len < "C:\\Windows".len) return false;
-    if (path[1] != ':') return false;
-    const slash = path[2];
-    if (slash != '\\' and slash != '/') return false;
-    if (!std.ascii.eqlIgnoreCase(path[3..10], "Windows")) return false;
-    if (path.len == 10) return true;
-    return path[10] == '\\' or path[10] == '/';
-}
-
-fn pathExtension(path: []const u8) ?[]const u8 {
-    var base_start = path.len;
-    while (base_start > 0) {
-        base_start -= 1;
-        if (path[base_start] == '\\' or path[base_start] == '/') {
-            base_start += 1;
-            break;
-        }
-    }
-    const name = path[base_start..];
-    const dot_index = std.mem.lastIndexOfScalar(u8, name, '.') orelse return null;
-    return name[dot_index..];
-}
-
-fn hasProtectedTextExtension(ext: []const u8) bool {
-    const text_extensions = [_][]const u8{
-        ".inf",  ".inf_loc", ".mof",     ".man",   ".cdxml", ".ps1xml", ".log",
-        ".ini",  ".psd1",    ".xml",     ".psm1",  ".yaml",  ".yml",    ".xsd",
-        ".msc",  ".gpd",     ".strings", ".forms", ".rtf",   ".dis",    ".txt",
-        ".json", ".xsl",     ".rs",      ".gdl",   ".vbs",   ".table",  ".hlp",
-        ".cfg",  ".dic",     ".1",       ".ppd",
-    };
-    for (text_extensions) |candidate| {
-        if (std.ascii.eqlIgnoreCase(ext, candidate)) return true;
-    }
-    return false;
-}
-
-fn isProtectedVolatileSystemStore(path: []const u8) bool {
-    return containsPathSegmentPairIgnoreCase(path, "System32", "catroot2");
-}
-
-fn containsPathSegmentPairIgnoreCase(path: []const u8, first: []const u8, second: []const u8) bool {
-    var segments = std.mem.tokenizeAny(u8, path, "\\/");
-    var saw_first = false;
-    while (segments.next()) |segment| {
-        if (!saw_first) {
-            saw_first = std.ascii.eqlIgnoreCase(segment, first);
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(segment, second)) return true;
-        saw_first = std.ascii.eqlIgnoreCase(segment, first);
-    }
-    return false;
+    return protected_paths.shouldSkipBinaryContainer(.{ .stats_only = request.stats_only }, path);
 }
 
 /// Thread-local shard report. Each worker thread accumulates results here
@@ -2514,7 +2407,12 @@ const ShardReport = struct {
     files_skipped: usize,
     matches_found: usize,
     scan_work_ms_total: f64,
+    scan_open_ms_total: f64,
+    scan_file_ms_total: f64,
+    capture_scan_open_timing: bool,
+    capture_linux_dominant_attribution: bool,
     acceleration_bailouts: usize,
+    fast_count_density_stats: core_stats.FastCountDensityStats,
     regex_decomposition_stats: core_stats.RegexDecompositionStats,
     trigram_stats: core_stats.TrigramAccelerationStats,
     byte_shard_stats: core_stats.ByteShardKernelStats,
@@ -2542,7 +2440,12 @@ const ShardReport = struct {
         .files_skipped = 0,
         .matches_found = 0,
         .scan_work_ms_total = 0,
+        .scan_open_ms_total = 0,
+        .scan_file_ms_total = 0,
+        .capture_scan_open_timing = false,
+        .capture_linux_dominant_attribution = false,
         .acceleration_bailouts = 0,
+        .fast_count_density_stats = .{},
         .regex_decomposition_stats = .{},
         .trigram_stats = .{},
         .byte_shard_stats = .{},
@@ -2593,6 +2496,7 @@ fn recordEvidenceSkipped(shard: *ShardReport) void {
 }
 
 fn recordLinuxDominantFileScan(shard: *ShardReport, display_path: []const u8, file_bytes: usize) bool {
+    if (!shard.capture_linux_dominant_attribution) return false;
     const min_bytes = shard.linux_dominant_file_stats.min_bytes;
     if (file_bytes < min_bytes) return false;
     if (!isLinuxDominantFilePath(display_path)) return false;
@@ -2603,6 +2507,7 @@ fn recordLinuxDominantFileScan(shard: *ShardReport, display_path: []const u8, fi
 }
 
 fn recordLinuxDominantFileActivation(shard: *ShardReport) void {
+    if (!shard.capture_linux_dominant_attribution) return;
     shard.linux_dominant_file_stats.activated_files += 1;
     const files_profiled = shard.byte_shard_stats.files_profiled;
     if (files_profiled > 0) {
@@ -2634,7 +2539,7 @@ fn isLinuxDominantFilePath(path: []const u8) bool {
     return has_amd and has_asic_reg;
 }
 
-/// Scan a single discovered file — used in the serial path and by
+/// Scan a single discovered file -- used in the serial path and by
 /// parallel workers. Opens the file, checks for binary content, and
 /// runs the line-by-line matching loop.
 fn scanDiscoveredFile(
@@ -2652,16 +2557,12 @@ fn scanDiscoveredFile(
         report.stats.admission.protected_entries_skipped += 1;
         return;
     }
-    const open_started = std.Io.Timestamp.now(io, .awake);
+    const file_started = std.Io.Timestamp.now(io, .awake);
     // Open via NT object path to bypass RtlGetFullPathName_U PEB lock contention.
-    const file = openFileNt(io, display_path) catch |err| switch (err) {
+    const file = nt_open.openFile(io, display_path) catch |err| switch (err) {
         error.IsDir => {
-            const open_ms = elapsedMs(io, open_started);
-            report.scan_work_ms_total += open_ms;
-            if (open_ms >= report.slowest_ms) {
-                report.slowest_ms = open_ms;
-                report.slowest_path = display_path;
-                report.slowest_bytes = 0;
+            if (report.capture_scan_open_timing) {
+                recordReportScanOpenMs(report, elapsedMs(io, file_started));
             }
             report.files_skipped += 1;
             recordReportAccessError(report, "scan", "open_file", display_path, err);
@@ -2669,12 +2570,8 @@ fn scanDiscoveredFile(
         },
         else => {
             if (isRecoverableScanAccessError(err)) {
-                const open_ms = elapsedMs(io, open_started);
-                report.scan_work_ms_total += open_ms;
-                if (open_ms >= report.slowest_ms) {
-                    report.slowest_ms = open_ms;
-                    report.slowest_path = display_path;
-                    report.slowest_bytes = 0;
+                if (report.capture_scan_open_timing) {
+                    recordReportScanOpenMs(report, elapsedMs(io, file_started));
                 }
                 report.files_skipped += 1;
                 recordReportAccessError(report, "scan", "open_file", display_path, err);
@@ -2683,15 +2580,11 @@ fn scanDiscoveredFile(
             return err;
         },
     };
-    const open_ms = elapsedMs(io, open_started);
-    report.scan_work_ms_total += open_ms;
-    if (open_ms >= report.slowest_ms) {
-        report.slowest_ms = open_ms;
-        report.slowest_path = display_path;
-        report.slowest_bytes = 0;
+    if (report.capture_scan_open_timing) {
+        recordReportScanOpenMs(report, elapsedMs(io, file_started));
     }
     defer file.close(io);
-    scanOpenFile(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, report) catch |err| switch (err) {
+    scanOpenFile(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, report, file_started) catch |err| switch (err) {
         else => {
             if (!isRecoverableScanAccessError(err)) return err;
             report.files_skipped += 1;
@@ -2718,29 +2611,15 @@ fn scanFileIntoShard(
         recordEvidenceSkipped(shard);
         return;
     }
-    const open_started = std.Io.Timestamp.now(io, .awake);
-    const file = openFileNt(io, display_path) catch |err| {
-        const open_ms = elapsedMs(io, open_started);
-        shard.scan_work_ms_total += open_ms;
-        if (open_ms >= shard.slowest_ms) {
-            shard.slowest_ms = open_ms;
-            shard.slowest_path = display_path;
-            shard.slowest_bytes = 0;
-        }
+    const file_started = std.Io.Timestamp.now(io, .awake);
+    const file = nt_open.openFile(io, display_path) catch |err| {
         shard.files_skipped += 1;
         recordShardAccessError(shard, "scan", "open_file", display_path, err);
         recordEvidenceSkipped(shard);
         return;
     };
-    const open_ms = elapsedMs(io, open_started);
-    shard.scan_work_ms_total += open_ms;
-    if (open_ms >= shard.slowest_ms) {
-        shard.slowest_ms = open_ms;
-        shard.slowest_path = display_path;
-        shard.slowest_bytes = 0;
-    }
     defer file.close(io);
-    scanOpenFileIntoShard(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch |err| {
+    scanOpenFileIntoShard(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard, file_started) catch |err| {
         if (isRecoverableScanAccessError(err)) {
             shard.files_skipped += 1;
             recordShardAccessError(shard, "scan", "read_file", display_path, err);
@@ -2751,13 +2630,50 @@ fn scanFileIntoShard(
     };
 }
 
-/// Memory-mapped file scan — zero-copy, no stack buffer, no carry buffer.
+/// Memory-mapped file scan -- zero-copy, no stack buffer, no carry buffer.
 /// Maps the entire file via NtCreateSection/NtMapViewOfSection (Windows) or
 /// mmap (POSIX). The OS page cache provides the data directly; no read()
 /// syscalls, no memcpy, no multi-chunk loop.
 ///
 /// Returns error on mmap failure (resource limits, non-regular file), allowing
 /// the caller to fall back to chunked reads.
+fn scanFileIntoShardTimed(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    display_path: []const u8,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+    trigram_admission: trigram.Admission,
+    trigram_program: *const TrigramAdmissionProgram,
+    shard: *ShardReport,
+) void {
+    if (shouldSkipProtectedBinaryContainer(request, display_path)) {
+        shard.files_skipped += 1;
+        shard.admission_stats.protected_entries_skipped += 1;
+        recordEvidenceSkipped(shard);
+        return;
+    }
+    const file_started = std.Io.Timestamp.now(io, .awake);
+    const file = nt_open.openFile(io, display_path) catch |err| {
+        recordShardScanOpenMs(shard, elapsedMs(io, file_started));
+        shard.files_skipped += 1;
+        recordShardAccessError(shard, "scan", "open_file", display_path, err);
+        recordEvidenceSkipped(shard);
+        return;
+    };
+    recordShardScanOpenMs(shard, elapsedMs(io, file_started));
+    defer file.close(io);
+    scanOpenFileIntoShard(io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard, file_started) catch |err| {
+        if (isRecoverableScanAccessError(err)) {
+            shard.files_skipped += 1;
+            recordShardAccessError(shard, "scan", "read_file", display_path, err);
+            recordEvidenceSkipped(shard);
+        } else {
+            shard.had_error = true;
+        }
+    };
+}
+
 fn scanFileMmap(
     comptime mono: ?MonoSpec,
     io: std.Io,
@@ -2779,7 +2695,7 @@ fn scanFileMmap(
         recordLineIntoShardImpl(mono, allocator, display_path, "", 1, request, plan, shard, false);
         recordEvidenceCandidate(shard, display_path);
         const file_ms = elapsedMs(io, file_started);
-        shard.scan_work_ms_total += file_ms;
+        recordShardScanFileMs(shard, file_ms);
         if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
         return;
     }
@@ -2813,18 +2729,18 @@ fn scanFileMmap(
     if (trigram_program.fileAdmissionMiss(data)) {
         recordEvidencePruned(shard, file_bytes);
         const file_ms = elapsedMs(io, file_started);
-        shard.scan_work_ms_total += file_ms;
+        recordShardScanFileMs(shard, file_ms);
         if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
         return;
     }
 
     if (request.stats_only and shouldRunByteShardBeforeAdmission(plan)) {
-        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
+        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.fast_count_density_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
             if (linux_dominant_target) recordLinuxDominantFileActivation(shard);
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
-            shard.scan_work_ms_total += file_ms;
+            recordShardScanFileMs(shard, file_ms);
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
             return;
         }
@@ -2836,7 +2752,7 @@ fn scanFileMmap(
             if (!request.case_insensitive and sz.indexOfAdmission(data, needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
-                shard.scan_work_ms_total += file_ms;
+                recordShardScanFileMs(shard, file_ms);
                 if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
                 return;
             }
@@ -2844,28 +2760,28 @@ fn scanFileMmap(
         }
     }
 
-    // Trigram prune — entire file available as one contiguous buffer.
+    // Trigram prune -- entire file available as one contiguous buffer.
     if (!shouldSkipTrigramAfterLiteralAdmission(plan, literal_admission_satisfied) and
         shouldAttemptTrigramPrune(file_bytes, true, trigram_admission, request.case_insensitive) and
         tryTrigramPruneFile(data, trigram_program, &shard.trigram_stats))
     {
         recordEvidencePruned(shard, file_bytes);
         const file_ms = elapsedMs(io, file_started);
-        shard.scan_work_ms_total += file_ms;
+        recordShardScanFileMs(shard, file_ms);
         if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
         return;
     }
 
-    // Whole-buffer fast count — always applicable (entire file is one buffer).
+    // Whole-buffer fast count -- always applicable (entire file is one buffer).
     // For casefold-literal patterns in stats_only mode, this handles the
     // case-insensitive counting without buffer modification.
     if (request.stats_only) {
-        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
+        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.fast_count_density_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
             if (linux_dominant_target) recordLinuxDominantFileActivation(shard);
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
-            shard.scan_work_ms_total += file_ms;
+            recordShardScanFileMs(shard, file_ms);
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
             return;
         }
@@ -2873,15 +2789,23 @@ fn scanFileMmap(
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
-            shard.scan_work_ms_total += file_ms;
+            recordShardScanFileMs(shard, file_ms);
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
             return;
         }
         if (wholeBufferFastCount(data, plan, request.case_insensitive, false)) |count| {
             shard.matches_found += count;
+            if (mono) |m| {
+                if (m.kind == .regex and m.strategy == .regex_literal_alternates) {
+                    shard.fast_count_density_stats.alternate_full_scan_calls += 1;
+                    shard.fast_count_density_stats.alternate_full_scan_bytes += data.len;
+                    shard.fast_count_density_stats.alternate_full_scan_matches += count;
+                    shard.fast_count_density_stats.alternate_matches += count;
+                }
+            }
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
-            shard.scan_work_ms_total += file_ms;
+            recordShardScanFileMs(shard, file_ms);
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
             return;
         }
@@ -2894,14 +2818,14 @@ fn scanFileMmap(
             if (!request.case_insensitive and sz.indexOfAdmission(data, needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
-                shard.scan_work_ms_total += file_ms;
+                recordShardScanFileMs(shard, file_ms);
                 if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
                 return;
             }
         }
     }
 
-    // Per-line processing on mapped memory — no carry buffer, no chunk boundaries.
+    // Per-line processing on mapped memory -- no carry buffer, no chunk boundaries.
     var line_number: usize = 1;
     var pos: usize = 0;
     while (pos < data.len) {
@@ -2924,7 +2848,7 @@ fn scanFileMmap(
 
     recordEvidenceCandidate(shard, display_path);
     const file_ms = elapsedMs(io, file_started);
-    shard.scan_work_ms_total += file_ms;
+    recordShardScanFileMs(shard, file_ms);
     if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
 }
 
@@ -2946,6 +2870,8 @@ fn trySerialMmapFastPath(
         !planUsesLiteralAlternatesFastCount(plan, request.case_insensitive)) return false;
 
     var shard = ShardReport.empty;
+    shard.capture_scan_open_timing = report.capture_scan_open_timing;
+    shard.capture_linux_dominant_attribution = report.capture_linux_dominant_attribution;
     scanFileMmap(null, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, &shard, file_started) catch return false;
     var shards = [_]ShardReport{shard};
     mergeShardsIntoReport(shards[0..], request, report);
@@ -2955,7 +2881,7 @@ fn trySerialMmapFastPath(
 fn planUsesRegexDecompositionFastCount(plan: expr.ExpressionPlan, case_insensitive: bool) bool {
     if (case_insensitive or plan.predicate_count != 1) return false;
     const predicate = plan.predicates[0];
-    return predicate.kind == .regex and regexDecompositionNeedle(predicate.value) != null;
+    return predicate.kind == .regex and byte_shard.regexDecompositionNeedle(predicate.value) != null;
 }
 
 fn writeEscapedWarmQueryField(writer: anytype, value: []const u8) !void {
@@ -2994,43 +2920,13 @@ fn unescapeWarmQueryField(allocator: std.mem.Allocator, value: []const u8) ![]co
 }
 
 fn planUsesLiteralAlternatesFastCount(plan: expr.ExpressionPlan, case_insensitive: bool) bool {
-    if (case_insensitive or plan.predicate_count != 1) return false;
+    _ = case_insensitive;
+    if (plan.predicate_count != 1) return false;
     const predicate = plan.predicates[0];
     return predicate.kind == .regex and
         predicate.strategy == .regex_literal_alternates and
-        parseLiteralAlternates(expr.literalAlternatesBody(predicate.value)) != null;
+        literal_alternates.parse(expr.literalAlternatesBody(predicate.value)) != null;
 }
-
-const ByteShardStrategy = enum {
-    literal_occurrence,
-    literal_alternates_line,
-    word_boundary_line,
-    regex_decomposition_line,
-
-    fn text(self: ByteShardStrategy) []const u8 {
-        return switch (self) {
-            .literal_occurrence => "literal",
-            .literal_alternates_line => "literal_alternates",
-            .word_boundary_line => "word_boundary_literal",
-            .regex_decomposition_line => "regex_decomposition",
-        };
-    }
-};
-
-const ByteShardPlan = struct {
-    strategy: ByteShardStrategy,
-    needle: []const u8,
-    pattern: []const u8 = "",
-    case_insensitive: bool = false,
-};
-
-const ByteShardRange = struct {
-    logical_start: usize,
-    logical_end: usize,
-    widened_start: usize,
-    widened_end: usize,
-    line_aligned: bool = false,
-};
 
 const WordBoundaryRangeCount = struct {
     matches: usize = 0,
@@ -3046,92 +2942,8 @@ const RegexDecompositionRangeCount = struct {
     bailed_out: bool = false,
 };
 
-const LiteralAlternatesRangeCount = struct {
-    matches: usize = 0,
-    bailed_out: bool = false,
-};
-
-const MAX_LITERAL_ALTERNATE_BRANCHES = 32;
-
-const LiteralAlternates = struct {
-    branches: [MAX_LITERAL_ALTERNATE_BRANCHES][]const u8 = undefined,
-    first_byte_mask: [4]u64 = [_]u64{0} ** 4,
-    first_byte_folded_mask: [4]u64 = [_]u64{0} ** 4,
-    count: usize = 0,
-
-    fn slice(self: *const LiteralAlternates) []const []const u8 {
-        return self.branches[0..self.count];
-    }
-
-    fn addBranch(self: *LiteralAlternates, branch: []const u8) void {
-        self.branches[self.count] = branch;
-        self.count += 1;
-        setByteMask(&self.first_byte_mask, branch[0]);
-        setByteMask(&self.first_byte_folded_mask, std.ascii.toLower(branch[0]));
-    }
-
-    fn mayContainStartByte(self: *const LiteralAlternates, line: []const u8, case_insensitive: bool) bool {
-        if (line.len == 0) return false;
-        if (case_insensitive) {
-            for (line) |byte| {
-                if (byteMaskContains(self.first_byte_folded_mask, std.ascii.toLower(byte))) return true;
-            }
-            return false;
-        }
-        for (line) |byte| {
-            if (byteMaskContains(self.first_byte_mask, byte)) return true;
-        }
-        return false;
-    }
-
-    fn column(self: *const LiteralAlternates, line: []const u8, case_insensitive: bool) ?usize {
-        if (!self.mayContainStartByte(line, case_insensitive)) return null;
-        var best: ?usize = null;
-        for (self.slice()) |branch| {
-            if (indexOfLiteral(line, branch, case_insensitive)) |index| {
-                const col = index + 1;
-                if (best == null or col < best.?) best = col;
-            }
-        }
-        return best;
-    }
-
-    fn countMatches(self: *const LiteralAlternates, line: []const u8, case_insensitive: bool) usize {
-        var total: usize = 0;
-        var cursor: usize = 0;
-        while (cursor < line.len) {
-            const remaining = line[cursor..];
-            if (!self.mayContainStartByte(remaining, case_insensitive)) break;
-
-            var best_index: ?usize = null;
-            var best_len: usize = 0;
-            for (self.slice()) |branch| {
-                if (indexOfLiteral(remaining, branch, case_insensitive)) |index| {
-                    if (best_index == null or index < best_index.?) {
-                        best_index = index;
-                        best_len = branch.len;
-                    }
-                }
-            }
-            const index = best_index orelse break;
-            total += 1;
-            cursor += index + best_len;
-        }
-        return total;
-    }
-};
-
-fn setByteMask(mask: *[4]u64, byte: u8) void {
-    const word: usize = @as(usize, byte) >> 6;
-    const bit: u6 = @intCast(byte & 63);
-    mask[word] |= @as(u64, 1) << bit;
-}
-
-fn byteMaskContains(mask: [4]u64, byte: u8) bool {
-    const word: usize = @as(usize, byte) >> 6;
-    const bit: u6 = @intCast(byte & 63);
-    return (mask[word] & (@as(u64, 1) << bit)) != 0;
-}
+const LiteralAlternatesRangeCount = literal_alternates.RangeCount;
+const ByteShardPlan = byte_shard.Plan;
 
 const ByteShardJob = struct {
     io: std.Io,
@@ -3149,6 +2961,8 @@ const ByteShardJob = struct {
     regex_duplicate_candidate_hits_skipped: usize = 0,
     regex_candidate_lines_matched: usize = 0,
     regex_bailed_out: bool = false,
+    alternate_used_pcre: bool = false,
+    alternate_used_teddy: bool = false,
     elapsed_ns: u64 = 0,
 };
 
@@ -3159,12 +2973,13 @@ fn tryByteShardFastCount(
     plan: expr.ExpressionPlan,
     data: []const u8,
     stats: *core_stats.ByteShardKernelStats,
+    density_stats: *core_stats.FastCountDensityStats,
     regex_stats: *core_stats.RegexDecompositionStats,
     acceleration_bailouts: *usize,
 ) ?usize {
-    if (!request.stats_only or request.case_insensitive) return null;
-    const shard_plan = byteShardPlan(plan) orelse return null;
-    if (shard_plan.case_insensitive) return null;
+    if (!request.stats_only) return null;
+    const shard_plan = byte_shard.plan(plan) orelse return null;
+    if (request.case_insensitive and !shard_plan.case_insensitive) return null;
     if (shard_plan.needle.len < 2 or shard_plan.needle.len > data.len) return null;
     const min_file_bytes: usize = switch (shard_plan.strategy) {
         .word_boundary_line => BYTE_SHARD_WORD_BOUNDARY_MIN_FILE_BYTES,
@@ -3189,7 +3004,7 @@ fn tryByteShardFastCount(
     for (jobs, 0..) |*job, index| {
         const logical_start = @min(index * logical_chunk, data.len);
         const logical_end = @min(logical_start + logical_chunk, data.len);
-        const range = byteShardRangeFor(data, shard_plan, logical_start, logical_end, index, range_count) orelse return null;
+        const range = byte_shard.rangeFor(data, shard_plan, logical_start, logical_end, index, range_count) orelse return null;
         job.* = .{
             .io = io,
             .data = data,
@@ -3226,6 +3041,12 @@ fn tryByteShardFastCount(
     var regex_candidate_lines_checked: usize = 0;
     var regex_duplicate_candidate_hits_skipped: usize = 0;
     var regex_candidate_lines_matched: usize = 0;
+    var alternate_pcre_range_calls: usize = 0;
+    var alternate_pcre_range_bytes: usize = 0;
+    var alternate_teddy_range_calls: usize = 0;
+    var alternate_teddy_range_bytes: usize = 0;
+    var alternate_compiled_range_calls: usize = 0;
+    var alternate_compiled_range_bytes: usize = 0;
     var range_elapsed_total: u64 = 0;
     var max_range_elapsed: u64 = 0;
     for (jobs) |job| {
@@ -3245,6 +3066,19 @@ fn tryByteShardFastCount(
         regex_candidate_lines_checked += job.regex_candidate_lines_checked;
         regex_duplicate_candidate_hits_skipped += job.regex_duplicate_candidate_hits_skipped;
         regex_candidate_lines_matched += job.regex_candidate_lines_matched;
+        if (shard_plan.strategy == .literal_alternates_line) {
+            const range_bytes = job.logical_end - job.logical_start;
+            if (job.alternate_used_pcre) {
+                alternate_pcre_range_calls += 1;
+                alternate_pcre_range_bytes += range_bytes;
+            } else if (job.alternate_used_teddy) {
+                alternate_teddy_range_calls += 1;
+                alternate_teddy_range_bytes += range_bytes;
+            } else {
+                alternate_compiled_range_calls += 1;
+                alternate_compiled_range_bytes += range_bytes;
+            }
+        }
         range_elapsed_total += job.elapsed_ns;
         max_range_elapsed = @max(max_range_elapsed, job.elapsed_ns);
     }
@@ -3261,6 +3095,17 @@ fn tryByteShardFastCount(
     stats.range_elapsed_ns_total += range_elapsed_total;
     stats.max_range_elapsed_ns = @max(stats.max_range_elapsed_ns, max_range_elapsed);
     stats.matches += total;
+    if (shard_plan.strategy == .literal_alternates_line) {
+        density_stats.alternate_range_calls += 1;
+        density_stats.alternate_range_bytes += data.len;
+        density_stats.alternate_matches += total;
+        density_stats.alternate_pcre_range_calls += alternate_pcre_range_calls;
+        density_stats.alternate_pcre_range_bytes += alternate_pcre_range_bytes;
+        density_stats.alternate_teddy_range_calls += alternate_teddy_range_calls;
+        density_stats.alternate_teddy_range_bytes += alternate_teddy_range_bytes;
+        density_stats.alternate_compiled_range_calls += alternate_compiled_range_calls;
+        density_stats.alternate_compiled_range_bytes += alternate_compiled_range_bytes;
+    }
     if (shard_plan.strategy == .regex_decomposition_line) {
         regex_stats.eligible_files += 1;
         regex_stats.counted_files += 1;
@@ -3284,9 +3129,11 @@ fn byteShardWorker(job: *ByteShardJob) void {
             job.matches = countLiteralLogicalRange(job.data, job.plan.needle, job.logical_start, job.logical_end, job.widened_start, job.widened_end);
         },
         .literal_alternates_line => {
-            const counted = countLiteralAlternatesLogicalLinesRange(job.data, job.plan.pattern, job.logical_start, job.logical_end);
+            const counted = countLiteralAlternatesLogicalLinesRange(job.data, job.plan.pattern, job.plan.case_insensitive, job.logical_start, job.logical_end);
             job.matches = counted.matches;
             job.regex_bailed_out = counted.bailed_out;
+            job.alternate_used_pcre = counted.used_pcre;
+            job.alternate_used_teddy = counted.used_teddy;
         },
         .word_boundary_line => {
             const counted = countWordBoundaryLiteralLogicalLinesRange(job.data, job.plan.needle, job.logical_start, job.logical_end);
@@ -3322,7 +3169,7 @@ fn countLiteralLogicalRange(data: []const u8, needle: []const u8, logical_start:
 }
 
 fn streamingLiteralNeedle(plan: expr.ExpressionPlan) ?[]const u8 {
-    const shard_plan = byteShardPlan(plan) orelse return null;
+    const shard_plan = byte_shard.plan(plan) orelse return null;
     if (shard_plan.strategy != .literal_occurrence or shard_plan.case_insensitive) return null;
     if (shard_plan.needle.len == 0 or shard_plan.needle.len > STREAMING_LITERAL_TAIL_CAP) return null;
     return shard_plan.needle;
@@ -3432,106 +3279,20 @@ fn countRegexDecompositionLogicalLinesRange(
 }
 
 fn shouldRunByteShardBeforeAdmission(plan: expr.ExpressionPlan) bool {
-    const shard_plan = byteShardPlan(plan) orelse return false;
+    const shard_plan = byte_shard.plan(plan) orelse return false;
     return shard_plan.strategy == .literal_alternates_line or
         shard_plan.strategy == .regex_decomposition_line;
 }
 
 fn shouldSkipTrigramAfterLiteralAdmission(plan: expr.ExpressionPlan, literal_admission_satisfied: bool) bool {
     if (!literal_admission_satisfied) return false;
-    const shard_plan = byteShardPlan(plan) orelse return false;
+    const shard_plan = byte_shard.plan(plan) orelse return false;
     return shard_plan.strategy == .literal_occurrence or
         shard_plan.strategy == .word_boundary_line;
 }
 
-fn byteShardPlan(plan: expr.ExpressionPlan) ?ByteShardPlan {
-    if (plan.predicate_count != 1) return null;
-    const predicate = plan.predicates[0];
-    return switch (predicate.kind) {
-        .literal => if (predicate.value.len >= 2) .{
-            .strategy = .literal_occurrence,
-            .needle = predicate.value,
-        } else null,
-        .regex => switch (predicate.strategy) {
-            .regex_plain_literal => if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null and predicate.value.len >= 2) .{
-                .strategy = .literal_occurrence,
-                .needle = predicate.value,
-            } else null,
-            .regex_word_boundary_literal => blk: {
-                const body = stripWordBoundaryAnchors(predicate.value);
-                break :blk if (body.len >= 2) .{
-                    .strategy = .word_boundary_line,
-                    .needle = body,
-                } else null;
-            },
-            .regex_literal_alternates => blk: {
-                const pattern = expr.literalAlternatesBody(predicate.value);
-                const branch = firstLiteralAlternateBranchAtLeast(pattern, 2) orelse break :blk null;
-                break :blk .{
-                    .strategy = .literal_alternates_line,
-                    .needle = branch,
-                    .pattern = pattern,
-                };
-            },
-            .regex_decomposition_candidate_lines => blk: {
-                const needle = regexDecompositionNeedle(predicate.value) orelse break :blk null;
-                break :blk .{
-                    .strategy = .regex_decomposition_line,
-                    .needle = needle,
-                    .pattern = predicate.value,
-                };
-            },
-            else => null,
-        },
-        else => null,
-    };
-}
-
-fn byteShardRangeFor(data: []const u8, plan: ByteShardPlan, logical_start: usize, logical_end: usize, index: usize, range_count: usize) ?ByteShardRange {
-    return switch (plan.strategy) {
-        .literal_occurrence => blk: {
-            const overlap = plan.needle.len - 1;
-            break :blk .{
-                .logical_start = logical_start,
-                .logical_end = logical_end,
-                .widened_start = logical_start -| overlap,
-                .widened_end = @min(logical_end + overlap, data.len),
-            };
-        },
-        .literal_alternates_line => byteShardLineOwnedRange(data, logical_start, logical_end, index, range_count),
-        .word_boundary_line => byteShardLineOwnedRange(data, logical_start, logical_end, index, range_count),
-        .regex_decomposition_line => byteShardLineOwnedRange(data, logical_start, logical_end, index, range_count),
-    };
-}
-
-fn byteShardLineOwnedRange(data: []const u8, nominal_start: usize, nominal_end: usize, index: usize, range_count: usize) ?ByteShardRange {
-    const start = if (index == 0)
-        @min(nominal_start, data.len)
-    else
-        findOwnedLineBoundaryAfter(data, nominal_start) orelse return null;
-    const end = if (index + 1 >= range_count)
-        data.len
-    else
-        findOwnedLineBoundaryAfter(data, nominal_end) orelse return null;
-    if (start > end) return null;
-    return .{
-        .logical_start = start,
-        .logical_end = end,
-        .widened_start = start,
-        .widened_end = end,
-        .line_aligned = true,
-    };
-}
-
-fn findOwnedLineBoundaryAfter(data: []const u8, position: usize) ?usize {
-    if (position >= data.len) return data.len;
-    const end = @min(data.len, position + BYTE_SHARD_LINE_BOUNDARY_SEARCH_LIMIT);
-    const relative = simd.indexOfByte(data[position..end], '\n') orelse return null;
-    return position + relative + 1;
-}
-
 /// Comptime-generic per-file scan. When mono is non-null, the per-line match
-/// dispatch is fully monomorphized — zero runtime switches in the inner loop.
+/// dispatch is fully monomorphized -- zero runtime switches in the inner loop.
 /// When null, falls back to the runtime multi-predicate path.
 fn scanOpenFileIntoShardImpl(
     comptime mono: ?MonoSpec,
@@ -3544,9 +3305,8 @@ fn scanOpenFileIntoShardImpl(
     trigram_admission: trigram.Admission,
     trigram_program: *const TrigramAdmissionProgram,
     shard: *ShardReport,
+    file_started: std.Io.Timestamp,
 ) anyerror!void {
-    const file_started = std.Io.Timestamp.now(io, .awake);
-
     var read_buffer: [1024 * 1024]u8 = undefined;
 
     // Binary-heavy protected trees should not pay a 1 MiB read before skip.
@@ -3560,7 +3320,7 @@ fn scanOpenFileIntoShardImpl(
         recordLineIntoShardImpl(mono, allocator, display_path, "", 1, request, plan, shard, false);
         recordEvidenceCandidate(shard, display_path);
         const file_ms = elapsedMs(io, file_started);
-        shard.scan_work_ms_total += file_ms;
+        recordShardScanFileMs(shard, file_ms);
         if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
         return;
     }
@@ -3606,7 +3366,7 @@ fn scanOpenFileIntoShardImpl(
                 shard.matches_found += count;
                 recordEvidenceCandidate(shard, display_path);
                 const file_ms = elapsedMs(io, file_started);
-                shard.scan_work_ms_total += file_ms;
+                recordShardScanFileMs(shard, file_ms);
                 if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
                 return;
             } else |_| {}
@@ -3618,7 +3378,7 @@ fn scanOpenFileIntoShardImpl(
             if (!request.case_insensitive and sz.indexOfAdmission(read_buffer[0..first_read], needle) == null) {
                 recordEvidencePruned(shard, file_bytes);
                 const file_ms = elapsedMs(io, file_started);
-                shard.scan_work_ms_total += file_ms;
+                recordShardScanFileMs(shard, file_ms);
                 if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
                 return;
             }
@@ -3631,7 +3391,7 @@ fn scanOpenFileIntoShardImpl(
     {
         recordEvidencePruned(shard, file_bytes);
         const file_ms = elapsedMs(io, file_started);
-        shard.scan_work_ms_total += file_ms;
+        recordShardScanFileMs(shard, file_ms);
         if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
         return;
     }
@@ -3640,7 +3400,7 @@ fn scanOpenFileIntoShardImpl(
     // casefold-literal predicate, lowercase the read buffer in-place once per
     // chunk instead of casefolding every line individually.  Reduces ~100k
     // per-line function calls to ~500 per-file AVX2 passes for large-dir.
-    // Only safe in stats-only mode — hit-collecting needs the original bytes
+    // Only safe in stats-only mode -- hit-collecting needs the original bytes
     // for preview display.
     const chunk_casefold = request.stats_only and planIsFullyCasefoldLiteral(plan);
 
@@ -3653,9 +3413,17 @@ fn scanOpenFileIntoShardImpl(
         const ci = if (chunk_casefold) false else request.case_insensitive;
         if (wholeBufferFastCount(read_buffer[0..first_read], plan, ci, chunk_casefold)) |count| {
             shard.matches_found += count;
+            if (mono) |m| {
+                if (m.kind == .regex and m.strategy == .regex_literal_alternates) {
+                    shard.fast_count_density_stats.alternate_full_scan_calls += 1;
+                    shard.fast_count_density_stats.alternate_full_scan_bytes += first_read;
+                    shard.fast_count_density_stats.alternate_full_scan_matches += count;
+                    shard.fast_count_density_stats.alternate_matches += count;
+                }
+            }
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
-            shard.scan_work_ms_total += file_ms;
+            recordShardScanFileMs(shard, file_ms);
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
             return;
         }
@@ -3663,7 +3431,7 @@ fn scanOpenFileIntoShardImpl(
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
             const file_ms = elapsedMs(io, file_started);
-            shard.scan_work_ms_total += file_ms;
+            recordShardScanFileMs(shard, file_ms);
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
             return;
         }
@@ -3707,7 +3475,7 @@ fn scanOpenFileIntoShardImpl(
                     if (std.mem.lastIndexOfScalar(u8, chunk, '\n')) |last_nl| {
                         try carry.appendSlice(allocator, chunk[last_nl + 1 ..]);
                     } else {
-                        // No newlines in chunk — entire chunk is carry.
+                        // No newlines in chunk -- entire chunk is carry.
                         try carry.appendSlice(allocator, chunk);
                     }
                 }
@@ -3743,7 +3511,7 @@ fn scanOpenFileIntoShardImpl(
             }
         }
         if (shard.truncated or offset >= file_bytes) break;
-        // Read next chunk — only for files > 1 MiB.
+        // Read next chunk -- only for files > 1 MiB.
         const remaining = file_bytes - @as(usize, @intCast(offset));
         const target_len: usize = @intCast(@min(read_buffer.len, remaining));
         const read_len = try file.readPositionalAll(io, read_buffer[0..target_len], offset);
@@ -3759,11 +3527,11 @@ fn scanOpenFileIntoShardImpl(
     }
     recordEvidenceCandidate(shard, display_path);
     const file_ms = elapsedMs(io, file_started);
-    shard.scan_work_ms_total += file_ms;
+    recordShardScanFileMs(shard, file_ms);
     if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
 }
 
-/// Runtime wrapper — dispatches to Impl with null mono (generic path).
+/// Runtime wrapper -- dispatches to Impl with null mono (generic path).
 fn scanOpenFileIntoShard(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -3774,8 +3542,9 @@ fn scanOpenFileIntoShard(
     trigram_admission: trigram.Admission,
     trigram_program: *const TrigramAdmissionProgram,
     shard: *ShardReport,
+    file_started: std.Io.Timestamp,
 ) anyerror!void {
-    return scanOpenFileIntoShardImpl(null, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard);
+    return scanOpenFileIntoShardImpl(null, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard, file_started);
 }
 
 /// Comptime-generic per-line processor. When mono is non-null (single-predicate
@@ -3840,6 +3609,7 @@ fn shardWorker(io: std.Io, allocator: std.mem.Allocator, files: []const Discover
     if (plan.predicate_count == 1) {
         dispatchMonoShardLoop(io, allocator, files, request, plan, trigram_admission, trigram_program, shard);
     } else {
+        if (shard.capture_scan_open_timing) return shardWorkerTimed(io, allocator, files, request, plan, trigram_admission, trigram_program, shard);
         for (files) |entry| {
             if (shard.truncated) break;
             scanFileIntoShard(io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
@@ -3847,15 +3617,31 @@ fn shardWorker(io: std.Io, allocator: std.mem.Allocator, files: []const Discover
     }
 }
 
+fn shardWorkerTimed(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    for (files) |entry| {
+        if (shard.truncated) break;
+        scanFileIntoShardTimed(io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
+    }
+}
+
 fn dynamicShardWorker(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     if (plan.predicate_count == 1) {
         dispatchMonoDynamicLoop(io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
     } else {
+        if (shard.capture_scan_open_timing) return dynamicShardWorkerTimed(io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
         while (!shard.truncated) {
             const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
             if (index >= files.len) break;
             scanFileIntoShard(io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
         }
+    }
+}
+
+fn dynamicShardWorkerTimed(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    while (!shard.truncated) {
+        const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
+        if (index >= files.len) break;
+        scanFileIntoShardTimed(io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
     }
 }
 
@@ -3874,9 +3660,17 @@ fn dispatchMonoShardLoop(io: std.Io, allocator: std.mem.Allocator, files: []cons
 }
 
 fn monoShardLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    if (shard.capture_scan_open_timing) return monoShardLoopTimed(mono, io, allocator, files, request, plan, trigram_admission, trigram_program, shard);
     for (files) |entry| {
         if (shard.truncated) break;
         scanFileIntoShardMono(mono, io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
+    }
+}
+
+fn monoShardLoopTimed(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    for (files) |entry| {
+        if (shard.truncated) break;
+        scanFileIntoShardMonoTimed(mono, io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
     }
 }
 
@@ -3893,6 +3687,7 @@ fn dispatchMonoDynamicLoop(io: std.Io, allocator: std.mem.Allocator, next_file: 
 }
 
 fn monoDynamicLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    if (shard.capture_scan_open_timing) return monoDynamicLoopTimed(mono, io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
     while (!shard.truncated) {
         const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
         if (index >= files.len) break;
@@ -3900,36 +3695,57 @@ fn monoDynamicLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Alloc
     }
 }
 
-/// Monomorphized file opener — calls scanOpenFileIntoShardImpl with comptime mono.
+fn monoDynamicLoopTimed(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    while (!shard.truncated) {
+        const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
+        if (index >= files.len) break;
+        scanFileIntoShardMonoTimed(mono, io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
+    }
+}
+
+/// Monomorphized file opener -- calls scanOpenFileIntoShardImpl with comptime mono.
 fn scanFileIntoShardMono(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, display_path: []const u8, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     if (shouldSkipProtectedBinaryContainer(request, display_path)) {
         shard.files_skipped += 1;
         recordEvidenceSkipped(shard);
         return;
     }
-    const open_started = std.Io.Timestamp.now(io, .awake);
-    const file = openFileNt(io, display_path) catch |err| {
-        const open_ms = elapsedMs(io, open_started);
-        shard.scan_work_ms_total += open_ms;
-        if (open_ms >= shard.slowest_ms) {
-            shard.slowest_ms = open_ms;
-            shard.slowest_path = display_path;
-            shard.slowest_bytes = 0;
-        }
+    const file_started = std.Io.Timestamp.now(io, .awake);
+    const file = nt_open.openFile(io, display_path) catch |err| {
         shard.files_skipped += 1;
         recordShardAccessError(shard, "scan", "open_file", display_path, err);
         recordEvidenceSkipped(shard);
         return;
     };
-    const open_ms = elapsedMs(io, open_started);
-    shard.scan_work_ms_total += open_ms;
-    if (open_ms >= shard.slowest_ms) {
-        shard.slowest_ms = open_ms;
-        shard.slowest_path = display_path;
-        shard.slowest_bytes = 0;
-    }
     defer file.close(io);
-    scanOpenFileIntoShardImpl(mono, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard) catch |err| {
+    scanOpenFileIntoShardImpl(mono, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard, file_started) catch |err| {
+        if (isRecoverableScanAccessError(err)) {
+            shard.files_skipped += 1;
+            recordShardAccessError(shard, "scan", "read_file", display_path, err);
+            recordEvidenceSkipped(shard);
+        } else {
+            shard.had_error = true;
+        }
+    };
+}
+
+fn scanFileIntoShardMonoTimed(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, display_path: []const u8, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    if (shouldSkipProtectedBinaryContainer(request, display_path)) {
+        shard.files_skipped += 1;
+        recordEvidenceSkipped(shard);
+        return;
+    }
+    const file_started = std.Io.Timestamp.now(io, .awake);
+    const file = nt_open.openFile(io, display_path) catch |err| {
+        recordShardScanOpenMs(shard, elapsedMs(io, file_started));
+        shard.files_skipped += 1;
+        recordShardAccessError(shard, "scan", "open_file", display_path, err);
+        recordEvidenceSkipped(shard);
+        return;
+    };
+    recordShardScanOpenMs(shard, elapsedMs(io, file_started));
+    defer file.close(io);
+    scanOpenFileIntoShardImpl(mono, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, shard, file_started) catch |err| {
         if (isRecoverableScanAccessError(err)) {
             shard.files_skipped += 1;
             recordShardAccessError(shard, "scan", "read_file", display_path, err);
@@ -3941,14 +3757,14 @@ fn scanFileIntoShardMono(comptime mono: MonoSpec, io: std.Io, allocator: std.mem
 }
 
 fn shouldUseDynamicWorkClaim(plan: expr.ExpressionPlan, file_count: usize) bool {
-    _ = file_count; // Dynamic claiming benefits all file counts — atomic counter contention is negligible.
+    _ = file_count; // Dynamic claiming benefits all file counts -- atomic counter contention is negligible.
     return canUseDynamicWorkClaimForPlan(plan);
 }
 
 fn canUseDynamicWorkClaimForPlan(plan: expr.ExpressionPlan) bool {
     // All single-predicate plans benefit from dynamic load balancing.
     // The monomorphized dispatch in dispatchMonoDynamicLoop handles every
-    // PredicateKind × MatcherStrategy variant.
+    // PredicateKind x MatcherStrategy variant.
     return plan.predicate_count == 1;
 }
 
@@ -3972,10 +3788,12 @@ fn parallelScanFiles(
     // Worker threads = actual_threads - 1 (main thread takes a shard too).
     const worker_count = actual_threads - 1;
 
-    // Allocate shard reports — one per thread (including main).
+    // Allocate shard reports -- one per thread (including main).
     const shards = try allocator.alloc(ShardReport, actual_threads);
     for (shards) |*s| {
         s.* = ShardReport.empty;
+        s.capture_scan_open_timing = report.capture_scan_open_timing;
+        s.capture_linux_dominant_attribution = report.capture_linux_dominant_attribution;
         if (evidence_runtime.enabled) {
             s.evidence_capture = true;
             s.evidence_allocator = allocator;
@@ -4035,9 +3853,11 @@ fn mergeShardsIntoReport(shards: []const ShardReport, request: cli.SearchRequest
         report.files_skipped += shard.files_skipped;
         report.matches_found += shard.matches_found;
         report.scan_work_ms_total += shard.scan_work_ms_total;
+        report.scan_open_ms_total += shard.scan_open_ms_total;
         report.stats.acceleration_bailouts += shard.acceleration_bailouts;
         report.stats.access_errors.merge(shard.access_errors);
         report.stats.admission.merge(shard.admission_stats);
+        mergeFastCountDensityStats(&report.stats.fast_count_density, shard.fast_count_density_stats);
         mergeRegexDecompositionStats(&report.stats.regex_decomposition, shard.regex_decomposition_stats);
         mergeTrigramStats(&report.stats.trigram_acceleration, shard.trigram_stats);
         mergeByteShardStats(&report.stats.byte_shard_kernel, shard.byte_shard_stats);
@@ -4047,6 +3867,10 @@ fn mergeShardsIntoReport(shards: []const ShardReport, request: cli.SearchRequest
             report.slowest_path = shard.slowest_path;
             report.slowest_bytes = shard.slowest_bytes;
         }
+        const linux_dominant_target = report.capture_linux_dominant_attribution and
+            shard.slowest_bytes >= report.stats.linux_dominant_file.min_bytes and
+            isLinuxDominantFilePath(shard.slowest_path);
+        report.stats.recordSlowFile(shard.slowest_path, shard.slowest_ms, shard.slowest_bytes, linux_dominant_target);
         // Merge hits: copy from shard into report, respecting the global cap.
         const available = retained_limit -| report.hit_count;
         const to_copy = @min(shard.hit_count, available);
@@ -4056,6 +3880,31 @@ fn mergeShardsIntoReport(shards: []const ShardReport, request: cli.SearchRequest
         }
         if (shard.truncated) report.truncated = true;
     }
+}
+
+fn mergeFastCountDensityStats(dst: *core_stats.FastCountDensityStats, src: core_stats.FastCountDensityStats) void {
+    dst.literal_reject_fast_calls += src.literal_reject_fast_calls;
+    dst.literal_reject_fast_bytes += src.literal_reject_fast_bytes;
+    dst.literal_range_calls += src.literal_range_calls;
+    dst.literal_range_bytes += src.literal_range_bytes;
+    dst.literal_matches += src.literal_matches;
+    dst.alternate_reject_fast_calls += src.alternate_reject_fast_calls;
+    dst.alternate_reject_fast_bytes += src.alternate_reject_fast_bytes;
+    dst.alternate_full_scan_calls += src.alternate_full_scan_calls;
+    dst.alternate_full_scan_bytes += src.alternate_full_scan_bytes;
+    dst.alternate_full_scan_matches += src.alternate_full_scan_matches;
+    dst.alternate_range_calls += src.alternate_range_calls;
+    dst.alternate_range_bytes += src.alternate_range_bytes;
+    dst.alternate_pcre_range_calls += src.alternate_pcre_range_calls;
+    dst.alternate_pcre_range_bytes += src.alternate_pcre_range_bytes;
+    dst.alternate_teddy_range_calls += src.alternate_teddy_range_calls;
+    dst.alternate_teddy_range_bytes += src.alternate_teddy_range_bytes;
+    dst.alternate_compiled_range_calls += src.alternate_compiled_range_calls;
+    dst.alternate_compiled_range_bytes += src.alternate_compiled_range_bytes;
+    dst.alternate_matches += src.alternate_matches;
+    dst.shard_merge_calls += src.shard_merge_calls;
+    dst.shard_merge_ranges += src.shard_merge_ranges;
+    dst.shard_merge_matches += src.shard_merge_matches;
 }
 
 const PreparedRoot = struct {
@@ -4073,9 +3922,9 @@ const PreparedRoots = struct {
 
 /// Deduplicates and prunes search roots to avoid scanning the same files
 /// multiple times. Three checks run in order:
-///   1. Exact duplicate: same normalized path → skip
-///   2. Contained by accepted: candidate is inside an already-accepted dir → skip
-///   3. Contains accepted: candidate is a parent dir of an accepted root →
+///   1. Exact duplicate: same normalized path -> skip
+///   2. Contained by accepted: candidate is inside an already-accepted dir -> skip
+///   3. Contains accepted: candidate is a parent dir of an accepted root ->
 ///      evict the child and accept the parent instead
 ///
 /// This mirrors Rust's root pruning logic so that telemetry counters
@@ -4100,7 +3949,7 @@ fn prepareRoots(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchReq
         }
         // Reverse containment: if the new candidate is a parent of an already-
         // accepted root, evict the child. Uses swap-remove (replace with last
-        // element) to avoid shifting the array — O(1) per eviction.
+        // element) to avoid shifting the array -- O(1) per eviction.
         var accepted_index: usize = 0;
         while (accepted_index < count) {
             if (isContainedBy(candidate, roots[accepted_index])) {
@@ -4140,7 +3989,7 @@ fn classifyRoot(io: std.Io, allocator: std.mem.Allocator, raw: []const u8) !Prep
 }
 
 /// Normalizes a root path for deduplication comparison.
-/// Backslashes → forward slashes, lowercased, trailing slashes stripped.
+/// Backslashes -> forward slashes, lowercased, trailing slashes stripped.
 /// This makes Windows paths like `src\Core\` compare equal to `src/core/`.
 fn normalizeComparableRoot(allocator: std.mem.Allocator, raw: []const u8) ![]const u8 {
     var normalized = try allocator.dupe(u8, raw);
@@ -4177,6 +4026,7 @@ fn isContainedBy(parent: PreparedRoot, candidate: PreparedRoot) bool {
 }
 
 fn refreshStats(report: *SearchReport) void {
+    report.scan_file_ms_total = @max(report.scan_work_ms_total, report.scan_open_ms_total) - report.scan_open_ms_total;
     report.stats.input_roots = report.input_roots;
     report.stats.effective_roots = report.effective_roots;
     report.stats.pruned_roots = report.pruned_roots;
@@ -4204,6 +4054,8 @@ fn refreshStats(report: *SearchReport) void {
         .aggregate_ms = report.aggregate_ms,
         .total_ms = report.total_ms,
         .scan_work_ms_total = report.scan_work_ms_total,
+        .scan_open_ms_total = report.scan_open_ms_total,
+        .scan_file_ms_total = report.scan_file_ms_total,
         .aggregate_merge_ms = report.aggregate_ms,
         .aggregate_finalize_ms = 0,
     };
@@ -4226,7 +4078,12 @@ fn refreshStats(report: *SearchReport) void {
         .max_shard_ranges = byte_shard_ranges,
         .max_shard_chunk_bytes = byte_shard_chunk,
     };
-    report.stats.recordSlowFile(report.slowest_path, report.slowest_ms, report.slowest_bytes, isLinuxDominantFilePath(report.slowest_path) and report.slowest_bytes >= report.stats.linux_dominant_file.min_bytes);
+    if (report.stats.slowest_file_count == 0) {
+        const linux_dominant_target = report.capture_linux_dominant_attribution and
+            report.slowest_bytes >= report.stats.linux_dominant_file.min_bytes and
+            isLinuxDominantFilePath(report.slowest_path);
+        report.stats.recordSlowFile(report.slowest_path, report.slowest_ms, report.slowest_bytes, linux_dominant_target);
+    }
 }
 
 fn initTrigramStats(stats: *core_stats.TrigramAccelerationStats, admission: trigram.Admission, case_insensitive: bool) void {
@@ -4479,7 +4336,7 @@ fn availableThreads() usize {
 ///
 /// Serial-path per-file scan (non-parallel reports, e.g. inspect mode).
 ///
-/// Single-chunk files (≤1 MiB) use a stack-allocated read buffer — one
+/// Single-chunk files (<=1 MiB) use a stack-allocated read buffer -- one
 /// ReadFile syscall, warm L2/L3 cache for the SIMD scan. Multi-chunk
 /// files dispatch to scanFileMmap for zero-copy access via
 /// NtCreateSection/NtMapViewOfSection.
@@ -4498,8 +4355,8 @@ fn scanOpenFile(
     trigram_admission: trigram.Admission,
     trigram_program: *const TrigramAdmissionProgram,
     report: *SearchReport,
+    file_started: std.Io.Timestamp,
 ) anyerror!void {
-    const file_started = std.Io.Timestamp.now(io, .awake);
     var read_buffer: [1024 * 1024]u8 = undefined;
 
     // Read first chunk before length lookup. Single-shot positional read avoids
@@ -4509,7 +4366,7 @@ fn scanOpenFile(
         report.files_scanned += 1;
         try recordLine(allocator, display_path, "", 1, request, plan, report, false);
         const file_ms = elapsedMs(io, file_started);
-        report.scan_work_ms_total += file_ms;
+        recordReportScanFileMs(report, file_ms);
         if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
         return;
     }
@@ -4536,7 +4393,7 @@ fn scanOpenFile(
         tryTrigramPruneFile(read_buffer[0..first_read], trigram_program, &report.stats.trigram_acceleration))
     {
         const file_ms = elapsedMs(io, file_started);
-        report.scan_work_ms_total += file_ms;
+        recordReportScanFileMs(report, file_ms);
         if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
         return;
     }
@@ -4545,10 +4402,9 @@ fn scanOpenFile(
     // casefold-literal predicate, lowercase the read buffer in-place once per
     // chunk instead of casefolding every line individually.  Reduces ~100k
     // per-line function calls to ~500 per-file AVX2 passes for large-dir.
-    // Only safe in stats-only mode — hit-collecting needs the original bytes
+    // Only safe in stats-only mode -- hit-collecting needs the original bytes
     // for preview display.
     const chunk_casefold = request.stats_only and planIsFullyCasefoldLiteral(plan);
-
     // Casefold the first chunk in-place after binary sniff confirms it is text.
     if (chunk_casefold) asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
 
@@ -4557,8 +4413,17 @@ fn scanOpenFile(
         const ci = if (chunk_casefold) false else request.case_insensitive;
         if (wholeBufferFastCount(read_buffer[0..first_read], plan, ci, chunk_casefold)) |count| {
             report.matches_found += count;
+            if (plan.predicate_count == 1) {
+                const predicate = plan.predicates[0];
+                if (predicate.kind == .regex and predicate.strategy == .regex_literal_alternates) {
+                    report.stats.fast_count_density.alternate_full_scan_calls += 1;
+                    report.stats.fast_count_density.alternate_full_scan_bytes += first_read;
+                    report.stats.fast_count_density.alternate_full_scan_matches += count;
+                    report.stats.fast_count_density.alternate_matches += count;
+                }
+            }
             const file_ms = elapsedMs(io, file_started);
-            report.scan_work_ms_total += file_ms;
+            recordReportScanFileMs(report, file_ms);
             if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
             return;
         }
@@ -4570,7 +4435,7 @@ fn scanOpenFile(
     var ended_with_newline = false;
 
     // Process first chunk then any remaining chunks (most files fit in one chunk).
-    // HOT PATH: simd.indexOfByte uses AVX2 VPCMPEQB — 32 bytes/cycle vs 1 byte/cycle scalar.
+    // HOT PATH: simd.indexOfByte uses AVX2 VPCMPEQB -- 32 bytes/cycle vs 1 byte/cycle scalar.
     var chunk: []const u8 = read_buffer[0..first_read];
     var offset: u64 = first_read;
     while (true) {
@@ -4595,7 +4460,7 @@ fn scanOpenFile(
             }
         }
         if (report.truncated or offset >= file_bytes) break;
-        // Read next chunk — only for files > 1 MiB.
+        // Read next chunk -- only for files > 1 MiB.
         const remaining = file_bytes - @as(usize, @intCast(offset));
         const target_len: usize = @intCast(@min(read_buffer.len, remaining));
         const read_len = try file.readPositionalAll(io, read_buffer[0..target_len], offset);
@@ -4610,7 +4475,7 @@ fn scanOpenFile(
         try recordLine(allocator, display_path, carry.items, line_number, request, plan, report, chunk_casefold);
     }
     const file_ms = elapsedMs(io, file_started);
-    report.scan_work_ms_total += file_ms;
+    recordReportScanFileMs(report, file_ms);
     if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
 }
 
@@ -4784,6 +4649,10 @@ fn wholeBufferRegexCount(buffer: []const u8, predicate: expr.Predicate, case_ins
             const after_flag = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
             break :blk countWordBoundaryLiteralLines(buffer, stripWordBoundaryAnchors(after_flag));
         },
+        .regex_literal_alternates => blk: {
+            const effective_ci = if (chunk_casefolded) false else case_insensitive or std.mem.startsWith(u8, predicate.value, "(?i)");
+            break :blk countLiteralAlternates(buffer, expr.literalAlternatesBody(predicate.value), effective_ci);
+        },
         else => null,
     };
 }
@@ -4798,7 +4667,7 @@ fn regexDecompositionFastCount(
     if (case_insensitive or plan.predicate_count != 1) return null;
     const predicate = plan.predicates[0];
     if (predicate.kind != .regex) return null;
-    const needle = regexDecompositionNeedle(predicate.value) orelse return null;
+    const needle = byte_shard.regexDecompositionNeedle(predicate.value) orelse return null;
 
     stats.eligible_files += 1;
     var count: usize = 0;
@@ -4837,13 +4706,6 @@ fn regexDecompositionFastCount(
     return count;
 }
 
-fn regexDecompositionNeedle(pattern: []const u8) ?[]const u8 {
-    if (std.mem.startsWith(u8, pattern, "(?i)")) return null;
-    const fragment = expr.regexDecompositionLiteralCandidate(pattern) orelse return null;
-    if (fragment.len < REGEX_DECOMPOSITION_MIN_LITERAL_LEN) return null;
-    return fragment;
-}
-
 fn lineStartForOffset(buffer: []const u8, offset: usize) usize {
     var index = @min(offset, buffer.len);
     while (index > 0 and buffer[index - 1] != '\n') : (index -= 1) {}
@@ -4865,12 +4727,12 @@ fn regexLineMatches(line: []const u8, pattern: []const u8) bool {
 /// Stats-only mode counts matches without retaining hit records.
 /// For single-predicate plans, it counts occurrences (a line with 3 matches
 /// reports 3, not 1). For multi-predicate plans, it falls back to boolean
-/// match — the line either matches all/any predicates or it doesn't.
+/// match -- the line either matches all/any predicates or it doesn't.
 /// This distinction matters for Rust parity: `ix search --stats-only "lit:ERROR"`
 /// must report the same occurrence count as the Rust binary.
 ///
 /// chunk_casefolded: the line bytes were already lowercased in the chunk
-/// buffer — skip per-line casefold and use case-sensitive matching directly.
+/// buffer -- skip per-line casefold and use case-sensitive matching directly.
 fn statsOnlyMatchCount(line: []const u8, plan: expr.ExpressionPlan, case_insensitive: bool, chunk_casefolded: bool) usize {
     if (plan.predicate_count == 1) {
         return predicateMatchCount(line, plan.predicates[0], case_insensitive, chunk_casefolded);
@@ -4914,7 +4776,7 @@ fn countRegexStatsOnly(line: []const u8, pattern: []const u8, case_insensitive: 
 }
 
 /// Comptime-specialized match count dispatch for stats-only mode.
-/// chunk_casefolded: line bytes already lowercased in-place → skip per-line casefold.
+/// chunk_casefolded: line bytes already lowercased in-place -> skip per-line casefold.
 fn predicateMatchCountByStrategyMono(comptime strategy: expr.MatcherStrategy, line: []const u8, predicate: expr.Predicate, case_insensitive: bool, chunk_casefolded: bool) usize {
     return switch (strategy) {
         .regex_plain_literal => blk: {
@@ -4937,12 +4799,15 @@ fn predicateMatchCountByStrategyMono(comptime strategy: expr.MatcherStrategy, li
             const effective_ci = if (chunk_casefolded) false else true;
             break :blk if (wordBoundaryLiteralColumn(line, stripWordBoundaryAnchors(after_flag), effective_ci) != null) 1 else 0;
         },
-        .regex_literal_alternates => countLiteralAlternates(line, expr.literalAlternatesBody(predicate.value), case_insensitive),
+        .regex_literal_alternates => blk: {
+            const effective_ci = if (chunk_casefolded) false else case_insensitive or std.mem.startsWith(u8, predicate.value, "(?i)");
+            break :blk countLiteralAlternates(line, expr.literalAlternatesBody(predicate.value), effective_ci);
+        },
         else => countRegexWithPrefilter(line, predicate.value, case_insensitive),
     };
 }
 
-/// Runtime dispatch wrapper — inline else forwards to comptime-specialized Mono.
+/// Runtime dispatch wrapper -- inline else forwards to comptime-specialized Mono.
 fn predicateMatchCountByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool, chunk_casefolded: bool) usize {
     return switch (predicate.strategy) {
         inline else => |strategy| predicateMatchCountByStrategyMono(strategy, line, predicate, case_insensitive, chunk_casefolded),
@@ -5039,34 +4904,7 @@ fn elapsedMs(io: std.Io, start: std.Io.Timestamp) f64 {
 fn currentWorkingDirectory(io: std.Io, allocator: std.mem.Allocator) ![]const u8 {
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
     const len = try std.process.currentPath(io, &buffer);
-    return normalizeDisplayPath(allocator, buffer[0..len]);
-}
-
-fn normalizeDisplayPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const normalized = try allocator.dupe(u8, path);
-    for (normalized) |*byte| {
-        if (byte.* == '\\') byte.* = '/';
-    }
-    return normalized;
-}
-
-fn joinPathForward(allocator: std.mem.Allocator, parent: []const u8, child: []const u8) ![]const u8 {
-    if (parent.len == 0 or std.mem.eql(u8, parent, ".")) return normalizeDisplayPath(allocator, child);
-    const buf = try allocator.alloc(u8, parent.len + 1 + child.len);
-    @memcpy(buf[0..parent.len], parent);
-    buf[parent.len] = '/';
-    @memcpy(buf[parent.len + 1 ..][0..child.len], child);
-    return buf;
-}
-
-test "search path join normalizes dot root for Windows NT open path" {
-    const joined = try joinPathForward(std.testing.allocator, ".", "packages\\shared\\src\\index.ts");
-    defer std.testing.allocator.free(joined);
-    try std.testing.expectEqualStrings("packages/shared/src/index.ts", joined);
-
-    var buffer: [64]u8 = undefined;
-    const bounded = joinPathForwardBounded(".", "apps\\backend", &buffer) orelse return error.TestExpectedJoin;
-    try std.testing.expectEqualStrings("apps/backend", bounded);
+    return discovered_files.normalizeDisplayPath(allocator, buffer[0..len]);
 }
 
 pub fn matchesLine(line: []const u8, plan: expr.ExpressionPlan) bool {
@@ -5133,7 +4971,7 @@ fn predicateColumn(line: []const u8, predicate: expr.Predicate, case_insensitive
 }
 
 /// Comptime-specialized predicate column for monomorphized single-predicate path.
-/// Both kind and strategy are comptime-known — all switches collapse.
+/// Both kind and strategy are comptime-known -- all switches collapse.
 fn predicateColumnMono(comptime kind: expr.PredicateKind, comptime strategy: expr.MatcherStrategy, line: []const u8, predicate: expr.Predicate, case_insensitive: bool) ?usize {
     return switch (kind) {
         .literal => if (indexOfLiteral(line, predicate.value, case_insensitive)) |index| index + 1 else null,
@@ -5144,7 +4982,7 @@ fn predicateColumnMono(comptime kind: expr.PredicateKind, comptime strategy: exp
 }
 
 /// Comptime-specialized regex column dispatch. When `strategy` is comptime-known,
-/// the switch collapses to a single branch — zero runtime dispatch overhead.
+/// the switch collapses to a single branch -- zero runtime dispatch overhead.
 fn regexColumnByStrategyMono(comptime strategy: expr.MatcherStrategy, line: []const u8, predicate: expr.Predicate, case_insensitive: bool) ?usize {
     return switch (strategy) {
         .regex_plain_literal => {
@@ -5172,7 +5010,7 @@ fn regexColumnByStrategyMono(comptime strategy: expr.MatcherStrategy, line: []co
             return wordBoundaryLiteralColumn(line, body, true);
         },
         .regex_literal_alternates => {
-            return literalAlternatesColumn(line, expr.literalAlternatesBody(predicate.value), case_insensitive);
+            return literalAlternatesColumn(line, expr.literalAlternatesBody(predicate.value), case_insensitive or std.mem.startsWith(u8, predicate.value, "(?i)"));
         },
         // regex_full, regex_fixed_width_bytes, regex_decomposition_candidate_lines,
         // and non-regex strategies all fall through to prefilter + regex engine.
@@ -5180,7 +5018,7 @@ fn regexColumnByStrategyMono(comptime strategy: expr.MatcherStrategy, line: []co
     };
 }
 
-/// Runtime strategy dispatch — inline else converts each runtime branch to a
+/// Runtime strategy dispatch -- inline else converts each runtime branch to a
 /// comptime-known call into regexColumnByStrategyMono.
 fn regexColumnByStrategy(line: []const u8, predicate: expr.Predicate, case_insensitive: bool) ?usize {
     return switch (predicate.strategy) {
@@ -5192,13 +5030,13 @@ fn regexColumnByStrategy(line: []const u8, predicate: expr.Predicate, case_insen
 /// anywhere in the pattern and use SIMD indexOf to reject lines that
 /// can't match before running the regex engine.
 ///
-/// E.g. `\w+Column` → fragment `Column` (suffix, not prefix).
-///      `process_\d+_\d+` → fragment `process_` (prefix).
-///      `[A-Z]+error_log` → fragment `error_log` (suffix).
+/// E.g. `\w+Column` -> fragment `Column` (suffix, not prefix).
+///      `process_\d+_\d+` -> fragment `process_` (prefix).
+///      `[A-Z]+error_log` -> fragment `error_log` (suffix).
 ///
 /// SIMD indexOf rejects non-matching lines at ~32 bytes/cycle (AVX2),
 /// eliminating the per-line PCRE2 JIT dispatch on ~99% of lines for
-/// patterns with a mandatory literal of ≥2 bytes.
+/// patterns with a mandatory literal of >=2 bytes.
 fn regexWithLiteralPrefilter(line: []const u8, pattern: []const u8, case_insensitive: bool) ?usize {
     // Use threadlocal cache to avoid re-extracting the same fragment per line.
     // The search loop uses the same pattern for every line in a file.
@@ -5240,11 +5078,11 @@ fn cachedLiteralFragment(pattern: []const u8) []const u8 {
 /// Returns the longest such run as a slice into the original pattern.
 ///
 /// Examples:
-///   `\w+Column`      → `Column`
-///   `process_\d+_\d+`→ `process_`
-///   `[A-Z]+error_log` → `error_log`
-///   `\d{4}-\d{2}`    → `-`  (short — caller applies ≥2 byte threshold)
-///   `.*`             → ``   (empty — no literals)
+///   `\w+Column`      -> `Column`
+///   `process_\d+_\d+`-> `process_`
+///   `[A-Z]+error_log` -> `error_log`
+///   `\d{4}-\d{2}`    -> `-`  (short -- caller applies >=2 byte threshold)
+///   `.*`             -> ``   (empty -- no literals)
 fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
     if (hasTopLevelRegexAlternation(pattern)) return "";
 
@@ -5257,7 +5095,7 @@ fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
     while (i < pattern.len) {
         const byte = pattern[i];
 
-        // Skip escape sequences — they are metachar classes (\w, \d, etc.)
+        // Skip escape sequences -- they are metachar classes (\w, \d, etc.)
         // or escaped literals (\., \\). Escaped literals could theoretically
         // be included but would complicate the fragment (it wouldn't be a
         // simple substring match anymore). Break the run.
@@ -5291,7 +5129,7 @@ fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
                     i = skipRegexQuantifier(pattern, i);
                 }
             } else if (byte == '(') {
-                // Groups contain alternation — cannot guarantee any single
+                // Groups contain alternation -- cannot guarantee any single
                 // branch's literal is mandatory. Skip to matching ')'.
                 var depth: usize = 1;
                 i += 1;
@@ -5313,7 +5151,7 @@ fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
         }
 
         // Check if this literal is followed by a quantifier that makes it
-        // optional (? or *). If so, it's not mandatory — break the run.
+        // optional (? or *). If so, it's not mandatory -- break the run.
         if (i + 1 < pattern.len and (pattern[i + 1] == '?' or pattern[i + 1] == '*')) {
             if (run_len > best_len) {
                 best_start = run_start;
@@ -5325,13 +5163,13 @@ fn extractLongestLiteralFragment(pattern: []const u8) []const u8 {
             continue;
         }
 
-        // Plain mandatory literal byte — extend the current run.
-        // If a `+` quantifier follows, the literal is still mandatory (≥1 match),
+        // Plain mandatory literal byte -- extend the current run.
+        // If a `+` quantifier follows, the literal is still mandatory (>=1 match),
         // so include the byte but skip the `+`.
         run_len += 1;
         i += 1;
         if (i < pattern.len and pattern[i] == '+') {
-            // `x+` means ≥1 x. The single `x` is mandatory. But the run
+            // `x+` means >=1 x. The single `x` is mandatory. But the run
             // must break here because the next byte is a separate token.
             if (run_len > best_len) {
                 best_start = run_start;
@@ -5425,19 +5263,7 @@ fn isGeneratedSourceIndexEntry(name: []const u8, is_directory: bool) bool {
     return std.mem.eql(u8, name, "tags") or std.mem.eql(u8, name, "TAGS");
 }
 
-fn hasProtectedBinaryContainerExtension(ext: []const u8) bool {
-    const binary_extensions = [_][]const u8{
-        ".dll", ".exe", ".sys", ".mui", ".cat", ".ocx", ".cpl", ".drv",
-        ".efi", ".scr", ".msi", ".msp", ".msu", ".cab", ".pnf", ".nls",
-        ".ttf", ".ttc", ".otf", ".fon",
-    };
-    for (binary_extensions) |candidate| {
-        if (std.ascii.eqlIgnoreCase(ext, candidate)) return true;
-    }
-    return false;
-}
-
-// ── SIMD Casefold Infrastructure ──────────────────────────────────────
+// SIMD Casefold Infrastructure
 //
 // ASCII case differs by exactly bit 5 (0x20). To search case-insensitively
 // at SIMD speed, we lowercase both the line and needle into scratch buffers,
@@ -5445,18 +5271,18 @@ fn hasProtectedBinaryContainerExtension(ext: []const u8) bool {
 //
 // The vector loop processes 32 bytes per iteration:
 //   1. Load 32 bytes
-//   2. Wrapping-subtract 'A' (maps A-Z → 0-25, everything else → ≥ 26)
-//   3. Compare < 26 → bool mask identifying uppercase bytes
+//   2. Wrapping-subtract 'A' (maps A-Z -> 0-25, everything else -> >= 26)
+//   3. Compare < 26 -> bool mask identifying uppercase bytes
 //   4. Select 0x20 where uppercase, 0 elsewhere
-//   5. OR with originals → lowercase A-Z, all other bytes unchanged
+//   5. OR with originals -> lowercase A-Z, all other bytes unchanged
 //
-// This converts O(n×m) scalar comparison into O(n) casefold + O(n) SIMD
-// search — a ~10-30x speedup on typical source code lines.
+// This converts O(nxm) scalar comparison into O(n) casefold + O(n) SIMD
+// search -- a ~10-30x speedup on typical source code lines.
 
 /// Stack buffer ceiling for SIMD casefold. 2 KiB keeps the combined
 /// casefold stack frame (line_buf + needle_buf + overhead) under 4 KiB,
-/// which is the Windows __chkstk threshold. Frames ≥ 4 KiB require a
-/// __chkstk page-probe call on every function entry — with 100k lines
+/// which is the Windows __chkstk threshold. Frames >= 4 KiB require a
+/// __chkstk page-probe call on every function entry -- with 100k lines
 /// this adds ~1ms on case-insensitive searches. Lines longer than 2 KiB
 /// are virtually absent in real source code and fall back to the scalar path.
 const CASEFOLD_LINE_MAX = 2 * 1024;
@@ -5468,7 +5294,7 @@ const CASEFOLD_NEEDLE_MAX = 256;
 
 /// SIMD-accelerated ASCII lowercase. Processes 32 bytes per iteration
 /// using AVX2 vector operations, with a scalar tail for the remainder.
-/// Non-alpha bytes pass through unchanged — the wrapping range check
+/// Non-alpha bytes pass through unchanged -- the wrapping range check
 /// ensures only A-Z (0x41-0x5A) receive the 0x20 OR.
 fn asciiLowerBuf(dst: []u8, src: []const u8) void {
     std.debug.assert(dst.len >= src.len);
@@ -5487,14 +5313,14 @@ fn asciiLowerBuf(dst: []u8, src: []const u8) void {
     }
 }
 
-/// HOT PATH 3: Literal substring matching — the core search operation.
+/// HOT PATH 3: Literal substring matching -- the core search operation.
 ///
 /// Case-sensitive path uses simd.indexOf (AVX2 first+last byte fingerprint), which
 /// fingerprints by first+last byte across 32 positions per SIMD pass.
 ///
 /// Case-insensitive path dispatches to indexOfLiteralCasefold (separate
 /// function) to keep this hot path's stack frame under 4 KiB. On Windows,
-/// frames > 4 KiB trigger __chkstk page probes on every call — including
+/// frames > 4 KiB trigger __chkstk page probes on every call -- including
 /// case-sensitive calls that take the early return. Isolating the 2 KiB
 /// casefold buffers into their own function eliminates that overhead.
 fn indexOfLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) ?usize {
@@ -5504,7 +5330,7 @@ fn indexOfLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) 
     return indexOfLiteralCasefold(line, needle);
 }
 
-/// SIMD casefold search — isolated from indexOfLiteral to quarantine the
+/// SIMD casefold search -- isolated from indexOfLiteral to quarantine the
 /// 2 KiB + 256 B stack buffers away from the case-sensitive hot path.
 /// Lowercase both line and needle into stack buffers via AVX2 vector ops,
 /// then search with simd.indexOf. O(n) casefold + O(n) SIMD search.
@@ -5519,7 +5345,7 @@ fn indexOfLiteralCasefold(line: []const u8, needle: []const u8) ?usize {
     return indexOfLiteralScalar(line, needle);
 }
 
-/// Scalar case-insensitive literal search. O(n×m) byte-by-byte comparison,
+/// Scalar case-insensitive literal search. O(nxm) byte-by-byte comparison,
 /// used only when line length exceeds the SIMD casefold stack buffer.
 fn indexOfLiteralScalar(line: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
@@ -5549,7 +5375,7 @@ fn countLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) us
     return total;
 }
 
-/// Casefold-once counting — isolated from countLiteral to quarantine the
+/// Casefold-once counting -- isolated from countLiteral to quarantine the
 /// casefold stack buffers. Lowercase the line once, then loop simd.indexOf
 /// on the lowered copy to avoid redundant casefold per match position.
 fn countLiteralCasefold(line: []const u8, needle: []const u8) usize {
@@ -5644,7 +5470,7 @@ fn byteEquals(left: u8, right: u8, case_insensitive: bool) bool {
 }
 
 /// Strip `\b` anchors from both ends of a word-boundary pattern.
-/// E.g. `\bsession\b` → `session`. Caller has already verified
+/// E.g. `\bsession\b` -> `session`. Caller has already verified
 /// the pattern is classified as regex_word_boundary_literal.
 fn stripWordBoundaryAnchors(pattern: []const u8) []const u8 {
     var body = pattern;
@@ -5720,36 +5546,8 @@ fn countWordBoundaryLiteralLogicalLinesRange(buffer: []const u8, needle: []const
     return counted;
 }
 
-fn countLiteralAlternatesLogicalLinesRange(buffer: []const u8, pattern: []const u8, logical_start: usize, logical_end: usize) LiteralAlternatesRangeCount {
-    if (pattern.len == 0 or logical_start >= logical_end) return .{};
-    const alternates = parseLiteralAlternates(pattern) orelse return .{ .bailed_out = true };
-    const end = @min(logical_end, buffer.len);
-    var counted = LiteralAlternatesRangeCount{};
-    const start = @min(logical_start, end);
-
-    if (literalAlternatesPcreRangeEligible(pattern, alternates.count)) {
-        if (pcre_regex.count(buffer[start..end], pattern, false)) |matches| {
-            counted.matches = matches;
-            return counted;
-        } else |_| {}
-    }
-
-    var cursor = start;
-
-    while (cursor < end) {
-        const newline = simd.indexOfByte(buffer[cursor..end], '\n');
-        const line_end = if (newline) |offset| cursor + offset else end;
-        const raw_line = buffer[cursor..line_end];
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
-        counted.matches += alternates.countMatches(line, false);
-        if (newline) |offset| {
-            cursor += offset + 1;
-        } else {
-            break;
-        }
-    }
-
-    return counted;
+fn countLiteralAlternatesLogicalLinesRange(buffer: []const u8, pattern: []const u8, case_insensitive: bool, logical_start: usize, logical_end: usize) LiteralAlternatesRangeCount {
+    return literal_alternates.countLogicalLinesRange(buffer, pattern, case_insensitive, logical_start, logical_end);
 }
 
 fn literalAlternatesPcreRangeEligible(pattern: []const u8, branch_count: usize) bool {
@@ -5775,87 +5573,14 @@ fn isWordChar(byte: u8) bool {
 }
 
 /// Search for a top-level literal alternation pattern such as `alpha|beta`.
-/// Each branch is a plain literal — search them individually and return
+/// Each branch is a plain literal -- search them individually and return
 /// the earliest match column.
 fn literalAlternatesColumn(line: []const u8, pattern: []const u8, case_insensitive: bool) ?usize {
-    if (parseLiteralAlternates(pattern)) |alternates| {
-        return alternates.column(line, case_insensitive);
-    }
-
-    var best: ?usize = null;
-    var start: usize = 0;
-    while (start <= pattern.len) {
-        const end = std.mem.indexOfScalarPos(u8, pattern, start, '|') orelse pattern.len;
-        const branch = pattern[start..end];
-        if (branch.len > 0) {
-            if (indexOfLiteral(line, branch, case_insensitive)) |index| {
-                const col = index + 1;
-                if (best == null or col < best.?) best = col;
-            }
-        }
-        if (end == pattern.len) break;
-        start = end + 1;
-    }
-    return best;
+    return literal_alternates.column(line, pattern, case_insensitive);
 }
 
 fn countLiteralAlternates(line: []const u8, pattern: []const u8, case_insensitive: bool) usize {
-    if (parseLiteralAlternates(pattern)) |alternates| {
-        return alternates.countMatches(line, case_insensitive);
-    }
-
-    var total: usize = 0;
-    var cursor: usize = 0;
-    while (cursor < line.len) {
-        var best_index: ?usize = null;
-        var best_len: usize = 0;
-        var start: usize = 0;
-        while (start <= pattern.len) {
-            const end = std.mem.indexOfScalarPos(u8, pattern, start, '|') orelse pattern.len;
-            const branch = pattern[start..end];
-            if (branch.len > 0) {
-                if (indexOfLiteral(line[cursor..], branch, case_insensitive)) |index| {
-                    if (best_index == null or index < best_index.?) {
-                        best_index = index;
-                        best_len = branch.len;
-                    }
-                }
-            }
-            if (end == pattern.len) break;
-            start = end + 1;
-        }
-        const index = best_index orelse break;
-        total += 1;
-        cursor += index + best_len;
-    }
-    return total;
-}
-
-fn parseLiteralAlternates(pattern: []const u8) ?LiteralAlternates {
-    var alternates: LiteralAlternates = .{};
-    var start: usize = 0;
-    while (start <= pattern.len) {
-        const end = std.mem.indexOfScalarPos(u8, pattern, start, '|') orelse pattern.len;
-        const branch = pattern[start..end];
-        if (branch.len == 0) return null;
-        if (alternates.count == MAX_LITERAL_ALTERNATE_BRANCHES) return null;
-        alternates.addBranch(branch);
-        if (end == pattern.len) break;
-        start = end + 1;
-    }
-    return if (alternates.count > 1) alternates else null;
-}
-
-fn firstLiteralAlternateBranchAtLeast(pattern: []const u8, min_len: usize) ?[]const u8 {
-    var start: usize = 0;
-    while (start <= pattern.len) {
-        const end = std.mem.indexOfScalarPos(u8, pattern, start, '|') orelse pattern.len;
-        const branch = pattern[start..end];
-        if (branch.len >= min_len) return branch;
-        if (end == pattern.len) break;
-        start = end + 1;
-    }
-    return null;
+    return literal_alternates.count(line, pattern, case_insensitive);
 }
 
 test "trigram gate rejects impossible complete file without verifier authority" {
@@ -6059,6 +5784,7 @@ test "warm index rejects dead owner before trusting generation" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid=999999\nprocess_start_ns=55\ncreated_ns=99\nroot={s}\n", .{root_path});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -6096,6 +5822,7 @@ test "warm index reports corrupt generation payload before falling back" {
     try corrupt_catalog.writeStreamingAll(io, "BROKEN-CATALOG");
 
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -6163,100 +5890,6 @@ test "byte shard logical range preserves non-overlapping semantics" {
     try std.testing.expectEqual(countLiteral(data, needle, false), left + right);
 }
 
-test "byte shard plan admits word-boundary line kernels" {
-    const literal_plan = try expr.parse("lit:Sherlock Holmes");
-    const literal = byteShardPlan(literal_plan).?;
-    try std.testing.expectEqual(ByteShardStrategy.literal_occurrence, literal.strategy);
-    try std.testing.expectEqualStrings("Sherlock Holmes", literal.needle);
-
-    const regex_literal = try expr.parse("re:Sherlock Holmes");
-    const regex_plain = byteShardPlan(regex_literal).?;
-    try std.testing.expectEqual(ByteShardStrategy.literal_occurrence, regex_plain.strategy);
-    try std.testing.expectEqualStrings("Sherlock Holmes", regex_plain.needle);
-
-    const regex_word = try expr.parse("re:\\bSherlock Holmes\\b");
-    const word = byteShardPlan(regex_word).?;
-    try std.testing.expectEqual(ByteShardStrategy.word_boundary_line, word.strategy);
-    try std.testing.expectEqualStrings("Sherlock Holmes", word.needle);
-
-    const regex_decomposed = try expr.parse("re:Sherlock\\s+Holmes");
-    const decomposed = byteShardPlan(regex_decomposed).?;
-    try std.testing.expectEqual(ByteShardStrategy.regex_decomposition_line, decomposed.strategy);
-    try std.testing.expectEqualStrings("Sherlock", decomposed.needle);
-    try std.testing.expectEqualStrings("Sherlock\\s+Holmes", decomposed.pattern);
-
-    const regex_alternates = try expr.parse("re:Sherlock Holmes|John Watson|Irene Adler");
-    const alternates = byteShardPlan(regex_alternates).?;
-    try std.testing.expectEqual(ByteShardStrategy.literal_alternates_line, alternates.strategy);
-    try std.testing.expectEqualStrings("Sherlock Holmes", alternates.needle);
-    try std.testing.expectEqualStrings("Sherlock Holmes|John Watson|Irene Adler", alternates.pattern);
-
-    const regex_wrapped_alternates = try expr.parse("re:(Sherlock Holmes|John Watson|Irene Adler)");
-    const wrapped_alternates = byteShardPlan(regex_wrapped_alternates).?;
-    try std.testing.expectEqual(ByteShardStrategy.literal_alternates_line, wrapped_alternates.strategy);
-    try std.testing.expectEqualStrings("Sherlock Holmes", wrapped_alternates.needle);
-    try std.testing.expectEqualStrings("Sherlock Holmes|John Watson|Irene Adler", wrapped_alternates.pattern);
-
-    const regex_casefold_word = try expr.parse("re:(?i)\\bSherlock Holmes\\b");
-    try std.testing.expect(byteShardPlan(regex_casefold_word) == null);
-}
-
-test "literal alternates line range counts regex occurrences" {
-    const buffer =
-        "Sherlock Holmes and John Watson\n" ++
-        "Irene Adler\n" ++
-        "Professor Moriarty\n" ++
-        "plain line\n";
-    const count = countLiteralAlternatesLogicalLinesRange(buffer, "Sherlock Holmes|John Watson|Irene Adler", 0, buffer.len);
-    try std.testing.expect(!count.bailed_out);
-    try std.testing.expectEqual(@as(usize, 3), count.matches);
-
-    try std.testing.expectEqual(@as(?usize, 1), literalAlternatesColumn(buffer, expr.literalAlternatesBody("(Sherlock Holmes|John Watson|Irene Adler)"), false));
-    try std.testing.expectEqual(@as(usize, 3), countLiteralAlternates(buffer, expr.literalAlternatesBody("(Sherlock Holmes|John Watson|Irene Adler)"), false));
-}
-
-test "literal alternates compiled start mask rejects impossible lines" {
-    const alternates = parseLiteralAlternates("Sherlock Holmes|John Watson|Irene Adler").?;
-
-    try std.testing.expect(!alternates.mayContainStartByte("plain line", false));
-    try std.testing.expectEqual(@as(?usize, null), alternates.column("plain line", false));
-    try std.testing.expectEqual(@as(usize, 0), alternates.countMatches("plain line", false));
-
-    try std.testing.expect(alternates.mayContainStartByte("John Watson", false));
-    try std.testing.expectEqual(@as(?usize, 1), alternates.column("John Watson", false));
-    try std.testing.expectEqual(@as(usize, 1), alternates.countMatches("John Watson", false));
-}
-
-test "literal alternates compiled folded start mask admits case insensitive lines" {
-    const alternates = parseLiteralAlternates("Sherlock Holmes|John Watson|Irene Adler").?;
-
-    try std.testing.expect(!alternates.mayContainStartByte("sherlock holmes", false));
-    try std.testing.expect(alternates.mayContainStartByte("sherlock holmes", true));
-    try std.testing.expectEqual(@as(?usize, 1), alternates.column("sherlock holmes", true));
-    try std.testing.expectEqual(@as(usize, 2), alternates.countMatches("sherlock holmes and irene adler", true));
-}
-
-test "large literal alternates range may use pcre count path" {
-    const pattern = "Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty";
-    const buffer =
-        "Sherlock Holmes and John Watson\n" ++
-        "Irene Adler\n" ++
-        "Inspector Lestrade\n" ++
-        "Professor Moriarty Sherlock Holmes\n";
-
-    const alternates = parseLiteralAlternates(pattern).?;
-    try std.testing.expect(literalAlternatesPcreRangeEligible(pattern, alternates.count));
-
-    const count = countLiteralAlternatesLogicalLinesRange(buffer, pattern, 0, buffer.len);
-    try std.testing.expect(!count.bailed_out);
-    try std.testing.expectEqual(@as(usize, 6), count.matches);
-
-    const small = parseLiteralAlternates("Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade").?;
-    try std.testing.expect(!literalAlternatesPcreRangeEligible("Sherlock Holmes|John Watson|Irene Adler|Inspector Lestrade", small.count));
-    const escaped = parseLiteralAlternates("Sherlock\\.Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty").?;
-    try std.testing.expect(!literalAlternatesPcreRangeEligible("Sherlock\\.Holmes|John Watson|Irene Adler|Inspector Lestrade|Professor Moriarty", escaped.count));
-}
-
 test "fixed word whitespace chain fast count matches regex count semantics" {
     const pattern = "\\w{5}\\s+\\w{5}\\s+\\w{5}\\s+\\w{5}\\s+\\w{5}";
     const chain = fixedWordWhitespaceChain(pattern) orelse return error.TestExpectedEqual;
@@ -6291,7 +5924,7 @@ test "byte shard default fanout caps implicit hardware thread count" {
 test "regex decomposition fast count verifies mandatory literal candidate lines" {
     const plan = try expr.parse("re:Sherlock\\s+Holmes");
     try std.testing.expect(planUsesRegexDecompositionFastCount(plan, false));
-    try std.testing.expectEqualStrings("Sherlock", regexDecompositionNeedle(plan.predicates[0].value).?);
+    try std.testing.expectEqualStrings("Sherlock", byte_shard.regexDecompositionNeedle(plan.predicates[0].value).?);
 
     const buffer =
         "Sherlock Holmes\n" ++
@@ -6311,7 +5944,7 @@ test "regex decomposition fast count verifies mandatory literal candidate lines"
 
 test "regex decomposition byte ranges preserve line-owned candidate counts" {
     const pattern = "Sherlock\\s+Holmes";
-    const needle = regexDecompositionNeedle(pattern).?;
+    const needle = byte_shard.regexDecompositionNeedle(pattern).?;
     const buffer =
         "Sherlock Holmes\n" ++
         "Sherlock\n" ++
@@ -6321,7 +5954,7 @@ test "regex decomposition byte ranges preserve line-owned candidate counts" {
     const expected = countRegexDecompositionLogicalLinesRange(buffer, needle, pattern, 0, buffer.len);
     const seams = [_]usize{ 1, 9, 17, 31, 44, buffer.len - 1 };
     for (seams) |seam| {
-        const left_end = findOwnedLineBoundaryAfter(buffer, seam) orelse buffer.len;
+        const left_end = byte_shard.findOwnedLineBoundaryAfter(buffer, seam) orelse buffer.len;
         const left = countRegexDecompositionLogicalLinesRange(buffer, needle, pattern, 0, left_end);
         const right = countRegexDecompositionLogicalLinesRange(buffer, needle, pattern, left_end, buffer.len);
         try std.testing.expectEqual(expected.matches, left.matches + right.matches);
@@ -6401,7 +6034,7 @@ test "word-boundary byte ranges preserve whole-buffer count across seams" {
     const expected = countWordBoundaryLiteralLines(buffer, "PM_RESUME");
     const seams = [_]usize{ 1, 7, 16, 29, 47, buffer.len - 1 };
     for (seams) |seam| {
-        const left_end = findOwnedLineBoundaryAfter(buffer, seam) orelse buffer.len;
+        const left_end = byte_shard.findOwnedLineBoundaryAfter(buffer, seam) orelse buffer.len;
         const left = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", 0, left_end);
         const right = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", left_end, buffer.len);
         try std.testing.expectEqual(expected, left.matches + right.matches);
@@ -6413,8 +6046,8 @@ test "word-boundary byte ranges count boundary and final-line cases once" {
         "PM_RESUME\n" ++
         "split prefix PM_RESUME suffix\n" ++
         "no newline PM_RESUME";
-    const first_end = findOwnedLineBoundaryAfter(buffer, 1).?;
-    const second_end = findOwnedLineBoundaryAfter(buffer, first_end + 1).?;
+    const first_end = byte_shard.findOwnedLineBoundaryAfter(buffer, 1).?;
+    const second_end = byte_shard.findOwnedLineBoundaryAfter(buffer, first_end + 1).?;
     const first = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", 0, first_end);
     const second = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", first_end, second_end);
     const third = countWordBoundaryLiteralLogicalLinesRange(buffer, "PM_RESUME", second_end, buffer.len);
@@ -6513,6 +6146,24 @@ test "evidence frontier signatures are independent of discovery order" {
         try computeContentSignature(io, &forward),
         try computeContentSignature(io, &reversed),
     );
+}
+
+test "content signature changes for same-length same-path mutations" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "same-len.txt", .data = "absent\n" });
+    const file_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/same-len.txt", .{&tmp.sub_path});
+    const files = [_]DiscoveredFile{.{ .path = file_path }};
+    const before = try computeContentSignature(io, &files);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "same-len.txt", .data = "needle\n" });
+    const after = try computeContentSignature(io, &files);
+    try std.testing.expect(before != after);
 }
 
 test "evidence frontier prepare narrows active files and accounts cached prunes" {
@@ -6649,6 +6300,7 @@ test "search run consumes live warm postings and scans only candidate files" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -6760,6 +6412,7 @@ test "warm delta generation overlays parent postings without stale base matches"
     });
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -6855,6 +6508,7 @@ test "stats-only live warm postings return empty frontier without catalog scan" 
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -6891,6 +6545,7 @@ test "capped warm query hit cache reuses capped-first result" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -6933,6 +6588,7 @@ test "stats-only warm query cache reuses exact pinned-generation count" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -7034,6 +6690,7 @@ test "warm index preserves cold parity for source-bearing directory names" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -7066,6 +6723,7 @@ test "warm index falls back when root contains unindexed coverage directories" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -7099,6 +6757,7 @@ test "capped warm hit query uses stats cache for exact count and prefix scan" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -7144,6 +6803,7 @@ test "warm hit query seeds exact stats cache for stats-only reuse" {
     const index_dir = try testRootIndexDir(allocator, root_path);
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
     const live_marker = try testLiveMarker(allocator, root_path);
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -7163,34 +6823,6 @@ test "warm hit query seeds exact stats cache for stats-only reuse" {
     try std.testing.expectEqual(@as(usize, 3), stats_report.matches_found);
     try std.testing.expectEqual(@as(usize, 0), stats_report.files_scanned);
     try std.testing.expectEqual(@as(usize, 0), stats_report.hit_count);
-}
-
-test "protected Windows stats-only binary container skip stays scoped" {
-    var request = testSearchRequest("lit:needle", "C:\\Windows\\System32");
-    request.stats_only = true;
-
-    if (builtin.os.tag == .windows) {
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:/Windows/System32/catroot/example.cat"));
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\en-US\\shell32.dll.mui"));
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\catroot2\\edbtmp.log"));
-        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\DriverStore\\sample.inf"));
-        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\drivers\\etc\\hosts"));
-        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "E:\\repo\\fake.dll"));
-        request.stats_only = false;
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\en-US\\shell32.dll.mui"));
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\Globalization\\Sorting\\sortdefault.nls"));
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\Fonts\\arial.ttf"));
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\Fonts\\msgothic.ttc"));
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\Fonts\\cascadia.otf"));
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\Fonts\\vgaoem.fon"));
-        try std.testing.expect(shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\catroot2\\edbtmp.log"));
-        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\DriverStore\\sample.inf"));
-        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "E:\\repo\\arial.ttf"));
-    } else {
-        try std.testing.expect(!shouldSkipProtectedBinaryContainer(request, "C:\\Windows\\System32\\kernel32.dll"));
-    }
 }
 
 test "protected Windows stats-only roots allow parallel discovery under default ignore policy" {
@@ -7279,6 +6911,11 @@ fn testSearchReport(expression_source: []const u8, plan: expr.ExpressionPlan) Se
         .aggregate_ms = 0,
         .total_ms = 0,
         .scan_work_ms_total = 0,
+        .scan_open_ms_total = 0,
+        .scan_file_ms_total = 0,
+        .capture_scan_open_timing = false,
+        .capture_linux_dominant_attribution = false,
+        .capture_discovery_skip_bytes = false,
         .matcher_strategy_supported = plan.supportsLargeDirectoryStreamingSelector(),
         .outer_parallel_shard_safe = plan.supportsOuterParallelShardFastCount(),
         .uses_single_literal_counter = plan.usesSingleLiteralCounter(),

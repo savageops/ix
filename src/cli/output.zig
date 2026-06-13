@@ -13,6 +13,7 @@ pub fn writeHelp(writer: anytype, topic: cli.HelpTopic) !void {
         .matches => writeSearchHelp(writer, "Hit records only, same search engine", "matches"),
         .inspect => writeInspectHelp(writer),
         .explain => writeExplainHelp(writer),
+        .process => writeProcessHelp(writer),
     };
 }
 
@@ -27,6 +28,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  matches  Hit records only, same search engine
         \\  inspect  Read-only file windows and match context
         \\  explain  Expression plan JSON
+        \\  process  IX-owned state-dir process inspection and cleanup
         \\  help     Print this message or the help of the given subcommand(s)
         \\
         \\Options:
@@ -49,6 +51,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  matches prints hit records only, no terminal result sentinel
         \\  inspect grouped output prints ix.inspect.* sentinels and ix.next.v1 hints
         \\  inspect without file bounds uses a bounded first window
+        \\  agent shorthand: -n N means line numbers plus max N hits
         \\SNIPS
         \\  ix error src
         \\  ix -e timeout -e error src
@@ -100,6 +103,7 @@ fn writeSearchHelp(writer: anytype, summary: []const u8, command: []const u8) !v
         \\  zero-match search is status:"ok" with matches:0, not an error
         \\  ix matches emits hit records only, no terminal result sentinel
         \\  --json emits the structured SearchReport contract
+        \\  agent shorthand: -n N means line numbers plus max N hits
         \\
     , .{ summary, command });
 }
@@ -198,6 +202,26 @@ fn writeExplainHelp(writer: anytype) !void {
     );
 }
 
+fn writeProcessHelp(writer: anytype) !void {
+    try writer.writeAll(
+        \\IX-owned state-dir process inspection and cleanup
+        \\
+        \\Usage: ix.exe process [status|cleanup] [OPTIONS]
+        \\
+        \\Options:
+        \\      --json     Emit structured JSON
+        \\      --dry-run  Show cleanup actions without deleting stale markers
+        \\  -h, --help     Print help
+        \\
+        \\CONTRACT
+        \\  scans IX_STATE_DIR ownership surfaces under index/roots/*
+        \\  classifies index.live and indexd.heartbeat markers as live, stale, or malformed
+        \\  emits memory-limit warnings for live Windows workers above IX_INDEXD_MEMORY_LIMIT_MB
+        \\  cleanup deletes stale or malformed IX-owned markers only
+        \\
+    );
+}
+
 pub fn writeError(writer: anytype, code: []const u8, message: []const u8) !void {
     try writer.print("-- ix.error.v1 {{\"code\":\"{s}\",\"message\":\"{s}\"}} --\n", .{ code, message });
 }
@@ -285,7 +309,8 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
     try writer.print("\"linux_dominant_file\":{{\"target_class\":\"{s}\",\"min_bytes\":{},\"targeted_files_scanned\":{},\"targeted_bytes_scanned\":{},\"targeted_slowest_files\":{},\"targeted_slowest_bytes\":{},\"eligible_files\":{},\"activated_files\":{},\"bailout_files\":{},\"max_shard_threads\":{},\"max_range_count\":{},\"max_chunk_bytes\":{}}},", .{ report.stats.linux_dominant_file.target_class, report.stats.linux_dominant_file.min_bytes, report.stats.linux_dominant_file.targeted_files_scanned, report.stats.linux_dominant_file.targeted_bytes_scanned, report.stats.linux_dominant_file.targeted_slowest_files, report.stats.linux_dominant_file.targeted_slowest_bytes, report.stats.linux_dominant_file.eligible_files, report.stats.linux_dominant_file.activated_files, report.stats.linux_dominant_file.bailout_files, report.stats.linux_dominant_file.max_shard_threads, report.stats.linux_dominant_file.max_range_count, report.stats.linux_dominant_file.max_chunk_bytes });
     try writer.print("\"regex_decomposition\":{{\"eligible_files\":{},\"counted_files\":{},\"bailout_files\":{},\"candidate_lines_checked\":{},\"duplicate_candidate_hits_skipped\":{},\"candidate_lines_matched\":{}}},", .{ report.stats.regex_decomposition.eligible_files, report.stats.regex_decomposition.counted_files, report.stats.regex_decomposition.bailout_files, report.stats.regex_decomposition.candidate_lines_checked, report.stats.regex_decomposition.duplicate_candidate_hits_skipped, report.stats.regex_decomposition.candidate_lines_matched });
     try writer.writeAll("\"unicode_casefold_prefilter\":{\"full_scan_calls\":0,\"range_scan_calls\":0,\"candidate_prefix_hits\":0,\"candidate_windows_verified\":0,\"confirmed_matches\":0,\"rejected_candidates\":0,\"candidate_gap_bytes_total\":0,\"candidate_gap_samples\":0,\"max_prefix_variant_count\":0,\"max_prefix_len\":0,\"max_match_len\":0},");
-    try writer.writeAll("\"fast_count_density\":{\"literal_reject_fast_calls\":0,\"literal_reject_fast_bytes\":0,\"literal_range_calls\":0,\"literal_range_bytes\":0,\"literal_matches\":0,\"alternate_reject_fast_calls\":0,\"alternate_reject_fast_bytes\":0,\"alternate_full_scan_calls\":0,\"alternate_full_scan_bytes\":0,\"alternate_full_scan_matches\":0,\"alternate_range_calls\":0,\"alternate_range_bytes\":0,\"alternate_matches\":0,\"shard_merge_calls\":0,\"shard_merge_ranges\":0,\"shard_merge_matches\":0},");
+    try writeFastCountDensityJson(writer, report.stats.fast_count_density);
+    try writer.writeAll(",");
     try writer.print("\"byte_shard_kernel\":{{\"enabled\":{s},\"strategy\":\"{s}\",\"files_profiled\":{},\"range_calls\":{},\"line_aligned_ranges\":{},\"logical_range_bytes\":{},\"widened_range_bytes\":{},\"overlap_bytes\":{},\"boundary_verified_candidates\":{},\"boundary_rejected_candidates\":{},\"range_elapsed_ns_total\":{},\"max_range_elapsed_ns\":{},\"reduce_elapsed_ns_total\":{},\"max_reduce_elapsed_ns\":{},\"matches\":{}}},", .{ boolText(report.stats.byte_shard_kernel.enabled), report.stats.byte_shard_kernel.strategy, report.stats.byte_shard_kernel.files_profiled, report.stats.byte_shard_kernel.range_calls, report.stats.byte_shard_kernel.line_aligned_ranges, report.stats.byte_shard_kernel.logical_range_bytes, report.stats.byte_shard_kernel.widened_range_bytes, report.stats.byte_shard_kernel.overlap_bytes, report.stats.byte_shard_kernel.boundary_verified_candidates, report.stats.byte_shard_kernel.boundary_rejected_candidates, report.stats.byte_shard_kernel.range_elapsed_ns_total, report.stats.byte_shard_kernel.max_range_elapsed_ns, report.stats.byte_shard_kernel.reduce_elapsed_ns_total, report.stats.byte_shard_kernel.max_reduce_elapsed_ns, report.stats.byte_shard_kernel.matches });
     try writer.print("\"trigram_acceleration\":{{\"eligible\":{s},\"mode\":\"{s}\",\"mandatory_groups\":{},\"mandatory_trigrams\":{},\"candidate_files_checked\":{},\"pruned_files\":{},\"verified_files\":{},\"ineligible_files\":{}}},", .{ boolText(report.stats.trigram_acceleration.eligible), report.stats.trigram_acceleration.mode, report.stats.trigram_acceleration.mandatory_groups, report.stats.trigram_acceleration.mandatory_trigrams, report.stats.trigram_acceleration.candidate_files_checked, report.stats.trigram_acceleration.pruned_files, report.stats.trigram_acceleration.verified_files, report.stats.trigram_acceleration.ineligible_files });
     try writeCatalogIndexJson(writer, report.stats.catalog_index);
@@ -298,12 +323,12 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
     try writer.writeAll(",");
     try writeAdmissionJson(writer, report.stats.admission);
     try writer.writeAll(",");
-    try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ report.stats.timings.discover_ms, report.stats.timings.scan_ms, report.stats.timings.aggregate_ms, report.stats.timings.total_ms, report.stats.timings.scan_work_ms_total, report.stats.timings.aggregate_merge_ms, report.stats.timings.aggregate_finalize_ms });
+    try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"scan_open_ms_total\":{d},\"scan_file_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ report.stats.timings.discover_ms, report.stats.timings.scan_ms, report.stats.timings.aggregate_ms, report.stats.timings.total_ms, report.stats.timings.scan_work_ms_total, report.stats.timings.scan_open_ms_total, report.stats.timings.scan_file_ms_total, report.stats.timings.aggregate_merge_ms, report.stats.timings.aggregate_finalize_ms });
     try writer.print("\"concurrency\":{{\"available_threads\":{},\"outer_scan_threads\":{},\"execution_mode\":\"{s}\",\"sharding_enabled\":{s},\"sharded_files\":{},\"max_shard_threads\":{},\"max_shard_ranges\":{},\"max_shard_chunk_bytes\":{}}},", .{ report.stats.concurrency.available_threads, report.stats.concurrency.outer_scan_threads, report.stats.concurrency.execution_mode, boolText(report.stats.concurrency.sharding_enabled), report.stats.concurrency.sharded_files, report.stats.concurrency.max_shard_threads, report.stats.concurrency.max_shard_ranges, report.stats.concurrency.max_shard_chunk_bytes });
     try writer.writeAll("\"slowest_files\":[");
-    if (report.stats.slowest_file_count > 0) {
+    for (report.stats.slowest_files[0..report.stats.slowest_file_count], 0..) |slowest, index| {
+        if (index != 0) try writer.writeAll(",");
         try writer.writeAll("{\"path\":");
-        const slowest = report.stats.slowest_files[0];
         try writeJsonString(writer, slowest.path);
         try writer.print(",\"duration_ms\":{d},\"bytes\":{},\"linux_dominant_target\":{s}}}", .{ slowest.duration_ms, slowest.bytes, boolText(slowest.linux_dominant_target) });
     }
@@ -312,6 +337,33 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
 
 fn searchStatus(report: search.SearchReport) []const u8 {
     return if (report.stats.access_errors.total == 0) "ok" else "partial";
+}
+
+fn writeFastCountDensityJson(writer: anytype, stats: core_stats.FastCountDensityStats) !void {
+    try writer.print("\"fast_count_density\":{{\"literal_reject_fast_calls\":{},\"literal_reject_fast_bytes\":{},\"literal_range_calls\":{},\"literal_range_bytes\":{},\"literal_matches\":{},\"alternate_reject_fast_calls\":{},\"alternate_reject_fast_bytes\":{},\"alternate_full_scan_calls\":{},\"alternate_full_scan_bytes\":{},\"alternate_full_scan_matches\":{},\"alternate_range_calls\":{},\"alternate_range_bytes\":{},\"alternate_pcre_range_calls\":{},\"alternate_pcre_range_bytes\":{},\"alternate_teddy_range_calls\":{},\"alternate_teddy_range_bytes\":{},\"alternate_compiled_range_calls\":{},\"alternate_compiled_range_bytes\":{},\"alternate_matches\":{},\"shard_merge_calls\":{},\"shard_merge_ranges\":{},\"shard_merge_matches\":{}}}", .{
+        stats.literal_reject_fast_calls,
+        stats.literal_reject_fast_bytes,
+        stats.literal_range_calls,
+        stats.literal_range_bytes,
+        stats.literal_matches,
+        stats.alternate_reject_fast_calls,
+        stats.alternate_reject_fast_bytes,
+        stats.alternate_full_scan_calls,
+        stats.alternate_full_scan_bytes,
+        stats.alternate_full_scan_matches,
+        stats.alternate_range_calls,
+        stats.alternate_range_bytes,
+        stats.alternate_pcre_range_calls,
+        stats.alternate_pcre_range_bytes,
+        stats.alternate_teddy_range_calls,
+        stats.alternate_teddy_range_bytes,
+        stats.alternate_compiled_range_calls,
+        stats.alternate_compiled_range_bytes,
+        stats.alternate_matches,
+        stats.shard_merge_calls,
+        stats.shard_merge_ranges,
+        stats.shard_merge_matches,
+    });
 }
 
 fn writeAdmissionJson(writer: anytype, stats: core_stats.AdmissionStats) !void {
@@ -383,13 +435,18 @@ fn writePostingsIndexJson(writer: anytype, postings_index: core_stats.PostingsIn
     } else {
         try writer.writeAll("null");
     }
-    try writer.print(",\"trigram_count\":{},\"postings_count\":{},\"file_count\":{},\"candidate_files\":{},\"pruned_files\":{},\"verified_files\":{},\"fallback_reason\":", .{
+    try writer.print(",\"trigram_count\":{},\"postings_count\":{},\"file_count\":{},\"candidate_files\":{},\"pruned_files\":{},\"verified_files\":{},\"block_proof_enabled\":{s},\"block_count\":{},\"block_prune_candidate_blocks\":{},\"block_prune_candidate_postings\":{},\"block_prune_candidate_compressed_bytes\":{},\"fallback_reason\":", .{
         postings_index.trigram_count,
         postings_index.postings_count,
         postings_index.file_count,
         postings_index.candidate_files,
         postings_index.pruned_files,
         postings_index.verified_files,
+        boolText(postings_index.block_proof_enabled),
+        postings_index.block_count,
+        postings_index.block_prune_candidate_blocks,
+        postings_index.block_prune_candidate_postings,
+        postings_index.block_prune_candidate_compressed_bytes,
     });
     try writeJsonString(writer, postings_index.fallback_reason);
     try writer.writeAll("}");
@@ -683,6 +740,11 @@ test "matches json emits hit records only" {
         .aggregate_ms = 0,
         .total_ms = 0,
         .scan_work_ms_total = 0,
+        .scan_open_ms_total = 0,
+        .scan_file_ms_total = 0,
+        .capture_scan_open_timing = false,
+        .capture_linux_dominant_attribution = false,
+        .capture_discovery_skip_bytes = false,
         .matcher_strategy_supported = true,
         .outer_parallel_shard_safe = true,
         .uses_single_literal_counter = true,
@@ -732,6 +794,11 @@ test "search result sentinel includes agent-safe absolute hit paths" {
         .aggregate_ms = 0,
         .total_ms = 0,
         .scan_work_ms_total = 0,
+        .scan_open_ms_total = 0,
+        .scan_file_ms_total = 0,
+        .capture_scan_open_timing = false,
+        .capture_linux_dominant_attribution = false,
+        .capture_discovery_skip_bytes = false,
         .matcher_strategy_supported = true,
         .outer_parallel_shard_safe = true,
         .uses_single_literal_counter = true,
@@ -799,6 +866,86 @@ test "access error json exposes partial-search diagnostics" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"error\":\"AccessDenied\"") != null);
 }
 
+test "fast count density json exposes live counters" {
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeFastCountDensityJson(&writer, .{
+        .alternate_range_calls = 2,
+        .alternate_range_bytes = 4096,
+        .alternate_pcre_range_calls = 1,
+        .alternate_pcre_range_bytes = 2048,
+        .alternate_teddy_range_calls = 1,
+        .alternate_teddy_range_bytes = 2048,
+        .alternate_compiled_range_calls = 1,
+        .alternate_compiled_range_bytes = 2048,
+        .alternate_matches = 7,
+    });
+    const out = writer.buffered();
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"fast_count_density\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"alternate_range_calls\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"alternate_pcre_range_calls\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"alternate_teddy_range_calls\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"alternate_compiled_range_calls\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"alternate_matches\":7") != null);
+}
+
+test "search json emits bounded slowest file attribution list" {
+    var report = search.SearchReport{
+        .expression = "lit:needle",
+        .cwd = "C:/repo",
+        .input_roots = 1,
+        .effective_roots = 1,
+        .pruned_roots = 0,
+        .overlap_pruned_roots = 0,
+        .discovered_duplicate_paths = 0,
+        .collect_hits = false,
+        .stats = .{},
+        .bytes_scanned = 512,
+        .files_discovered = 2,
+        .files_scanned = 2,
+        .files_skipped = 0,
+        .matches_found = 0,
+        .truncated = false,
+        .slowest_path = "slow.h",
+        .slowest_bytes = 256,
+        .slowest_ms = 3.5,
+        .discover_ms = 0,
+        .scan_ms = 0,
+        .aggregate_ms = 0,
+        .total_ms = 0,
+        .scan_work_ms_total = 0,
+        .scan_open_ms_total = 0,
+        .scan_file_ms_total = 0,
+        .capture_scan_open_timing = false,
+        .capture_linux_dominant_attribution = false,
+        .capture_discovery_skip_bytes = false,
+        .matcher_strategy_supported = true,
+        .outer_parallel_shard_safe = true,
+        .uses_single_literal_counter = true,
+        .fast_count_range_overlap = null,
+        .available_threads = 1,
+        .outer_scan_threads = 1,
+        .hits = undefined,
+        .hit_count = 0,
+    };
+    report.stats.recordSlowFile("fast.h", 1.0, 128, false);
+    report.stats.recordSlowFile("slow.h", 3.5, 256, true);
+
+    var buffer: [16384]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeSearchJsonReport(&writer, report);
+    const out = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_open_ms_total\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_file_ms_total\"") != null);
+    const slow_index = std.mem.indexOf(u8, out, "\"path\":\"slow.h\"") orelse return error.MissingSlowFile;
+    const fast_index = std.mem.indexOf(u8, out, "\"path\":\"fast.h\"") orelse return error.MissingFastFile;
+
+    try std.testing.expect(slow_index < fast_index);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"targeted_slowest_files\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"targeted_slowest_bytes\":256") != null);
+}
+
 test "catalog index json exposes inactive default state" {
     var buffer: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
@@ -825,6 +972,11 @@ test "postings index json exposes candidate pruning counters" {
         .candidate_files = 2,
         .pruned_files = 9,
         .verified_files = 2,
+        .block_proof_enabled = true,
+        .block_count = 4,
+        .block_prune_candidate_blocks = 3,
+        .block_prune_candidate_postings = 12,
+        .block_prune_candidate_compressed_bytes = 6,
         .fallback_reason = "",
     });
     const out = writer.buffered();
@@ -835,6 +987,8 @@ test "postings index json exposes candidate pruning counters" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"candidate_files\":2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"pruned_files\":9") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"verified_files\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"block_proof_enabled\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"block_prune_candidate_blocks\":3") != null);
 }
 
 test "generation refresh json exposes epoch status and fallback" {

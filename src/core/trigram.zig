@@ -50,6 +50,8 @@ pub fn key(bytes: []const u8) Trigram {
 }
 
 pub fn admit(plan: expr.ExpressionPlan) Admission {
+    if (literalAlternatesAdmission(plan)) |admission| return admission;
+
     var admission = Admission{
         .mode = if (plan.mode == .any) .any else .all,
     };
@@ -76,12 +78,56 @@ pub fn admit(plan: expr.ExpressionPlan) Admission {
     return admission;
 }
 
+fn literalAlternatesAdmission(plan: expr.ExpressionPlan) ?Admission {
+    if (plan.predicate_count != 1) return null;
+
+    const predicate = plan.predicates[0];
+    if (predicate.kind != .regex) return null;
+    if (predicate.strategy != .regex_literal_alternates) return null;
+    if (std.mem.startsWith(u8, predicate.value, "(?i)")) return null;
+
+    const body = expr.literalAlternatesBody(predicate.value);
+    var admission = Admission{
+        .eligible = true,
+        .mode = .any,
+    };
+
+    var branch_start: usize = 0;
+    var index: usize = 0;
+    while (index <= body.len) : (index += 1) {
+        if (index < body.len) {
+            if (body[index] == '\\') {
+                index += 1;
+                continue;
+            }
+            if (body[index] != '|') continue;
+        }
+
+        if (admission.group_count == admission.groups.len) return null;
+        const evidence = evidenceForLiteralAlternateBranch(body[branch_start..index], admission.group_count);
+        if (evidence.trigram_count == 0) return null;
+        admission.groups[admission.group_count] = evidence;
+        admission.group_count += 1;
+        branch_start = index + 1;
+    }
+
+    if (admission.group_count == 0) return null;
+    admission.reason = .none;
+    return admission;
+}
+
 fn evidenceForPredicate(predicate: expr.Predicate, source_index: usize) PredicateEvidence {
     var evidence = PredicateEvidence{ .source_index = source_index };
     switch (predicate.kind) {
         .literal, .prefix, .suffix => appendTrigramsFromLiteral(&evidence, predicate.value),
         .regex => appendTrigramsFromRegex(&evidence, predicate.value),
     }
+    return evidence;
+}
+
+fn evidenceForLiteralAlternateBranch(branch: []const u8, source_index: usize) PredicateEvidence {
+    var evidence = PredicateEvidence{ .source_index = source_index };
+    appendTrigramsFromLiteralAlternateBranch(&evidence, branch);
     return evidence;
 }
 
@@ -104,6 +150,45 @@ fn appendTrigramsFromRegex(evidence: *PredicateEvidence, pattern: []const u8) vo
     }
 
     appendMandatoryRegexPrefix(evidence, body);
+}
+
+fn appendTrigramsFromLiteralAlternateBranch(evidence: *PredicateEvidence, branch: []const u8) void {
+    var decoded_len: usize = 0;
+    var last: [2]u8 = undefined;
+    var index: usize = 0;
+
+    while (index < branch.len) : (index += 1) {
+        var byte = branch[index];
+        if (byte == '\\') {
+            index += 1;
+            if (index >= branch.len) return;
+            byte = branch[index];
+            switch (byte) {
+                'b', 'B', 'd', 'D', 's', 'S', 'w', 'W', 'x', 'u', 'p', 'P' => return,
+                else => {},
+            }
+        } else if (isRegexMeta(byte)) {
+            return;
+        }
+
+        if (decoded_len >= 2) {
+            appendUnique(evidence, key(&.{ last[0], last[1], byte }));
+        }
+
+        if (decoded_len == 0) {
+            last[0] = byte;
+        } else if (decoded_len == 1) {
+            last[1] = byte;
+        } else {
+            last[0] = last[1];
+            last[1] = byte;
+        }
+        decoded_len += 1;
+    }
+
+    if (decoded_len < 3) {
+        evidence.trigram_count = 0;
+    }
 }
 
 fn appendMandatoryRegexPrefix(evidence: *PredicateEvidence, pattern: []const u8) void {
@@ -254,6 +339,30 @@ test "casefold regex is verifier-only until folded byte semantics are explicit" 
     const plan = try expr.parse("re:(?i)sherlock");
     const admission = admit(plan);
 
+    try std.testing.expect(!admission.eligible);
+    try std.testing.expectEqual(IneligibleReason.no_mandatory_trigram, admission.reason);
+}
+
+test "literal alternates admission lowers each branch as any-mode evidence" {
+    const plan = try expr.parse("re:(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)");
+    const admission = admit(plan);
+
+    try std.testing.expect(admission.eligible);
+    try std.testing.expectEqual(AdmissionMode.any, admission.mode);
+    try std.testing.expectEqual(@as(usize, 4), admission.group_count);
+    try std.testing.expect(admission.groups[0].contains(key("ERR")));
+    try std.testing.expect(admission.groups[1].contains(key("PME")));
+    try std.testing.expect(admission.groups[2].contains(key("LIN")));
+    try std.testing.expect(admission.groups[3].contains(key("CFG")));
+}
+
+test "literal alternates admission rejects short or regexy branches" {
+    try std.testing.expect(!admit(try expr.parse("re:(ab|cde)")).eligible);
+    try std.testing.expect(!admit(try expr.parse("re:(abc|de\\w)")).eligible);
+}
+
+test "literal alternates admission fails closed for case-insensitive alternates" {
+    const admission = admit(try expr.parse("re:(?i)(alpha|beta)"));
     try std.testing.expect(!admission.eligible);
     try std.testing.expectEqual(IneligibleReason.no_mandatory_trigram, admission.reason);
 }

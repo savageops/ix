@@ -9,6 +9,7 @@ pub const CommandTag = enum {
     matches,
     inspect,
     explain,
+    process,
     nexus,
     indexd,
 };
@@ -19,6 +20,7 @@ pub const HelpTopic = enum {
     matches,
     inspect,
     explain,
+    process,
 };
 
 pub const SearchRequest = struct {
@@ -82,12 +84,24 @@ pub const IndexdRequest = struct {
     repair: bool,
 };
 
+pub const ProcessAction = enum {
+    status,
+    cleanup,
+};
+
+pub const ProcessRequest = struct {
+    action: ProcessAction,
+    json: bool,
+    dry_run: bool,
+};
+
 pub const Command = union(CommandTag) {
     help: HelpTopic,
     search: SearchRequest,
     matches: SearchRequest,
     inspect: InspectRequest,
     explain: ExplainRequest,
+    process: ProcessRequest,
     nexus: SearchRequest,
     indexd: IndexdRequest,
 };
@@ -131,6 +145,10 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
         if (argv.len < 3) return ParseError.MissingExpression;
         return .{ .command = .{ .explain = .{ .expression = argv[2] } } };
     }
+    if (std.mem.eql(u8, first, "process")) {
+        if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .process } };
+        return .{ .command = .{ .process = try parseProcess(argv[2..]) } };
+    }
     if (std.mem.eql(u8, first, "__ix_nexus")) {
         var request = try parseSearch(argv[2..]);
         request.stats_only = true;
@@ -154,7 +172,36 @@ fn helpTopic(arg: []const u8) ?HelpTopic {
     if (std.mem.eql(u8, arg, "matches")) return .matches;
     if (std.mem.eql(u8, arg, "inspect")) return .inspect;
     if (std.mem.eql(u8, arg, "explain")) return .explain;
+    if (std.mem.eql(u8, arg, "process")) return .process;
     return null;
+}
+
+fn parseProcess(args: []const []const u8) ParseError!ProcessRequest {
+    var request = ProcessRequest{
+        .action = .status,
+        .json = false,
+        .dry_run = false,
+    };
+    var action_seen = false;
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "status")) {
+            request.action = .status;
+            action_seen = true;
+        } else if (std.mem.eql(u8, arg, "cleanup")) {
+            request.action = .cleanup;
+            action_seen = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            request.json = true;
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            request.dry_run = true;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return ParseError.UnsupportedFlag;
+        } else {
+            return ParseError.MissingValue;
+        }
+    }
+    if (!action_seen and args.len != 0) return ParseError.MissingValue;
+    return request;
 }
 
 fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
@@ -180,7 +227,9 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
             if (index >= args.len) return ParseError.MissingValue;
             request.no_ignore = false;
             try pushIgnoreFile(&request, args[index]);
-        } else if (std.mem.eql(u8, arg, "--line-number") or std.mem.eql(u8, arg, "-n")) request.line_numbers = true else if (std.mem.eql(u8, arg, "--fixed-strings") or std.mem.eql(u8, arg, "-F")) request.fixed_strings = true else if (std.mem.eql(u8, arg, "--ignore-case") or std.mem.eql(u8, arg, "-i")) request.case_insensitive = true else if (std.mem.eql(u8, arg, "--follow-symlinks")) request.follow_symlinks = true else if (std.mem.eql(u8, arg, "--max-hits")) {
+        } else if (std.mem.eql(u8, arg, "--line-number") or std.mem.eql(u8, arg, "-n")) {
+            try parseLineNumberLimit(args, &index, &request);
+        } else if (std.mem.eql(u8, arg, "--fixed-strings") or std.mem.eql(u8, arg, "-F")) request.fixed_strings = true else if (std.mem.eql(u8, arg, "--ignore-case") or std.mem.eql(u8, arg, "-i")) request.case_insensitive = true else if (std.mem.eql(u8, arg, "--follow-symlinks")) request.follow_symlinks = true else if (std.mem.eql(u8, arg, "--max-hits")) {
             index += 1;
             if (index >= args.len) return ParseError.MissingValue;
             request.max_hits = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
@@ -258,6 +307,22 @@ fn pushIgnoreFile(request: *SearchRequest, path: []const u8) ParseError!void {
     if (request.ignore_file_count >= MAX_IGNORE_FILES) return ParseError.MissingValue;
     request.ignore_files[request.ignore_file_count] = path;
     request.ignore_file_count += 1;
+}
+
+fn parseLineNumberLimit(args: []const []const u8, index: *usize, request: *SearchRequest) ParseError!void {
+    request.line_numbers = true;
+    const next_index = index.* + 1;
+    if (next_index >= args.len or request.max_hits != null or !isUnsignedDecimal(args[next_index])) return;
+    request.max_hits = std.fmt.parseInt(usize, args[next_index], 10) catch return ParseError.MissingValue;
+    index.* = next_index;
+}
+
+fn isUnsignedDecimal(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| {
+        if (byte < '0' or byte > '9') return false;
+    }
+    return true;
 }
 
 fn parseInspect(args: []const []const u8) ParseError!InspectRequest {
@@ -420,7 +485,7 @@ fn parseCompatSearch(allocator: std.mem.Allocator, args: []const []const u8) !Se
             request.no_ignore = false;
             try pushIgnoreFile(&request, args[index]);
         } else if (std.mem.eql(u8, arg, "--line-number") or std.mem.eql(u8, arg, "-n")) {
-            request.line_numbers = true;
+            try parseLineNumberLimit(args, &index, &request);
         } else if (std.mem.eql(u8, arg, "--fixed-strings") or std.mem.eql(u8, arg, "-F")) {
             request.fixed_strings = true;
         } else if (std.mem.eql(u8, arg, "--ignore-case") or std.mem.eql(u8, arg, "-i")) {
@@ -568,6 +633,24 @@ test "search defaults preserve explicit no-ignore discovery" {
     try std.testing.expect(!request.hidden);
 }
 
+test "search accepts agent line-number limit shorthand without treating the number as a path" {
+    const argv = [_][]const u8{
+        "ix-zig",
+        "search",
+        "lit:needle",
+        "src",
+        "-n",
+        "80",
+    };
+    const invocation = try parseInvocation(std.testing.allocator, &argv);
+    try std.testing.expect(invocation.command == .search);
+    const request = invocation.command.search;
+    try std.testing.expect(request.line_numbers);
+    try std.testing.expectEqual(@as(?usize, 80), request.max_hits);
+    try std.testing.expectEqual(@as(usize, 1), request.path_count);
+    try std.testing.expectEqualStrings("src", request.paths[0]);
+}
+
 test "compat admission flags preserve rg-shaped entrypoint" {
     const argv = [_][]const u8{
         "ix-zig",
@@ -598,6 +681,24 @@ test "compat defaults preserve explicit no-ignore discovery" {
     defer std.testing.allocator.free(request.expression);
     try std.testing.expect(request.no_ignore);
     try std.testing.expect(!request.hidden);
+}
+
+test "compat search accepts agent line-number limit shorthand without treating the number as a path" {
+    const argv = [_][]const u8{
+        "ix-zig",
+        "needle",
+        "src",
+        "-n",
+        "80",
+    };
+    const invocation = try parseInvocation(std.testing.allocator, &argv);
+    try std.testing.expect(invocation.command == .search);
+    const request = invocation.command.search;
+    defer std.testing.allocator.free(request.expression);
+    try std.testing.expect(request.line_numbers);
+    try std.testing.expectEqual(@as(?usize, 80), request.max_hits);
+    try std.testing.expectEqual(@as(usize, 1), request.path_count);
+    try std.testing.expectEqualStrings("src", request.paths[0]);
 }
 
 test "hidden indexd command parses without public command exposure" {
@@ -634,4 +735,28 @@ test "hidden indexd command rejects unsupported lifecycle flags and duplicate ro
         "src",
     };
     try std.testing.expectError(ParseError.MissingValue, parseInvocation(std.testing.allocator, &duplicate_root));
+}
+
+test "process command parses status and cleanup flags" {
+    const status_argv = [_][]const u8{
+        "ix-zig",
+        "process",
+        "status",
+        "--json",
+    };
+    const status_invocation = try parseInvocation(std.testing.allocator, &status_argv);
+    try std.testing.expect(status_invocation.command == .process);
+    try std.testing.expectEqual(.status, status_invocation.command.process.action);
+    try std.testing.expect(status_invocation.command.process.json);
+
+    const cleanup_argv = [_][]const u8{
+        "ix-zig",
+        "process",
+        "cleanup",
+        "--dry-run",
+    };
+    const cleanup_invocation = try parseInvocation(std.testing.allocator, &cleanup_argv);
+    try std.testing.expect(cleanup_invocation.command == .process);
+    try std.testing.expectEqual(.cleanup, cleanup_invocation.command.process.action);
+    try std.testing.expect(cleanup_invocation.command.process.dry_run);
 }

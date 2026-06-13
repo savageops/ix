@@ -259,7 +259,7 @@ fn classifyRegex(pattern: []const u8) MatcherStrategy {
     if (isWordBoundaryLiteral(body)) {
         return if (casefold) .regex_ascii_casefold_word_boundary_literal else .regex_word_boundary_literal;
     }
-    if (!casefold and isTopLevelLiteralAlternates(literalAlternatesBody(body))) return .regex_literal_alternates;
+    if (isTopLevelLiteralAlternates(literalAlternatesBody(body))) return .regex_literal_alternates;
     if (isPlainLiteralRegex(body)) {
         return if (casefold) .regex_ascii_casefold_literal else .regex_plain_literal;
     }
@@ -486,7 +486,8 @@ test "regex literal alternates may be wrapped in one full pattern group" {
     try std.testing.expectEqual(MatcherStrategy.regex_full, partial.predicates[0].strategy);
 
     const casefold = try parse("re:(?i)alpha|beta");
-    try std.testing.expectEqual(MatcherStrategy.regex_full, casefold.predicates[0].strategy);
+    try std.testing.expectEqual(MatcherStrategy.regex_literal_alternates, casefold.predicates[0].strategy);
+    try std.testing.expectEqualStrings("alpha|beta", literalAlternatesBody(casefold.predicates[0].value));
 }
 
 test "parser trims source and splits rust-style boolean tokens" {

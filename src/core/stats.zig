@@ -6,6 +6,8 @@ pub const PhaseTimings = struct {
     aggregate_ms: f64 = 0,
     total_ms: f64 = 0,
     scan_work_ms_total: f64 = 0,
+    scan_open_ms_total: f64 = 0,
+    scan_file_ms_total: f64 = 0,
     aggregate_merge_ms: f64 = 0,
     aggregate_finalize_ms: f64 = 0,
 };
@@ -91,6 +93,12 @@ pub const FastCountDensityStats = struct {
     alternate_full_scan_matches: usize = 0,
     alternate_range_calls: usize = 0,
     alternate_range_bytes: usize = 0,
+    alternate_pcre_range_calls: usize = 0,
+    alternate_pcre_range_bytes: usize = 0,
+    alternate_teddy_range_calls: usize = 0,
+    alternate_teddy_range_bytes: usize = 0,
+    alternate_compiled_range_calls: usize = 0,
+    alternate_compiled_range_bytes: usize = 0,
     alternate_matches: usize = 0,
     shard_merge_calls: usize = 0,
     shard_merge_ranges: usize = 0,
@@ -145,6 +153,11 @@ pub const PostingsIndexStats = struct {
     candidate_files: usize = 0,
     pruned_files: usize = 0,
     verified_files: usize = 0,
+    block_proof_enabled: bool = false,
+    block_count: usize = 0,
+    block_prune_candidate_blocks: usize = 0,
+    block_prune_candidate_postings: usize = 0,
+    block_prune_candidate_compressed_bytes: usize = 0,
     fallback_reason: []const u8 = "not_wired",
 };
 
@@ -358,16 +371,37 @@ pub const SearchStats = struct {
     slowest_file_count: usize = 0,
 
     pub fn recordSlowFile(self: *SearchStats, path: []const u8, duration_ms: f64, bytes: usize, linux_dominant_target: bool) void {
-        self.slowest_files[0] = .{
+        if (path.len == 0 and bytes == 0) return;
+        const entry: SlowFileStat = .{
             .path = path,
             .duration_ms = duration_ms,
             .bytes = bytes,
             .linux_dominant_target = linux_dominant_target,
         };
-        self.slowest_file_count = if (path.len == 0 and bytes == 0) 0 else 1;
-        if (linux_dominant_target) {
-            self.linux_dominant_file.targeted_slowest_files = 1;
-            self.linux_dominant_file.targeted_slowest_bytes = bytes;
+        const cap = self.slowest_files.len;
+        var insert_at = self.slowest_file_count;
+        var index: usize = 0;
+        while (index < self.slowest_file_count) : (index += 1) {
+            if (duration_ms >= self.slowest_files[index].duration_ms) {
+                insert_at = index;
+                break;
+            }
+        }
+        if (insert_at >= cap) return;
+        const new_count = @min(self.slowest_file_count + 1, cap);
+        var move_index = new_count - 1;
+        while (move_index > insert_at) : (move_index -= 1) {
+            self.slowest_files[move_index] = self.slowest_files[move_index - 1];
+        }
+        self.slowest_files[insert_at] = entry;
+        self.slowest_file_count = new_count;
+
+        self.linux_dominant_file.targeted_slowest_files = 0;
+        self.linux_dominant_file.targeted_slowest_bytes = 0;
+        for (self.slowest_files[0..self.slowest_file_count]) |slow| {
+            if (!slow.linux_dominant_target) continue;
+            self.linux_dominant_file.targeted_slowest_files += 1;
+            self.linux_dominant_file.targeted_slowest_bytes += slow.bytes;
         }
     }
 };
@@ -417,6 +451,8 @@ test "warm performance gates reject regressions and incomplete benchmark matrice
 test "search stats owns rust-compatible top-level schema defaults" {
     var snapshot = SearchStats{};
     snapshot.recordSlowFile("fixture.txt", 1.25, 42, false);
+    snapshot.recordSlowFile("slower.txt", 2.5, 84, true);
+    snapshot.recordSlowFile("fast.txt", 0.5, 21, false);
     try std.testing.expectEqual(@as(usize, 1), snapshot.concurrency.available_threads);
     try std.testing.expectEqualStrings("materialized", snapshot.concurrency.execution_mode);
     try std.testing.expectEqualStrings("linux_amd_asic_reg_giant_header", snapshot.linux_dominant_file.target_class);
@@ -427,7 +463,11 @@ test "search stats owns rust-compatible top-level schema defaults" {
     try std.testing.expect(!snapshot.generation_refresh.enabled);
     try std.testing.expectEqualStrings("not_wired", snapshot.generation_refresh.refresh_status);
     try std.testing.expectEqualStrings("not_wired", snapshot.generation_refresh.fallback_reason);
-    try std.testing.expectEqual(@as(usize, 1), snapshot.slowest_file_count);
+    try std.testing.expectEqual(@as(usize, 3), snapshot.slowest_file_count);
+    try std.testing.expectEqualStrings("slower.txt", snapshot.slowest_files[0].path);
+    try std.testing.expectEqualStrings("fixture.txt", snapshot.slowest_files[1].path);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.linux_dominant_file.targeted_slowest_files);
+    try std.testing.expectEqual(@as(usize, 84), snapshot.linux_dominant_file.targeted_slowest_bytes);
     try std.testing.expect(!snapshot.admission.enabled);
 }
 

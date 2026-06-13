@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { classifyHotspot, computeRatio, computeSpeedupPct, summarizeSeries } from "./metrics.mjs";
+import { pairOrderSummary } from "./speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports");
@@ -17,6 +18,8 @@ const REPORT_FILESETS = {
   [DEFAULT_SCENARIO_ID]: {
     liveJsonl: path.join(REPORT_DIR, "live-metrics.jsonl"),
     latestJson: path.join(REPORT_DIR, "latest.json"),
+    registryJsonl: path.join(REPORT_DIR, "benchmark-registry.jsonl"),
+    registryLatestJson: path.join(REPORT_DIR, "benchmark-registry.latest.json"),
   },
 };
 
@@ -285,8 +288,58 @@ function topCpuProcessSnapshot() {
   return processSnapshot("CPU");
 }
 
+function activeCpuProcessSnapshot(sampleMs = 750) {
+  if (process.platform !== "win32") return [];
+  const json = safeCommand("powershell", [
+    "-NoProfile",
+    "-Command",
+    [
+      "$sampleMs = " + String(sampleMs),
+      "$before = @{}",
+      "Get-Process | ForEach-Object { if ($null -ne $_.CPU) { $before[$_.Id] = $_.CPU } }",
+      "Start-Sleep -Milliseconds $sampleMs",
+      "$rows = Get-Process | ForEach-Object {",
+      "  $prev = $before[$_.Id]",
+      "  if ($null -ne $prev -and $null -ne $_.CPU) {",
+      "    [pscustomobject]@{",
+      "      Id = $_.Id",
+      "      ProcessName = $_.ProcessName",
+      "      CpuDeltaSec = [Math]::Round(($_.CPU - $prev), 6)",
+      "      WorkingSet64 = $_.WorkingSet64",
+      "    }",
+      "  }",
+      "}",
+      "$rows | Sort-Object CpuDeltaSec -Descending | Select-Object -First 12 | ConvertTo-Json -Compress",
+    ].join("; "),
+  ]);
+  if (!json) return [];
+  try {
+    const parsed = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return [];
+  }
+}
+
+function elevationSnapshot() {
+  if (process.platform !== "win32") return { checked: false, isAdmin: null, reason: "non-windows" };
+  const output = safeCommand("powershell", [
+    "-NoProfile",
+    "-Command",
+    [
+      "$identity = [Security.Principal.WindowsIdentity]::GetCurrent()",
+      "$principal = [Security.Principal.WindowsPrincipal]::new($identity)",
+      "$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
+    ].join("; "),
+  ]);
+  if (output === "True") return { checked: true, isAdmin: true, reason: null };
+  if (output === "False") return { checked: true, isAdmin: false, reason: null };
+  return { checked: false, isAdmin: null, reason: "powershell_admin_check_failed" };
+}
+
 function classifyHostForBenchmark(snapshot) {
   const issues = [];
+  const activeCpuMinSec = 0.05;
   const powerName = snapshot.powerScheme?.name?.toLowerCase?.() ?? "";
   if (process.platform === "win32" && powerName && !powerName.includes("performance")) {
     issues.push({
@@ -298,9 +351,23 @@ function classifyHostForBenchmark(snapshot) {
   const topNames = new Set((snapshot.topProcessesByWorkingSet ?? []).map((entry) => String(entry.ProcessName ?? "").toLowerCase()));
   if (topNames.has("msmpeng")) {
     issues.push({
-      id: "defender_active_in_top_working_set",
-      severity: "warning",
+      id: "defender_resident_in_top_working_set",
+      severity: "info",
       detail: "MsMpEng appeared among top working-set processes",
+    });
+  }
+  const activeCpu = snapshot.activeCpuProcesses ?? [];
+  const activeDefender = activeCpu.find((entry) =>
+    String(entry.ProcessName ?? "").toLowerCase() === "msmpeng" &&
+    Number(entry.CpuDeltaSec ?? 0) >= activeCpuMinSec
+  );
+  if (activeDefender) {
+    issues.push({
+      id: "defender_active_cpu_sample",
+      severity: "warning",
+      detail: `MsMpEng used ${activeDefender.CpuDeltaSec}s CPU during host preflight sample`,
+      sampleMs: snapshot.activeCpuSampleMs,
+      cpuDeltaSec: activeDefender.CpuDeltaSec,
     });
   }
   const browserOrAgentCount = [...topNames].filter((name) => name === "chrome" || name === "codex").length;
@@ -348,8 +415,11 @@ export function hostSnapshot() {
       speedMeanMhz: cpuSpeeds.length ? Math.round(cpuSpeeds.reduce((sum, speed) => sum + speed, 0) / cpuSpeeds.length) : null,
     },
     powerScheme,
+    elevation: elevationSnapshot(),
     topProcessesByWorkingSet: topProcessSnapshot(),
     topProcessesByCpu: topCpuProcessSnapshot(),
+    activeCpuSampleMs: 750,
+    activeCpuProcesses: activeCpuProcessSnapshot(750),
   };
   snapshot.benchmarkEnvironment = classifyHostForBenchmark(snapshot);
   return snapshot;
@@ -377,6 +447,7 @@ function measureIxSearch(binaryPath, context, measureOptions) {
       report,
       engineMs,
       cliMs: result.durationMs,
+      phaseMs: extractPhaseMs(report),
       sampleIndex: i,
     });
   }
@@ -401,9 +472,23 @@ function measureIxSearch(binaryPath, context, measureOptions) {
     processOverheadMs: Math.max(0, selected.cliMs - selected.engineMs),
     sampleDurationsMs: cliSamples,
     engineSampleDurationsMs: engineSamples,
+    phaseSampleDurationsMs: summarizePhaseSamples(byEngine),
+    processOverheadSampleDurationsMs: summarizeProcessOverheadSamples(byEngine),
     sampleSummary: sampleSummary(cliSamples),
     engineSampleSummary: sampleSummary(engineSamples),
     timingSource: selected.report?.stats?.timings?.total_ms ? "engine_total_ms" : "wall_clock_ms",
+  };
+}
+
+function extractPhaseMs(report) {
+  const timings = report?.stats?.timings ?? {};
+  return {
+    discover: Number(timings.discover_ms ?? 0),
+    scan: Number(timings.scan_ms ?? 0),
+    aggregate: Number(timings.aggregate_ms ?? 0),
+    scanOpen: Number(timings.scan_open_ms_total ?? 0),
+    scanFile: Number(timings.scan_file_ms_total ?? 0),
+    total: Number(timings.total_ms ?? 0),
   };
 }
 
@@ -418,8 +503,33 @@ function measuredIxEntry(binaryPath, args, result, sampleIndex) {
     report,
     engineMs,
     cliMs: result.durationMs,
+    phaseMs: extractPhaseMs(report),
     sampleIndex,
   };
+}
+
+function summarizePhaseSamples(runsByEngine) {
+  const phases = {
+    discover: [],
+    scan: [],
+    aggregate: [],
+    scanOpen: [],
+    scanFile: [],
+    total: [],
+  };
+  for (const run of runsByEngine) {
+    phases.discover.push(run.phaseMs.discover);
+    phases.scan.push(run.phaseMs.scan);
+    phases.aggregate.push(run.phaseMs.aggregate);
+    phases.scanOpen.push(run.phaseMs.scanOpen);
+    phases.scanFile.push(run.phaseMs.scanFile);
+    phases.total.push(run.phaseMs.total);
+  }
+  return phases;
+}
+
+function summarizeProcessOverheadSamples(runsByEngine) {
+  return runsByEngine.map((run) => Math.max(0, run.cliMs - run.engineMs));
 }
 
 function summarizeIxEntries(binaryPath, args, measuredRuns) {
@@ -443,6 +553,8 @@ function summarizeIxEntries(binaryPath, args, measuredRuns) {
     processOverheadMs: Math.max(0, selected.cliMs - selected.engineMs),
     sampleDurationsMs: cliSamples,
     engineSampleDurationsMs: engineSamples,
+    phaseSampleDurationsMs: summarizePhaseSamples(byEngine),
+    processOverheadSampleDurationsMs: summarizeProcessOverheadSamples(byEngine),
     sampleSummary: sampleSummary(cliSamples),
     engineSampleSummary: sampleSummary(engineSamples),
     timingSource: selected.report?.stats?.timings?.total_ms ? "engine_total_ms" : "wall_clock_ms",
@@ -482,6 +594,7 @@ function measurePairedIxSearch(currentBinaryPath, previousBinaryPath, context, m
     pairing: {
       mode: "interleaved_current_previous",
       pairOrder,
+      pairOrderSummary: pairOrderSummary(pairOrder, { firstLabel: "current", secondLabel: "previous" }),
     },
   };
 }
@@ -856,6 +969,8 @@ function ixMeasurementToCompetitor(measured, { label, kind, pairing }) {
     processOverheadMs: measured.processOverheadMs,
     sampleDurationsMs: measured.sampleDurationsMs,
     engineSampleDurationsMs: measured.engineSampleDurationsMs,
+    phaseSampleDurationsMs: measured.phaseSampleDurationsMs,
+    processOverheadSampleDurationsMs: measured.processOverheadSampleDurationsMs,
     sampleSummary: measured.sampleSummary,
     engineSampleSummary: measured.engineSampleSummary,
     status: measured.result.status,
@@ -1188,12 +1303,15 @@ export function runOneBenchmark(options = {}) {
     ixBinaryPath: ixBin,
     ixBinaryIdentity,
     previousIxBinaryPath: competitors?.iex_previous?.binaryPath ?? null,
+    previousIxBinaryIdentity,
     previousIxSourceRelation: compareBinaryIdentities(ixBinaryIdentity, previousIxBinaryIdentity),
     iexMs: ixEngineMs,
     iexCliMs: ixMeasurement.cliMs,
     iexProcessOverheadMs: ixMeasurement.processOverheadMs,
     iexSampleDurationsMs: ixMeasurement.sampleDurationsMs,
     iexEngineSampleDurationsMs: ixMeasurement.engineSampleDurationsMs,
+    iexPhaseSampleDurationsMs: ixMeasurement.phaseSampleDurationsMs,
+    iexProcessOverheadSampleDurationsMs: ixMeasurement.processOverheadSampleDurationsMs,
     iexSampleSummary: ixMeasurement.sampleSummary,
     iexEngineSampleSummary: ixMeasurement.engineSampleSummary,
     rgMs,
@@ -1215,6 +1333,9 @@ export function runOneBenchmark(options = {}) {
     linuxStrategy: ixReport?.stats?.linux_strategy ?? {},
     linuxDominantFile: ixReport?.stats?.linux_dominant_file ?? {},
     regexDecomposition: ixReport?.stats?.regex_decomposition ?? {},
+    fastCountDensity: ixReport?.stats?.fast_count_density ?? {},
+    byteShardKernel: ixReport?.stats?.byte_shard_kernel ?? {},
+    trigramAcceleration: ixReport?.stats?.trigram_acceleration ?? {},
     fallbackLineScan: ixReport?.stats?.fallback_line_scan ?? {},
     matchCount: ixReport?.stats?.matches_found ?? 0,
     filesScanned: ixReport?.stats?.files_scanned ?? 0,
@@ -1230,6 +1351,8 @@ export function runOneBenchmark(options = {}) {
     mkdirSync(REPORT_DIR, { recursive: true });
     appendFileSync(reportPaths.liveJsonl, `${JSON.stringify(run)}\n`, "utf8");
     writeFileSync(reportPaths.latestJson, JSON.stringify(run, null, 2), "utf8");
+    appendFileSync(reportPaths.registryJsonl, `${JSON.stringify(run)}\n`, "utf8");
+    writeFileSync(reportPaths.registryLatestJson, JSON.stringify(run, null, 2), "utf8");
   }
 
   return run;

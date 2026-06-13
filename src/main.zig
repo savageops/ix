@@ -5,6 +5,7 @@ const output = @import("cli/output.zig");
 const expr = @import("core/expr.zig");
 const indexd = @import("core/indexd.zig");
 const inspect = @import("core/inspect.zig");
+const process_tool = @import("core/process_tool.zig");
 const search = @import("core/search.zig");
 
 const NEXUS_MIN_BUILD_FRONTIER_FILES: usize = 4096;
@@ -13,7 +14,12 @@ test {
     _ = @import("core/trigram.zig");
     _ = @import("core/corpus.zig");
     _ = @import("core/catalog.zig");
+    _ = @import("core/byte_shard.zig");
+    _ = @import("core/discovered_files.zig");
     _ = @import("core/postings.zig");
+    _ = @import("core/literal_alternates.zig");
+    _ = @import("core/process_tool.zig");
+    _ = @import("core/protected_paths.zig");
     _ = @import("core/indexd.zig");
     _ = @import("core/generation.zig");
     _ = @import("core/usn.zig");
@@ -179,6 +185,22 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             try output.writeExplain(stdout, plan);
+        },
+        .process => |request| {
+            const report = process_tool.run(init.io, allocator, .{
+                .action = switch (request.action) {
+                    .status => .status,
+                    .cleanup => .cleanup,
+                },
+                .json = request.json,
+                .dry_run = request.dry_run,
+            }) catch |err| {
+                try output.writeError(stderr, "process_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            defer report.deinit(allocator);
+            try process_tool.writeReport(stdout, report, request.json);
         },
         .nexus => |request| {
             const effective_request = request;
@@ -511,6 +533,11 @@ fn testSearchReportForSidecar(pruned_files: usize) search.SearchReport {
         .aggregate_ms = 0,
         .total_ms = 0,
         .scan_work_ms_total = 0,
+        .scan_open_ms_total = 0,
+        .scan_file_ms_total = 0,
+        .capture_scan_open_timing = false,
+        .capture_linux_dominant_attribution = false,
+        .capture_discovery_skip_bytes = false,
         .matcher_strategy_supported = false,
         .outer_parallel_shard_safe = false,
         .uses_single_literal_counter = false,

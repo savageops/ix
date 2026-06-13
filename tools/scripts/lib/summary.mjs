@@ -15,7 +15,6 @@ function asNumber(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
-
 function phaseMs(run, phase) {
   return asNumber(run?.phaseMs?.[phase], 0);
 }

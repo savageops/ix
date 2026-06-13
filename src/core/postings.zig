@@ -10,6 +10,7 @@ pub const INVALID_TRIGRAM_KEY: TrigramKey = 0;
 pub const SERIALIZED_HEADER_SIZE: u64 = 8 + 2 + 2 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8;
 pub const SERIALIZED_ENTRY_SIZE: u64 = 4 + 8 + 4 + 1 + 1 + 2;
 pub const SERIALIZED_FILE_ID_SIZE: u64 = 8;
+pub const DEFAULT_BLOCK_TARGET_POSTINGS: u32 = 256;
 
 pub const TrigramKey = u32;
 pub const FileId = catalog.FileId;
@@ -89,9 +90,28 @@ pub const PostingsFileLookup = struct {
     }
 };
 
+pub const BlockPruningProof = struct {
+    block_count: usize = 0,
+    candidate_prunable_blocks: usize = 0,
+    candidate_prunable_postings: usize = 0,
+    candidate_prunable_compressed_bytes: usize = 0,
+};
+
 pub const PostingsFileInput = struct {
     file_id: FileId,
     bytes: []const u8,
+};
+
+pub const PostingsBlockMetadata = extern struct {
+    first_entry: u32 = 0,
+    entry_count: u32 = 0,
+    file_offset: u64 = 0,
+    file_count: u32 = 0,
+    first_file_id: FileId = catalog.INVALID_FILE_ID,
+    last_file_id: FileId = catalog.INVALID_FILE_ID,
+    local_term_count: u32 = 0,
+    max_postings_per_term: u32 = 0,
+    compressed_file_id_bytes: u32 = 0,
 };
 
 pub const LookupMode = enum {
@@ -250,6 +270,102 @@ pub fn buildPostingsSegment(
     };
 }
 
+pub fn buildPostingsBlockMetadata(
+    allocator: std.mem.Allocator,
+    segment: PostingsSegment,
+    target_postings_per_block: u32,
+) ![]PostingsBlockMetadata {
+    const target = if (target_postings_per_block == 0) DEFAULT_BLOCK_TARGET_POSTINGS else target_postings_per_block;
+    var blocks = std.ArrayList(PostingsBlockMetadata).empty;
+    errdefer blocks.deinit(allocator);
+
+    var entry_index: usize = 0;
+    while (entry_index < segment.entries.len) {
+        const first_entry = entry_index;
+        var next_entry = entry_index;
+        var postings_in_block: u32 = 0;
+        while (next_entry < segment.entries.len and (next_entry == first_entry or postings_in_block < target)) : (next_entry += 1) {
+            const count = segment.entries[next_entry].file_count;
+            postings_in_block = std.math.add(u32, postings_in_block, count) catch return error.PostingsBlockCountOverflow;
+        }
+
+        try blocks.append(allocator, try makeBlockMetadata(segment, first_entry, next_entry));
+        entry_index = next_entry;
+    }
+
+    const out = try blocks.toOwnedSlice(allocator);
+    errdefer allocator.free(out);
+    try validatePostingsBlockMetadata(segment, out);
+    return out;
+}
+
+pub fn validatePostingsBlockMetadata(segment: PostingsSegment, blocks: []const PostingsBlockMetadata) !void {
+    var expected_entry: usize = 0;
+
+    for (blocks) |block| {
+        if (block.entry_count == 0) return error.EmptyPostingsBlock;
+        if (block.first_entry != expected_entry) return error.NonContiguousPostingsBlocks;
+        if (block.local_term_count != block.entry_count) return error.PostingsBlockTermCountMismatch;
+        if (block.file_count == 0) return error.EmptyPostingsBlock;
+        if (!catalog.isValidFileId(block.first_file_id)) return error.InvalidCatalogFileId;
+        if (!catalog.isValidFileId(block.last_file_id)) return error.InvalidCatalogFileId;
+        if (block.first_file_id > block.last_file_id) return error.InvalidPostingsBlockFileRange;
+        if (block.compressed_file_id_bytes == 0) return error.InvalidPostingsBlockCompression;
+        if (block.file_offset > segment.file_ids.len) return error.InvalidPostingsBlockFileRange;
+        if (block.file_count > segment.file_ids.len - @as(usize, @intCast(block.file_offset))) return error.InvalidPostingsBlockFileRange;
+        if (block.max_postings_per_term == 0) return error.InvalidPostingsBlockMaxPostings;
+
+        const start_entry: usize = @intCast(block.first_entry);
+        const end_entry = start_entry + block.entry_count;
+        if (end_entry > segment.entries.len) return error.InvalidPostingsBlockEntryRange;
+        if (start_entry != expected_entry) return error.NonContiguousPostingsBlocks;
+
+        var expected_file_count: u32 = 0;
+        var expected_max_postings: u32 = 0;
+        var expected_first_file_id: FileId = std.math.maxInt(FileId);
+        var expected_last_file_id: FileId = 0;
+        var expected_file_offset: ?u64 = null;
+
+        for (segment.entries[start_entry..end_entry]) |entry| {
+            if (expected_file_offset == null) expected_file_offset = entry.file_offset;
+            expected_file_count = std.math.add(u32, expected_file_count, entry.file_count) catch return error.PostingsBlockCountOverflow;
+            expected_max_postings = @max(expected_max_postings, entry.file_count);
+            const ids = segment.fileIds(entry);
+            if (ids.len == 0) return error.EmptyPostingsBlock;
+            expected_first_file_id = @min(expected_first_file_id, ids[0]);
+            expected_last_file_id = @max(expected_last_file_id, ids[ids.len - 1]);
+        }
+
+        if (block.file_offset != expected_file_offset.?) return error.PostingsBlockOffsetMismatch;
+        if (block.file_count != expected_file_count) return error.PostingsBlockFileCountMismatch;
+        if (block.max_postings_per_term != expected_max_postings) return error.PostingsBlockMaxPostingsMismatch;
+        if (block.first_file_id != expected_first_file_id or block.last_file_id != expected_last_file_id) return error.InvalidPostingsBlockFileRange;
+        if (block.compressed_file_id_bytes != estimateCompressedFileIdBytes(segment, start_entry, end_entry)) return error.InvalidPostingsBlockCompression;
+        expected_entry = end_entry;
+    }
+
+    if (expected_entry != segment.entries.len) return error.PostingsBlockCoverageMismatch;
+}
+
+pub fn proveBlockPruning(
+    allocator: std.mem.Allocator,
+    segment: PostingsSegment,
+    candidate_file_ids: []const FileId,
+    target_postings_per_block: u32,
+) !BlockPruningProof {
+    const blocks = try buildPostingsBlockMetadata(allocator, segment, target_postings_per_block);
+    defer allocator.free(blocks);
+
+    var proof = BlockPruningProof{ .block_count = blocks.len };
+    for (blocks) |block| {
+        if (blockHasCandidate(segment, block, candidate_file_ids)) continue;
+        proof.candidate_prunable_blocks += 1;
+        proof.candidate_prunable_postings += block.file_count;
+        proof.candidate_prunable_compressed_bytes += block.compressed_file_id_bytes;
+    }
+    return proof;
+}
+
 pub fn lowerExpressionToLookupPlan(plan: expr.ExpressionPlan) LookupPlan {
     if (literalAlternatesLookupPlan(plan)) |lookup| return lookup;
 
@@ -283,6 +399,7 @@ fn literalAlternatesLookupPlan(plan: expr.ExpressionPlan) ?LookupPlan {
     const predicate = plan.predicates[0];
     if (predicate.kind != .regex) return null;
     if (predicate.strategy != .regex_literal_alternates) return null;
+    if (std.mem.startsWith(u8, predicate.value, "(?i)")) return null;
 
     const body = expr.literalAlternatesBody(predicate.value);
     var lookup = LookupPlan{
@@ -440,10 +557,13 @@ pub fn selectCatalogEntriesForCandidates(
     var selected = std.ArrayList(catalog.PathEntry).empty;
     errdefer selected.deinit(allocator);
 
-    for (snapshot.entries) |entry| {
-        if (containsFileId(candidate_file_ids, entry.file_id)) {
-            try selected.append(allocator, entry);
-        }
+    for (candidate_file_ids) |file_id| {
+        if (!catalog.isValidFileId(file_id)) return error.InvalidCatalogFileId;
+        const index = file_id - 1;
+        if (index >= snapshot.entries.len or index >= snapshot.metas.len) return error.InvalidCatalogFileId;
+        const entry = snapshot.entries[index];
+        if (entry.file_id != file_id or snapshot.metas[index].file_id != file_id) return error.CatalogFileIdMismatch;
+        try selected.append(allocator, entry);
     }
     return selected.toOwnedSlice(allocator);
 }
@@ -549,6 +669,64 @@ fn samePostingPair(lhs: PostingPair, rhs: PostingPair) bool {
     return lhs.key == rhs.key and lhs.file_id == rhs.file_id;
 }
 
+fn makeBlockMetadata(segment: PostingsSegment, first_entry: usize, end_entry: usize) !PostingsBlockMetadata {
+    if (first_entry >= end_entry or end_entry > segment.entries.len) return error.InvalidPostingsBlockEntryRange;
+
+    var block = PostingsBlockMetadata{
+        .first_entry = @intCast(first_entry),
+        .entry_count = @intCast(end_entry - first_entry),
+        .first_file_id = std.math.maxInt(FileId),
+    };
+
+    for (segment.entries[first_entry..end_entry]) |entry| {
+        if (block.local_term_count == 0) block.file_offset = entry.file_offset;
+        block.local_term_count += 1;
+        block.file_count = std.math.add(u32, block.file_count, entry.file_count) catch return error.PostingsBlockCountOverflow;
+        block.max_postings_per_term = @max(block.max_postings_per_term, entry.file_count);
+
+        const ids = segment.fileIds(entry);
+        if (ids.len == 0) return error.EmptyPostingsBlock;
+        block.first_file_id = @min(block.first_file_id, ids[0]);
+        block.last_file_id = @max(block.last_file_id, ids[ids.len - 1]);
+    }
+
+    block.compressed_file_id_bytes = estimateCompressedFileIdBytes(segment, first_entry, end_entry);
+    return block;
+}
+
+fn estimateCompressedFileIdBytes(segment: PostingsSegment, first_entry: usize, end_entry: usize) u32 {
+    var total: u32 = 0;
+    for (segment.entries[first_entry..end_entry]) |entry| {
+        const ids = segment.fileIds(entry);
+        var previous: FileId = 0;
+        for (ids) |file_id| {
+            const delta = if (previous == 0) file_id else file_id - previous;
+            total += varintLen(delta);
+            previous = file_id;
+        }
+    }
+    return total;
+}
+
+fn blockHasCandidate(segment: PostingsSegment, block: PostingsBlockMetadata, candidate_file_ids: []const FileId) bool {
+    const start_entry: usize = @intCast(block.first_entry);
+    const end_entry = start_entry + block.entry_count;
+    for (segment.entries[start_entry..end_entry]) |entry| {
+        const ids = segment.fileIds(entry);
+        for (candidate_file_ids) |candidate| {
+            if (containsFileId(ids, candidate)) return true;
+        }
+    }
+    return false;
+}
+
+fn varintLen(value: u64) u32 {
+    var remaining = value;
+    var len: u32 = 1;
+    while (remaining >= 0x80) : (len += 1) remaining >>= 7;
+    return len;
+}
+
 fn lookupFallback(reason: trigram.IneligibleReason) LookupFallback {
     return switch (reason) {
         .none => .none,
@@ -559,18 +737,19 @@ fn lookupFallback(reason: trigram.IneligibleReason) LookupFallback {
 
 fn evaluateLookupGroup(allocator: std.mem.Allocator, segment: PostingsSegment, group: LookupGroup) ![]FileId {
     if (group.key_count == 0) return allocator.alloc(FileId, 0);
-    var current = try allocator.dupe(FileId, lookupFileIds(segment, group.keys[0]) orelse return allocator.alloc(FileId, 0));
+    var ordered = [_]LookupKeySpan{undefined} ** trigram.MAX_TRIGRAMS_PER_GROUP;
+    const ordered_count = collectLookupKeySpans(segment, group, &ordered);
+    if (ordered_count == 0) return allocator.alloc(FileId, 0);
+
+    var current = try allocator.dupe(FileId, ordered[0].ids);
     errdefer allocator.free(current);
 
     var key_index: usize = 1;
-    while (key_index < group.key_count) : (key_index += 1) {
-        const ids = lookupFileIds(segment, group.keys[key_index]) orelse {
-            allocator.free(current);
-            return allocator.alloc(FileId, 0);
-        };
-        const merged = try intersectFileIds(allocator, current, ids);
+    while (key_index < ordered_count) : (key_index += 1) {
+        const merged = try intersectFileIds(allocator, current, ordered[key_index].ids);
         allocator.free(current);
         current = merged;
+        if (current.len == 0) break;
     }
     return current;
 }
@@ -624,27 +803,71 @@ fn evaluateLookupGroupFromOpenFile(
     group: LookupGroup,
 ) ![]FileId {
     if (group.key_count == 0) return allocator.alloc(FileId, 0);
-    if (group.key_count > 1) {
-        for (group.keys[0..group.key_count]) |key| {
-            _ = try lookupEntryFromOpenFile(io, file, header, key) orelse return allocator.alloc(FileId, 0);
-        }
-    }
+    var ordered = [_]LookupEntrySpan{undefined} ** trigram.MAX_TRIGRAMS_PER_GROUP;
+    const ordered_count = try collectLookupEntrySpansFromOpenFile(io, file, header, group, &ordered);
+    if (ordered_count == 0) return allocator.alloc(FileId, 0);
 
-    var current = try lookupFileIdsFromOpenFile(io, allocator, file, header, group.keys[0]) orelse return allocator.alloc(FileId, 0);
+    var current = try readFileIdsForEntryFromOpenFile(io, allocator, file, header, ordered[0].entry);
     errdefer allocator.free(current);
 
     var key_index: usize = 1;
-    while (key_index < group.key_count) : (key_index += 1) {
-        const ids = try lookupFileIdsFromOpenFile(io, allocator, file, header, group.keys[key_index]) orelse {
-            allocator.free(current);
-            return allocator.alloc(FileId, 0);
-        };
+    while (key_index < ordered_count) : (key_index += 1) {
+        const ids = try readFileIdsForEntryFromOpenFile(io, allocator, file, header, ordered[key_index].entry);
         defer allocator.free(ids);
         const merged = try intersectFileIds(allocator, current, ids);
         allocator.free(current);
         current = merged;
+        if (current.len == 0) break;
     }
     return current;
+}
+
+const LookupKeySpan = struct {
+    key: TrigramKey,
+    ids: []const FileId,
+};
+
+const LookupEntrySpan = struct {
+    key: TrigramKey,
+    entry: PostingsEntry,
+};
+
+fn collectLookupKeySpans(segment: PostingsSegment, group: LookupGroup, out: *[trigram.MAX_TRIGRAMS_PER_GROUP]LookupKeySpan) usize {
+    var count: usize = 0;
+    for (group.keys[0..group.key_count]) |key| {
+        const ids = lookupFileIds(segment, key) orelse return 0;
+        out[count] = .{ .key = key, .ids = ids };
+        count += 1;
+    }
+    std.sort.insertion(LookupKeySpan, out[0..count], {}, lessThanLookupKeySpan);
+    return count;
+}
+
+fn collectLookupEntrySpansFromOpenFile(
+    io: std.Io,
+    file: *std.Io.File,
+    header: PostingsSegmentHeader,
+    group: LookupGroup,
+    out: *[trigram.MAX_TRIGRAMS_PER_GROUP]LookupEntrySpan,
+) !usize {
+    var count: usize = 0;
+    for (group.keys[0..group.key_count]) |key| {
+        const entry = try lookupEntryFromOpenFile(io, file, header, key) orelse return 0;
+        out[count] = .{ .key = key, .entry = entry };
+        count += 1;
+    }
+    std.sort.insertion(LookupEntrySpan, out[0..count], {}, lessThanLookupEntrySpan);
+    return count;
+}
+
+fn lessThanLookupKeySpan(_: void, lhs: LookupKeySpan, rhs: LookupKeySpan) bool {
+    if (lhs.ids.len == rhs.ids.len) return lhs.key < rhs.key;
+    return lhs.ids.len < rhs.ids.len;
+}
+
+fn lessThanLookupEntrySpan(_: void, lhs: LookupEntrySpan, rhs: LookupEntrySpan) bool {
+    if (lhs.entry.file_count == rhs.entry.file_count) return lhs.key < rhs.key;
+    return lhs.entry.file_count < rhs.entry.file_count;
 }
 
 fn lookupFileIdsFromOpenFile(
@@ -1083,6 +1306,76 @@ test "postings builder deduplicates repeated file trigram pairs" {
     try std.testing.expectEqualSlices(FileId, &.{catalog.makeFileId(0)}, file_ids);
 }
 
+test "postings block metadata captures boundaries counts and compressed bytes" {
+    const files = [_]PostingsFileInput{
+        .{ .file_id = catalog.makeFileId(0), .bytes = "alpha beta gamma" },
+        .{ .file_id = catalog.makeFileId(1), .bytes = "alpha beta" },
+        .{ .file_id = catalog.makeFileId(2), .bytes = "alpha delta" },
+        .{ .file_id = catalog.makeFileId(3), .bytes = "omega" },
+    };
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0);
+    defer segment.deinit(std.testing.allocator);
+
+    const blocks = try buildPostingsBlockMetadata(std.testing.allocator, segment, 4);
+    defer std.testing.allocator.free(blocks);
+
+    try std.testing.expect(blocks.len > 1);
+    try validatePostingsBlockMetadata(segment, blocks);
+
+    var covered_entries: u32 = 0;
+    for (blocks) |block| {
+        try std.testing.expectEqual(block.entry_count, block.local_term_count);
+        try std.testing.expect(block.file_count >= block.max_postings_per_term);
+        try std.testing.expect(block.compressed_file_id_bytes <= block.file_count * @as(u32, @intCast(SERIALIZED_FILE_ID_SIZE)));
+        covered_entries += block.entry_count;
+    }
+    try std.testing.expectEqual(@as(u32, @intCast(segment.entries.len)), covered_entries);
+}
+
+test "postings block metadata validation rejects corruption" {
+    const files = [_]PostingsFileInput{
+        .{ .file_id = catalog.makeFileId(0), .bytes = "auth token" },
+        .{ .file_id = catalog.makeFileId(1), .bytes = "auth token" },
+        .{ .file_id = catalog.makeFileId(2), .bytes = "auth value" },
+    };
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0);
+    defer segment.deinit(std.testing.allocator);
+
+    const blocks = try buildPostingsBlockMetadata(std.testing.allocator, segment, 2);
+    defer std.testing.allocator.free(blocks);
+    try std.testing.expect(blocks.len > 0);
+
+    var corrupted = try std.testing.allocator.dupe(PostingsBlockMetadata, blocks);
+    defer std.testing.allocator.free(corrupted);
+
+    corrupted[0].file_count += 1;
+    try std.testing.expectError(error.PostingsBlockFileCountMismatch, validatePostingsBlockMetadata(segment, corrupted));
+
+    corrupted[0] = blocks[0];
+    corrupted[0].compressed_file_id_bytes += 1;
+    try std.testing.expectError(error.InvalidPostingsBlockCompression, validatePostingsBlockMetadata(segment, corrupted));
+}
+
+test "postings block pruning proof reports potential without changing candidates" {
+    const files = [_]PostingsFileInput{
+        .{ .file_id = catalog.makeFileId(0), .bytes = "alpha beta" },
+        .{ .file_id = catalog.makeFileId(1), .bytes = "alpha beta" },
+        .{ .file_id = catalog.makeFileId(2), .bytes = "omega theta" },
+        .{ .file_id = catalog.makeFileId(3), .bytes = "omega theta" },
+    };
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0);
+    defer segment.deinit(std.testing.allocator);
+
+    const candidate_ids = [_]FileId{ catalog.makeFileId(0), catalog.makeFileId(1) };
+    const proof = try proveBlockPruning(std.testing.allocator, segment, &candidate_ids, 2);
+
+    try std.testing.expect(proof.block_count > 0);
+    try std.testing.expect(proof.candidate_prunable_blocks > 0);
+    try std.testing.expect(proof.candidate_prunable_postings > 0);
+    try std.testing.expect(proof.candidate_prunable_compressed_bytes > 0);
+    try std.testing.expectEqualSlices(FileId, &.{ catalog.makeFileId(0), catalog.makeFileId(1) }, &candidate_ids);
+}
+
 test "postings lookup lowering maps expression evidence to lookup keys" {
     const plan = try expr.parse("lit:auth && re:token_\\d+");
     const lookup = lowerExpressionToLookupPlan(plan);
@@ -1111,6 +1404,14 @@ test "postings lookup lowering maps literal alternate regex to branch evidence" 
 
 test "postings lookup lowering refuses literal alternates with short evidence branch" {
     const lookup = lowerExpressionToLookupPlan(try expr.parse("re:(alpha|ix)"));
+
+    try std.testing.expect(!lookup.eligible);
+    try std.testing.expectEqual(LookupFallback.no_mandatory_evidence, lookup.fallback);
+    try std.testing.expect(lookupRequiresFullScan(lookup));
+}
+
+test "postings lookup lowering fails closed for case-insensitive literal alternates" {
+    const lookup = lowerExpressionToLookupPlan(try expr.parse("re:(?i)(alpha|beta)"));
 
     try std.testing.expect(!lookup.eligible);
     try std.testing.expectEqual(LookupFallback.no_mandatory_evidence, lookup.fallback);
@@ -1151,6 +1452,34 @@ test "postings lookup evaluation intersects mandatory evidence" {
     const candidates = try evaluateLookupPlan(std.testing.allocator, segment, lookup);
     defer std.testing.allocator.free(candidates);
 
+    try std.testing.expectEqualSlices(FileId, &.{catalog.makeFileId(0)}, candidates);
+}
+
+test "postings lookup evaluation intersects rarest evidence first without changing result" {
+    const files = [_]PostingsFileInput{
+        .{ .file_id = catalog.makeFileId(0), .bytes = "alpha beta gamma" },
+        .{ .file_id = catalog.makeFileId(1), .bytes = "alpha beta" },
+        .{ .file_id = catalog.makeFileId(2), .bytes = "alpha gamma" },
+        .{ .file_id = catalog.makeFileId(3), .bytes = "alpha only" },
+    };
+    const segment = try buildPostingsSegment(std.testing.allocator, 1, 1, &files, 0);
+    defer segment.deinit(std.testing.allocator);
+
+    var group = LookupGroup{ .source_index = 0 };
+    group.keys[0] = makeTrigramKey(&.{ 'a', 'l', 'p' });
+    group.keys[1] = makeTrigramKey(&.{ 'b', 'e', 't' });
+    group.keys[2] = makeTrigramKey(&.{ 'g', 'a', 'm' });
+    group.key_count = 3;
+
+    var ordered = [_]LookupKeySpan{undefined} ** trigram.MAX_TRIGRAMS_PER_GROUP;
+    const ordered_count = collectLookupKeySpans(segment, group, &ordered);
+    try std.testing.expectEqual(@as(usize, 3), ordered_count);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'b', 'e', 't' }), ordered[0].key);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'g', 'a', 'm' }), ordered[1].key);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'a', 'l', 'p' }), ordered[2].key);
+
+    const candidates = try evaluateLookupGroup(std.testing.allocator, segment, group);
+    defer std.testing.allocator.free(candidates);
     try std.testing.expectEqualSlices(FileId, &.{catalog.makeFileId(0)}, candidates);
 }
 
@@ -1230,6 +1559,43 @@ test "postings file lookup evaluates candidates without full segment parse" {
     try std.testing.expectEqualSlices(FileId, expected, actual.candidates);
 }
 
+test "postings file lookup orders narrowest entry first without changing result" {
+    const files = [_]PostingsFileInput{
+        .{ .file_id = catalog.makeFileId(0), .bytes = "alpha beta gamma" },
+        .{ .file_id = catalog.makeFileId(1), .bytes = "alpha beta" },
+        .{ .file_id = catalog.makeFileId(2), .bytes = "alpha gamma" },
+        .{ .file_id = catalog.makeFileId(3), .bytes = "alpha only" },
+    };
+    const segment = try buildPostingsSegment(std.testing.allocator, 0x1234, 77, &files, 0);
+    defer segment.deinit(std.testing.allocator);
+    const encoded = try serializePostingsSegment(std.testing.allocator, segment);
+    defer std.testing.allocator.free(encoded);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "postings.ixpost", .data = encoded });
+    var file = try tmp.dir.openFile(std.testing.io, "postings.ixpost", .{});
+    defer file.close(std.testing.io);
+
+    const header = try readHeaderAt(std.testing.io, &file, 0);
+    var group = LookupGroup{ .source_index = 0 };
+    group.keys[0] = makeTrigramKey(&.{ 'a', 'l', 'p' });
+    group.keys[1] = makeTrigramKey(&.{ 'b', 'e', 't' });
+    group.keys[2] = makeTrigramKey(&.{ 'g', 'a', 'm' });
+    group.key_count = 3;
+
+    var ordered = [_]LookupEntrySpan{undefined} ** trigram.MAX_TRIGRAMS_PER_GROUP;
+    const ordered_count = try collectLookupEntrySpansFromOpenFile(std.testing.io, &file, header, group, &ordered);
+    try std.testing.expectEqual(@as(usize, 3), ordered_count);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'b', 'e', 't' }), ordered[0].key);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'g', 'a', 'm' }), ordered[1].key);
+    try std.testing.expectEqual(makeTrigramKey(&.{ 'a', 'l', 'p' }), ordered[2].key);
+
+    const candidates = try evaluateLookupGroupFromOpenFile(std.testing.io, std.testing.allocator, &file, header, group);
+    defer std.testing.allocator.free(candidates);
+    try std.testing.expectEqualSlices(FileId, &.{catalog.makeFileId(0)}, candidates);
+}
+
 test "postings lookup evaluation refuses unsafe fallback as zero candidates" {
     const files = [_]PostingsFileInput{
         .{ .file_id = catalog.makeFileId(0), .bytes = "auth" },
@@ -1262,6 +1628,22 @@ test "postings candidates select catalog entries for verifier handoff" {
     try std.testing.expectEqualStrings("README.md", snapshot.path(selected[0]));
     try std.testing.expectEqual(catalog.makeFileId(2), selected[1].file_id);
     try std.testing.expectEqualStrings("src/main.zig", snapshot.path(selected[1]));
+}
+
+test "postings candidates reject file ids outside catalog snapshot" {
+    const catalog_files = [_]catalog.CatalogFileInput{
+        .{ .path = "a.txt", .size = 1, .mtime_ns = 1, .sample = "a" },
+        .{ .path = "b.txt", .size = 1, .mtime_ns = 2, .sample = "b" },
+    };
+    const encoded = try catalog.buildCatalogBytes(std.testing.allocator, "E:\\Workspaces\\ix-zig", 1, &catalog_files);
+    defer std.testing.allocator.free(encoded);
+    const snapshot = try catalog.parseCatalog(std.testing.allocator, encoded);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.InvalidCatalogFileId,
+        selectCatalogEntriesForCandidates(std.testing.allocator, snapshot, &.{catalog.makeFileId(7)}),
+    );
 }
 
 test "postings serialization round trips header entries and file ids" {
