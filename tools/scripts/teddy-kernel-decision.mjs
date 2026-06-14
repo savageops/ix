@@ -18,7 +18,7 @@ const INSECT_PACKED_TEDDY_SHUFTI_REFRESH = path.join(ROOT, ".docs", "research", 
 const HISTORICAL_SPEED_PROOF_COMMAND =
   "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet";
 const OLDER_SNAPSHOT_PROOF_COMMAND =
-  "node tools/scripts/compare-older-snapshots.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-snapshots 2 --min-engine-improvement-pct 5 --min-paired-improvement-pct 5 --require-strict --quiet";
+  "node tools/scripts/compare-older-snapshots.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --min-retainable-samples 12 --max-snapshots 2 --target-retainable-snapshots 2 --min-engine-improvement-pct 5 --min-paired-improvement-pct 5 --require-strict --quiet";
 const SPEED_PROOF_COMMAND = `${HISTORICAL_SPEED_PROOF_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 
 const args = process.argv.slice(2);

@@ -178,6 +178,8 @@ export function createBenchmarkAdmission({
           "1",
           "--older-snapshot-max",
           "1",
+          "--older-snapshot-retainable-target",
+          "1",
           "--older-snapshot-identity-attempts",
           "3",
           "--min-retainable-speed-samples",
@@ -200,6 +202,8 @@ export function createBenchmarkAdmission({
           sampleArg,
           "--older-snapshot-samples",
           sampleArg,
+          "--older-snapshot-retainable-target",
+          "2",
           "--older-snapshot-identity-attempts",
           "3",
           "--min-retainable-speed-samples",
@@ -751,6 +755,7 @@ export function createBenchmarkAdmission({
         !hostSmoke.includes("--historical-speed-samples 1") ||
         !hostSmoke.includes("--older-snapshot-samples 1") ||
         !hostSmoke.includes("--older-snapshot-max 1") ||
+        !hostSmoke.includes("--older-snapshot-retainable-target 1") ||
         !hostSmoke.includes("--older-snapshot-identity-attempts 3") ||
         !hostSmoke.includes("--min-retainable-speed-samples 1")
       ) {
@@ -765,6 +770,7 @@ export function createBenchmarkAdmission({
         !retained.includes("--installed-speed-samples 12") ||
         !retained.includes("--historical-speed-samples 12") ||
         !retained.includes("--older-snapshot-samples 12") ||
+        !retained.includes("--older-snapshot-retainable-target 2") ||
         !retained.includes("--older-snapshot-identity-attempts 3") ||
         !retained.includes("--min-retainable-speed-samples 12")
       ) {

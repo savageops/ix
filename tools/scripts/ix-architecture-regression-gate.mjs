@@ -57,6 +57,7 @@ Options:
   --historical-speed-samples <n>           Historical speed samples. Default: 12.
   --older-snapshot-samples <n>             Older snapshot samples. Default: 12.
   --older-snapshot-max <n>                 Older snapshot cap for smoke runs.
+  --older-snapshot-retainable-target <n>   Retainable older snapshot target for strict runs.
   --older-snapshot-identity-attempts <n>   Same-binary control attempts. Default: 3.
   --min-older-snapshot-engine-pct <n>      Required older-snapshot engine improvement.
   --min-older-snapshot-paired-pct <n>      Required older-snapshot paired improvement.
@@ -96,6 +97,11 @@ const olderSnapshotSamples = Number(
   argValue(args, "--older-snapshot-samples", process.env.IX_OLDER_SNAPSHOT_SAMPLES ?? "12"),
 );
 const olderSnapshotMax = argValue(args, "--older-snapshot-max", process.env.IX_OLDER_SNAPSHOT_MAX ?? "");
+const olderSnapshotRetainableTarget = argValue(
+  args,
+  "--older-snapshot-retainable-target",
+  process.env.IX_OLDER_SNAPSHOT_RETAINABLE_TARGET ?? olderSnapshotMax,
+);
 const olderSnapshotIdentityAttempts = Number(
   argValue(args, "--older-snapshot-identity-attempts", process.env.IX_OLDER_SNAPSHOT_IDENTITY_ATTEMPTS ?? "3"),
 );
@@ -771,6 +777,8 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     String(Math.min(12, olderSnapshotSamples)),
     "--identity-control-attempts",
     String(olderSnapshotIdentityAttempts),
+    "--min-retainable-samples",
+    String(minRetainableSpeedSamples),
     "--min-engine-improvement-pct",
     String(strictRequired ? minOlderSnapshotEngineImprovementPct : 0),
     "--min-paired-improvement-pct",
@@ -781,6 +789,9 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     "--quiet",
   ];
   if (olderSnapshotMax !== "") commandArgs.push("--max-snapshots", olderSnapshotMax);
+  if (strictRequired && olderSnapshotRetainableTarget !== "") {
+    commandArgs.push("--target-retainable-snapshots", olderSnapshotRetainableTarget);
+  }
   if (strictRequired) commandArgs.push("--require-strict");
   const evidence = run(process.execPath, commandArgs);
   if (!existsSync(latestPath)) {
@@ -824,10 +835,14 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     samples: latest.samples ?? null,
     identityControlSamples: latest.identityControlSamples ?? null,
     identityControlAttempts: latest.identityControlAttempts ?? null,
+    minRetainableSamples: latest.minRetainableSamples ?? null,
+    targetRetainableSnapshots: latest.targetRetainableSnapshots ?? null,
     minEngineImprovementPct: latest.minEngineImprovementPct ?? null,
     minPairedImprovementPct: latest.minPairedImprovementPct ?? null,
     sort: latest.sort ?? null,
     runnableSnapshots: latest.runnableSnapshots ?? null,
+    retainableSnapshots: latest.retainableSnapshots ?? null,
+    nonRetainableRunnableSnapshots: latest.nonRetainableRunnableSnapshots ?? null,
     skippedSnapshots: latest.skippedSnapshots ?? null,
     strictRequired: latest.strictRequired === true,
     retainableEvidence: latest.retainableEvidence === true,
@@ -846,6 +861,9 @@ function olderSnapshotLadderLane(hostPreflight = null) {
   if (strictRequired && Number(parsed.samples) < minRetainableSpeedSamples) {
     laneFailures.push(`strict older snapshot evidence requires at least ${minRetainableSpeedSamples} samples`);
   }
+  if (strictRequired && Number(parsed.minRetainableSamples) !== minRetainableSpeedSamples) {
+    laneFailures.push(`strict older snapshot child evidence must use retained sample floor ${minRetainableSpeedSamples}`);
+  }
   if (strictRequired && parsed.strictRequired !== true) {
     laneFailures.push("strict older snapshot lane must run comparator in strict mode");
   }
@@ -857,6 +875,9 @@ function olderSnapshotLadderLane(hostPreflight = null) {
   }
   if (strictRequired && Number(parsed.minPairedImprovementPct) < minOlderSnapshotPairedImprovementPct) {
     laneFailures.push(`strict older snapshot evidence requires paired improvement target ${minOlderSnapshotPairedImprovementPct}%`);
+  }
+  if (strictRequired && olderSnapshotRetainableTarget !== "" && Number(parsed.retainableSnapshots) < Number(olderSnapshotRetainableTarget)) {
+    laneFailures.push(`strict older snapshot evidence requires ${olderSnapshotRetainableTarget} retainable snapshots`);
   }
   for (const round of parsedRounds) {
     if (round.runnable !== true) continue;
@@ -876,6 +897,7 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     strictRequired,
     samples: olderSnapshotSamples,
     maxSnapshots: olderSnapshotMax === "" ? null : Number(olderSnapshotMax),
+    targetRetainableSnapshots: strictRequired && olderSnapshotRetainableTarget !== "" ? Number(olderSnapshotRetainableTarget) : null,
     identityControlAttempts: olderSnapshotIdentityAttempts,
     minEngineImprovementPct: strictRequired ? minOlderSnapshotEngineImprovementPct : 0,
     minPairedImprovementPct: strictRequired ? minOlderSnapshotPairedImprovementPct : 0,

@@ -573,6 +573,16 @@ export function createSpeedGateValidation({
     if (!Number.isInteger(Number(entry.report.runnableSnapshots)) || Number(entry.report.runnableSnapshots) < 1) {
       failures.push("older_snapshot_ladder: ok status requires at least one runnable older snapshot");
     }
+    if (entry.strictRequired === true && !Number.isInteger(Number(entry.report.retainableSnapshots))) {
+      failures.push("older_snapshot_ladder: strict ok status requires retainable snapshot count");
+    }
+    if (
+      entry.strictRequired === true &&
+      Number.isInteger(Number(entry.targetRetainableSnapshots)) &&
+      Number(entry.report.retainableSnapshots) < Number(entry.targetRetainableSnapshots)
+    ) {
+      failures.push("older_snapshot_ladder: strict ok status requires requested retainable snapshot count");
+    }
     if (!Array.isArray(entry.report.rounds) || entry.report.rounds.length === 0) {
       failures.push("older_snapshot_ladder: ok status requires per-snapshot rounds");
       return;

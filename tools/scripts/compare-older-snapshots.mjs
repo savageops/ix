@@ -21,8 +21,13 @@ Options:
   --samples <n>                   Samples per snapshot. Default: 12.
   --identity-control-samples <n>  Same-binary control samples. Default: min(12, samples).
   --identity-control-attempts <n> Same-binary control attempts. Default: 1.
+  --min-retainable-samples <n>    Minimum samples for child strict evidence.
+                                  Default: 12.
   --max-snapshots <n>             Limit runnable snapshot comparisons after mtime sort.
                                   Skipped snapshots are still recorded. Default: all.
+  --target-retainable-snapshots <n>
+                                  Continue past noisy runnable snapshots until this many
+                                  retainable snapshot rounds are collected. Default: off.
   --max-candidates <n>            Optional hard cap on candidate executables scanned.
   --min-engine-improvement-pct <n>
                                   Required per-runnable-snapshot engine improvement.
@@ -47,8 +52,11 @@ const baselineDir = path.resolve(argValue(args, "--baseline-dir", DEFAULT_BASELI
 const samples = Number(argValue(args, "--samples", "12"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
 const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "1"));
+const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", process.env.IX_MIN_RETAINABLE_SPEED_SAMPLES ?? "12"));
 const maxSnapshotsRaw = argValue(args, "--max-snapshots", "");
 const maxSnapshots = maxSnapshotsRaw === "" ? Infinity : Number(maxSnapshotsRaw);
+const targetRetainableSnapshotsRaw = argValue(args, "--target-retainable-snapshots", "");
+const targetRetainableSnapshots = targetRetainableSnapshotsRaw === "" ? Infinity : Number(targetRetainableSnapshotsRaw);
 const maxCandidatesRaw = argValue(args, "--max-candidates", "");
 const maxCandidates = maxCandidatesRaw === "" ? Infinity : Number(maxCandidatesRaw);
 const minEngineImprovementPct = Number(argValue(args, "--min-engine-improvement-pct", "0"));
@@ -65,7 +73,11 @@ if (!existsSync(baselineDir)) throw new Error(`baseline directory not found: ${b
 if (!Number.isFinite(samples) || samples < 1) throw new Error("--samples must be a positive number");
 if (!Number.isFinite(identityControlSamples) || identityControlSamples < 0) throw new Error("--identity-control-samples must be a non-negative number");
 if (!Number.isFinite(identityControlAttempts) || identityControlAttempts < 1) throw new Error("--identity-control-attempts must be a positive number");
+if (!Number.isFinite(minRetainableSamples) || minRetainableSamples < 1) throw new Error("--min-retainable-samples must be a positive number");
 if (maxSnapshots !== Infinity && (!Number.isFinite(maxSnapshots) || maxSnapshots < 1)) throw new Error("--max-snapshots must be a positive number");
+if (targetRetainableSnapshots !== Infinity && (!Number.isFinite(targetRetainableSnapshots) || targetRetainableSnapshots < 1)) {
+  throw new Error("--target-retainable-snapshots must be a positive number");
+}
 if (maxCandidates !== Infinity && (!Number.isFinite(maxCandidates) || maxCandidates < 1)) throw new Error("--max-candidates must be a positive number");
 if (!Number.isFinite(minEngineImprovementPct)) throw new Error("--min-engine-improvement-pct must be a finite number");
 if (!Number.isFinite(minPairedImprovementPct)) throw new Error("--min-paired-improvement-pct must be a finite number");
@@ -153,6 +165,7 @@ function runSnapshot(candidate, index) {
     "--samples", String(samples),
     "--identity-control-samples", String(identityControlSamples),
     "--identity-control-attempts", String(identityControlAttempts),
+    "--min-retainable-samples", String(minRetainableSamples),
     "--installed-ix", candidate.path,
     "--quiet",
   ];
@@ -184,6 +197,15 @@ function runSnapshot(candidate, index) {
   };
 }
 
+function roundRetainable(round) {
+  return (
+    round.runnable === true &&
+    Number(round.enginePct) >= minEngineImprovementPct &&
+    Number(round.pairedPct) >= minPairedImprovementPct &&
+    (!requireStrict || round.strict === true)
+  );
+}
+
 const candidates = snapshotCandidates();
 if (dryRun) {
   for (const [index, candidate] of candidates.entries()) {
@@ -195,11 +217,13 @@ if (dryRun) {
 mkdirSync(REPORT_DIR, { recursive: true });
 const rounds = [];
 let runnableCount = 0;
+let retainableCount = 0;
 for (const [index, candidate] of candidates.entries()) {
   if (!quiet) console.log(`[${index + 1}/${candidates.length}] ${candidate.label}`);
   const result = runSnapshot(candidate, index + 1);
   rounds.push(result);
   if (result.runnable) runnableCount += 1;
+  if (roundRetainable(result)) retainableCount += 1;
   if (!quiet) {
     if (result.runnable) {
       console.log(`  ${result.status}: repo ${result.repoMedianMs} ms vs snapshot ${result.baselineMedianMs} ms; engine ${result.enginePct}% paired ${result.pairedPct}%`);
@@ -207,13 +231,24 @@ for (const [index, candidate] of candidates.entries()) {
       console.log(`  skipped: ${result.error}`);
     }
   }
-  if (runnableCount >= maxSnapshots) break;
+  if (targetRetainableSnapshots !== Infinity) {
+    if (retainableCount >= targetRetainableSnapshots) break;
+  } else if (runnableCount >= maxSnapshots) {
+    break;
+  }
 }
 
 const runnable = rounds.filter((round) => round.runnable);
+const retainable = rounds.filter(roundRetainable);
 const failures = [];
 if (runnable.length === 0) failures.push("no_runnable_snapshots");
-if (maxSnapshots !== Infinity && runnable.length < maxSnapshots) failures.push(`runnable_snapshots_below_requested:${runnable.length}<${maxSnapshots}`);
+if (targetRetainableSnapshots !== Infinity) {
+  if (retainable.length < targetRetainableSnapshots) {
+    failures.push(`retainable_snapshots_below_requested:${retainable.length}<${targetRetainableSnapshots}`);
+  }
+} else if (maxSnapshots !== Infinity && runnable.length < maxSnapshots) {
+  failures.push(`runnable_snapshots_below_requested:${runnable.length}<${maxSnapshots}`);
+}
 for (const round of runnable) {
   if (round.enginePct < minEngineImprovementPct) failures.push(`engine_improvement_below_target:${round.label}:${round.enginePct}<${minEngineImprovementPct}`);
   if (round.pairedPct < minPairedImprovementPct) failures.push(`paired_improvement_below_target:${round.label}:${round.pairedPct}<${minPairedImprovementPct}`);
@@ -227,13 +262,17 @@ const report = {
   samples,
   identityControlSamples,
   identityControlAttempts,
+  minRetainableSamples,
   maxSnapshots: maxSnapshots === Infinity ? null : maxSnapshots,
+  targetRetainableSnapshots: targetRetainableSnapshots === Infinity ? null : targetRetainableSnapshots,
   maxCandidates: maxCandidates === Infinity ? null : maxCandidates,
   minEngineImprovementPct,
   minPairedImprovementPct,
   sort: newestFirst ? "newest_first" : "oldest_first",
   candidateSnapshotsScanned: rounds.length,
   runnableSnapshots: runnable.length,
+  retainableSnapshots: retainable.length,
+  nonRetainableRunnableSnapshots: runnable.length - retainable.length,
   skippedSnapshots: rounds.length - runnable.length,
   strictRequired: requireStrict,
   retainableEvidence: failures.length === 0,
