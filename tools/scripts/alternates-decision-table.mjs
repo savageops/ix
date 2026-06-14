@@ -25,6 +25,7 @@ Options:
   --samples <n>                       Samples per branch. Default: 5.
   --threads <n>                       IX thread count. Default: 32.
   --identity-control-samples <n>      Same-binary control pairs per branch. Default: min(12, samples).
+  --identity-control-attempts <n>     Same-binary control attempts per branch; first stable attempt is selected. Default: 1.
   --no-identity-control               Disable same-binary noise control.
   --max-branches <n>                  Highest branch count when --branch-counts is omitted. Default: 8.
   --branch-counts <csv>               Explicit branch counts, e.g. 2,4,8.
@@ -48,6 +49,7 @@ const baselineIxBinary = argValue(args, "--baseline-ix", "");
 const samples = Number(argValue(args, "--samples", "5"));
 const threads = Number(argValue(args, "--threads", "32"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
+const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "1"));
 const identityControlEnabled = !args.includes("--no-identity-control");
 const maxBranches = Number(argValue(args, "--max-branches", "8"));
 const branchCountsArg = argValue(args, "--branch-counts", "");
@@ -778,6 +780,7 @@ function measurePaired(candidateBinaryPath, baselineBinaryPath, branchCount) {
 if (!Number.isFinite(samples) || samples < 1) throw new Error("--samples must be a positive number");
 if (!Number.isFinite(threads) || threads < 1) throw new Error("--threads must be a positive number");
 if (!Number.isFinite(identityControlSamples) || identityControlSamples < 0) throw new Error("--identity-control-samples must be a non-negative number");
+if (!Number.isFinite(identityControlAttempts) || identityControlAttempts < 1) throw new Error("--identity-control-attempts must be a positive number");
 if (!Number.isFinite(fingerprintMaxBytes) || fingerprintMaxBytes < 1) throw new Error("--fingerprint-max-bytes must be a positive number");
 if (!Number.isFinite(maxBranches) || maxBranches < 2 || maxBranches > DEFAULT_TERMS.length) {
   throw new Error(`--max-branches must be between 2 and ${DEFAULT_TERMS.length}`);
@@ -807,6 +810,7 @@ for (const branchCount of branchCounts) {
     binaryPath: ixBinary,
     ixArgs,
     samples: identityControlSamples,
+    attempts: identityControlAttempts,
     enabled: identityControlEnabled,
     label: `candidate-control-branch-${branchCount}`,
   });
@@ -984,6 +988,7 @@ const report = {
   },
   samples,
   identityControlSamples: identityControlEnabled ? identityControlSamples : 0,
+  identityControlAttempts: identityControlEnabled ? identityControlAttempts : 0,
   threads,
   branchCounts,
   branchCountsArg: branchCountsArg.length > 0 ? branchCountsArg : null,

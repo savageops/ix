@@ -32,6 +32,7 @@ Options:
   --samples <n>                   Samples per lane. Default: 12.
   --threads <n>                   IX/ripgrep thread count. Default: 32.
   --identity-control-samples <n>  Same-binary control pairs. Default: min(12, samples).
+  --identity-control-attempts <n> Same-binary control attempts; first stable attempt is selected. Default: 1.
   --no-identity-control           Disable same-binary noise control.
   --corpus <path>                 Corpus path.
   --expression <expr>             Search expression.
@@ -56,6 +57,7 @@ const repoIx = argValue(args, "--repo-ix", DEFAULT_REPO_IX);
 const samples = Number(argValue(args, "--samples", "12"));
 const threads = Number(argValue(args, "--threads", "32"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
+const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "1"));
 const identityControlEnabled = !args.includes("--no-identity-control");
 const buildFirst = args.includes("--build");
 const quiet = args.includes("--quiet");
@@ -149,6 +151,7 @@ function promotionFailures(host, processScan, installedHash, repoHash, installed
 if (samples < 1 || !Number.isFinite(samples)) throw new Error("--samples must be a positive number");
 if (threads < 1 || !Number.isFinite(threads)) throw new Error("--threads must be a positive number");
 if (identityControlSamples < 0 || !Number.isFinite(identityControlSamples)) throw new Error("--identity-control-samples must be a non-negative number");
+if (identityControlAttempts < 1 || !Number.isFinite(identityControlAttempts)) throw new Error("--identity-control-attempts must be a positive number");
 if (minRetainableSamples < 1 || !Number.isFinite(minRetainableSamples)) throw new Error("--min-retainable-samples must be a positive number");
 if (minInstalledImprovementPct < 0 || !Number.isFinite(minInstalledImprovementPct)) throw new Error("--min-installed-improvement-pct must be a non-negative number");
 if (identityNoiseMultiplier < 0 || !Number.isFinite(identityNoiseMultiplier)) throw new Error("--identity-noise-multiplier must be a non-negative number");
@@ -167,6 +170,7 @@ const identityControl = measureSameBinaryIdentityControl({
   binaryPath: repoIx,
   ixArgs: ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)],
   samples: identityControlSamples,
+  attempts: identityControlAttempts,
   env: BENCH_ENV,
   enabled: identityControlEnabled,
   label: "repo-control",
@@ -291,6 +295,7 @@ const report = {
   effectiveInstalledImprovementPct,
   identityNoiseMultiplier,
   identityControlSamples: identityControlEnabled ? identityControlSamples : 0,
+  identityControlAttempts: identityControlEnabled ? identityControlAttempts : 0,
   threads,
   benchEnv: BENCH_ENV,
   host,

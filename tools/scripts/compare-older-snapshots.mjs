@@ -20,6 +20,7 @@ Options:
                                   Default: tools/reports/manual-speed-compare/tmp-baselines.
   --samples <n>                   Samples per snapshot. Default: 12.
   --identity-control-samples <n>  Same-binary control samples. Default: min(12, samples).
+  --identity-control-attempts <n> Same-binary control attempts. Default: 1.
   --max-snapshots <n>             Limit snapshots after mtime sort. Default: all.
   --latest-path <path>            Path for latest-report pointer. Default:
                                   tools/reports/older-snapshot-ladder/latest-older-snapshot-ladder.json.
@@ -35,6 +36,7 @@ Options:
 const baselineDir = path.resolve(argValue(args, "--baseline-dir", DEFAULT_BASELINE_DIR));
 const samples = Number(argValue(args, "--samples", "12"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
+const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "1"));
 const maxSnapshotsRaw = argValue(args, "--max-snapshots", "");
 const maxSnapshots = maxSnapshotsRaw === "" ? Infinity : Number(maxSnapshotsRaw);
 const latestPath = path.resolve(argValue(args, "--latest-path", path.join(REPORT_DIR, "latest-older-snapshot-ladder.json")));
@@ -47,6 +49,7 @@ if (!existsSync(COMPARE_SCRIPT)) throw new Error(`compare script not found: ${CO
 if (!existsSync(baselineDir)) throw new Error(`baseline directory not found: ${baselineDir}`);
 if (!Number.isFinite(samples) || samples < 1) throw new Error("--samples must be a positive number");
 if (!Number.isFinite(identityControlSamples) || identityControlSamples < 0) throw new Error("--identity-control-samples must be a non-negative number");
+if (!Number.isFinite(identityControlAttempts) || identityControlAttempts < 1) throw new Error("--identity-control-attempts must be a positive number");
 if (maxSnapshots !== Infinity && (!Number.isFinite(maxSnapshots) || maxSnapshots < 1)) throw new Error("--max-snapshots must be a positive number");
 
 function snapshotCandidates() {
@@ -89,6 +92,11 @@ function readLatestInstalledSummary() {
     identityControl: report.identityControl
       ? {
           samples: report.identityControl.samples ?? null,
+          attemptsRequested: report.identityControl.attemptsRequested ?? null,
+          attemptsRun: report.identityControl.attemptsRun ?? null,
+          selectedAttempt: report.identityControl.selectedAttempt ?? null,
+          attemptSelection: report.identityControl.attemptSelection ?? null,
+          attemptSummaries: report.identityControl.attemptSummaries ?? null,
           medianDeltaPct: report.identityControl.medianDeltaPct ?? null,
           diagnostics: report.identityControl.diagnostics ?? null,
           pairedWinRate: report.identityControl.pairedEngine?.candidateWinRate ?? null,
@@ -126,6 +134,7 @@ function runSnapshot(candidate, index) {
     COMPARE_SCRIPT,
     "--samples", String(samples),
     "--identity-control-samples", String(identityControlSamples),
+    "--identity-control-attempts", String(identityControlAttempts),
     "--installed-ix", candidate.path,
     "--quiet",
   ];
@@ -194,6 +203,7 @@ const report = {
   baselineDir,
   samples,
   identityControlSamples,
+  identityControlAttempts,
   sort: newestFirst ? "newest_first" : "oldest_first",
   runnableSnapshots: runnable.length,
   skippedSnapshots: rounds.length - runnable.length,

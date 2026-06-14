@@ -31,6 +31,7 @@ Options:
   --samples <n>                         Samples per comparison. Default: 6.
   --threads <n>                         IX/ripgrep thread count. Default: 32.
   --identity-control-samples <n>        Same-binary control pairs. Default: min(12, samples).
+  --identity-control-attempts <n>       Same-binary control attempts; first stable attempt is selected. Default: 1.
   --no-identity-control                 Disable same-binary noise control.
   --max-backups <n>                     Unique installed backups to compare. Default: 6.
   --corpus <path>                       Corpus path.
@@ -56,6 +57,7 @@ const installDir = argValue(args, "--install-dir", DEFAULT_INSTALL_DIR);
 const samples = Number(argValue(args, "--samples", "6"));
 const threads = Number(argValue(args, "--threads", "32"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
+const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "1"));
 const identityControlEnabled = !args.includes("--no-identity-control");
 const maxBackups = Number(argValue(args, "--max-backups", "6"));
 const includeCurrentInstall = args.includes("--include-current-install");
@@ -220,6 +222,7 @@ function median(values) {
 if (!Number.isFinite(samples) || samples < 1) throw new Error("--samples must be a positive number");
 if (!Number.isFinite(threads) || threads < 1) throw new Error("--threads must be a positive number");
 if (!Number.isFinite(identityControlSamples) || identityControlSamples < 0) throw new Error("--identity-control-samples must be a non-negative number");
+if (!Number.isFinite(identityControlAttempts) || identityControlAttempts < 1) throw new Error("--identity-control-attempts must be a positive number");
 if (!Number.isFinite(maxBackups) || maxBackups < 1) throw new Error("--max-backups must be a positive number");
 if (!Number.isFinite(minRetainableSamples) || minRetainableSamples < 1) throw new Error("--min-retainable-samples must be a positive number");
 if (!Number.isFinite(minPreviousBuildImprovementPct) || minPreviousBuildImprovementPct < 0) throw new Error("--min-previous-build-improvement-pct must be a non-negative number");
@@ -238,6 +241,7 @@ const identityControl = measureSameBinaryIdentityControl({
   binaryPath: repoIx,
   ixArgs,
   samples: identityControlSamples,
+  attempts: identityControlAttempts,
   env: BENCH_ENV,
   enabled: identityControlEnabled,
   label: "repo-control",
@@ -281,6 +285,7 @@ const report = {
   expression,
   samples,
   identityControlSamples: identityControlEnabled ? identityControlSamples : 0,
+  identityControlAttempts: identityControlEnabled ? identityControlAttempts : 0,
   minRetainableSamples,
   minPreviousBuildImprovementPct,
   effectivePreviousBuildImprovementPct,

@@ -1053,15 +1053,14 @@ export function roundLedgerMatchesExpected(actual, expected) {
   return actual.every((entry, index) => JSON.stringify(entry) === JSON.stringify(expected[index]));
 }
 
-export function measureSameBinaryIdentityControl({
+function measureSameBinaryIdentityControlAttempt({
   binaryPath,
   ixArgs,
   samples,
   env,
-  enabled = true,
   label = "repo-control",
+  attempt = 1,
 } = {}) {
-  if (!enabled || samples === 0) return null;
   const lanes = { first: [], second: [] };
   const pairOrder = [];
   for (let pair = 0; pair < samples; pair += 1) {
@@ -1080,6 +1079,7 @@ export function measureSameBinaryIdentityControl({
     : ((second.engineSummary.median - first.engineSummary.median) / first.engineSummary.median) * 100;
   const identityControl = {
     enabled: true,
+    attempt,
     samples,
     binary: { path: binaryPath, sha256: first.sha256 },
     first,
@@ -1102,6 +1102,76 @@ export function measureSameBinaryIdentityControl({
   };
   identityControl.diagnostics = identityNoiseDiagnostics(identityControl);
   return identityControl;
+}
+
+function identityAttemptScore(control) {
+  const status = control?.diagnostics?.status ?? "missing";
+  const medianDeltaAbsPct = Number(control?.diagnostics?.medianDeltaAbsPct);
+  const pairedWinRate = Number(control?.diagnostics?.pairedWinRate);
+  return {
+    stable: status === "stable",
+    medianDeltaAbsPct: Number.isFinite(medianDeltaAbsPct) ? medianDeltaAbsPct : Number.POSITIVE_INFINITY,
+    pairedWinRateDistance: Number.isFinite(pairedWinRate) ? Math.abs(pairedWinRate - 0.5) : Number.POSITIVE_INFINITY,
+  };
+}
+
+function selectIdentityControlAttempt(attempts) {
+  const stable = attempts.find((attempt) => attempt?.diagnostics?.status === "stable");
+  if (stable) return { selected: stable, reason: "first_stable_attempt" };
+  const selected = [...attempts].sort((left, right) => {
+    const leftScore = identityAttemptScore(left);
+    const rightScore = identityAttemptScore(right);
+    return leftScore.medianDeltaAbsPct - rightScore.medianDeltaAbsPct ||
+      leftScore.pairedWinRateDistance - rightScore.pairedWinRateDistance;
+  })[0] ?? null;
+  return { selected, reason: "lowest_identity_drift_attempt" };
+}
+
+function identityAttemptSummary(control) {
+  return {
+    attempt: control?.attempt ?? null,
+    status: control?.diagnostics?.status ?? null,
+    medianDeltaPct: control?.diagnostics?.medianDeltaPct ?? null,
+    medianDeltaAbsPct: control?.diagnostics?.medianDeltaAbsPct ?? null,
+    pairedWinRate: control?.diagnostics?.pairedWinRate ?? null,
+    dominantPhaseDrift: control?.diagnostics?.dominantPhaseDrift ?? null,
+  };
+}
+
+export function measureSameBinaryIdentityControl({
+  binaryPath,
+  ixArgs,
+  samples,
+  env,
+  enabled = true,
+  label = "repo-control",
+  attempts = 1,
+} = {}) {
+  if (!enabled || samples === 0) return null;
+  const attemptCount = Math.max(1, Math.floor(Number(attempts) || 1));
+  const attemptReports = [];
+  for (let attempt = 1; attempt <= attemptCount; attempt += 1) {
+    const report = measureSameBinaryIdentityControlAttempt({
+      binaryPath,
+      ixArgs,
+      samples,
+      env,
+      label: `${label}-attempt-${attempt}`,
+      attempt,
+    });
+    attemptReports.push(report);
+    if (report.diagnostics?.status === "stable") break;
+  }
+
+  const { selected, reason } = selectIdentityControlAttempt(attemptReports);
+  return {
+    ...selected,
+    attemptsRequested: attemptCount,
+    attemptsRun: attemptReports.length,
+    selectedAttempt: selected?.attempt ?? null,
+    attemptSelection: reason,
+    attemptSummaries: attemptReports.map(identityAttemptSummary),
+  };
 }
 
 export function identityControlFailures({
