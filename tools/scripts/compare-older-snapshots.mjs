@@ -35,6 +35,8 @@ Options:
   --newest-first                  Sort snapshots newest to oldest. Default: oldest first.
   --require-strict                Exit non-zero if any runnable snapshot lacks strict evidence.
   --dry-run                       Print selected snapshots and write no benchmark report.
+  --no-child-benchmark-lock       Forward --no-benchmark-lock to child comparators.
+                                  Use only from an outer benchmark gate.
   --quiet                         Suppress per-snapshot console summary.
   --help, -h                      Print this help.
 `);
@@ -55,6 +57,7 @@ const latestPath = path.resolve(argValue(args, "--latest-path", path.join(REPORT
 const newestFirst = args.includes("--newest-first");
 const requireStrict = args.includes("--require-strict");
 const dryRun = args.includes("--dry-run");
+const childBenchmarkLock = !args.includes("--no-child-benchmark-lock");
 const quiet = args.includes("--quiet");
 
 if (!existsSync(COMPARE_SCRIPT)) throw new Error(`compare script not found: ${COMPARE_SCRIPT}`);
@@ -153,6 +156,7 @@ function runSnapshot(candidate, index) {
     "--installed-ix", candidate.path,
     "--quiet",
   ];
+  if (!childBenchmarkLock) compareArgs.push("--no-benchmark-lock");
   const started = Date.now();
   const child = spawnSync(process.execPath, compareArgs, {
     cwd: ROOT,

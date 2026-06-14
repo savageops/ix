@@ -96,6 +96,16 @@ const requiredProofCommands = [
   "ix-architecture-regression-gate.mjs --quick",
 ];
 
+const requiredDecisionProofCommands = [
+  "compare-historical-speed.mjs --samples 12",
+  "compare-older-snapshots.mjs --samples 12",
+  "--identity-control-attempts 3",
+  "--max-snapshots 2",
+  "--min-engine-improvement-pct 5",
+  "--min-paired-improvement-pct 5",
+  "--require-strict",
+];
+
 for (const source of includesAll(contractLower, requiredSources.map((entry) => entry.toLowerCase()))) {
   failures.push(`contract missing source: ${source}`);
 }
@@ -163,6 +173,17 @@ if (decision.summary?.fullScanBytesParity !== true) failures.push("decision summ
 if (decision.summary?.fullScanMatchesParity !== true) failures.push("decision summary lacks alternates full-scan match parity");
 if (!String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-historical-speed.mjs")) {
   failures.push("decision next move lacks historical-speed proof command");
+}
+const decisionProofText = normalized([
+  decision.proofCommands?.historicalSpeed,
+  decision.proofCommands?.olderSnapshots,
+  decision.proofCommands?.speedGate,
+  decision.nextAllowedMove?.proofCommand,
+  decision.nextEngineeringMove?.proofCommand,
+  ...(Array.isArray(decision.candidateMoves) ? decision.candidateMoves.map((move) => move?.proofCommand) : []),
+].filter(Boolean).join("\n"));
+for (const command of includesAll(decisionProofText, requiredDecisionProofCommands.map((entry) => entry.toLowerCase()))) {
+  failures.push(`decision missing required proof command: ${command}`);
 }
 for (const rejected of ["scalar_start_byte_or_line_admission", "parallel_first_read_positional_transplant"]) {
   if (!decisionRejectedIds.has(rejected)) failures.push(`decision missing rejected move: ${rejected}`);
@@ -238,11 +259,13 @@ const report = {
     evidenceQuality: decision.evidenceQuality ?? null,
     nextAllowedMove: decision.nextAllowedMove ?? null,
     nextEngineeringMove: decision.nextEngineeringMove ?? null,
+    proofCommands: decision.proofCommands ?? null,
     rejectedIds: [...decisionRejectedIds],
   },
   requiredSources,
   rejectedShapes,
   requiredProofCommands,
+  requiredDecisionProofCommands,
   failures,
 };
 

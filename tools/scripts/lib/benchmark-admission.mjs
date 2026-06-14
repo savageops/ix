@@ -169,7 +169,7 @@ export function createBenchmarkAdmission({
           "--speed-only",
           "--strict-installed-speed",
           "--strict-historical-speed",
-          "--older-snapshots",
+          "--strict-older-snapshots",
           "--installed-speed-samples",
           "1",
           "--historical-speed-samples",
@@ -178,6 +178,8 @@ export function createBenchmarkAdmission({
           "1",
           "--older-snapshot-max",
           "1",
+          "--older-snapshot-identity-attempts",
+          "3",
           "--min-retainable-speed-samples",
           "1",
         ].join(" "),
@@ -191,13 +193,15 @@ export function createBenchmarkAdmission({
           "--speed-only",
           "--strict-installed-speed",
           "--strict-historical-speed",
-          "--older-snapshots",
+          "--strict-older-snapshots",
           "--installed-speed-samples",
           sampleArg,
           "--historical-speed-samples",
           sampleArg,
           "--older-snapshot-samples",
           sampleArg,
+          "--older-snapshot-identity-attempts",
+          "3",
           "--min-retainable-speed-samples",
           sampleArg,
         ].join(" "),
@@ -742,11 +746,12 @@ export function createBenchmarkAdmission({
         !hostSmoke.includes("--speed-only") ||
         !hostSmoke.includes("--strict-installed-speed") ||
         !hostSmoke.includes("--strict-historical-speed") ||
-        !hostSmoke.includes("--older-snapshots") ||
+        !hostSmoke.includes("--strict-older-snapshots") ||
         !hostSmoke.includes("--installed-speed-samples 1") ||
         !hostSmoke.includes("--historical-speed-samples 1") ||
         !hostSmoke.includes("--older-snapshot-samples 1") ||
         !hostSmoke.includes("--older-snapshot-max 1") ||
+        !hostSmoke.includes("--older-snapshot-identity-attempts 3") ||
         !hostSmoke.includes("--min-retainable-speed-samples 1")
       ) {
         failures.push("benchmark_readiness: host preflight smoke command must run strict one-sample speed gates");
@@ -756,10 +761,11 @@ export function createBenchmarkAdmission({
         !retained.includes("--speed-only") ||
         !retained.includes("--strict-installed-speed") ||
         !retained.includes("--strict-historical-speed") ||
-        !retained.includes("--older-snapshots") ||
+        !retained.includes("--strict-older-snapshots") ||
         !retained.includes("--installed-speed-samples 12") ||
         !retained.includes("--historical-speed-samples 12") ||
         !retained.includes("--older-snapshot-samples 12") ||
+        !retained.includes("--older-snapshot-identity-attempts 3") ||
         !retained.includes("--min-retainable-speed-samples 12")
       ) {
         failures.push("benchmark_readiness: retained installed/historical command must run strict retained sample gates");

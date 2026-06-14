@@ -558,6 +558,18 @@ export function createSpeedGateValidation({
     if (entry.strictRequired === true && Number(entry.report.samples) < minRetainableSpeedSamples) {
       failures.push("older_snapshot_ladder: strict ok status requires the retained sample floor");
     }
+    if (entry.strictRequired === true && !Number.isFinite(Number(entry.report.identityControlAttempts))) {
+      failures.push("older_snapshot_ladder: strict ok status requires identity-control attempt count");
+    }
+    if (entry.strictRequired === true && Number(entry.report.identityControlAttempts) < 2) {
+      failures.push("older_snapshot_ladder: strict ok status requires multi-attempt identity control");
+    }
+    if (entry.strictRequired === true && !Number.isFinite(Number(entry.report.minEngineImprovementPct))) {
+      failures.push("older_snapshot_ladder: strict ok status requires engine improvement target");
+    }
+    if (entry.strictRequired === true && !Number.isFinite(Number(entry.report.minPairedImprovementPct))) {
+      failures.push("older_snapshot_ladder: strict ok status requires paired improvement target");
+    }
     if (!Number.isInteger(Number(entry.report.runnableSnapshots)) || Number(entry.report.runnableSnapshots) < 1) {
       failures.push("older_snapshot_ladder: ok status requires at least one runnable older snapshot");
     }

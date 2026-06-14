@@ -15,6 +15,11 @@ const INSECT_ATTRIBUTION_RESEARCH = path.join(ROOT, ".docs", "research", "insect
 const INSECT_LITERAL_ALTERNATES_REFRESH = path.join(ROOT, ".docs", "research", "insect-literal-alternates-prefilter-refresh-20260613.json");
 const INSECT_TEDDY_ATTRIBUTION_REFRESH = path.join(ROOT, ".docs", "research", "insect-teddy-attribution-refresh-20260613.json");
 const INSECT_PACKED_TEDDY_SHUFTI_REFRESH = path.join(ROOT, ".docs", "research", "insect-packed-teddy-shufti-refresh-20260613.json");
+const HISTORICAL_SPEED_PROOF_COMMAND =
+  "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet";
+const OLDER_SNAPSHOT_PROOF_COMMAND =
+  "node tools/scripts/compare-older-snapshots.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-snapshots 2 --min-engine-improvement-pct 5 --min-paired-improvement-pct 5 --require-strict --quiet";
+const SPEED_PROOF_COMMAND = `${HISTORICAL_SPEED_PROOF_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -247,7 +252,7 @@ function candidateMoves(summary, leakSummary, quality) {
         ? "Latest historical evidence has no host or identity-control noise blocker."
         : `Latest report is not suitable for a runtime code decision: hostFailures=${quality.hostFailures.length}, identityFailures=${quality.identityFailures.length}, processFailures=${quality.processFailures?.length ?? 0}. Preserve the current runtime slice, rerun under a clean host, and only then act on sub-percent scanWork deltas.`,
       expectedGainScore: quality.usableForRuntimeMove ? 0 : 10 + quality.hostFailures.length + quality.identityFailures.length + (quality.processFailures?.length ?? 0),
-      proofCommand: "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet",
+      proofCommand: SPEED_PROOF_COMMAND,
     },
     {
       id: "whole_engine_leak_attribution",
@@ -257,7 +262,7 @@ function candidateMoves(summary, leakSummary, quality) {
         ? `Latest historical evidence shows Teddy attribution is positive while whole-engine evidence still has a losing round; preserve the Teddy gain and isolate ${leakSummary?.nextRepairTarget ?? "discovery, scheduling, scan bookkeeping, or reporting"} overhead before changing the Teddy kernel again. Current averaged phase medians: discover=${summary.averagePairedDiscoverMedianPct}%, scan=${summary.averagePairedScanMedianPct}%, scanWork=${summary.averagePairedScanWorkMedianPct}%, teddy=${summary.averagePairedTeddyMedianPct}%. Worst round=${leakSummary?.worstRound?.baselineLabel ?? "unknown"}.`
         : "Use this only after Teddy route attribution is already net-positive and whole-engine evidence still regresses.",
       expectedGainScore: teddyGainNeedsLeakRepair ? 3 + Math.max(0, -enginePressure) + Math.max(0, teddyPressure / 4) : 0,
-      proofCommand: "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet",
+      proofCommand: SPEED_PROOF_COMMAND,
     },
     {
       id: "packed_nibble_shuffle_teddy_kernel",
@@ -265,7 +270,7 @@ function candidateMoves(summary, leakSummary, quality) {
       owner: "src/core/search.zig::nextTeddyLiteralAlternatesCandidate or a narrow src/core/simd.zig helper",
       reason: `${teddyReason} Current Teddy path still compares each branch vector independently; research and contract require a packed SIMD/Shufti-style candidate extractor.`,
       expectedGainScore: teddyGainNeedsLeakRepair ? 1 : 2.5 + negativePressure,
-      proofCommand: "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet",
+      proofCommand: SPEED_PROOF_COMMAND,
     },
     {
       id: "corpus_measured_fingerprint_selector_inside_packed_kernel",
@@ -398,6 +403,11 @@ const report = {
   comparisonCurrentHashes,
   evidenceFresh,
   promotionAllowed,
+  proofCommands: {
+    historicalSpeed: HISTORICAL_SPEED_PROOF_COMMAND,
+    olderSnapshots: OLDER_SNAPSHOT_PROOF_COMMAND,
+    speedGate: SPEED_PROOF_COMMAND,
+  },
   noRuntimePromotionReason: evidenceFresh
     ? (promotionAllowed ? null : (policy.preserveTeddyGain ? "Teddy gain is protected, but whole-engine evidence is not net-positive; repair the leak instead of reverting" : (quality.usableForRuntimeMove ? "historical report is not net-positive across all previous-build rounds" : "historical report is blocked by host or identity-control benchmark noise")))
     : "historical report candidate hash does not match the current repo binary",

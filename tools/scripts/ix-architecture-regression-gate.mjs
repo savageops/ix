@@ -57,6 +57,9 @@ Options:
   --historical-speed-samples <n>           Historical speed samples. Default: 12.
   --older-snapshot-samples <n>             Older snapshot samples. Default: 12.
   --older-snapshot-max <n>                 Older snapshot cap for smoke runs.
+  --older-snapshot-identity-attempts <n>   Same-binary control attempts. Default: 3.
+  --min-older-snapshot-engine-pct <n>      Required older-snapshot engine improvement.
+  --min-older-snapshot-paired-pct <n>      Required older-snapshot paired improvement.
   --alternates-decision-samples <n>        Alternates samples. Default: 12.
   --alternates-decision-max-branches <n>   Alternates max branch count. Default: 8.
   --alternates-decision-branch-counts <csv>
@@ -93,6 +96,9 @@ const olderSnapshotSamples = Number(
   argValue(args, "--older-snapshot-samples", process.env.IX_OLDER_SNAPSHOT_SAMPLES ?? "12"),
 );
 const olderSnapshotMax = argValue(args, "--older-snapshot-max", process.env.IX_OLDER_SNAPSHOT_MAX ?? "");
+const olderSnapshotIdentityAttempts = Number(
+  argValue(args, "--older-snapshot-identity-attempts", process.env.IX_OLDER_SNAPSHOT_IDENTITY_ATTEMPTS ?? "3"),
+);
 const alternatesDecisionSamples = Number(
   argValue(args, "--alternates-decision-samples", process.env.IX_ALTERNATES_DECISION_SAMPLES ?? "12"),
 );
@@ -123,6 +129,12 @@ const pairedImprovementTolerancePct = Number(argValue(args, "--paired-improvemen
 const patchNoRegressionTolerancePct = Number(argValue(args, "--patch-no-regression-tolerance-pct", process.env.IX_ARCH_GATE_PATCH_NO_REGRESSION_TOLERANCE_PCT ?? "0"));
 const minPreviousBuildImprovementPct = Number(
   argValue(args, "--min-previous-build-improvement-pct", process.env.IX_MIN_PREVIOUS_BUILD_IMPROVEMENT_PCT ?? "5"),
+);
+const minOlderSnapshotEngineImprovementPct = Number(
+  argValue(args, "--min-older-snapshot-engine-pct", process.env.IX_MIN_OLDER_SNAPSHOT_ENGINE_PCT ?? "5"),
+);
+const minOlderSnapshotPairedImprovementPct = Number(
+  argValue(args, "--min-older-snapshot-paired-pct", process.env.IX_MIN_OLDER_SNAPSHOT_PAIRED_PCT ?? "5"),
 );
 const benchmarkControlDriftTolerancePct = Number(argValue(args, "--benchmark-control-drift-pct", process.env.IX_ARCH_GATE_CONTROL_DRIFT_PCT ?? "3"));
 const benchmarkControlRobustCvPct = Number(argValue(args, "--benchmark-control-robust-cv-pct", process.env.IX_ARCH_GATE_CONTROL_ROBUST_CV_PCT ?? "8"));
@@ -757,6 +769,13 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     String(olderSnapshotSamples),
     "--identity-control-samples",
     String(Math.min(12, olderSnapshotSamples)),
+    "--identity-control-attempts",
+    String(olderSnapshotIdentityAttempts),
+    "--min-engine-improvement-pct",
+    String(strictRequired ? minOlderSnapshotEngineImprovementPct : 0),
+    "--min-paired-improvement-pct",
+    String(strictRequired ? minOlderSnapshotPairedImprovementPct : 0),
+    "--no-child-benchmark-lock",
     "--latest-path",
     latestPath,
     "--quiet",
@@ -804,6 +823,9 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     baselineDir: latest.baselineDir ?? null,
     samples: latest.samples ?? null,
     identityControlSamples: latest.identityControlSamples ?? null,
+    identityControlAttempts: latest.identityControlAttempts ?? null,
+    minEngineImprovementPct: latest.minEngineImprovementPct ?? null,
+    minPairedImprovementPct: latest.minPairedImprovementPct ?? null,
     sort: latest.sort ?? null,
     runnableSnapshots: latest.runnableSnapshots ?? null,
     skippedSnapshots: latest.skippedSnapshots ?? null,
@@ -827,10 +849,25 @@ function olderSnapshotLadderLane(hostPreflight = null) {
   if (strictRequired && parsed.strictRequired !== true) {
     laneFailures.push("strict older snapshot lane must run comparator in strict mode");
   }
+  if (strictRequired && Number(parsed.identityControlAttempts) < olderSnapshotIdentityAttempts) {
+    laneFailures.push(`strict older snapshot evidence requires at least ${olderSnapshotIdentityAttempts} identity-control attempts`);
+  }
+  if (strictRequired && Number(parsed.minEngineImprovementPct) < minOlderSnapshotEngineImprovementPct) {
+    laneFailures.push(`strict older snapshot evidence requires engine improvement target ${minOlderSnapshotEngineImprovementPct}%`);
+  }
+  if (strictRequired && Number(parsed.minPairedImprovementPct) < minOlderSnapshotPairedImprovementPct) {
+    laneFailures.push(`strict older snapshot evidence requires paired improvement target ${minOlderSnapshotPairedImprovementPct}%`);
+  }
   for (const round of parsedRounds) {
     if (round.runnable !== true) continue;
-    if (enforceRetainedSpeed && Number(round.enginePct) < 0) laneFailures.push(`older snapshot engine regression: ${round.label}`);
-    if (enforceRetainedSpeed && Number(round.pairedPct) < 0) laneFailures.push(`older snapshot paired regression: ${round.label}`);
+    const requiredEnginePct = strictRequired ? minOlderSnapshotEngineImprovementPct : 0;
+    const requiredPairedPct = strictRequired ? minOlderSnapshotPairedImprovementPct : 0;
+    if (enforceRetainedSpeed && Number(round.enginePct) < requiredEnginePct) {
+      laneFailures.push(`older snapshot engine improvement below target: ${round.label}`);
+    }
+    if (enforceRetainedSpeed && Number(round.pairedPct) < requiredPairedPct) {
+      laneFailures.push(`older snapshot paired improvement below target: ${round.label}`);
+    }
     if (strictRequired && round.strict !== true) laneFailures.push(`older snapshot strict evidence missing: ${round.label}`);
   }
   const comparatorExitAcceptable = evidence.exitCode === 0 || (!enforceRetainedSpeed && Number(parsed.runnableSnapshots) >= 1);
@@ -839,6 +876,9 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     strictRequired,
     samples: olderSnapshotSamples,
     maxSnapshots: olderSnapshotMax === "" ? null : Number(olderSnapshotMax),
+    identityControlAttempts: olderSnapshotIdentityAttempts,
+    minEngineImprovementPct: strictRequired ? minOlderSnapshotEngineImprovementPct : 0,
+    minPairedImprovementPct: strictRequired ? minOlderSnapshotPairedImprovementPct : 0,
     retainedSampleFloorMet,
     diagnosticOnly: !enforceRetainedSpeed,
     evidence,
