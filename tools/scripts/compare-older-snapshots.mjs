@@ -21,7 +21,9 @@ Options:
   --samples <n>                   Samples per snapshot. Default: 12.
   --identity-control-samples <n>  Same-binary control samples. Default: min(12, samples).
   --identity-control-attempts <n> Same-binary control attempts. Default: 1.
-  --max-snapshots <n>             Limit snapshots after mtime sort. Default: all.
+  --max-snapshots <n>             Limit runnable snapshot comparisons after mtime sort.
+                                  Skipped snapshots are still recorded. Default: all.
+  --max-candidates <n>            Optional hard cap on candidate executables scanned.
   --latest-path <path>            Path for latest-report pointer. Default:
                                   tools/reports/older-snapshot-ladder/latest-older-snapshot-ladder.json.
   --newest-first                  Sort snapshots newest to oldest. Default: oldest first.
@@ -39,6 +41,8 @@ const identityControlSamples = Number(argValue(args, "--identity-control-samples
 const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "1"));
 const maxSnapshotsRaw = argValue(args, "--max-snapshots", "");
 const maxSnapshots = maxSnapshotsRaw === "" ? Infinity : Number(maxSnapshotsRaw);
+const maxCandidatesRaw = argValue(args, "--max-candidates", "");
+const maxCandidates = maxCandidatesRaw === "" ? Infinity : Number(maxCandidatesRaw);
 const latestPath = path.resolve(argValue(args, "--latest-path", path.join(REPORT_DIR, "latest-older-snapshot-ladder.json")));
 const newestFirst = args.includes("--newest-first");
 const requireStrict = args.includes("--require-strict");
@@ -51,6 +55,7 @@ if (!Number.isFinite(samples) || samples < 1) throw new Error("--samples must be
 if (!Number.isFinite(identityControlSamples) || identityControlSamples < 0) throw new Error("--identity-control-samples must be a non-negative number");
 if (!Number.isFinite(identityControlAttempts) || identityControlAttempts < 1) throw new Error("--identity-control-attempts must be a positive number");
 if (maxSnapshots !== Infinity && (!Number.isFinite(maxSnapshots) || maxSnapshots < 1)) throw new Error("--max-snapshots must be a positive number");
+if (maxCandidates !== Infinity && (!Number.isFinite(maxCandidates) || maxCandidates < 1)) throw new Error("--max-candidates must be a positive number");
 
 function snapshotCandidates() {
   const candidates = readdirSync(baselineDir)
@@ -67,7 +72,7 @@ function snapshotCandidates() {
       };
     })
     .sort((left, right) => newestFirst ? right.mtimeMs - left.mtimeMs : left.mtimeMs - right.mtimeMs);
-  return candidates.slice(0, maxSnapshots);
+  return candidates.slice(0, maxCandidates);
 }
 
 function readLatestInstalledSummary() {
@@ -175,10 +180,12 @@ if (dryRun) {
 
 mkdirSync(REPORT_DIR, { recursive: true });
 const rounds = [];
+let runnableCount = 0;
 for (const [index, candidate] of candidates.entries()) {
   if (!quiet) console.log(`[${index + 1}/${candidates.length}] ${candidate.label}`);
   const result = runSnapshot(candidate, index + 1);
   rounds.push(result);
+  if (result.runnable) runnableCount += 1;
   if (!quiet) {
     if (result.runnable) {
       console.log(`  ${result.status}: repo ${result.repoMedianMs} ms vs snapshot ${result.baselineMedianMs} ms; engine ${result.enginePct}% paired ${result.pairedPct}%`);
@@ -186,6 +193,7 @@ for (const [index, candidate] of candidates.entries()) {
       console.log(`  skipped: ${result.error}`);
     }
   }
+  if (runnableCount >= maxSnapshots) break;
 }
 
 const runnable = rounds.filter((round) => round.runnable);
@@ -204,7 +212,10 @@ const report = {
   samples,
   identityControlSamples,
   identityControlAttempts,
+  maxSnapshots: maxSnapshots === Infinity ? null : maxSnapshots,
+  maxCandidates: maxCandidates === Infinity ? null : maxCandidates,
   sort: newestFirst ? "newest_first" : "oldest_first",
+  candidateSnapshotsScanned: rounds.length,
   runnableSnapshots: runnable.length,
   skippedSnapshots: rounds.length - runnable.length,
   strictRequired: requireStrict,
