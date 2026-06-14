@@ -24,6 +24,12 @@ Options:
   --max-snapshots <n>             Limit runnable snapshot comparisons after mtime sort.
                                   Skipped snapshots are still recorded. Default: all.
   --max-candidates <n>            Optional hard cap on candidate executables scanned.
+  --min-engine-improvement-pct <n>
+                                  Required per-runnable-snapshot engine improvement.
+                                  Default: 0.
+  --min-paired-improvement-pct <n>
+                                  Required per-runnable-snapshot paired median improvement.
+                                  Default: 0.
   --latest-path <path>            Path for latest-report pointer. Default:
                                   tools/reports/older-snapshot-ladder/latest-older-snapshot-ladder.json.
   --newest-first                  Sort snapshots newest to oldest. Default: oldest first.
@@ -43,6 +49,8 @@ const maxSnapshotsRaw = argValue(args, "--max-snapshots", "");
 const maxSnapshots = maxSnapshotsRaw === "" ? Infinity : Number(maxSnapshotsRaw);
 const maxCandidatesRaw = argValue(args, "--max-candidates", "");
 const maxCandidates = maxCandidatesRaw === "" ? Infinity : Number(maxCandidatesRaw);
+const minEngineImprovementPct = Number(argValue(args, "--min-engine-improvement-pct", "0"));
+const minPairedImprovementPct = Number(argValue(args, "--min-paired-improvement-pct", "0"));
 const latestPath = path.resolve(argValue(args, "--latest-path", path.join(REPORT_DIR, "latest-older-snapshot-ladder.json")));
 const newestFirst = args.includes("--newest-first");
 const requireStrict = args.includes("--require-strict");
@@ -56,6 +64,8 @@ if (!Number.isFinite(identityControlSamples) || identityControlSamples < 0) thro
 if (!Number.isFinite(identityControlAttempts) || identityControlAttempts < 1) throw new Error("--identity-control-attempts must be a positive number");
 if (maxSnapshots !== Infinity && (!Number.isFinite(maxSnapshots) || maxSnapshots < 1)) throw new Error("--max-snapshots must be a positive number");
 if (maxCandidates !== Infinity && (!Number.isFinite(maxCandidates) || maxCandidates < 1)) throw new Error("--max-candidates must be a positive number");
+if (!Number.isFinite(minEngineImprovementPct)) throw new Error("--min-engine-improvement-pct must be a finite number");
+if (!Number.isFinite(minPairedImprovementPct)) throw new Error("--min-paired-improvement-pct must be a finite number");
 
 function snapshotCandidates() {
   const candidates = readdirSync(baselineDir)
@@ -199,9 +209,10 @@ for (const [index, candidate] of candidates.entries()) {
 const runnable = rounds.filter((round) => round.runnable);
 const failures = [];
 if (runnable.length === 0) failures.push("no_runnable_snapshots");
+if (maxSnapshots !== Infinity && runnable.length < maxSnapshots) failures.push(`runnable_snapshots_below_requested:${runnable.length}<${maxSnapshots}`);
 for (const round of runnable) {
-  if (round.enginePct < 0) failures.push(`engine_regression:${round.label}:${round.enginePct}`);
-  if (round.pairedPct < 0) failures.push(`paired_regression:${round.label}:${round.pairedPct}`);
+  if (round.enginePct < minEngineImprovementPct) failures.push(`engine_improvement_below_target:${round.label}:${round.enginePct}<${minEngineImprovementPct}`);
+  if (round.pairedPct < minPairedImprovementPct) failures.push(`paired_improvement_below_target:${round.label}:${round.pairedPct}<${minPairedImprovementPct}`);
   if (requireStrict && round.strict !== true) failures.push(`strict_evidence_missing:${round.label}`);
 }
 
@@ -214,6 +225,8 @@ const report = {
   identityControlAttempts,
   maxSnapshots: maxSnapshots === Infinity ? null : maxSnapshots,
   maxCandidates: maxCandidates === Infinity ? null : maxCandidates,
+  minEngineImprovementPct,
+  minPairedImprovementPct,
   sort: newestFirst ? "newest_first" : "oldest_first",
   candidateSnapshotsScanned: rounds.length,
   runnableSnapshots: runnable.length,
