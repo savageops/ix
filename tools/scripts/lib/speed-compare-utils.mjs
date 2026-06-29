@@ -699,6 +699,12 @@ export function buildHistoricalComparisonScore({
   const pairedImprovementMeanPct = Number(pairedEngine?.candidateImprovementPctSummary?.mean);
   const pairedAttribution = pairedAttributionLedgerFields(pairedEngine ?? null);
   const routeScore = teddyRouteScoreFields(pairedAttribution);
+  const repairDirective = installedRepairDirective({
+    improvementPct,
+    pairedImprovementMedianPct,
+    pairedAttribution,
+    routeScore,
+  });
   return {
       roundIndex,
       testedOneAtATime: true,
@@ -716,6 +722,7 @@ export function buildHistoricalComparisonScore({
     pairedCurrentImprovementMeanPct: Number.isFinite(pairedImprovementMeanPct) ? pairedImprovementMeanPct : null,
     ...pairedAttribution,
     ...routeScore,
+    ...repairDirective,
     ...pairOrderScoreFields(pairOrderSummary),
     matchParity,
     routeParity,
@@ -799,6 +806,9 @@ export function buildHistoricalRoundLedger(comparisons) {
     pairedCandidateTeddyRangeWinRate: comparison.score?.pairedCandidateTeddyRangeWinRate,
     teddyRouteObserved: comparison.score?.teddyRouteObserved,
     teddyRouteNetPositive: comparison.score?.teddyRouteNetPositive,
+    mixedKernelEngineSignal: comparison.score?.mixedKernelEngineSignal,
+    repairDirective: comparison.score?.repairDirective,
+    repairTargetPhase: comparison.score?.repairTargetPhase,
     pairCount: comparison.pairedEngine?.count ?? null,
     ...pairOrderScoreFields(comparison.pairOrderSummary ?? comparison.pairedEngine?.pairOrderSummary),
     matchParity: comparison.score?.matchParity ?? comparison.matchParity,
@@ -860,6 +870,9 @@ export function buildHistoricalScorecard(comparisons) {
       pairedCandidateTeddyRangeWinRate: comparison.score?.pairedCandidateTeddyRangeWinRate,
       teddyRouteObserved: comparison.score?.teddyRouteObserved,
       teddyRouteNetPositive: comparison.score?.teddyRouteNetPositive,
+      mixedKernelEngineSignal: comparison.score?.mixedKernelEngineSignal,
+      repairDirective: comparison.score?.repairDirective,
+      repairTargetPhase: comparison.score?.repairTargetPhase,
       requiredImprovementPct: comparison.score?.requiredImprovementPct ?? comparison.minPreviousBuildImprovementPct,
       matchParity: comparison.score?.matchParity ?? comparison.matchParity,
       routeParity: comparison.score?.routeParity ?? comparison.routeParity,
