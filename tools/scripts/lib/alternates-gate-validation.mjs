@@ -12,6 +12,14 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function identityControlAttemptsComplete(identityControl) {
+  const attemptsRequested = Number(identityControl?.attemptsRequested);
+  const attemptsRun = Number(identityControl?.attemptsRun);
+  return Number.isFinite(attemptsRequested) &&
+    Number.isFinite(attemptsRun) &&
+    attemptsRun >= attemptsRequested;
+}
+
 export function parseIntegerList(value) {
   if (value.length === 0) return [];
   return [...new Set(value.split(",")
@@ -417,8 +425,13 @@ export function createAlternatesGateValidation({
         !Number.isFinite(Number(identityControl.pairedEngine.candidateWinRate))
       ) {
         failures.push("alternates_decision: comparisons require same-binary identity control evidence");
-      } else if (!pairOrderSummaryIsBalanced(identityControl.pairOrderSummary, identityControl.samples)) {
-        failures.push("alternates_decision: comparisons require balanced same-binary identity-control pair order");
+      } else {
+        if (!pairOrderSummaryIsBalanced(identityControl.pairOrderSummary, identityControl.samples)) {
+          failures.push("alternates_decision: comparisons require balanced same-binary identity-control pair order");
+        }
+        if (!identityControlAttemptsComplete(identityControl)) {
+          failures.push("alternates_decision: comparisons require full requested same-binary identity-control attempts");
+        }
       }
     }
   }
@@ -635,6 +648,11 @@ export function createAlternatesDecisionGateLane({
       );
     })) {
       laneFailures.push("alternates decision comparisons require same-binary identity control evidence");
+    }
+    if (parsed.comparisons.some((comparison) =>
+      !identityControlAttemptsComplete(parsed.identityControls?.[String(comparison?.branchCount)])
+    )) {
+      laneFailures.push("alternates decision comparisons require full requested same-binary identity-control attempts");
     }
     if (parsed.comparisons.some((comparison) =>
       (comparison?.classification === "regression" || comparison?.regression === true) &&

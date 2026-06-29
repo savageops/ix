@@ -38,6 +38,14 @@ function comparatorStateReportsClean(reports) {
   });
 }
 
+function identityControlAttemptsComplete(identityControl) {
+  const attemptsRequested = Number(identityControl?.attemptsRequested);
+  const attemptsRun = Number(identityControl?.attemptsRun);
+  return Number.isFinite(attemptsRequested) &&
+    Number.isFinite(attemptsRun) &&
+    attemptsRun >= attemptsRequested;
+}
+
 export function createSpeedGateValidation({
   minInstalledImprovementPct,
   minPreviousBuildImprovementPct,
@@ -239,8 +247,13 @@ export function createSpeedGateValidation({
       identityControl.routeParity !== true
     ) {
       failures.push("installed_speed_compare: ok status requires same-binary identity control evidence");
-    } else if (!pairOrderSummaryIsBalanced(identityControl.pairOrderSummary, identityControl.samples)) {
-      failures.push("installed_speed_compare: ok status requires balanced same-binary identity-control pair order");
+    } else {
+      if (!pairOrderSummaryIsBalanced(identityControl.pairOrderSummary, identityControl.samples)) {
+        failures.push("installed_speed_compare: ok status requires balanced same-binary identity-control pair order");
+      }
+      if (!identityControlAttemptsComplete(identityControl)) {
+        failures.push("installed_speed_compare: ok status requires full requested same-binary identity-control attempts");
+      }
     }
     const comparison = entry.report.installedRepoComparison;
     if (!isPlainObject(comparison)) {
@@ -390,8 +403,13 @@ export function createSpeedGateValidation({
       identityControl.routeParity !== true
     ) {
       failures.push("historical_speed_compare: ok status requires same-binary identity control evidence");
-    } else if (!pairOrderSummaryIsBalanced(identityControl.pairOrderSummary, identityControl.samples)) {
-      failures.push("historical_speed_compare: ok status requires balanced same-binary identity-control pair order");
+    } else {
+      if (!pairOrderSummaryIsBalanced(identityControl.pairOrderSummary, identityControl.samples)) {
+        failures.push("historical_speed_compare: ok status requires balanced same-binary identity-control pair order");
+      }
+      if (!identityControlAttemptsComplete(identityControl)) {
+        failures.push("historical_speed_compare: ok status requires full requested same-binary identity-control attempts");
+      }
     }
     if (!Array.isArray(entry.report.comparisons) || entry.report.comparisons.length === 0) {
       failures.push("historical_speed_compare: ok status requires historical comparisons");
