@@ -304,6 +304,12 @@ function candidateMoves(summary, leakSummary, quality) {
     teddyGainNeedsLeakRepair &&
     leakSummary?.nextRepairTarget === "scanWork" &&
     leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen";
+  const filesScannedParityStatus = (() => {
+    const value = leakSummary?.leakAttribution?.currentOnlyScanSplit?.filesScannedParity;
+    if (value === true) return "proved";
+    if (value === false) return "mismatch";
+    return "missing";
+  })();
   const fullScanVolumeStable =
     summary.fullScanCallsParity === true &&
     summary.fullScanBytesParity === true &&
@@ -339,7 +345,7 @@ function candidateMoves(summary, leakSummary, quality) {
       status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (scanOpenDominatesLeak ? "allowed_next" : "waiting_for_scan_open_split"),
       owner: "src/core/search.zig::scanFileIntoShardTimed and scanFileIntoShardMonoTimed",
       reason: scanOpenDominatesLeak
-        ? `Scan-open timing split is now present and identifies the file-open wrapper as the dominant candidate subphase: scanOpen median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMedianMs?.median}ms, scanOpen per file=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMsPerFileMedian?.median}ms, scanFile median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanFileMedianMs?.median}ms. The next runtime candidate must reduce open-path pressure per file or prove a lower-risk scan scheduling owner before touching the Teddy kernel.`
+        ? `Scan-open timing split is now present and identifies the file-open wrapper as the dominant candidate subphase under file-count parity=${filesScannedParityStatus}: scanOpen median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMedianMs?.median}ms, scanOpen per file=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMsPerFileMedian?.median}ms, scanFile median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanFileMedianMs?.median}ms. The next runtime candidate must reduce open-path pressure per file, not chase scanned-file count, before touching the Teddy kernel.`
         : "Run historical proof with --scan-open-timing before choosing an open-path, scan-file, or Teddy-kernel repair.",
       expectedGainScore: scanOpenDominatesLeak ? 4 + Math.max(0, -enginePressure) : 0,
       proofCommand: SPEED_SCAN_OPEN_PROMOTION_COMMAND,

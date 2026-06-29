@@ -302,6 +302,11 @@ function routeTimingMedianFields(baseline, candidate) {
 }
 
 function stageTimingMedianFields(baseline, candidate) {
+  const baselineFilesScanned = Array.isArray(baseline?.filesScanned) ? baseline.filesScanned : null;
+  const candidateFilesScanned = Array.isArray(candidate?.filesScanned) ? candidate.filesScanned : null;
+  const filesScannedParity = baselineFilesScanned != null && candidateFilesScanned != null
+    ? JSON.stringify(baselineFilesScanned) === JSON.stringify(candidateFilesScanned)
+    : null;
   return {
     baselineDiscoverMedianMs: baseline?.discoverSummary?.median ?? null,
     candidateDiscoverMedianMs: candidate?.discoverSummary?.median ?? null,
@@ -321,6 +326,9 @@ function stageTimingMedianFields(baseline, candidate) {
     candidateScanOpenMsPerFileMedian: candidate?.scanOpenMsPerFileSummary?.median ?? null,
     baselineScanFileMsPerFileMedian: baseline?.scanFileMsPerFileSummary?.median ?? null,
     candidateScanFileMsPerFileMedian: candidate?.scanFileMsPerFileSummary?.median ?? null,
+    baselineFilesScanned,
+    candidateFilesScanned,
+    filesScannedParity,
     baselineSlowestFileMedianMs: baseline?.slowestMsSummary?.median ?? null,
     candidateSlowestFileMedianMs: candidate?.slowestMsSummary?.median ?? null,
     baselineSlowestFileMedianBytes: baseline?.slowestBytesSummary?.median ?? null,

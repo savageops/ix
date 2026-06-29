@@ -240,6 +240,12 @@ if (teddyGainNeedsLeakRepair) {
         failures.push("decision scanOpen-dominant leak attribution must include per-file open pressure");
       }
       if (
+        split.dominantCandidateSubphase === "scanOpen" &&
+        split.filesScannedParity !== true
+      ) {
+        failures.push("decision scanOpen-dominant leak attribution must prove scanned-file-count parity");
+      }
+      if (
         split.dominantCandidateSubphase === "scanFile" &&
         !["teddyRange", "alternateFullScan", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
       ) {

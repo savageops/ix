@@ -35,6 +35,10 @@ function optionalNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function optionalBoolean(value) {
+  return typeof value === "boolean" ? value : null;
+}
+
 function ratioPct(part, whole) {
   const partNumber = Number(part);
   const wholeNumber = Number(whole);
@@ -376,6 +380,9 @@ export function phaseLeakSummaryFromRounds(rounds) {
         baselineScanFileMedianMs: optionalNumber(sourceRound.baselineScanFileMedianMs),
         baselineScanOpenMsPerFileMedian: optionalNumber(sourceRound.baselineScanOpenMsPerFileMedian),
         baselineScanFileMsPerFileMedian: optionalNumber(sourceRound.baselineScanFileMsPerFileMedian),
+        baselineFilesScanned: Array.isArray(sourceRound.baselineFilesScanned) ? sourceRound.baselineFilesScanned : null,
+        candidateFilesScanned: Array.isArray(sourceRound.candidateFilesScanned) ? sourceRound.candidateFilesScanned : null,
+        filesScannedParity: optionalBoolean(sourceRound.filesScannedParity),
         baselineScanSplitPresent,
         candidateScanWorkMedianMs: optionalNumber(sourceRound.candidateScanWorkMedianMs),
         candidateScanOpenMedianMs: optionalNumber(sourceRound.candidateScanOpenMedianMs),
@@ -408,6 +415,10 @@ export function phaseLeakSummaryFromRounds(rounds) {
         const candidateScanWorkMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanWorkMedianMs));
         const candidateScanOpenMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenMsPerFileMedian));
         const candidateScanFileMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileMsPerFileMedian));
+        const fileParityValues = candidateSplitRounds.map((round) => round.filesScannedParity);
+        const filesScannedParity = fileParityValues.length === 0 || fileParityValues.some((value) => value == null)
+          ? null
+          : fileParityValues.every((value) => value === true);
         const scanFileResidualRounds = candidateSplitRounds.map((round) => {
           const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
           const teddyMs = nsToMs(sourceRound.candidateAlternateTeddyRangeElapsedNsMedian);
@@ -465,6 +476,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
           candidateScanWorkMedianMs,
           candidateScanOpenMsPerFileMedian,
           candidateScanFileMsPerFileMedian,
+          filesScannedParity,
           candidateTeddyShareOfScanFilePct: teddyShareOfScanFilePct,
           candidateAlternateFullScanShareOfScanFilePct: alternateFullScanShareOfScanFilePct,
           candidateAlternateFullScanMedianMs: alternateFullScanMedianMs,
