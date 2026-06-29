@@ -178,6 +178,8 @@ const speedGateValidation = createSpeedGateValidation({
   validateHostPreflightSkipRemediation,
 });
 const {
+  historicalRoundLedgerMatches,
+  historicalScorecardMatches,
   historicalScoreMatchesRaw,
   installedScoreMatchesRaw,
   validateHistoricalSpeedLane,

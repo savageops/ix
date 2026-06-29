@@ -658,6 +658,8 @@ export function createSpeedGateValidation({
   }
 
   return {
+    historicalRoundLedgerMatches,
+    historicalScorecardMatches,
     historicalScoreMatchesRaw,
     installedScoreMatchesRaw,
     validateHistoricalSpeedLane,
