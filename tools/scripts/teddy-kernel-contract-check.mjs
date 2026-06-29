@@ -181,9 +181,15 @@ if (teddyGainNeedsLeakRepair) {
       }
       if (
         split.dominantCandidateSubphase === "scanFile" &&
-        !["teddyRange", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
+        !["teddyRange", "alternateFullScan", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
       ) {
         failures.push("decision scanFile leak attribution must name dominant candidate scan-file component");
+      }
+      if (
+        split.dominantCandidateScanFileComponent === "alternateFullScan" &&
+        Number(split.candidateAlternateFullScanMedianMs?.median ?? 0) <= 0
+      ) {
+        failures.push("decision alternate full-scan attribution must include elapsed median timing");
       }
       if (
         split.dominantCandidateScanFileComponent === "scanFileResidual" &&

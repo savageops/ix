@@ -113,9 +113,15 @@ function validateTeddyDecision(decision, evidence) {
         }
         if (
           split.dominantCandidateSubphase === "scanFile" &&
-          !["teddyRange", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
+          !["teddyRange", "alternateFullScan", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
         ) {
           failures.push("scanFile leak attribution requires a dominant candidate scan-file component");
+        }
+        if (
+          split.dominantCandidateScanFileComponent === "alternateFullScan" &&
+          Number(split.candidateAlternateFullScanMedianMs?.median ?? 0) <= 0
+        ) {
+          failures.push("alternate full-scan attribution requires elapsed median timing");
         }
         if (
           split.dominantCandidateScanFileComponent === "scanFileResidual" &&
