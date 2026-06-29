@@ -345,6 +345,31 @@ function teddyRouteScoreFields(pairedAttribution, { minRouteImprovementPct = 0 }
   };
 }
 
+function installedRepairDirective({ improvementPct, pairedImprovementMedianPct, pairedAttribution, routeScore } = {}) {
+  const teddyMedianPct = Number(pairedAttribution?.pairedCandidateTeddyRangeImprovementMedianPct);
+  const scanWorkPct = Number(pairedAttribution?.pairedCandidateScanWorkImprovementMedianPct);
+  const scanPct = Number(pairedAttribution?.pairedCandidateScanImprovementMedianPct);
+  const discoverPct = Number(pairedAttribution?.pairedCandidateDiscoverImprovementMedianPct);
+  const engineRegressed = Number(improvementPct) < 0 || Number(pairedImprovementMedianPct) < 0;
+  const teddyImproved = routeScore?.teddyRouteObserved === true &&
+    routeScore?.teddyRouteNetPositive === true &&
+    Number.isFinite(teddyMedianPct) &&
+    teddyMedianPct > 0;
+  const targetPhase = [
+    ["scanWork", scanWorkPct],
+    ["scan", scanPct],
+    ["discover", discoverPct],
+  ].find(([, value]) => Number.isFinite(value) && value < 0)?.[0] ?? null;
+
+  return {
+    mixedKernelEngineSignal: teddyImproved && engineRegressed,
+    repairDirective: teddyImproved && engineRegressed
+      ? "preserve_teddy_gain_repair_whole_engine"
+      : (engineRegressed ? "repair_whole_engine_regression" : null),
+    repairTargetPhase: targetPhase,
+  };
+}
+
 export function buildInstalledComparisonScore({
   comparison,
   binaryRelation,
@@ -358,6 +383,12 @@ export function buildInstalledComparisonScore({
   const pairedAttribution = pairedAttributionLedgerFields(pairedEngine ?? null);
   const routeScore = teddyRouteScoreFields(pairedAttribution);
   const routeParityAcceptable = comparison?.routeParityAcceptable ?? (comparison?.routeParity === true);
+  const repairDirective = installedRepairDirective({
+    improvementPct,
+    pairedImprovementMedianPct,
+    pairedAttribution,
+    routeScore,
+  });
   return {
     roundIndex: 1,
     testedOneAtATime: true,
@@ -401,6 +432,7 @@ export function buildInstalledComparisonScore({
     pairedRepoImprovementMeanPct: Number.isFinite(pairedImprovementMeanPct) ? pairedImprovementMeanPct : null,
     ...pairedAttribution,
     ...routeScore,
+    ...repairDirective,
     ...pairOrderScoreFields(comparison?.pairOrderSummary),
     matchParity: comparison?.matchParity,
     routeParity: comparison?.routeParity,
@@ -489,6 +521,9 @@ export function buildInstalledScorecard({ score, binaryRelation } = {}) {
             pairedCandidateEngineResidualWinRate: score?.pairedCandidateEngineResidualWinRate,
             teddyRouteObserved: score?.teddyRouteObserved,
             teddyRouteNetPositive: score?.teddyRouteNetPositive,
+            mixedKernelEngineSignal: score?.mixedKernelEngineSignal,
+            repairDirective: score?.repairDirective,
+            repairTargetPhase: score?.repairTargetPhase,
             requiredImprovementPct: score?.requiredImprovementPct,
             matchParity: score?.matchParity,
             routeParity: score?.routeParity,
