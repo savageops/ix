@@ -444,6 +444,25 @@ export function createBenchmarkAdmission({
 
   function benchmarkReadinessLane({ lane, hostPreflight, benchmarkControl, speedLanes = [] }) {
     const blockers = [];
+    const speedLaneFailureSummary = (speedLane) => ({
+      lane: speedLane?.id ?? null,
+      status: speedLane?.status ?? null,
+      reason: speedLane?.reason ?? null,
+      failures: speedLane?.failures ?? [],
+      reportFailures: speedLane?.report?.failures ?? [],
+      strictEvidenceFailures: speedLane?.report?.strictEvidenceFailures ?? [],
+      requiredGateFailures: speedLane?.report?.requiredGateFailures ?? [],
+      scorecard: isPlainObject(speedLane?.report?.scorecard)
+        ? {
+            testedOneAtATime: speedLane.report.scorecard.testedOneAtATime ?? null,
+            netPositive: speedLane.report.scorecard.netPositive ?? null,
+            losingRounds: Array.isArray(speedLane.report.scorecard.losingRounds)
+              ? speedLane.report.scorecard.losingRounds.slice(0, 4)
+              : [],
+          }
+        : null,
+      reportFailureSummary: speedLane?.report?.failureSummary ?? null,
+    });
     const hostRemediation = hostPreflight?.metrics?.remediation ?? null;
     const controlRemediation = benchmarkControl?.status === "failed"
       ? benchmarkHostRemediation(benchmarkControl.metrics?.hostIssues ?? [], { corpus: benchmarkCorpus, stateDir })
@@ -484,6 +503,7 @@ export function createBenchmarkAdmission({
           id: `${speedLane.id}_failed`,
           lane: speedLane.id,
           reason: speedLane.reason ?? "speed comparison lane failed",
+          failureSummary: speedLaneFailureSummary(speedLane),
           affectedLanes: [speedLane.id],
         });
       }
@@ -496,6 +516,7 @@ export function createBenchmarkAdmission({
           id: `${speedLane.id}_required_gate`,
           lane: speedLane.id,
           reason: speedLane.reason ?? "speed comparison required gate failed",
+          failureSummary: speedLaneFailureSummary(speedLane),
           affectedLanes: [speedLane.id],
         });
       }
@@ -629,6 +650,15 @@ export function createBenchmarkAdmission({
         !isPlainObject(controlBlocker.failureSummary)
       ) {
         failures.push("benchmark_readiness: benchmark-control blocker requires propagated failure summary");
+      }
+      for (const blocker of entry.metrics.blockers) {
+        if (
+          typeof blocker?.id === "string" &&
+          (blocker.id.endsWith("_failed") || blocker.id.endsWith("_required_gate")) &&
+          !isPlainObject(blocker.failureSummary)
+        ) {
+          failures.push(`benchmark_readiness: speed blocker requires failure summary: ${blocker.id}`);
+        }
       }
     }
     if (entry.status === "ok" && entry.metrics.admissible !== true) {
