@@ -31,10 +31,10 @@ Options:
   --max-candidates <n>            Optional hard cap on candidate executables scanned.
   --min-engine-improvement-pct <n>
                                   Required per-runnable-snapshot engine improvement.
-                                  Default: 0.
+                                  Default: 5.
   --min-paired-improvement-pct <n>
                                   Required per-runnable-snapshot paired median improvement.
-                                  Default: 0.
+                                  Default: 5.
   --latest-path <path>            Path for latest-report pointer. Default:
                                   tools/reports/older-snapshot-ladder/latest-older-snapshot-ladder.json.
   --newest-first                  Sort snapshots newest to oldest. Default: oldest first.
@@ -59,8 +59,8 @@ const targetRetainableSnapshotsRaw = argValue(args, "--target-retainable-snapsho
 const targetRetainableSnapshots = targetRetainableSnapshotsRaw === "" ? Infinity : Number(targetRetainableSnapshotsRaw);
 const maxCandidatesRaw = argValue(args, "--max-candidates", "");
 const maxCandidates = maxCandidatesRaw === "" ? Infinity : Number(maxCandidatesRaw);
-const minEngineImprovementPct = Number(argValue(args, "--min-engine-improvement-pct", "0"));
-const minPairedImprovementPct = Number(argValue(args, "--min-paired-improvement-pct", "0"));
+const minEngineImprovementPct = Number(argValue(args, "--min-engine-improvement-pct", process.env.IX_MIN_OLDER_SNAPSHOT_ENGINE_PCT ?? "5"));
+const minPairedImprovementPct = Number(argValue(args, "--min-paired-improvement-pct", process.env.IX_MIN_OLDER_SNAPSHOT_PAIRED_PCT ?? "5"));
 const latestPath = path.resolve(argValue(args, "--latest-path", path.join(REPORT_DIR, "latest-older-snapshot-ladder.json")));
 const newestFirst = args.includes("--newest-first");
 const requireStrict = args.includes("--require-strict");

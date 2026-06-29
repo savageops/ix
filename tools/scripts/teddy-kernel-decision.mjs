@@ -223,7 +223,10 @@ function researchBasis() {
 }
 
 function evidenceQuality(historical) {
-  return historical?.evidenceQuality ?? evidenceQualityFromFailures(historical?.strictEvidenceFailures ?? []);
+  const failures = Array.isArray(historical?.strictEvidenceFailures)
+    ? historical.strictEvidenceFailures
+    : historical?.evidenceQuality?.failures ?? [];
+  return evidenceQualityFromFailures(failures);
 }
 
 function candidateMoves(summary, leakSummary, quality) {

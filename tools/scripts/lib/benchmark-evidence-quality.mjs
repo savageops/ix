@@ -50,7 +50,12 @@ export function evidenceQualityFromFailures(failures = []) {
     !sampleFailures.includes(failure),
   );
   return {
-    usableForRuntimeMove: hostFailures.length === 0 && identityFailures.length === 0 && processFailures.length === 0,
+    usableForRuntimeMove:
+      hostFailures.length === 0 &&
+      identityFailures.length === 0 &&
+      processFailures.length === 0 &&
+      sampleFailures.length === 0 &&
+      comparisonFailures.length === 0,
     hostFailures,
     identityFailures,
     processFailures,

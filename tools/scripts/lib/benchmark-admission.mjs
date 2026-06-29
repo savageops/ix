@@ -182,6 +182,10 @@ export function createBenchmarkAdmission({
           "1",
           "--older-snapshot-identity-attempts",
           "3",
+          "--min-older-snapshot-engine-pct",
+          "5",
+          "--min-older-snapshot-paired-pct",
+          "5",
           "--min-retainable-speed-samples",
           smokeSampleArg,
         ].join(" "),
@@ -206,6 +210,10 @@ export function createBenchmarkAdmission({
           "2",
           "--older-snapshot-identity-attempts",
           "3",
+          "--min-older-snapshot-engine-pct",
+          "5",
+          "--min-older-snapshot-paired-pct",
+          "5",
           "--min-retainable-speed-samples",
           sampleArg,
         ].join(" "),
@@ -797,6 +805,8 @@ export function createBenchmarkAdmission({
         !hostSmoke.includes("--older-snapshot-max 1") ||
         !hostSmoke.includes("--older-snapshot-retainable-target 1") ||
         !hostSmoke.includes("--older-snapshot-identity-attempts 3") ||
+        !hostSmoke.includes("--min-older-snapshot-engine-pct 5") ||
+        !hostSmoke.includes("--min-older-snapshot-paired-pct 5") ||
         !hostSmoke.includes("--min-retainable-speed-samples 2")
       ) {
         failures.push("benchmark_readiness: host preflight smoke command must run strict paired-smoke speed gates");
@@ -812,6 +822,8 @@ export function createBenchmarkAdmission({
         !retained.includes("--older-snapshot-samples 12") ||
         !retained.includes("--older-snapshot-retainable-target 2") ||
         !retained.includes("--older-snapshot-identity-attempts 3") ||
+        !retained.includes("--min-older-snapshot-engine-pct 5") ||
+        !retained.includes("--min-older-snapshot-paired-pct 5") ||
         !retained.includes("--min-retainable-speed-samples 12")
       ) {
         failures.push("benchmark_readiness: retained installed/historical command must run strict retained sample gates");
