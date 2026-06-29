@@ -35,6 +35,13 @@ function optionalNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function ratioPct(part, whole) {
+  const partNumber = Number(part);
+  const wholeNumber = Number(whole);
+  if (!Number.isFinite(partNumber) || !Number.isFinite(wholeNumber) || wholeNumber === 0) return null;
+  return (partNumber / wholeNumber) * 100;
+}
+
 export function phaseTimingResidualMs(timings, engineMs) {
   const discover = Number(timings?.discover_ms ?? 0);
   const scan = Number(timings?.scan_ms ?? 0);
@@ -296,6 +303,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
     .filter((round) => Array.isArray(round.negativePhases) && round.negativePhases.some((phase) => phase.name === nextRepairTarget))
     .map((round) => {
       const phase = round.negativePhases.find((entry) => entry.name === nextRepairTarget) ?? {};
+      const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
       return {
         roundIndex: round.roundIndex,
         baselineLabel: round.baselineLabel,
@@ -304,6 +312,11 @@ export function phaseLeakSummaryFromRounds(rounds) {
         targetPhase: nextRepairTarget,
         targetPhaseMedianPct: Number.isFinite(Number(phase.pairedMedianPct)) ? Number(phase.pairedMedianPct) : null,
         targetPhaseDeltaMs: Number.isFinite(Number(phase.pairedDeltaMedianMs)) ? Number(phase.pairedDeltaMedianMs) : null,
+        candidateScanWorkMedianMs: optionalNumber(sourceRound.candidateScanWorkMedianMs),
+        candidateScanOpenMedianMs: optionalNumber(sourceRound.candidateScanOpenMedianMs),
+        candidateScanFileMedianMs: optionalNumber(sourceRound.candidateScanFileMedianMs),
+        candidateScanOpenSharePct: ratioPct(sourceRound.candidateScanOpenMedianMs, sourceRound.candidateScanWorkMedianMs),
+        candidateScanFileSharePct: ratioPct(sourceRound.candidateScanFileMedianMs, sourceRound.candidateScanWorkMedianMs),
       };
     });
   const protectedWinningRounds = roundsWithLeaks
@@ -320,7 +333,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
   const nextProbe = nextRepairTarget === "scanWork"
     ? {
         id: "split_scan_work_open_vs_file",
-        reason: "scanWork is leaking but scanOpen/scanFile attribution is disabled or incomplete in the retained comparison",
+        reason: "scanWork is leaking; use current-only scanOpen/scanFile medians when predecessor builds lack those counters",
         commandSuffix: "--scan-open-timing",
       }
     : (nextRepairTarget == null ? null : {
