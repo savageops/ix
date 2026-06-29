@@ -468,6 +468,7 @@ export function createBenchmarkAdmission({
         id: "benchmark_control",
         lane: "benchmark_control",
         reason: benchmarkControl.reason ?? "same-binary benchmark control failed",
+        failureSummary: benchmarkControl.metrics?.failureSummary ?? null,
         affectedLanes: [
           "ripgrep_12_sample",
           "installed_speed_compare",
@@ -620,6 +621,15 @@ export function createBenchmarkAdmission({
     }
     if (!Array.isArray(entry.metrics.blockers)) {
       failures.push("benchmark_readiness: metrics.blockers must be an array");
+    }
+    if (Array.isArray(entry.metrics.blockers)) {
+      const controlBlocker = entry.metrics.blockers.find((blocker) => blocker?.id === "benchmark_control");
+      if (
+        controlBlocker &&
+        !isPlainObject(controlBlocker.failureSummary)
+      ) {
+        failures.push("benchmark_readiness: benchmark-control blocker requires propagated failure summary");
+      }
     }
     if (entry.status === "ok" && entry.metrics.admissible !== true) {
       failures.push("benchmark_readiness: ok status requires admissible true");
