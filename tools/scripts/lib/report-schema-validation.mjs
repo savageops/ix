@@ -49,6 +49,7 @@ export function createReportSchemaValidation({
     const expectedLaneIds = new Set([
       "worktree",
       "planning_chain",
+      "planning_queue",
       "diff_check",
       "benchmark_host_preflight",
       "benchmark_lock",

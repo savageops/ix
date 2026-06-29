@@ -962,7 +962,7 @@ function diffCheckLane() {
   return lane("diff_check", check.exitCode === 0 ? "ok" : "failed", { evidence: check });
 }
 
-const { planningLane } = createPlanningGateValidation({
+const { planningLane, planningQueueLane } = createPlanningGateValidation({
   root: ROOT,
   lane,
   planningChainSlug,
@@ -1207,6 +1207,7 @@ function benchmarkReadinessLane(hostPreflight, benchmarkControl, speedLanes = []
 
 const worktree = worktreeLane();
 const planning = planningLane();
+const planningQueue = planningQueueLane();
 const diffCheck = diffCheckLane();
 const benchmarkLock = benchmarkLockLane();
 const benchmarkHostPreflight = benchmarkHostPreflightLane();
@@ -1227,6 +1228,7 @@ const teddyKernelContract = teddyKernelContractLane();
 const lanes = [
   worktree,
   planning,
+  planningQueue,
   diffCheck,
   benchmarkLock,
   benchmarkHostPreflight,
