@@ -17,11 +17,14 @@ const INSECT_TEDDY_ATTRIBUTION_REFRESH = path.join(ROOT, ".docs", "research", "i
 const INSECT_PACKED_TEDDY_SHUFTI_REFRESH = path.join(ROOT, ".docs", "research", "insect-packed-teddy-shufti-refresh-20260613.json");
 const HISTORICAL_SPEED_DIAGNOSTIC_COMMAND =
   "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --no-require-strict";
+const HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND =
+  "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --no-require-strict --scan-open-timing";
 const HISTORICAL_SPEED_STRICT_COMMAND =
   "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --require-strict";
 const OLDER_SNAPSHOT_PROOF_COMMAND =
   "node tools/scripts/compare-older-snapshots.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --min-retainable-samples 12 --max-snapshots 2 --target-retainable-snapshots 2 --min-engine-improvement-pct 5 --min-paired-improvement-pct 5 --require-strict --quiet";
 const SPEED_DIAGNOSTIC_COMMAND = `${HISTORICAL_SPEED_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
+const SPEED_LEAK_ATTRIBUTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 const SPEED_PROMOTION_COMMAND = `${HISTORICAL_SPEED_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 
 const args = process.argv.slice(2);
@@ -282,7 +285,7 @@ function candidateMoves(summary, leakSummary, quality) {
         ? `Latest historical evidence shows Teddy attribution is positive while whole-engine evidence still has a losing round; preserve the Teddy gain and isolate ${leakSummary?.nextRepairTarget ?? "discovery, scheduling, scan bookkeeping, or reporting"} overhead before changing the Teddy kernel again. Current averaged phase medians: discover=${summary.averagePairedDiscoverMedianPct}%, scan=${summary.averagePairedScanMedianPct}%, scanWork=${summary.averagePairedScanWorkMedianPct}%, teddy=${summary.averagePairedTeddyMedianPct}%. Worst round=${leakSummary?.worstRound?.baselineLabel ?? "unknown"}.`
         : "Use this only after Teddy route attribution is already net-positive and whole-engine evidence still regresses.",
       expectedGainScore: teddyGainNeedsLeakRepair ? 3 + Math.max(0, -enginePressure) + Math.max(0, teddyPressure / 4) : 0,
-      proofCommand: SPEED_DIAGNOSTIC_COMMAND,
+      proofCommand: SPEED_LEAK_ATTRIBUTION_COMMAND,
     },
     {
       id: "packed_nibble_shuffle_teddy_kernel",

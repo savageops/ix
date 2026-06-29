@@ -162,6 +162,12 @@ if (teddyGainNeedsLeakRepair) {
   if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
     failures.push("decision must expose whole-engine leak attribution as next engineering move");
   }
+  if (
+    decision.leakSummary?.nextRepairTarget === "scanWork" &&
+    !String(decision.nextAllowedMove?.proofCommand ?? "").includes("--scan-open-timing")
+  ) {
+    failures.push("decision scanWork leak attribution proof command must enable scan-open timing");
+  }
   if (!String(decision.preservationPolicy?.rule ?? "").includes("do_not_revert_teddy_gain")) {
     failures.push("decision preservation policy must encode the no-revert Teddy rule");
   }
