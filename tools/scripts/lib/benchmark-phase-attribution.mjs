@@ -292,6 +292,42 @@ export function phaseLeakSummaryFromRounds(rounds) {
   const nextRepairTarget = roundLevelTeddyWinningEngineLeaking
     ? worstRoundRepairTarget ?? repairTargets[0]?.name ?? null
     : repairTargets[0]?.name ?? worstRoundRepairTarget;
+  const targetRounds = nextRepairTarget == null ? [] : roundsWithLeaks
+    .filter((round) => Array.isArray(round.negativePhases) && round.negativePhases.some((phase) => phase.name === nextRepairTarget))
+    .map((round) => {
+      const phase = round.negativePhases.find((entry) => entry.name === nextRepairTarget) ?? {};
+      return {
+        roundIndex: round.roundIndex,
+        baselineLabel: round.baselineLabel,
+        pairedEngineMedianPct: round.pairedEngineMedianPct,
+        teddyRangeMedianPct: round.teddyRangeMedianPct,
+        targetPhase: nextRepairTarget,
+        targetPhaseMedianPct: Number.isFinite(Number(phase.pairedMedianPct)) ? Number(phase.pairedMedianPct) : null,
+        targetPhaseDeltaMs: Number.isFinite(Number(phase.pairedDeltaMedianMs)) ? Number(phase.pairedDeltaMedianMs) : null,
+      };
+    });
+  const protectedWinningRounds = roundsWithLeaks
+    .filter((round) =>
+      Number(round.teddyRangeMedianPct) > 0 &&
+      Number(round.pairedEngineMedianPct) < 0
+    )
+    .map((round) => ({
+      roundIndex: round.roundIndex,
+      baselineLabel: round.baselineLabel,
+      pairedEngineMedianPct: round.pairedEngineMedianPct,
+      teddyRangeMedianPct: round.teddyRangeMedianPct,
+    }));
+  const nextProbe = nextRepairTarget === "scanWork"
+    ? {
+        id: "split_scan_work_open_vs_file",
+        reason: "scanWork is leaking but scanOpen/scanFile attribution is disabled or incomplete in the retained comparison",
+        commandSuffix: "--scan-open-timing",
+      }
+    : (nextRepairTarget == null ? null : {
+        id: `measure_${nextRepairTarget}_leak`,
+        reason: `${nextRepairTarget} is the current whole-engine leak target`,
+        commandSuffix: null,
+      });
   return {
     averages,
     deltaMsAverages,
@@ -299,6 +335,12 @@ export function phaseLeakSummaryFromRounds(rounds) {
     repairTargets,
     leakingPhaseCounts,
     worstRound,
+    leakAttribution: {
+      targetPhase: nextRepairTarget,
+      targetRounds,
+      protectedWinningRounds,
+      nextProbe,
+    },
     preservePositivePhase: shouldRepairLeak ? "teddyRange" : null,
     nextRepairTarget,
     diagnosis: shouldRepairLeak

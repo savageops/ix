@@ -13,10 +13,9 @@ const DEFAULT_EXPR = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)";
 const DEFAULT_INSTALL_DIR = path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin");
 const DEFAULT_REPO_IX = path.join(ROOT, "zig-out", "bin", process.platform === "win32" ? "ix-zig.exe" : "ix-zig");
 const BENCH_STATE_DIR = path.join(os.tmpdir(), "ix-zig-historical-speed-state");
-const BENCH_ENV = {
+const BASE_BENCH_ENV = {
   IX_INDEX: "0",
   IX_NEXUS: "0",
-  IX_SCAN_OPEN_TIMING: "0",
   IX_STATE_DIR: BENCH_STATE_DIR,
 };
 
@@ -43,6 +42,7 @@ Options:
   --min-previous-build-improvement-pct <n>
                                        Required improvement over previous builds. Default: 5.
   --identity-noise-multiplier <n>      Effective target multiplier for same-binary drift. Default: 3.
+  --scan-open-timing                   Enable scan open/file subphase timing in IX telemetry.
   --no-benchmark-lock                  Disable the cross-script benchmark lock.
   --require-strict                     Exit non-zero unless strict evidence passes.
   --quiet                               Write reports without printing summary.
@@ -64,9 +64,14 @@ const includeCurrentInstall = args.includes("--include-current-install");
 const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", process.env.IX_MIN_RETAINABLE_SPEED_SAMPLES ?? "12"));
 const minPreviousBuildImprovementPct = Number(argValue(args, "--min-previous-build-improvement-pct", process.env.IX_MIN_PREVIOUS_BUILD_IMPROVEMENT_PCT ?? "5"));
 const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "3"));
+const scanOpenTiming = args.includes("--scan-open-timing");
 const benchmarkLock = !args.includes("--no-benchmark-lock");
 const quiet = args.includes("--quiet");
 const requireStrict = args.includes("--require-strict");
+const BENCH_ENV = {
+  ...BASE_BENCH_ENV,
+  IX_SCAN_OPEN_TIMING: scanOpenTiming ? "1" : "0",
+};
 
 function measurePairedHistory(history, ixArgs, effectivePreviousBuildImprovementPct) {
   const currentRuns = [];
@@ -292,6 +297,7 @@ const report = {
   identityNoiseMultiplier,
   includeCurrentInstall,
   threads,
+  scanOpenTiming,
   benchEnv: BENCH_ENV,
   host,
   processScan,
