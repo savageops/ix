@@ -165,6 +165,22 @@ if (teddyGainNeedsLeakRepair) {
   if (!String(decision.preservationPolicy?.rule ?? "").includes("do_not_revert_teddy_gain")) {
     failures.push("decision preservation policy must encode the no-revert Teddy rule");
   }
+  if (decision.leakSummary?.nextRepairTarget === "scanWork") {
+    const split = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit;
+    if (split == null || typeof split !== "object" || Array.isArray(split)) {
+      failures.push("decision scanWork leak attribution must include current-only scanOpen/scanFile split summary");
+    } else {
+      if (Number(split.targetRoundCount ?? 0) < 1) {
+        failures.push("decision scanWork leak attribution must include target rounds");
+      }
+      if (Number(split.candidateSplitRoundCount ?? 0) < Number(split.targetRoundCount ?? 0)) {
+        failures.push("decision scanWork leak attribution must have candidate split telemetry for every target round");
+      }
+      if (!["scanOpen", "scanFile"].includes(split.dominantCandidateSubphase)) {
+        failures.push("decision scanWork leak attribution must name dominant candidate subphase");
+      }
+    }
+  }
 }
 if (evidenceBlockedByNoise &&
     !decision.candidateMoves?.some((move) =>

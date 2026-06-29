@@ -55,6 +55,11 @@ function subphaseTimingPresent(openMs, fileMs) {
   return (Number.isFinite(open) && open > 0) || (Number.isFinite(file) && file > 0);
 }
 
+function optionalSummary(values) {
+  const finite = finiteNumbers(values);
+  return finite.length === 0 ? null : summary(finite);
+}
+
 export function phaseTimingResidualMs(timings, engineMs) {
   const discover = Number(timings?.discover_ms ?? 0);
   const scan = Number(timings?.scan_ms ?? 0);
@@ -355,6 +360,41 @@ export function phaseLeakSummaryFromRounds(rounds) {
         scanFileShareDeltaPct: baselineScanSplitPresent ? delta(candidateScanFileSharePct, baselineScanFileSharePct) : null,
       };
     });
+  const currentOnlyScanSplit = nextRepairTarget === "scanWork"
+    ? (() => {
+        const candidateSplitRounds = targetRounds.filter((round) =>
+          subphaseTimingPresent(round.candidateScanOpenMedianMs, round.candidateScanFileMedianMs)
+        );
+        const predecessorSplitRounds = targetRounds.filter((round) => round.baselineScanSplitPresent);
+        const candidateScanOpenShare = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenSharePct));
+        const candidateScanFileShare = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileSharePct));
+        const candidateScanOpenMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenMedianMs));
+        const candidateScanFileMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileMedianMs));
+        const candidateScanWorkMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanWorkMedianMs));
+        const dominantCandidateSubphase =
+          Number(candidateScanOpenShare?.median ?? 0) > Number(candidateScanFileShare?.median ?? 0)
+            ? "scanOpen"
+            : (candidateScanFileShare == null ? null : "scanFile");
+        return {
+          targetRoundCount: targetRounds.length,
+          candidateSplitRoundCount: candidateSplitRounds.length,
+          predecessorSplitRoundCount: predecessorSplitRounds.length,
+          predecessorSplitMissingCount: targetRounds.length - predecessorSplitRounds.length,
+          predecessorComparisonLimited: predecessorSplitRounds.length < targetRounds.length,
+          dominantCandidateSubphase,
+          candidateScanOpenSharePct: candidateScanOpenShare,
+          candidateScanFileSharePct: candidateScanFileShare,
+          candidateScanOpenMedianMs,
+          candidateScanFileMedianMs,
+          candidateScanWorkMedianMs,
+          interpretation: candidateSplitRounds.length === 0
+            ? "scanWork is leaking, but current split telemetry is unavailable; rerun with --scan-open-timing"
+            : (predecessorSplitRounds.length < targetRounds.length
+                ? "scanWork is leaking; predecessor split telemetry is incomplete, so use current-only scanOpen/scanFile shares to choose the next owner"
+                : "scanWork is leaking; predecessor and candidate scanOpen/scanFile split telemetry are comparable"),
+        };
+      })()
+    : null;
   const protectedWinningRounds = roundsWithLeaks
     .filter((round) =>
       Number(round.teddyRangeMedianPct) > 0 &&
@@ -387,6 +427,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
     leakAttribution: {
       targetPhase: nextRepairTarget,
       targetRounds,
+      currentOnlyScanSplit,
       protectedWinningRounds,
       nextProbe,
     },

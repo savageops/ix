@@ -97,6 +97,22 @@ function validateTeddyDecision(decision, evidence) {
     if (!String(decision.preservationPolicy?.rule ?? "").includes("do_not_revert_teddy_gain")) {
       failures.push("teddy kernel decision must encode the no-revert preservation rule for mixed gains");
     }
+    if (decision.leakSummary?.nextRepairTarget === "scanWork") {
+      const split = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit;
+      if (!isPlainObject(split)) {
+        failures.push("scanWork leak attribution requires current-only scanOpen/scanFile split summary");
+      } else {
+        if (Number(split.targetRoundCount ?? 0) < 1) {
+          failures.push("scanWork leak attribution requires at least one target round");
+        }
+        if (Number(split.candidateSplitRoundCount ?? 0) < Number(split.targetRoundCount ?? 0)) {
+          failures.push("scanWork leak attribution requires candidate split telemetry for every target round");
+        }
+        if (!["scanOpen", "scanFile"].includes(split.dominantCandidateSubphase)) {
+          failures.push("scanWork leak attribution requires a dominant candidate subphase");
+        }
+      }
+    }
   }
   if (!rejectedIds.has("scalar_start_byte_or_line_admission")) {
     failures.push("teddy kernel decision must reject scalar start-byte/line admission");
