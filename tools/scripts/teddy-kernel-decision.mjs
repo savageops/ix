@@ -232,7 +232,21 @@ function evidenceQuality(historical) {
   return evidenceQualityFromFailures(failures);
 }
 
+function benchmarkNoiseFailures(quality) {
+  return [
+    ...(quality.hostFailures ?? []),
+    ...(quality.identityFailures ?? []),
+    ...(quality.processFailures ?? []),
+    ...(quality.sampleFailures ?? []),
+  ];
+}
+
+function blockedByBenchmarkNoise(quality) {
+  return benchmarkNoiseFailures(quality).length > 0;
+}
+
 function candidateMoves(summary, leakSummary, quality) {
+  const benchmarkNoiseBlocked = blockedByBenchmarkNoise(quality);
   const teddyPressure = Number(summary.averagePairedTeddyMedianPct ?? 0);
   const enginePressure = Number(summary.averagePairedEngineMedianPct ?? 0);
   const scanPressure = Number(summary.averagePairedScanMedianPct ?? 0);
@@ -252,17 +266,17 @@ function candidateMoves(summary, leakSummary, quality) {
   const moves = [
     {
       id: "benchmark_host_noise_control",
-      status: quality.usableForRuntimeMove ? "satisfied" : "allowed_next",
+      status: benchmarkNoiseBlocked ? "allowed_next" : "satisfied",
       owner: "tools/scripts/compare-historical-speed.mjs host preflight plus benchmark environment",
-      reason: quality.usableForRuntimeMove
-        ? "Latest historical evidence has no host or identity-control noise blocker."
-        : `Latest report is not suitable for a runtime code decision: hostFailures=${quality.hostFailures.length}, identityFailures=${quality.identityFailures.length}, processFailures=${quality.processFailures?.length ?? 0}. Preserve the current runtime slice, rerun under a clean host, and only then act on sub-percent scanWork deltas.`,
-      expectedGainScore: quality.usableForRuntimeMove ? 0 : 10 + quality.hostFailures.length + quality.identityFailures.length + (quality.processFailures?.length ?? 0),
+      reason: benchmarkNoiseBlocked
+        ? `Latest report is not suitable for a runtime code decision: hostFailures=${quality.hostFailures.length}, identityFailures=${quality.identityFailures.length}, processFailures=${quality.processFailures?.length ?? 0}, sampleFailures=${quality.sampleFailures?.length ?? 0}. Preserve the current runtime slice, rerun under a clean host, and only then act on sub-percent scanWork deltas.`
+        : "Latest historical evidence has no host, identity-control, process, or sample-size noise blocker.",
+      expectedGainScore: benchmarkNoiseBlocked ? 10 + benchmarkNoiseFailures(quality).length : 0,
       proofCommand: SPEED_DIAGNOSTIC_COMMAND,
     },
     {
       id: "whole_engine_leak_attribution",
-      status: !quality.usableForRuntimeMove ? "blocked_by_benchmark_noise" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win"),
+      status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win"),
       owner: "tools/scripts/compare-historical-speed.mjs plus src/core/search.zig phase telemetry",
       reason: teddyGainNeedsLeakRepair
         ? `Latest historical evidence shows Teddy attribution is positive while whole-engine evidence still has a losing round; preserve the Teddy gain and isolate ${leakSummary?.nextRepairTarget ?? "discovery, scheduling, scan bookkeeping, or reporting"} overhead before changing the Teddy kernel again. Current averaged phase medians: discover=${summary.averagePairedDiscoverMedianPct}%, scan=${summary.averagePairedScanMedianPct}%, scanWork=${summary.averagePairedScanWorkMedianPct}%, teddy=${summary.averagePairedTeddyMedianPct}%. Worst round=${leakSummary?.worstRound?.baselineLabel ?? "unknown"}.`
@@ -272,7 +286,7 @@ function candidateMoves(summary, leakSummary, quality) {
     },
     {
       id: "packed_nibble_shuffle_teddy_kernel",
-      status: !quality.usableForRuntimeMove ? "blocked_by_benchmark_noise" : (teddyGainNeedsLeakRepair ? "allowed_after_whole_engine_leak_attribution" : "allowed_next"),
+      status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (teddyGainNeedsLeakRepair ? "allowed_after_whole_engine_leak_attribution" : "allowed_next"),
       owner: "src/core/search.zig::nextTeddyLiteralAlternatesCandidate or a narrow src/core/simd.zig helper",
       reason: `${teddyReason} Current Teddy path still compares each branch vector independently; research and contract require a packed SIMD/Shufti-style candidate extractor.`,
       expectedGainScore: teddyGainNeedsLeakRepair ? 1 : 2.5 + negativePressure,
@@ -354,14 +368,15 @@ function nextEngineeringMove(moves, summary, leakSummary) {
 
 function preservationPolicy(summary, leakSummary, quality, engineeringMove) {
   const preserveTeddyGain = mixedTeddyGainNeedsLeakRepair(summary, leakSummary);
+  const benchmarkNoiseBlocked = blockedByBenchmarkNoise(quality);
   return {
     preserveTeddyGain,
     protectedPhase: preserveTeddyGain ? "teddyRange" : null,
     repairPhase: preserveTeddyGain ? leakSummary?.nextRepairTarget ?? "wholeEngine" : null,
     promotionBlocked: true,
-    promotionBlocker: quality.usableForRuntimeMove
-      ? "whole_engine_not_net_positive"
-      : "benchmark_host_or_identity_noise",
+    promotionBlocker: benchmarkNoiseBlocked
+      ? "benchmark_host_or_identity_noise"
+      : "whole_engine_not_net_positive",
     rule: preserveTeddyGain
       ? "do_not_revert_teddy_gain; isolate and repair the smaller whole-engine loss"
       : "advance only changes that improve the whole engine without route-local regression",
@@ -416,7 +431,7 @@ const report = {
     speedGate: SPEED_PROMOTION_COMMAND,
   },
   noRuntimePromotionReason: evidenceFresh
-    ? (promotionAllowed ? null : (policy.preserveTeddyGain ? "Teddy gain is protected, but whole-engine evidence is not net-positive; repair the leak instead of reverting" : (quality.usableForRuntimeMove ? "historical report is not net-positive across all previous-build rounds" : "historical report is blocked by host or identity-control benchmark noise")))
+    ? (promotionAllowed ? null : (policy.preserveTeddyGain ? "Teddy gain is protected, but whole-engine evidence is not net-positive; repair the leak instead of reverting" : (blockedByBenchmarkNoise(quality) ? "historical report is blocked by host, identity-control, process, or sample-size benchmark noise" : "historical report is not net-positive across all previous-build rounds")))
     : "historical report candidate hash does not match the current repo binary",
   scorecard: historical.scorecard ?? null,
   summary,

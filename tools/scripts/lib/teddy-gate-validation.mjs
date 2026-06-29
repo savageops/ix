@@ -13,8 +13,22 @@ function mixedTeddyGainNeedsLeakRepair(decision) {
   );
 }
 
+function benchmarkNoiseFailures(decision) {
+  const evidenceQuality = decision?.evidenceQuality ?? {};
+  return [
+    ...(evidenceQuality.hostFailures ?? []),
+    ...(evidenceQuality.identityFailures ?? []),
+    ...(evidenceQuality.processFailures ?? []),
+    ...(evidenceQuality.sampleFailures ?? []),
+  ];
+}
+
+function evidenceBlockedByBenchmarkNoise(decision) {
+  return benchmarkNoiseFailures(decision).length > 0;
+}
+
 function expectedTeddyNextMove(decision) {
-  if (decision?.evidenceQuality?.usableForRuntimeMove === false) {
+  if (evidenceBlockedByBenchmarkNoise(decision)) {
     return "benchmark_host_noise_control";
   }
   return mixedTeddyGainNeedsLeakRepair(decision)
@@ -39,7 +53,7 @@ function validateTeddyDecision(decision, evidence) {
   if (Number(decision.summary?.count ?? 0) < 1) failures.push("teddy kernel decision requires historical rounds");
 
   const expectedNextMove = expectedTeddyNextMove(decision);
-  const evidenceBlockedByNoise = decision.evidenceQuality?.usableForRuntimeMove === false;
+  const evidenceBlockedByNoise = evidenceBlockedByBenchmarkNoise(decision);
   const preserveTeddyWin = mixedTeddyGainNeedsLeakRepair(decision);
   if (decision.nextAllowedMove?.id !== expectedNextMove) {
     failures.push(`teddy kernel decision must rank ${expectedNextMove} as next allowed move`);

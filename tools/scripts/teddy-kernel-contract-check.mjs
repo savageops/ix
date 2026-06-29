@@ -131,7 +131,14 @@ const teddyGainNeedsLeakRepair =
   decision.leakSummary?.diagnosis === "preserve_positive_teddy_gain_and_repair_whole_engine_leak" &&
   decision.summary?.matchParity === true &&
   decision.summary?.routeParity === true;
-const evidenceBlockedByNoise = decision.evidenceQuality?.usableForRuntimeMove === false;
+const evidenceQuality = decision.evidenceQuality ?? {};
+const benchmarkNoiseFailures = [
+  ...(evidenceQuality.hostFailures ?? []),
+  ...(evidenceQuality.identityFailures ?? []),
+  ...(evidenceQuality.processFailures ?? []),
+  ...(evidenceQuality.sampleFailures ?? []),
+];
+const evidenceBlockedByNoise = benchmarkNoiseFailures.length > 0;
 const expectedNextMove = evidenceBlockedByNoise
   ? "benchmark_host_noise_control"
   : (teddyGainNeedsLeakRepair ? "whole_engine_leak_attribution" : "packed_nibble_shuffle_teddy_kernel");
