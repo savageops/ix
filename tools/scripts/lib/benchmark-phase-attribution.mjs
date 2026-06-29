@@ -42,6 +42,19 @@ function ratioPct(part, whole) {
   return (partNumber / wholeNumber) * 100;
 }
 
+function delta(left, right) {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  if (!Number.isFinite(leftNumber) || !Number.isFinite(rightNumber)) return null;
+  return leftNumber - rightNumber;
+}
+
+function subphaseTimingPresent(openMs, fileMs) {
+  const open = Number(openMs);
+  const file = Number(fileMs);
+  return (Number.isFinite(open) && open > 0) || (Number.isFinite(file) && file > 0);
+}
+
 export function phaseTimingResidualMs(timings, engineMs) {
   const discover = Number(timings?.discover_ms ?? 0);
   const scan = Number(timings?.scan_ms ?? 0);
@@ -304,6 +317,18 @@ export function phaseLeakSummaryFromRounds(rounds) {
     .map((round) => {
       const phase = round.negativePhases.find((entry) => entry.name === nextRepairTarget) ?? {};
       const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
+      const baselineScanSplitPresent = subphaseTimingPresent(
+        sourceRound.baselineScanOpenMedianMs,
+        sourceRound.baselineScanFileMedianMs,
+      );
+      const baselineScanOpenSharePct = baselineScanSplitPresent
+        ? ratioPct(sourceRound.baselineScanOpenMedianMs, sourceRound.baselineScanWorkMedianMs)
+        : null;
+      const baselineScanFileSharePct = baselineScanSplitPresent
+        ? ratioPct(sourceRound.baselineScanFileMedianMs, sourceRound.baselineScanWorkMedianMs)
+        : null;
+      const candidateScanOpenSharePct = ratioPct(sourceRound.candidateScanOpenMedianMs, sourceRound.candidateScanWorkMedianMs);
+      const candidateScanFileSharePct = ratioPct(sourceRound.candidateScanFileMedianMs, sourceRound.candidateScanWorkMedianMs);
       return {
         roundIndex: round.roundIndex,
         baselineLabel: round.baselineLabel,
@@ -312,11 +337,22 @@ export function phaseLeakSummaryFromRounds(rounds) {
         targetPhase: nextRepairTarget,
         targetPhaseMedianPct: Number.isFinite(Number(phase.pairedMedianPct)) ? Number(phase.pairedMedianPct) : null,
         targetPhaseDeltaMs: Number.isFinite(Number(phase.pairedDeltaMedianMs)) ? Number(phase.pairedDeltaMedianMs) : null,
+        baselineScanWorkMedianMs: optionalNumber(sourceRound.baselineScanWorkMedianMs),
+        baselineScanOpenMedianMs: optionalNumber(sourceRound.baselineScanOpenMedianMs),
+        baselineScanFileMedianMs: optionalNumber(sourceRound.baselineScanFileMedianMs),
+        baselineScanSplitPresent,
         candidateScanWorkMedianMs: optionalNumber(sourceRound.candidateScanWorkMedianMs),
         candidateScanOpenMedianMs: optionalNumber(sourceRound.candidateScanOpenMedianMs),
         candidateScanFileMedianMs: optionalNumber(sourceRound.candidateScanFileMedianMs),
-        candidateScanOpenSharePct: ratioPct(sourceRound.candidateScanOpenMedianMs, sourceRound.candidateScanWorkMedianMs),
-        candidateScanFileSharePct: ratioPct(sourceRound.candidateScanFileMedianMs, sourceRound.candidateScanWorkMedianMs),
+        scanWorkDeltaMs: delta(sourceRound.candidateScanWorkMedianMs, sourceRound.baselineScanWorkMedianMs),
+        scanOpenDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenMedianMs, sourceRound.baselineScanOpenMedianMs) : null,
+        scanFileDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileMedianMs, sourceRound.baselineScanFileMedianMs) : null,
+        baselineScanOpenSharePct,
+        baselineScanFileSharePct,
+        candidateScanOpenSharePct,
+        candidateScanFileSharePct,
+        scanOpenShareDeltaPct: baselineScanSplitPresent ? delta(candidateScanOpenSharePct, baselineScanOpenSharePct) : null,
+        scanFileShareDeltaPct: baselineScanSplitPresent ? delta(candidateScanFileSharePct, baselineScanFileSharePct) : null,
       };
     });
   const protectedWinningRounds = roundsWithLeaks
