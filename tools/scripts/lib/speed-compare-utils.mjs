@@ -1208,7 +1208,6 @@ export function measureSameBinaryIdentityControl({
       attempt,
     });
     attemptReports.push(report);
-    if (report.diagnostics?.status === "stable") break;
   }
 
   const { selected, reason } = selectIdentityControlAttempt(attemptReports);
@@ -1238,6 +1237,11 @@ export function identityControlFailures({
   }
   if (Number.isFinite(requiredSamples) && identityControl.samples < requiredSamples) {
     failures.push(`identity_control_underpowered:${identityControl.samples}<${requiredSamples}`);
+  }
+  const attemptsRequested = Number(identityControl.attemptsRequested);
+  const attemptsRun = Number(identityControl.attemptsRun);
+  if (Number.isFinite(attemptsRequested) && Number.isFinite(attemptsRun) && attemptsRun < attemptsRequested) {
+    failures.push(`identity_control_attempts_underpowered:${attemptsRun}<${attemptsRequested}`);
   }
   if (!pairOrderSummaryIsBalanced(identityControl.pairOrderSummary, identityControl.samples)) {
     failures.push("identity_control_pair_order_unbalanced");
