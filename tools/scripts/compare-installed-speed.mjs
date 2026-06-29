@@ -44,7 +44,8 @@ Options:
   --identity-noise-multiplier <n> Effective target multiplier for same-binary drift. Default: 3.
   --no-benchmark-lock             Disable the cross-script benchmark lock.
   --require-promotion             Exit non-zero unless repo is promotable over installed.
-  --require-strict                Exit non-zero unless strict evidence passes.
+  --require-strict                Exit non-zero unless strict evidence passes. Default behavior.
+  --no-require-strict             Allow exploratory reports to exit zero when strict evidence fails.
   --quiet                         Write reports without printing summary.
   --help, -h                      Print this help and exit without measuring.
 `);
@@ -61,7 +62,7 @@ const identityControlAttempts = Number(argValue(args, "--identity-control-attemp
 const identityControlEnabled = !args.includes("--no-identity-control");
 const buildFirst = args.includes("--build");
 const quiet = args.includes("--quiet");
-const requireStrict = args.includes("--require-strict");
+const requireStrict = !args.includes("--no-require-strict");
 const requirePromotion = args.includes("--require-promotion");
 const benchmarkLock = !args.includes("--no-benchmark-lock");
 const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", process.env.IX_MIN_RETAINABLE_SPEED_SAMPLES ?? "12"));

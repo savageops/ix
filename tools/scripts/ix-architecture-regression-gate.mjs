@@ -385,7 +385,11 @@ function installedSpeedLane(hostPreflight = null) {
     String(identityNoiseMultiplier),
     "--quiet",
   ];
-  if (strictRequired) commandArgs.push("--require-strict", "--require-promotion");
+  if (strictRequired) {
+    commandArgs.push("--require-strict", "--require-promotion");
+  } else {
+    commandArgs.push("--no-require-strict");
+  }
   const evidence = run(process.execPath, commandArgs);
   if (!existsSync(latestPath)) {
     return lane("installed_speed_compare", "failed", {
@@ -562,7 +566,11 @@ function historicalSpeedLane(hostPreflight = null) {
     "6",
     "--quiet",
   ];
-  if (strictRequired) commandArgs.push("--require-strict");
+  if (strictRequired) {
+    commandArgs.push("--require-strict");
+  } else {
+    commandArgs.push("--no-require-strict");
+  }
   const evidence = run(process.execPath, commandArgs);
   if (!existsSync(latestPath)) {
     return lane("historical_speed_compare", "failed", {

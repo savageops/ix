@@ -44,7 +44,8 @@ Options:
   --identity-noise-multiplier <n>      Effective target multiplier for same-binary drift. Default: 3.
   --scan-open-timing                   Enable scan open/file subphase timing in IX telemetry.
   --no-benchmark-lock                  Disable the cross-script benchmark lock.
-  --require-strict                     Exit non-zero unless strict evidence passes.
+  --require-strict                     Exit non-zero unless strict evidence passes. Default behavior.
+  --no-require-strict                  Allow exploratory reports to exit zero when strict evidence fails.
   --quiet                               Write reports without printing summary.
   --help, -h                            Print this help and exit without measuring.
 `);
@@ -67,7 +68,7 @@ const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multipli
 const scanOpenTiming = args.includes("--scan-open-timing");
 const benchmarkLock = !args.includes("--no-benchmark-lock");
 const quiet = args.includes("--quiet");
-const requireStrict = args.includes("--require-strict");
+const requireStrict = !args.includes("--no-require-strict");
 const BENCH_ENV = {
   ...BASE_BENCH_ENV,
   IX_SCAN_OPEN_TIMING: scanOpenTiming ? "1" : "0",
