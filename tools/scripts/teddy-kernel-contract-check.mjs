@@ -127,6 +127,33 @@ const decisionRejectedIds = new Set((decision.candidateMoves ?? [])
 const topLevelRejectedIds = new Set(Array.isArray(decision.rejectedIds) ? decision.rejectedIds : []);
 if (decision.evidenceFresh !== true) failures.push("decision evidence is not fresh for current repo binary");
 if (decision.promotionAllowed === true) failures.push("decision unexpectedly allows runtime promotion");
+const retainablePointer = decision.speedProofPointers?.latestRetainable ?? decision.finalizationGate?.requiredRetainablePointer ?? null;
+const diagnosticPointer = decision.speedProofPointers?.latestDiagnostic ?? decision.finalizationGate?.latestDiagnosticPointer ?? null;
+const retainablePointerReady = retainablePointer?.status === "retainable_current";
+if (diagnosticPointer == null || typeof diagnosticPointer !== "object") {
+  failures.push("decision lacks latest diagnostic speed proof pointer");
+}
+if (retainablePointer == null || typeof retainablePointer !== "object") {
+  failures.push("decision lacks latest retainable speed proof pointer");
+}
+if (decision.finalizationGate?.requiredProofCommand == null ||
+    !normalized(String(decision.finalizationGate.requiredProofCommand)).includes("compare-historical-speed.mjs") ||
+    !normalized(String(decision.finalizationGate.requiredProofCommand)).includes("--require-strict")) {
+  failures.push("decision finalization gate lacks strict historical proof command");
+}
+if (decision.finalizationGate?.speedRegressionFinalizationAllowed !== decision.promotionAllowed) {
+  failures.push("decision finalization gate must mirror promotionAllowed");
+}
+if (!retainablePointerReady) {
+  if (decision.promotionAllowed === true) failures.push("decision allows promotion without current retainable strict speed proof");
+  if (decision.finalizationGate?.speedRegressionFinalizationAllowed === true) failures.push("decision allows finalization without current retainable strict speed proof");
+  if (!String(decision.finalizationGate?.blocker ?? "").includes("no current retainable strict speed proof")) {
+    failures.push("decision finalization gate must name missing/stale retainable strict proof as blocker");
+  }
+  if (!String(decision.noRuntimePromotionReason ?? "").includes("no current retainable strict speed proof")) {
+    failures.push("decision no-runtime reason must name missing retainable strict speed proof");
+  }
+}
 const teddyGainNeedsLeakRepair =
   decision.leakSummary?.diagnosis === "preserve_positive_teddy_gain_and_repair_whole_engine_leak" &&
   decision.summary?.matchParity === true &&
@@ -325,6 +352,8 @@ const report = {
     currentIxSha256: decision.currentIxSha256 ?? null,
     evidenceFresh: decision.evidenceFresh === true,
     promotionAllowed: decision.promotionAllowed === true,
+    speedProofPointers: decision.speedProofPointers ?? null,
+    finalizationGate: decision.finalizationGate ?? null,
     scorecard: {
       testedOneAtATime: decision.scorecard?.testedOneAtATime === true,
       previousBuildRounds: decision.scorecard?.previousBuildRounds ?? null,

@@ -7,6 +7,8 @@ import { phaseLeakSummaryFromRounds } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const HISTORICAL_REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
+const LATEST_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-historical-speed.json");
+const LATEST_RETAINABLE_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-retainable-historical-speed.json");
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "teddy-kernel-decision");
 const DEFAULT_CURRENT_IX = path.join(ROOT, "zig-out", "bin", process.platform === "win32" ? "ix-zig.exe" : "ix-zig");
 const TEDDY_CONTRACT = path.join(ROOT, ".docs", "research", "2026-06-12-teddy-literal-alternates-contract.md");
@@ -123,6 +125,42 @@ function latestHistoricalReports(limit = 8) {
     })
     .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)))
     .slice(0, limit);
+}
+
+function historicalPointerStatus(filePath, currentHash) {
+  if (!existsSync(filePath)) {
+    return {
+      path: path.relative(ROOT, filePath),
+      exists: false,
+      status: "missing",
+      runId: null,
+      timestamp: null,
+      freshForCurrentBinary: false,
+      retainableStrictEvidence: false,
+      strictEvidenceFailureCount: null,
+    };
+  }
+
+  const pointer = readJson(filePath, {});
+  const freshForCurrentBinary = reportMatchesCurrentBinary(pointer, currentHash);
+  const retainableStrictEvidence = pointer.retainableStrictEvidence === true;
+  const strictEvidenceFailures = Array.isArray(pointer.strictEvidenceFailures)
+    ? pointer.strictEvidenceFailures
+    : [];
+  let status = "retainable_current";
+  if (!freshForCurrentBinary) status = "stale_current_binary";
+  else if (!retainableStrictEvidence) status = "strict_failed";
+
+  return {
+    path: path.relative(ROOT, filePath),
+    exists: true,
+    status,
+    runId: pointer.runId ?? null,
+    timestamp: pointer.timestamp ?? null,
+    freshForCurrentBinary,
+    retainableStrictEvidence,
+    strictEvidenceFailureCount: strictEvidenceFailures.length,
+  };
 }
 
 function finiteNumbers(values) {
@@ -435,6 +473,10 @@ const moves = candidateMoves(summary, leakSummary, quality);
 const rejectedIds = moves.filter((move) => move.status === "rejected").map((move) => move.id);
 const engineeringMove = nextEngineeringMove(moves, summary, leakSummary);
 const policy = preservationPolicy(summary, leakSummary, quality, engineeringMove);
+const speedProofPointers = {
+  latestDiagnostic: historicalPointerStatus(LATEST_HISTORICAL_PATH, currentIxSha256),
+  latestRetainable: historicalPointerStatus(LATEST_RETAINABLE_HISTORICAL_PATH, currentIxSha256),
+};
 const promotionAllowed =
   historical.scorecard?.netPositive === true &&
   summary.matchParity === true &&
@@ -443,7 +485,35 @@ const promotionAllowed =
   summary.fullScanBytesParity === true &&
   summary.fullScanMatchesParity === true &&
   summary.netPositiveRounds === summary.count &&
-  quality.usableForRuntimeMove === true;
+  quality.usableForRuntimeMove === true &&
+  speedProofPointers.latestRetainable.status === "retainable_current";
+const finalizationGate = {
+  speedRegressionFinalizationAllowed: promotionAllowed,
+  requiredRetainablePointer: speedProofPointers.latestRetainable,
+  latestDiagnosticPointer: speedProofPointers.latestDiagnostic,
+  requiredProofCommand: SPEED_PROMOTION_COMMAND,
+  blocker: promotionAllowed
+    ? null
+    : (
+        speedProofPointers.latestRetainable.status === "retainable_current"
+          ? "current retainable strict proof exists, but the selected report is not net-positive enough for runtime promotion"
+          : `no current retainable strict speed proof (${speedProofPointers.latestRetainable.status}); run the strict speed gate before finalizing code changes`
+      ),
+};
+const noRuntimePromotionReason = (() => {
+  if (!evidenceFresh) return "historical report candidate hash does not match the current repo binary";
+  if (promotionAllowed) return null;
+  if (speedProofPointers.latestRetainable.status !== "retainable_current") {
+    return "no current retainable strict speed proof exists for the repo binary; finalization must run and pass the strict predecessor speed gate";
+  }
+  if (policy.preserveTeddyGain) {
+    return "Teddy gain is protected, but whole-engine evidence is not net-positive; repair the leak instead of reverting";
+  }
+  if (blockedByBenchmarkNoise(quality)) {
+    return "historical report is blocked by host, identity-control, process, or sample-size benchmark noise";
+  }
+  return "historical report is not net-positive across all previous-build rounds";
+})();
 
 const report = {
   runId: `teddy-kernel-decision-${timestampSlug()}`,
@@ -456,15 +526,15 @@ const report = {
   comparisonCurrentHashes,
   evidenceFresh,
   promotionAllowed,
+  speedProofPointers,
+  finalizationGate,
   proofCommands: {
     historicalSpeed: HISTORICAL_SPEED_DIAGNOSTIC_COMMAND,
     historicalStrictSpeed: HISTORICAL_SPEED_STRICT_COMMAND,
     olderSnapshots: OLDER_SNAPSHOT_PROOF_COMMAND,
     speedGate: SPEED_PROMOTION_COMMAND,
   },
-  noRuntimePromotionReason: evidenceFresh
-    ? (promotionAllowed ? null : (policy.preserveTeddyGain ? "Teddy gain is protected, but whole-engine evidence is not net-positive; repair the leak instead of reverting" : (blockedByBenchmarkNoise(quality) ? "historical report is blocked by host, identity-control, process, or sample-size benchmark noise" : "historical report is not net-positive across all previous-build rounds")))
-    : "historical report candidate hash does not match the current repo binary",
+  noRuntimePromotionReason,
   scorecard: historical.scorecard ?? null,
   summary,
   leakSummary,
