@@ -49,6 +49,11 @@ function delta(left, right) {
   return leftNumber - rightNumber;
 }
 
+function nsToMs(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number / 1_000_000 : null;
+}
+
 function subphaseTimingPresent(openMs, fileMs) {
   const open = Number(openMs);
   const file = Number(fileMs);
@@ -371,10 +376,31 @@ export function phaseLeakSummaryFromRounds(rounds) {
         const candidateScanOpenMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenMedianMs));
         const candidateScanFileMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileMedianMs));
         const candidateScanWorkMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanWorkMedianMs));
+        const scanFileResidualRounds = candidateSplitRounds.map((round) => {
+          const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
+          const teddyMs = nsToMs(sourceRound.candidateAlternateTeddyRangeElapsedNsMedian);
+          const residualMs = delta(round.candidateScanFileMedianMs, teddyMs);
+          return {
+            roundIndex: round.roundIndex,
+            baselineLabel: round.baselineLabel,
+            candidateScanFileMedianMs: round.candidateScanFileMedianMs,
+            candidateTeddyRangeMedianMs: teddyMs,
+            candidateScanFileResidualMedianMs: residualMs,
+            candidateTeddyShareOfScanFilePct: ratioPct(teddyMs, round.candidateScanFileMedianMs),
+            candidateScanFileResidualSharePct: ratioPct(residualMs, round.candidateScanFileMedianMs),
+          };
+        });
+        const scanFileResidualMedianMs = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileResidualMedianMs));
+        const teddyShareOfScanFilePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateTeddyShareOfScanFilePct));
+        const scanFileResidualSharePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileResidualSharePct));
         const dominantCandidateSubphase =
           Number(candidateScanOpenShare?.median ?? 0) > Number(candidateScanFileShare?.median ?? 0)
             ? "scanOpen"
             : (candidateScanFileShare == null ? null : "scanFile");
+        const dominantCandidateScanFileComponent =
+          Number(teddyShareOfScanFilePct?.median ?? 0) > Number(scanFileResidualSharePct?.median ?? 0)
+            ? "teddyRange"
+            : (scanFileResidualSharePct == null ? null : "scanFileResidual");
         return {
           targetRoundCount: targetRounds.length,
           candidateSplitRoundCount: candidateSplitRounds.length,
@@ -382,11 +408,16 @@ export function phaseLeakSummaryFromRounds(rounds) {
           predecessorSplitMissingCount: targetRounds.length - predecessorSplitRounds.length,
           predecessorComparisonLimited: predecessorSplitRounds.length < targetRounds.length,
           dominantCandidateSubphase,
+          dominantCandidateScanFileComponent,
           candidateScanOpenSharePct: candidateScanOpenShare,
           candidateScanFileSharePct: candidateScanFileShare,
           candidateScanOpenMedianMs,
           candidateScanFileMedianMs,
           candidateScanWorkMedianMs,
+          candidateTeddyShareOfScanFilePct: teddyShareOfScanFilePct,
+          candidateScanFileResidualSharePct: scanFileResidualSharePct,
+          candidateScanFileResidualMedianMs: scanFileResidualMedianMs,
+          scanFileResidualRounds,
           interpretation: candidateSplitRounds.length === 0
             ? "scanWork is leaking, but current split telemetry is unavailable; rerun with --scan-open-timing"
             : (predecessorSplitRounds.length < targetRounds.length

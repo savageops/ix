@@ -179,6 +179,12 @@ if (teddyGainNeedsLeakRepair) {
       if (!["scanOpen", "scanFile"].includes(split.dominantCandidateSubphase)) {
         failures.push("decision scanWork leak attribution must name dominant candidate subphase");
       }
+      if (
+        split.dominantCandidateSubphase === "scanFile" &&
+        !["teddyRange", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
+      ) {
+        failures.push("decision scanFile leak attribution must name dominant candidate scan-file component");
+      }
     }
   }
 }

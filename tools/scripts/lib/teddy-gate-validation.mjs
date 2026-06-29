@@ -111,6 +111,12 @@ function validateTeddyDecision(decision, evidence) {
         if (!["scanOpen", "scanFile"].includes(split.dominantCandidateSubphase)) {
           failures.push("scanWork leak attribution requires a dominant candidate subphase");
         }
+        if (
+          split.dominantCandidateSubphase === "scanFile" &&
+          !["teddyRange", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
+        ) {
+          failures.push("scanFile leak attribution requires a dominant candidate scan-file component");
+        }
       }
     }
   }
