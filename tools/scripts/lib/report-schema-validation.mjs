@@ -135,6 +135,18 @@ export function createReportSchemaValidation({
       if (entry.id === "benchmark_control" && entry.status === "ok" && entry.metrics?.hostClean === false) {
         failures.push("benchmark_control: ok status cannot rely on a warning-class host benchmark envelope");
       }
+      if (entry.id === "benchmark_control" && entry.status === "failed" && isPlainObject(entry.metrics)) {
+        const summary = entry.metrics.failureSummary;
+        if (!isPlainObject(summary) || !Array.isArray(summary.failedChecks) || summary.failedChecks.length === 0) {
+          failures.push("benchmark_control: failed status with metrics requires structured failure summary");
+        }
+        if (isPlainObject(summary) && !isPlainObject(summary.thresholds)) {
+          failures.push("benchmark_control: failure summary requires threshold evidence");
+        }
+        if (isPlainObject(summary) && !isPlainObject(summary.observed)) {
+          failures.push("benchmark_control: failure summary requires observed metric evidence");
+        }
+      }
       validateBenchmarkHostPreflightLane(entry, failures);
       validateBenchmarkLockLane(entry, failures);
       validateBenchmarkReadinessLane(entry, failures);

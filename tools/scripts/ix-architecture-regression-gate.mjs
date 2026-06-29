@@ -1109,6 +1109,36 @@ function benchmarkControlLane(hostPreflight = null) {
     Number.isFinite(driftPct) &&
     driftPct <= benchmarkControlDriftTolerancePct;
   const ok = selfOk && robustCvOk && baselineComparable && hostClean && baselineOk;
+  const failedChecks = [];
+  if (!selfOk) failedChecks.push("self_drift");
+  if (!robustCvOk) failedChecks.push("robust_cv");
+  if (!baselineComparable) failedChecks.push("baseline_warmup");
+  if (!hostClean) failedChecks.push("host_noise");
+  if (!baselineOk) failedChecks.push("fixed_baseline");
+  const failureSummary = {
+    failedChecks,
+    primary: failedChecks[0] ?? null,
+    thresholds: {
+      driftPct: benchmarkControlDriftTolerancePct,
+      robustCvPct: benchmarkControlRobustCvPct,
+      maxAllowedIxMs: baselineIxMs * (1 + baselineTolerancePct / 100),
+      baselineTolerancePct,
+    },
+    observed: {
+      driftPct,
+      currentRobustCvPct,
+      previousRobustCvPct,
+      ixMs,
+      selfMs,
+      baselineRegressionPct,
+      baselineComparable,
+      hostClean,
+    },
+    sampleSpread: {
+      ixEngine: latest.iexEngineSampleSummary ?? null,
+      selfEngine: latest.competitors?.iex_previous?.engineSampleSummary ?? null,
+    },
+  };
   const reason = !selfOk
     ? "same-binary control drift exceeded tolerance; benchmark window is too noisy for attribution"
     : !hostClean
@@ -1164,6 +1194,7 @@ function benchmarkControlLane(hostPreflight = null) {
       matchCount: latest.matchCount ?? null,
       phaseMs: latest.phaseMs ?? {},
       host,
+      failureSummary,
     },
   });
 }
