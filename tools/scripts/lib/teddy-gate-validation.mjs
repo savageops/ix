@@ -135,6 +135,9 @@ function validateTeddyDecision(decision, evidence) {
   if (!rejectedIds.has("scalar_start_byte_or_line_admission")) {
     failures.push("teddy kernel decision must reject scalar start-byte/line admission");
   }
+  if (!rejectedIds.has("folded_trigram_admission_for_casefold_alternates")) {
+    failures.push("teddy kernel decision must reject folded trigram admission for casefold alternates");
+  }
   if (!rejectedIds.has("parallel_first_read_positional_transplant")) {
     failures.push("teddy kernel decision must reject parallel first-read positional transplant");
   }

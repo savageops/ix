@@ -228,7 +228,11 @@ const decisionProofText = normalized([
 for (const command of includesAll(decisionProofText, requiredDecisionProofCommands.map((entry) => entry.toLowerCase()))) {
   failures.push(`decision missing required proof command: ${command}`);
 }
-for (const rejected of ["scalar_start_byte_or_line_admission", "parallel_first_read_positional_transplant"]) {
+for (const rejected of [
+  "scalar_start_byte_or_line_admission",
+  "folded_trigram_admission_for_casefold_alternates",
+  "parallel_first_read_positional_transplant",
+]) {
   if (!decisionRejectedIds.has(rejected)) failures.push(`decision missing rejected move: ${rejected}`);
 }
 for (const rejected of decisionRejectedIds) {
@@ -276,6 +280,10 @@ if (!Array.isArray(decision.candidateMoves) ||
 if (!Array.isArray(decision.candidateMoves) ||
     !decision.candidateMoves.some((move) => move?.id === "per_shard_literal_alternates_counter_hoist" && move?.status === "rejected")) {
   failures.push("decision does not reject per-shard literal alternates counter hoist after repeat focused regression");
+}
+if (!Array.isArray(decision.candidateMoves) ||
+    !decision.candidateMoves.some((move) => move?.id === "folded_trigram_admission_for_casefold_alternates" && move?.status === "rejected")) {
+  failures.push("decision does not reject folded trigram admission after predecessor-speed regression");
 }
 
 const report = {

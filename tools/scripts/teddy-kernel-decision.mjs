@@ -309,6 +309,14 @@ function candidateMoves(summary, leakSummary, quality) {
       proofCommand: "historical-speed-2026-06-13T08-12-14-696Z.json",
     },
     {
+      id: "folded_trigram_admission_for_casefold_alternates",
+      status: "rejected",
+      owner: "src/core/trigram.zig + src/core/search_admission.zig + src/core/search.zig::shouldAttemptTrigramPrune",
+      reason: "Case-insensitive folded trigram admission preserved correctness and pruned mid-size files, but failed historical predecessor proof with 0/4 net-positive rounds, route mismatches, and added scalar file scans without reducing the byte-sharded hot path enough.",
+      expectedGainScore: 0,
+      proofCommand: "historical-speed-2026-06-29T21-56-18-971Z.json",
+    },
+    {
       id: "parallel_first_read_positional_transplant",
       status: "rejected",
       owner: "src/core/search.zig::scanOpenFileIntoShardImpl",
