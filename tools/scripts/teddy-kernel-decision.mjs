@@ -303,7 +303,12 @@ function candidateMoves(summary, leakSummary, quality) {
   const scanOpenDominatesLeak =
     teddyGainNeedsLeakRepair &&
     leakSummary?.nextRepairTarget === "scanWork" &&
-    leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen";
+    leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen" &&
+    leakSummary?.leakAttribution?.currentOnlyScanSplit?.regressingCandidateSubphase !== "scanFile";
+  const scanFileResidualRegresses =
+    teddyGainNeedsLeakRepair &&
+    leakSummary?.nextRepairTarget === "scanWork" &&
+    leakSummary?.leakAttribution?.currentOnlyScanSplit?.regressingCandidateSubphase === "scanFile";
   const filesScannedParityStatus = (() => {
     const value = leakSummary?.leakAttribution?.currentOnlyScanSplit?.filesScannedParity;
     if (value === true) return "proved";
@@ -342,12 +347,24 @@ function candidateMoves(summary, leakSummary, quality) {
     },
     {
       id: "scan_open_path_pressure_attribution",
-      status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (scanOpenDominatesLeak ? "allowed_next" : "waiting_for_scan_open_split"),
+      status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (scanOpenDominatesLeak ? "allowed_next" : (scanFileResidualRegresses ? "blocked_by_scan_file_regression" : "waiting_for_scan_open_split")),
       owner: "src/core/search.zig::scanFileIntoShardTimed and scanFileIntoShardMonoTimed",
       reason: scanOpenDominatesLeak
         ? `Scan-open timing split is now present and identifies the file-open wrapper as the dominant candidate subphase under file-count parity=${filesScannedParityStatus}: scanOpen median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMedianMs?.median}ms, scanOpen per file=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMsPerFileMedian?.median}ms, scanFile median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanFileMedianMs?.median}ms. The next runtime candidate must reduce open-path pressure per file, not chase scanned-file count, before touching the Teddy kernel.`
-        : "Run historical proof with --scan-open-timing before choosing an open-path, scan-file, or Teddy-kernel repair.",
+        : (scanFileResidualRegresses
+            ? `Scan-open owns the largest current scan-work share, but scanFile is the measured regressing subphase: scanFile paired=${leakSummary.leakAttribution.currentOnlyScanSplit.regressingCandidateSubphaseMedianPct}%, scanFile delta=${leakSummary.leakAttribution.currentOnlyScanSplit.regressingCandidateSubphaseDeltaMs}ms. Do not chase open-path pressure until scan-file residual/hotspots are repaired or disproven.`
+            : "Run historical proof with --scan-open-timing before choosing an open-path, scan-file, or Teddy-kernel repair."),
       expectedGainScore: scanOpenDominatesLeak ? 4 + Math.max(0, -enginePressure) : 0,
+      proofCommand: SPEED_SCAN_OPEN_PROMOTION_COMMAND,
+    },
+    {
+      id: "scan_file_residual_hotspot_attribution",
+      status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (scanFileResidualRegresses ? "allowed_next" : "waiting_for_scan_file_regression"),
+      owner: "src/core/search.zig::scanOpenFileIntoShardImpl and large-file range counters",
+      reason: scanFileResidualRegresses
+        ? `Fresh historical proof shows scanFile is the negative scan subphase while file-count parity holds. Candidate scan-file residual median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanFileResidualMedianMs?.median}ms, residual share=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanFileResidualSharePct?.median}%, slow class=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateSlowestPathClasses?.[0]?.value ?? "unknown"}. The next runtime candidate must reduce large-file scan residual work without changing route or match volume.`
+        : "Use only when scanWork leaks and scanFile, not scanOpen, is the measured regressing subphase.",
+      expectedGainScore: scanFileResidualRegresses ? 4 + Math.max(0, -enginePressure) + Math.max(0, -Number(leakSummary.leakAttribution.currentOnlyScanSplit.regressingCandidateSubphaseMedianPct ?? 0)) / 2 : 0,
       proofCommand: SPEED_SCAN_OPEN_PROMOTION_COMMAND,
     },
     {
@@ -435,8 +452,10 @@ function mixedTeddyGainNeedsLeakRepair(summary, leakSummary) {
 }
 
 function nextEngineeringMove(moves, summary, leakSummary) {
+  const scanFileResidual = moves.find((move) => move.id === "scan_file_residual_hotspot_attribution") ?? null;
   const scanOpenPressure = moves.find((move) => move.id === "scan_open_path_pressure_attribution") ?? null;
   const wholeEngineLeak = moves.find((move) => move.id === "whole_engine_leak_attribution") ?? null;
+  if (scanFileResidual?.status === "allowed_next") return scanFileResidual;
   if (scanOpenPressure?.status === "allowed_next") return scanOpenPressure;
   if (mixedTeddyGainNeedsLeakRepair(summary, leakSummary)) return wholeEngineLeak;
   return moves.find((move) => move.id === "packed_nibble_shuffle_teddy_kernel") ?? wholeEngineLeak ?? null;

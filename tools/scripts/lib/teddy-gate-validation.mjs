@@ -27,6 +27,13 @@ function evidenceBlockedByBenchmarkNoise(decision) {
   return benchmarkNoiseFailures(decision).length > 0;
 }
 
+function expectedScanWorkRepairMove(decision) {
+  const split = decision?.leakSummary?.leakAttribution?.currentOnlyScanSplit;
+  if (split?.regressingCandidateSubphase === "scanFile") return "scan_file_residual_hotspot_attribution";
+  if (split?.dominantCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
+  return "whole_engine_leak_attribution";
+}
+
 function expectedTeddyNextMove(decision) {
   if (evidenceBlockedByBenchmarkNoise(decision)) {
     return "benchmark_host_noise_control";
@@ -34,9 +41,9 @@ function expectedTeddyNextMove(decision) {
   if (
     mixedTeddyGainNeedsLeakRepair(decision) &&
     decision?.leakSummary?.nextRepairTarget === "scanWork" &&
-    decision?.leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen"
+    ["scan_file_residual_hotspot_attribution", "scan_open_path_pressure_attribution"].includes(expectedScanWorkRepairMove(decision))
   ) {
-    return "scan_open_path_pressure_attribution";
+    return expectedScanWorkRepairMove(decision);
   }
   return mixedTeddyGainNeedsLeakRepair(decision)
     ? "whole_engine_leak_attribution"
@@ -44,9 +51,7 @@ function expectedTeddyNextMove(decision) {
 }
 
 function expectedTeddyRepairMove(decision) {
-  return decision?.leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen"
-    ? "scan_open_path_pressure_attribution"
-    : "whole_engine_leak_attribution";
+  return expectedScanWorkRepairMove(decision);
 }
 
 function rejectedMoveIds(decision) {
@@ -106,8 +111,7 @@ function validateTeddyDecision(decision, evidence) {
     }
     if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
       const split = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit;
-      if (split?.dominantCandidateSubphase !== "scanOpen" ||
-          decision.nextEngineeringMove?.id !== "scan_open_path_pressure_attribution") {
+      if (decision.nextEngineeringMove?.id !== expectedScanWorkRepairMove(decision)) {
         failures.push("teddy kernel decision must expose the proved leak owner as the next engineering move");
       }
     }
@@ -134,8 +138,26 @@ function validateTeddyDecision(decision, evidence) {
         if (!["scanOpen", "scanFile"].includes(split.dominantCandidateSubphase)) {
           failures.push("scanWork leak attribution requires a dominant candidate subphase");
         }
+        if (split.regressingCandidateSubphase != null && !["scanOpen", "scanFile"].includes(split.regressingCandidateSubphase)) {
+          failures.push("scanWork leak attribution requires a valid regressing candidate subphase");
+        }
+        if (
+          split.regressingCandidateSubphase === "scanFile" &&
+          !decision.candidateMoves?.some((move) =>
+            move?.id === "scan_file_residual_hotspot_attribution" &&
+            move?.status === "allowed_next")
+        ) {
+          failures.push("scanFile-regressing leak attribution must route to scan-file residual hotspots");
+        }
+        if (
+          split.regressingCandidateSubphase === "scanFile" &&
+          !Array.isArray(split.candidateSlowestPathHotspots)
+        ) {
+          failures.push("scanFile-regressing leak attribution requires candidate slowest-path hotspots");
+        }
         if (
           split.dominantCandidateSubphase === "scanOpen" &&
+          split.regressingCandidateSubphase !== "scanFile" &&
           !decision.candidateMoves?.some((move) =>
             move?.id === "scan_open_path_pressure_attribution" &&
             move?.status === "allowed_next")
@@ -144,12 +166,14 @@ function validateTeddyDecision(decision, evidence) {
         }
         if (
           split.dominantCandidateSubphase === "scanOpen" &&
+          split.regressingCandidateSubphase !== "scanFile" &&
           Number(split.candidateScanOpenMsPerFileMedian?.median ?? 0) <= 0
         ) {
           failures.push("scanOpen-dominant leak attribution requires per-file open pressure");
         }
         if (
           split.dominantCandidateSubphase === "scanOpen" &&
+          split.regressingCandidateSubphase !== "scanFile" &&
           split.filesScannedParity !== true
         ) {
           failures.push("scanOpen-dominant leak attribution requires scanned-file-count parity");

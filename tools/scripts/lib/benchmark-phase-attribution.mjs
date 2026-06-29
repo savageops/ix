@@ -454,6 +454,23 @@ export function phaseLeakSummaryFromRounds(rounds) {
           Number(candidateScanOpenShare?.median ?? 0) > Number(candidateScanFileShare?.median ?? 0)
             ? "scanOpen"
             : (candidateScanFileShare == null ? null : "scanFile");
+        const regressingCandidateSubphase = [
+          {
+            name: "scanOpen",
+            pairedMedianPct: averages.scanOpen,
+            pairedDeltaMedianMs: deltaMsAverages.scanOpen,
+          },
+          {
+            name: "scanFile",
+            pairedMedianPct: averages.scanFile,
+            pairedDeltaMedianMs: deltaMsAverages.scanFile,
+          },
+        ]
+          .filter((entry) => Number.isFinite(Number(entry.pairedMedianPct)) && Number(entry.pairedMedianPct) < 0)
+          .sort((left, right) =>
+            Math.abs(Number(right.pairedDeltaMedianMs ?? 0)) - Math.abs(Number(left.pairedDeltaMedianMs ?? 0)) ||
+            Number(left.pairedMedianPct) - Number(right.pairedMedianPct)
+          )[0] ?? null;
         const dominantCandidateScanFileComponent = [
           { name: "teddyRange", share: teddyShareOfScanFilePct },
           { name: "alternateFullScan", share: alternateFullScanShareOfScanFilePct },
@@ -468,6 +485,9 @@ export function phaseLeakSummaryFromRounds(rounds) {
           predecessorSplitMissingCount: targetRounds.length - predecessorSplitRounds.length,
           predecessorComparisonLimited: predecessorSplitRounds.length < targetRounds.length,
           dominantCandidateSubphase,
+          regressingCandidateSubphase: regressingCandidateSubphase?.name ?? null,
+          regressingCandidateSubphaseMedianPct: Number.isFinite(Number(regressingCandidateSubphase?.pairedMedianPct)) ? Number(regressingCandidateSubphase.pairedMedianPct) : null,
+          regressingCandidateSubphaseDeltaMs: Number.isFinite(Number(regressingCandidateSubphase?.pairedDeltaMedianMs)) ? Number(regressingCandidateSubphase.pairedDeltaMedianMs) : null,
           dominantCandidateScanFileComponent,
           candidateScanOpenSharePct: candidateScanOpenShare,
           candidateScanFileSharePct: candidateScanFileShare,
