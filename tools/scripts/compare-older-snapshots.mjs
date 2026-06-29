@@ -206,6 +206,80 @@ function roundRetainable(round) {
   );
 }
 
+function classifyRoundFailure(round) {
+  if (round.runnable !== true) return "skipped";
+  const failures = [
+    ...(round.failures ?? []),
+    ...(round.promotionFailures ?? []),
+  ].map(String);
+  if (failures.some((failure) => failure.startsWith("identity_control"))) return "identity_control";
+  if (failures.some((failure) => failure.startsWith("host:"))) return "host";
+  if (failures.some((failure) => failure.startsWith("process_") || failure.startsWith("stale_processes"))) return "process";
+  if (Number(round.enginePct) < minEngineImprovementPct) return "engine_target";
+  if (Number(round.pairedPct) < minPairedImprovementPct) return "paired_target";
+  if (requireStrict && round.strict !== true) return "strict_evidence";
+  if (failures.length > 0) return "other";
+  return "none";
+}
+
+function bestRetainableRound(rounds) {
+  const retainableRounds = rounds.filter(roundRetainable);
+  return [...retainableRounds].sort((left, right) =>
+    Number(right.pairedPct) - Number(left.pairedPct) ||
+    Number(right.enginePct) - Number(left.enginePct)
+  )[0] ?? null;
+}
+
+function worstBlockingRound(rounds) {
+  const blocked = rounds
+    .filter((round) => round.runnable === true && !roundRetainable(round))
+    .map((round) => ({
+      label: round.label,
+      status: round.status ?? null,
+      category: classifyRoundFailure(round),
+      enginePct: round.enginePct ?? null,
+      pairedPct: round.pairedPct ?? null,
+      strict: round.strict === true,
+      failures: round.failures ?? [],
+    }));
+  return blocked.sort((left, right) =>
+    Number(left.pairedPct ?? Number.POSITIVE_INFINITY) - Number(right.pairedPct ?? Number.POSITIVE_INFINITY) ||
+    Number(left.enginePct ?? Number.POSITIVE_INFINITY) - Number(right.enginePct ?? Number.POSITIVE_INFINITY)
+  )[0] ?? null;
+}
+
+function buildFailureSummary({ rounds, failures }) {
+  const categoryCounts = {};
+  for (const round of rounds) {
+    const category = classifyRoundFailure(round);
+    categoryCounts[category] = (categoryCounts[category] ?? 0) + 1;
+  }
+  const retainableLabels = rounds.filter(roundRetainable).map((round) => round.label);
+  const blockedLabels = rounds
+    .filter((round) => round.runnable === true && !roundRetainable(round))
+    .map((round) => round.label);
+  const skippedLabels = rounds
+    .filter((round) => round.runnable !== true)
+    .map((round) => round.label);
+  const best = bestRetainableRound(rounds);
+  return {
+    categories: categoryCounts,
+    retainableLabels,
+    blockedLabels,
+    skippedLabels,
+    bestRetainableRound: best
+      ? {
+          label: best.label,
+          enginePct: best.enginePct ?? null,
+          pairedPct: best.pairedPct ?? null,
+          winRate: best.winRate ?? null,
+        }
+      : null,
+    worstBlockingRound: worstBlockingRound(rounds),
+    topLevelFailures: failures,
+  };
+}
+
 const candidates = snapshotCandidates();
 if (dryRun) {
   for (const [index, candidate] of candidates.entries()) {
@@ -277,6 +351,7 @@ const report = {
   strictRequired: requireStrict,
   retainableEvidence: failures.length === 0,
   failures,
+  failureSummary: buildFailureSummary({ rounds, failures }),
   rounds,
 };
 

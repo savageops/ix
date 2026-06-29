@@ -847,6 +847,7 @@ function olderSnapshotLadderLane(hostPreflight = null) {
     strictRequired: latest.strictRequired === true,
     retainableEvidence: latest.retainableEvidence === true,
     failures: latest.failures ?? [],
+    failureSummary: latest.failureSummary ?? null,
     rounds: parsedRounds,
   };
   const retainedSampleFloorMet = Number(parsed.samples) >= minRetainableSpeedSamples;

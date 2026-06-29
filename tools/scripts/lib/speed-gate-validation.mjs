@@ -552,6 +552,27 @@ export function createSpeedGateValidation({
     if (!diagnosticOnly && Array.isArray(entry.report.failures) && entry.report.failures.length > 0) {
       failures.push("older_snapshot_ladder: ok status requires an empty failure ledger");
     }
+    const failureSummary = entry.report.failureSummary;
+    if (!isPlainObject(failureSummary) || !isPlainObject(failureSummary.categories)) {
+      failures.push("older_snapshot_ladder: ok status requires categorized failure summary");
+    } else {
+      const summarizedTotal = Object.values(failureSummary.categories)
+        .map(Number)
+        .filter(Number.isFinite)
+        .reduce((sum, count) => sum + count, 0);
+      if (summarizedTotal !== Number(entry.report.rounds?.length ?? 0)) {
+        failures.push("older_snapshot_ladder: failure summary categories must account for every round");
+      }
+      if (!Array.isArray(failureSummary.retainableLabels) || Number(failureSummary.retainableLabels.length) !== Number(entry.report.retainableSnapshots ?? 0)) {
+        failures.push("older_snapshot_ladder: failure summary retainable labels must match retainable count");
+      }
+      if (!Array.isArray(failureSummary.blockedLabels) || !Array.isArray(failureSummary.skippedLabels)) {
+        failures.push("older_snapshot_ladder: failure summary requires blocked and skipped label ledgers");
+      }
+      if (entry.strictRequired === true && Number(entry.report.retainableSnapshots ?? 0) > 0 && !isPlainObject(failureSummary.bestRetainableRound)) {
+        failures.push("older_snapshot_ladder: strict retained evidence requires best retainable round summary");
+      }
+    }
     if (entry.strictRequired === true && entry.report.strictRequired !== true) {
       failures.push("older_snapshot_ladder: strict ok status requires strict comparator mode");
     }
