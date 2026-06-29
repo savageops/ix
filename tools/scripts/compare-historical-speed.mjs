@@ -8,6 +8,8 @@ import { acquireBenchmarkLock, buildHistoricalComparisonScore, buildHistoricalRo
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
+const LATEST_HISTORICAL_PATH = path.join(REPORT_DIR, "latest-historical-speed.json");
+const LATEST_RETAINABLE_HISTORICAL_PATH = path.join(REPORT_DIR, "latest-retainable-historical-speed.json");
 const DEFAULT_CORPUS = "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux";
 const DEFAULT_EXPR = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)";
 const DEFAULT_INSTALL_DIR = path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin");
@@ -320,7 +322,10 @@ const report = {
 mkdirSync(REPORT_DIR, { recursive: true });
 const outPath = path.join(REPORT_DIR, `${report.runId}.json`);
 writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-writeFileSync(path.join(REPORT_DIR, "latest-historical-speed.json"), `${JSON.stringify(report, null, 2)}\n`, "utf8");
+writeFileSync(LATEST_HISTORICAL_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+if (report.retainableStrictEvidence) {
+  writeFileSync(LATEST_RETAINABLE_HISTORICAL_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+}
 
 if (!quiet) {
   console.log(JSON.stringify({
