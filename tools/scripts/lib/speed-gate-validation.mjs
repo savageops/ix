@@ -655,6 +655,9 @@ export function createSpeedGateValidation({
       if (!isPlainObject(round.identityControl) || !Number.isFinite(Number(round.identityControl.medianDeltaPct))) {
         failures.push(`older_snapshot_ladder: runnable round requires same-binary noise diagnostics: ${round.label ?? "unknown"}`);
       }
+      if (entry.strictRequired === true && !identityControlAttemptsComplete(round.identityControl)) {
+        failures.push(`older_snapshot_ladder: strict runnable round requires complete identity-control attempts: ${round.label ?? "unknown"}`);
+      }
       if (!isPlainObject(round.processScan) || Number(round.processScan.beforeMatched) !== 0 || Number(round.processScan.afterMatched) !== 0) {
         failures.push(`older_snapshot_ladder: runnable round requires clean process diagnostics: ${round.label ?? "unknown"}`);
       }
