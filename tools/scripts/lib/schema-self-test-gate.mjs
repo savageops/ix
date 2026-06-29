@@ -1768,7 +1768,7 @@ export function runSchemaSelfTest({
     "benchmark_readiness: unavailable admin remediation must be surfaced",
     "benchmark_readiness: failed status requires executable next commands",
     "benchmark_readiness: failed status requires the canonical speed recovery command set",
-    "benchmark_readiness: host preflight smoke command must run strict one-sample speed gates",
+    "benchmark_readiness: host preflight smoke command must run strict paired-smoke speed gates",
     "benchmark_readiness: retained installed/historical command must run strict retained sample gates",
     "benchmark_readiness: retained alternates command must run branch-count route gates",
     "benchmark_readiness: direct comparator smoke command must require strict installed identity/promotion evidence with a matched sample floor",

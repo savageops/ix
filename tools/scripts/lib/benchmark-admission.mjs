@@ -159,7 +159,7 @@ export function createBenchmarkAdmission({
   function benchmarkReadinessNextCommands({ corpus = benchmarkCorpus } = {}) {
     const retainedSamples = Math.max(12, minRetainableSpeedSamples);
     const sampleArg = String(retainedSamples);
-    const smokeSampleArg = String(Math.min(2, retainedSamples));
+    const smokeSampleArg = "2";
     return [
       {
         id: "host_preflight_smoke",
@@ -171,11 +171,11 @@ export function createBenchmarkAdmission({
           "--strict-historical-speed",
           "--strict-older-snapshots",
           "--installed-speed-samples",
-          "1",
+          smokeSampleArg,
           "--historical-speed-samples",
-          "1",
+          smokeSampleArg,
           "--older-snapshot-samples",
-          "1",
+          smokeSampleArg,
           "--older-snapshot-max",
           "1",
           "--older-snapshot-retainable-target",
@@ -183,7 +183,7 @@ export function createBenchmarkAdmission({
           "--older-snapshot-identity-attempts",
           "3",
           "--min-retainable-speed-samples",
-          "1",
+          smokeSampleArg,
         ].join(" "),
         reason: "Confirms the host preflight is clean before spending full benchmark time.",
       },
@@ -751,15 +751,15 @@ export function createBenchmarkAdmission({
         !hostSmoke.includes("--strict-installed-speed") ||
         !hostSmoke.includes("--strict-historical-speed") ||
         !hostSmoke.includes("--strict-older-snapshots") ||
-        !hostSmoke.includes("--installed-speed-samples 1") ||
-        !hostSmoke.includes("--historical-speed-samples 1") ||
-        !hostSmoke.includes("--older-snapshot-samples 1") ||
+        !hostSmoke.includes("--installed-speed-samples 2") ||
+        !hostSmoke.includes("--historical-speed-samples 2") ||
+        !hostSmoke.includes("--older-snapshot-samples 2") ||
         !hostSmoke.includes("--older-snapshot-max 1") ||
         !hostSmoke.includes("--older-snapshot-retainable-target 1") ||
         !hostSmoke.includes("--older-snapshot-identity-attempts 3") ||
-        !hostSmoke.includes("--min-retainable-speed-samples 1")
+        !hostSmoke.includes("--min-retainable-speed-samples 2")
       ) {
-        failures.push("benchmark_readiness: host preflight smoke command must run strict one-sample speed gates");
+        failures.push("benchmark_readiness: host preflight smoke command must run strict paired-smoke speed gates");
       }
       const retained = String(commandById.get("retained_installed_historical") ?? "");
       if (
