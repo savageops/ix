@@ -117,6 +117,12 @@ function validateTeddyDecision(decision, evidence) {
         ) {
           failures.push("scanFile leak attribution requires a dominant candidate scan-file component");
         }
+        if (
+          split.dominantCandidateScanFileComponent === "scanFileResidual" &&
+          !Array.isArray(split.candidateSlowestPathHotspots)
+        ) {
+          failures.push("scanFile residual attribution requires candidate slowest-path hotspots");
+        }
       }
     }
   }

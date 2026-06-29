@@ -65,6 +65,30 @@ function optionalSummary(values) {
   return finite.length === 0 ? null : summary(finite);
 }
 
+function topWeightedEntries(entries, limit = 8) {
+  const counts = new Map();
+  for (const entry of entries) {
+    const value = typeof entry === "string" ? entry : entry?.value;
+    if (!value) continue;
+    const count = Number(typeof entry === "string" ? 1 : entry?.count ?? 1);
+    counts.set(value, (counts.get(value) ?? 0) + (Number.isFinite(count) ? count : 1));
+  }
+  return [...counts.entries()]
+    .map(([value, count]) => ({ value, count }))
+    .sort((left, right) => right.count - left.count || left.value.localeCompare(right.value))
+    .slice(0, limit);
+}
+
+function pathClass(path) {
+  const normalized = String(path ?? "").replaceAll("\\", "/").toLowerCase();
+  if (normalized.includes("/linux/drivers/gpu/drm/amd/include/asic_reg/")) return "linux_amd_asic_reg_header";
+  if (normalized.includes("/linux/")) return "linux_tree";
+  if (normalized.endsWith(".h")) return "c_header";
+  if (normalized.endsWith(".c")) return "c_source";
+  if (normalized.endsWith(".rs")) return "rust_source";
+  return normalized.length === 0 ? "unknown" : "other";
+}
+
 export function phaseTimingResidualMs(timings, engineMs) {
   const discover = Number(timings?.discover_ms ?? 0);
   const scan = Number(timings?.scan_ms ?? 0);
@@ -393,6 +417,14 @@ export function phaseLeakSummaryFromRounds(rounds) {
         const scanFileResidualMedianMs = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileResidualMedianMs));
         const teddyShareOfScanFilePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateTeddyShareOfScanFilePct));
         const scanFileResidualSharePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileResidualSharePct));
+        const candidateSlowestPathHotspots = topWeightedEntries(candidateSplitRounds.flatMap((round) => {
+          const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
+          return Array.isArray(sourceRound.candidateSlowestPathTop) ? sourceRound.candidateSlowestPathTop : [];
+        }));
+        const candidateSlowestPathClasses = topWeightedEntries(candidateSlowestPathHotspots.map((entry) => ({
+          value: pathClass(entry.value),
+          count: entry.count,
+        })));
         const dominantCandidateSubphase =
           Number(candidateScanOpenShare?.median ?? 0) > Number(candidateScanFileShare?.median ?? 0)
             ? "scanOpen"
@@ -418,6 +450,8 @@ export function phaseLeakSummaryFromRounds(rounds) {
           candidateScanFileResidualSharePct: scanFileResidualSharePct,
           candidateScanFileResidualMedianMs: scanFileResidualMedianMs,
           scanFileResidualRounds,
+          candidateSlowestPathHotspots,
+          candidateSlowestPathClasses,
           interpretation: candidateSplitRounds.length === 0
             ? "scanWork is leaking, but current split telemetry is unavailable; rerun with --scan-open-timing"
             : (predecessorSplitRounds.length < targetRounds.length

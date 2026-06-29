@@ -185,6 +185,12 @@ if (teddyGainNeedsLeakRepair) {
       ) {
         failures.push("decision scanFile leak attribution must name dominant candidate scan-file component");
       }
+      if (
+        split.dominantCandidateScanFileComponent === "scanFileResidual" &&
+        !Array.isArray(split.candidateSlowestPathHotspots)
+      ) {
+        failures.push("decision scanFile residual attribution must include candidate slowest-path hotspots");
+      }
     }
   }
 }
