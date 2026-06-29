@@ -141,7 +141,13 @@ const benchmarkNoiseFailures = [
 const evidenceBlockedByNoise = benchmarkNoiseFailures.length > 0;
 const expectedNextMove = evidenceBlockedByNoise
   ? "benchmark_host_noise_control"
-  : (teddyGainNeedsLeakRepair ? "whole_engine_leak_attribution" : "packed_nibble_shuffle_teddy_kernel");
+  : (
+      teddyGainNeedsLeakRepair &&
+      decision.leakSummary?.nextRepairTarget === "scanWork" &&
+      decision.leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen"
+        ? "scan_open_path_pressure_attribution"
+        : (teddyGainNeedsLeakRepair ? "whole_engine_leak_attribution" : "packed_nibble_shuffle_teddy_kernel")
+    );
 if (decision.nextAllowedMove?.id !== expectedNextMove) {
   failures.push(`decision next move expected ${expectedNextMove}`);
 }
@@ -156,11 +162,18 @@ if (teddyGainNeedsLeakRepair) {
   if (decision.preservationPolicy?.preserveTeddyGain !== true) {
     failures.push("decision preservation policy must protect the positive Teddy gain");
   }
-  if (decision.preservationPolicy?.nextEngineeringMoveId !== "whole_engine_leak_attribution") {
-    failures.push("decision preservation policy must route engineering repair to whole-engine leak attribution");
+  const expectedRepairMove = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen"
+    ? "scan_open_path_pressure_attribution"
+    : "whole_engine_leak_attribution";
+  if (decision.preservationPolicy?.nextEngineeringMoveId !== expectedRepairMove) {
+    failures.push("decision preservation policy must route engineering repair to the proved repair owner");
   }
   if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
-    failures.push("decision must expose whole-engine leak attribution as next engineering move");
+    const split = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit;
+    if (split?.dominantCandidateSubphase !== "scanOpen" ||
+        decision.nextEngineeringMove?.id !== "scan_open_path_pressure_attribution") {
+      failures.push("decision must expose the proved leak owner as next engineering move");
+    }
   }
   if (
     decision.leakSummary?.nextRepairTarget === "scanWork" &&
@@ -184,6 +197,14 @@ if (teddyGainNeedsLeakRepair) {
       }
       if (!["scanOpen", "scanFile"].includes(split.dominantCandidateSubphase)) {
         failures.push("decision scanWork leak attribution must name dominant candidate subphase");
+      }
+      if (
+        split.dominantCandidateSubphase === "scanOpen" &&
+        !decision.candidateMoves?.some((move) =>
+          move?.id === "scan_open_path_pressure_attribution" &&
+          move?.status === "allowed_next")
+      ) {
+        failures.push("decision scanOpen-dominant leak attribution must route to scan-open path pressure");
       }
       if (
         split.dominantCandidateSubphase === "scanFile" &&

@@ -21,10 +21,13 @@ const HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND =
   "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --no-require-strict --scan-open-timing";
 const HISTORICAL_SPEED_STRICT_COMMAND =
   "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --require-strict";
+const HISTORICAL_SPEED_SCAN_OPEN_STRICT_COMMAND =
+  "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --require-strict --scan-open-timing";
 const OLDER_SNAPSHOT_PROOF_COMMAND =
   "node tools/scripts/compare-older-snapshots.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --min-retainable-samples 12 --max-snapshots 2 --target-retainable-snapshots 2 --min-engine-improvement-pct 5 --min-paired-improvement-pct 5 --require-strict --quiet";
 const SPEED_DIAGNOSTIC_COMMAND = `${HISTORICAL_SPEED_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 const SPEED_LEAK_ATTRIBUTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
+const SPEED_SCAN_OPEN_PROMOTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 const SPEED_PROMOTION_COMMAND = `${HISTORICAL_SPEED_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 
 const args = process.argv.slice(2);
@@ -259,6 +262,10 @@ function candidateMoves(summary, leakSummary, quality) {
     leakSummary?.diagnosis === "preserve_positive_teddy_gain_and_repair_whole_engine_leak" &&
     summary.matchParity === true &&
     summary.routeParity === true;
+  const scanOpenDominatesLeak =
+    teddyGainNeedsLeakRepair &&
+    leakSummary?.nextRepairTarget === "scanWork" &&
+    leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen";
   const fullScanVolumeStable =
     summary.fullScanCallsParity === true &&
     summary.fullScanBytesParity === true &&
@@ -279,13 +286,25 @@ function candidateMoves(summary, leakSummary, quality) {
     },
     {
       id: "whole_engine_leak_attribution",
-      status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win"),
+      status: benchmarkNoiseBlocked
+        ? "blocked_by_benchmark_noise"
+        : (scanOpenDominatesLeak ? "satisfied_by_scan_open_split" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win")),
       owner: "tools/scripts/compare-historical-speed.mjs plus src/core/search.zig phase telemetry",
       reason: teddyGainNeedsLeakRepair
         ? `Latest historical evidence shows Teddy attribution is positive while whole-engine evidence still has a losing round; preserve the Teddy gain and isolate ${leakSummary?.nextRepairTarget ?? "discovery, scheduling, scan bookkeeping, or reporting"} overhead before changing the Teddy kernel again. Current averaged phase medians: discover=${summary.averagePairedDiscoverMedianPct}%, scan=${summary.averagePairedScanMedianPct}%, scanWork=${summary.averagePairedScanWorkMedianPct}%, teddy=${summary.averagePairedTeddyMedianPct}%. Worst round=${leakSummary?.worstRound?.baselineLabel ?? "unknown"}.`
         : "Use this only after Teddy route attribution is already net-positive and whole-engine evidence still regresses.",
       expectedGainScore: teddyGainNeedsLeakRepair ? 3 + Math.max(0, -enginePressure) + Math.max(0, teddyPressure / 4) : 0,
       proofCommand: SPEED_LEAK_ATTRIBUTION_COMMAND,
+    },
+    {
+      id: "scan_open_path_pressure_attribution",
+      status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (scanOpenDominatesLeak ? "allowed_next" : "waiting_for_scan_open_split"),
+      owner: "src/core/search.zig::scanFileIntoShardTimed and scanFileIntoShardMonoTimed",
+      reason: scanOpenDominatesLeak
+        ? `Scan-open timing split is now present and identifies the file-open wrapper as the dominant candidate subphase: scanOpen median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMedianMs?.median}ms, scanFile median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanFileMedianMs?.median}ms. The next runtime candidate must reduce open-path pressure or prove a lower-risk scan scheduling owner before touching the Teddy kernel.`
+        : "Run historical proof with --scan-open-timing before choosing an open-path, scan-file, or Teddy-kernel repair.",
+      expectedGainScore: scanOpenDominatesLeak ? 4 + Math.max(0, -enginePressure) : 0,
+      proofCommand: SPEED_SCAN_OPEN_PROMOTION_COMMAND,
     },
     {
       id: "packed_nibble_shuffle_teddy_kernel",
@@ -372,7 +391,9 @@ function mixedTeddyGainNeedsLeakRepair(summary, leakSummary) {
 }
 
 function nextEngineeringMove(moves, summary, leakSummary) {
+  const scanOpenPressure = moves.find((move) => move.id === "scan_open_path_pressure_attribution") ?? null;
   const wholeEngineLeak = moves.find((move) => move.id === "whole_engine_leak_attribution") ?? null;
+  if (scanOpenPressure?.status === "allowed_next") return scanOpenPressure;
   if (mixedTeddyGainNeedsLeakRepair(summary, leakSummary)) return wholeEngineLeak;
   return moves.find((move) => move.id === "packed_nibble_shuffle_teddy_kernel") ?? wholeEngineLeak ?? null;
 }

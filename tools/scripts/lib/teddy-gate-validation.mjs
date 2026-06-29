@@ -31,9 +31,22 @@ function expectedTeddyNextMove(decision) {
   if (evidenceBlockedByBenchmarkNoise(decision)) {
     return "benchmark_host_noise_control";
   }
+  if (
+    mixedTeddyGainNeedsLeakRepair(decision) &&
+    decision?.leakSummary?.nextRepairTarget === "scanWork" &&
+    decision?.leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen"
+  ) {
+    return "scan_open_path_pressure_attribution";
+  }
   return mixedTeddyGainNeedsLeakRepair(decision)
     ? "whole_engine_leak_attribution"
     : "packed_nibble_shuffle_teddy_kernel";
+}
+
+function expectedTeddyRepairMove(decision) {
+  return decision?.leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen"
+    ? "scan_open_path_pressure_attribution"
+    : "whole_engine_leak_attribution";
 }
 
 function rejectedMoveIds(decision) {
@@ -88,11 +101,15 @@ function validateTeddyDecision(decision, evidence) {
     if (decision.preservationPolicy?.preserveTeddyGain !== true) {
       failures.push("teddy kernel decision must explicitly preserve the positive Teddy gain");
     }
-    if (decision.preservationPolicy?.nextEngineeringMoveId !== "whole_engine_leak_attribution") {
-      failures.push("teddy kernel decision must route mixed Teddy/engine evidence to whole-engine leak attribution");
+    if (decision.preservationPolicy?.nextEngineeringMoveId !== expectedTeddyRepairMove(decision)) {
+      failures.push("teddy kernel decision must route mixed Teddy/engine evidence to the proved repair owner");
     }
     if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
-      failures.push("teddy kernel decision must expose whole-engine leak attribution as the next engineering move");
+      const split = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit;
+      if (split?.dominantCandidateSubphase !== "scanOpen" ||
+          decision.nextEngineeringMove?.id !== "scan_open_path_pressure_attribution") {
+        failures.push("teddy kernel decision must expose the proved leak owner as the next engineering move");
+      }
     }
     if (
       decision.leakSummary?.nextRepairTarget === "scanWork" &&
@@ -116,6 +133,14 @@ function validateTeddyDecision(decision, evidence) {
         }
         if (!["scanOpen", "scanFile"].includes(split.dominantCandidateSubphase)) {
           failures.push("scanWork leak attribution requires a dominant candidate subphase");
+        }
+        if (
+          split.dominantCandidateSubphase === "scanOpen" &&
+          !decision.candidateMoves?.some((move) =>
+            move?.id === "scan_open_path_pressure_attribution" &&
+            move?.status === "allowed_next")
+        ) {
+          failures.push("scanOpen-dominant leak attribution must route to scan-open path pressure");
         }
         if (
           split.dominantCandidateSubphase === "scanFile" &&
@@ -244,9 +269,9 @@ export function createTeddyGateValidation({ root, run, lane }) {
     if (
       isPlainObject(parsed.decision) &&
       mixedTeddyGainNeedsLeakRepair(parsed.decision) &&
-      parsed.decision.preservationPolicy?.nextEngineeringMoveId !== "whole_engine_leak_attribution"
+      parsed.decision.preservationPolicy?.nextEngineeringMoveId !== expectedTeddyRepairMove(parsed.decision)
     ) {
-      failures.push("teddy kernel contract must preserve Teddy gain and route engineering repair to whole-engine leak attribution");
+      failures.push("teddy kernel contract must preserve Teddy gain and route engineering repair to the proved repair owner");
     }
     return lane("teddy_kernel_contract", failures.length === 0 ? "ok" : "failed", {
       evidence,
