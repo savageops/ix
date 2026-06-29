@@ -374,13 +374,19 @@ export function phaseLeakSummaryFromRounds(rounds) {
         baselineScanWorkMedianMs: optionalNumber(sourceRound.baselineScanWorkMedianMs),
         baselineScanOpenMedianMs: optionalNumber(sourceRound.baselineScanOpenMedianMs),
         baselineScanFileMedianMs: optionalNumber(sourceRound.baselineScanFileMedianMs),
+        baselineScanOpenMsPerFileMedian: optionalNumber(sourceRound.baselineScanOpenMsPerFileMedian),
+        baselineScanFileMsPerFileMedian: optionalNumber(sourceRound.baselineScanFileMsPerFileMedian),
         baselineScanSplitPresent,
         candidateScanWorkMedianMs: optionalNumber(sourceRound.candidateScanWorkMedianMs),
         candidateScanOpenMedianMs: optionalNumber(sourceRound.candidateScanOpenMedianMs),
         candidateScanFileMedianMs: optionalNumber(sourceRound.candidateScanFileMedianMs),
+        candidateScanOpenMsPerFileMedian: optionalNumber(sourceRound.candidateScanOpenMsPerFileMedian),
+        candidateScanFileMsPerFileMedian: optionalNumber(sourceRound.candidateScanFileMsPerFileMedian),
         scanWorkDeltaMs: delta(sourceRound.candidateScanWorkMedianMs, sourceRound.baselineScanWorkMedianMs),
         scanOpenDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenMedianMs, sourceRound.baselineScanOpenMedianMs) : null,
         scanFileDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileMedianMs, sourceRound.baselineScanFileMedianMs) : null,
+        scanOpenMsPerFileDelta: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenMsPerFileMedian, sourceRound.baselineScanOpenMsPerFileMedian) : null,
+        scanFileMsPerFileDelta: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileMsPerFileMedian, sourceRound.baselineScanFileMsPerFileMedian) : null,
         baselineScanOpenSharePct,
         baselineScanFileSharePct,
         candidateScanOpenSharePct,
@@ -400,6 +406,8 @@ export function phaseLeakSummaryFromRounds(rounds) {
         const candidateScanOpenMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenMedianMs));
         const candidateScanFileMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileMedianMs));
         const candidateScanWorkMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanWorkMedianMs));
+        const candidateScanOpenMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenMsPerFileMedian));
+        const candidateScanFileMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileMsPerFileMedian));
         const scanFileResidualRounds = candidateSplitRounds.map((round) => {
           const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
           const teddyMs = nsToMs(sourceRound.candidateAlternateTeddyRangeElapsedNsMedian);
@@ -455,6 +463,8 @@ export function phaseLeakSummaryFromRounds(rounds) {
           candidateScanOpenMedianMs,
           candidateScanFileMedianMs,
           candidateScanWorkMedianMs,
+          candidateScanOpenMsPerFileMedian,
+          candidateScanFileMsPerFileMedian,
           candidateTeddyShareOfScanFilePct: teddyShareOfScanFilePct,
           candidateAlternateFullScanShareOfScanFilePct: alternateFullScanShareOfScanFilePct,
           candidateAlternateFullScanMedianMs: alternateFullScanMedianMs,

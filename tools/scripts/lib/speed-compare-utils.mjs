@@ -178,6 +178,13 @@ function optionalNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function msPerFile(totalMs, filesScanned) {
+  const total = Number(totalMs);
+  const files = Number(filesScanned);
+  if (!Number.isFinite(total) || !Number.isFinite(files) || files <= 0) return null;
+  return total / files;
+}
+
 export function pairOrderSummary(pairOrder, { firstLabel, secondLabel } = {}) {
   if (!Array.isArray(pairOrder)) {
     return {
@@ -310,6 +317,10 @@ function stageTimingMedianFields(baseline, candidate) {
     candidateScanOpenMedianMs: candidate?.scanOpenSummary?.median ?? null,
     baselineScanFileMedianMs: baseline?.scanFileSummary?.median ?? null,
     candidateScanFileMedianMs: candidate?.scanFileSummary?.median ?? null,
+    baselineScanOpenMsPerFileMedian: baseline?.scanOpenMsPerFileSummary?.median ?? null,
+    candidateScanOpenMsPerFileMedian: candidate?.scanOpenMsPerFileSummary?.median ?? null,
+    baselineScanFileMsPerFileMedian: baseline?.scanFileMsPerFileSummary?.median ?? null,
+    candidateScanFileMsPerFileMedian: candidate?.scanFileMsPerFileSummary?.median ?? null,
     baselineSlowestFileMedianMs: baseline?.slowestMsSummary?.median ?? null,
     candidateSlowestFileMedianMs: candidate?.slowestMsSummary?.median ?? null,
     baselineSlowestFileMedianBytes: baseline?.slowestBytesSummary?.median ?? null,
@@ -1462,6 +1473,8 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
     aggregateFinalizeMs: Number(timings.aggregate_finalize_ms ?? 0),
     matches: Number(report.stats?.matches_found ?? 0),
     filesScanned: Number(report.stats?.files_scanned ?? 0),
+    scanOpenMsPerFile: msPerFile(timings.scan_open_ms_total, report.stats?.files_scanned),
+    scanFileMsPerFile: msPerFile(timings.scan_file_ms_total, report.stats?.files_scanned),
     slowestPath: slowest.path ?? slowestFiles[0]?.path ?? "",
     slowestMs: Number(slowest.ms ?? slowest.duration_ms ?? slowestFiles[0]?.duration_ms ?? 0),
     slowestBytes: Number(slowest.bytes ?? slowestFiles[0]?.bytes ?? 0),
@@ -1505,6 +1518,8 @@ export function summarizeIxRuns(binaryPath, label, runs) {
     scanWorkSummary: summary(runs.map((entry) => entry.scanWorkMsTotal)),
     scanOpenSummary: summary(runs.map((entry) => entry.scanOpenMsTotal)),
     scanFileSummary: summary(runs.map((entry) => entry.scanFileMsTotal)),
+    scanOpenMsPerFileSummary: summary(runs.map((entry) => entry.scanOpenMsPerFile)),
+    scanFileMsPerFileSummary: summary(runs.map((entry) => entry.scanFileMsPerFile)),
     slowestMsSummary: summary(runs.map((entry) => entry.slowestMs)),
     slowestBytesSummary: summary(runs.map((entry) => entry.slowestBytes)),
     slowestPathTop: topCounts(runs.flatMap((entry) => {
