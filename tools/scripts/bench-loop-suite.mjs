@@ -4,7 +4,26 @@ import { runOneBenchmark } from "./lib/benchmark-runner.mjs";
 import { argValue, sleep } from "./lib/script-helpers.mjs";
 
 const args = process.argv.slice(2);
-const loops = Number(argValue(args, "--loops", "0"));
+if (args.includes("--help") || args.includes("-h")) {
+  console.log(`Usage: node tools/scripts/bench-loop-suite.mjs [options]
+
+Runs the benchmark profile suite once by default. Use --loops 0 only for an
+intentional continuous monitor.
+
+Options:
+  --loops <n>                 Suite loops to run. Default: 1. Use 0 for forever.
+  --delay-ms <n>              Delay between profiles. Default: 0.
+  --ix-binary <path>          IX binary to measure.
+  --previous-ix-binary <path> Optional previous IX comparator.
+  --rust-ix-binary <path>     Optional Rust IX comparator.
+  --threads <n>               IX/ripgrep thread count.
+  --warmup <n>                Warmup samples per profile. Default: 1.
+  --samples <n>               Measured samples per profile. Default: 1.
+  --help, -h                  Print this help and exit without measuring.
+`);
+  process.exit(0);
+}
+const loops = Number(argValue(args, "--loops", "1"));
 const delayMs = Number(argValue(args, "--delay-ms", "0"));
 const ixBinary = argValue(args, "--ix-binary", undefined);
 const previousIxBinary = argValue(args, "--previous-ix-binary", process.env.IX_PREVIOUS_BINARY ?? undefined);
