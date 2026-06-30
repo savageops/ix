@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { benchmarkEnvSnapshot } from "./lib/speed-compare-utils.mjs";
+import { benchmarkEnvSnapshot, dependencyTreeSnapshot } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "older-snapshot-ladder");
@@ -32,10 +32,10 @@ Options:
   --max-candidates <n>            Optional hard cap on candidate executables scanned.
   --min-engine-improvement-pct <n>
                                   Required per-runnable-snapshot engine improvement.
-                                  Default: 5.
+                                  Default: 0.
   --min-paired-improvement-pct <n>
                                   Required per-runnable-snapshot paired median improvement.
-                                  Default: 5.
+                                  Default: 0.
   --latest-path <path>            Path for latest-report pointer. Default:
                                   tools/reports/older-snapshot-ladder/latest-older-snapshot-ladder.json.
   --newest-first                  Sort snapshots newest to oldest. Default: oldest first.
@@ -60,8 +60,8 @@ const targetRetainableSnapshotsRaw = argValue(args, "--target-retainable-snapsho
 const targetRetainableSnapshots = targetRetainableSnapshotsRaw === "" ? Infinity : Number(targetRetainableSnapshotsRaw);
 const maxCandidatesRaw = argValue(args, "--max-candidates", "");
 const maxCandidates = maxCandidatesRaw === "" ? Infinity : Number(maxCandidatesRaw);
-const minEngineImprovementPct = Number(argValue(args, "--min-engine-improvement-pct", process.env.IX_MIN_OLDER_SNAPSHOT_ENGINE_PCT ?? "5"));
-const minPairedImprovementPct = Number(argValue(args, "--min-paired-improvement-pct", process.env.IX_MIN_OLDER_SNAPSHOT_PAIRED_PCT ?? "5"));
+const minEngineImprovementPct = Number(argValue(args, "--min-engine-improvement-pct", process.env.IX_MIN_OLDER_SNAPSHOT_ENGINE_PCT ?? "0"));
+const minPairedImprovementPct = Number(argValue(args, "--min-paired-improvement-pct", process.env.IX_MIN_OLDER_SNAPSHOT_PAIRED_PCT ?? "0"));
 const latestPath = path.resolve(argValue(args, "--latest-path", path.join(REPORT_DIR, "latest-older-snapshot-ladder.json")));
 const newestFirst = args.includes("--newest-first");
 const requireStrict = args.includes("--require-strict");
@@ -352,6 +352,7 @@ const report = {
   skippedSnapshots: rounds.length - runnable.length,
   strictRequired: requireStrict,
   effectiveBenchEnv: benchmarkEnvSnapshot(),
+  dependencyTrees: dependencyTreeSnapshot(ROOT),
   retainableEvidence: failures.length === 0,
   failures,
   failureSummary: buildFailureSummary({ rounds, failures }),

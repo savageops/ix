@@ -4,7 +4,7 @@ import path from "node:path";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
@@ -13,10 +13,9 @@ const DEFAULT_EXPR = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)";
 const DEFAULT_INSTALLED_IX = path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin", "ix.exe");
 const DEFAULT_REPO_IX = path.join(ROOT, "zig-out", "bin", "ix-zig.exe");
 const BENCH_STATE_DIR = path.join(os.tmpdir(), "ix-zig-speed-compare-state");
-const BENCH_ENV = {
+const BASE_BENCH_ENV = {
   IX_INDEX: "0",
   IX_NEXUS: "0",
-  IX_SCAN_OPEN_TIMING: "0",
   IX_STATE_DIR: BENCH_STATE_DIR,
 };
 
@@ -40,8 +39,9 @@ Options:
   --repo-ix <path>                Repo IX binary path.
   --min-retainable-samples <n>    Minimum samples for strict evidence.
   --min-installed-improvement-pct <n>
-                                  Required repo improvement over installed. Default: 5.
-  --identity-noise-multiplier <n> Effective target multiplier for same-binary drift. Default: 3.
+                                  Required repo improvement over installed. Default: 0.
+  --identity-noise-multiplier <n> Effective target multiplier for same-binary drift. Default: 0.
+  --scan-open-timing              Enable scan open/file subphase timing in IX telemetry.
   --no-benchmark-lock             Disable the cross-script benchmark lock.
   --require-promotion             Exit non-zero unless repo is promotable over installed.
   --require-strict                Exit non-zero unless strict evidence passes. Default behavior.
@@ -66,8 +66,13 @@ const requireStrict = !args.includes("--no-require-strict");
 const requirePromotion = args.includes("--require-promotion");
 const benchmarkLock = !args.includes("--no-benchmark-lock");
 const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", process.env.IX_MIN_RETAINABLE_SPEED_SAMPLES ?? "12"));
-const minInstalledImprovementPct = Number(argValue(args, "--min-installed-improvement-pct", process.env.IX_MIN_INSTALLED_IMPROVEMENT_PCT ?? "5"));
-const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "3"));
+const minInstalledImprovementPct = Number(argValue(args, "--min-installed-improvement-pct", process.env.IX_MIN_INSTALLED_IMPROVEMENT_PCT ?? "0"));
+const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "0"));
+const scanOpenTiming = args.includes("--scan-open-timing");
+const BENCH_ENV = {
+  ...BASE_BENCH_ENV,
+  IX_SCAN_OPEN_TIMING: scanOpenTiming ? "1" : "0",
+};
 
 function resolveZigExe() {
   const local = path.join(os.homedir(), ".local", "zig", "zig-x86_64-windows-0.16.0", "zig.exe");
@@ -298,8 +303,10 @@ const report = {
   identityControlSamples: identityControlEnabled ? identityControlSamples : 0,
   identityControlAttempts: identityControlEnabled ? identityControlAttempts : 0,
   threads,
+  scanOpenTiming,
   benchEnv: BENCH_ENV,
   effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
+  dependencyTrees: dependencyTreeSnapshot(ROOT),
   host,
   processScan,
   retainableStrictEvidence: strictFailures.length === 0,

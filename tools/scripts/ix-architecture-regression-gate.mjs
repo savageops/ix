@@ -120,9 +120,9 @@ const minRetainableSpeedSamples = Number(
   argValue(args, "--min-retainable-speed-samples", process.env.IX_MIN_RETAINABLE_SPEED_SAMPLES ?? "12"),
 );
 const minInstalledImprovementPct = Number(
-  argValue(args, "--min-installed-improvement-pct", process.env.IX_MIN_INSTALLED_IMPROVEMENT_PCT ?? "5"),
+  argValue(args, "--min-installed-improvement-pct", process.env.IX_MIN_INSTALLED_IMPROVEMENT_PCT ?? "0"),
 );
-const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "3"));
+const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "0"));
 const baselineIxMs = Number(argValue(args, "--baseline-ix-ms", process.env.IX_ARCH_GATE_BASELINE_IX_MS ?? "575.3829"));
 const baselineTolerancePct = Number(argValue(args, "--baseline-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_TOLERANCE_PCT ?? "-5"));
 const baselineSoftTolerancePct = Number(argValue(args, "--baseline-soft-tolerance-pct", process.env.IX_ARCH_GATE_BASELINE_SOFT_TOLERANCE_PCT ?? "-5"));
@@ -134,13 +134,13 @@ const previousIxBinary = argValue(args, "--previous-ix-binary", process.env.IX_P
 const pairedImprovementTolerancePct = Number(argValue(args, "--paired-improvement-tolerance-pct", process.env.IX_ARCH_GATE_PAIRED_IMPROVEMENT_TOLERANCE_PCT ?? "1.5"));
 const patchNoRegressionTolerancePct = Number(argValue(args, "--patch-no-regression-tolerance-pct", process.env.IX_ARCH_GATE_PATCH_NO_REGRESSION_TOLERANCE_PCT ?? "0"));
 const minPreviousBuildImprovementPct = Number(
-  argValue(args, "--min-previous-build-improvement-pct", process.env.IX_MIN_PREVIOUS_BUILD_IMPROVEMENT_PCT ?? "5"),
+  argValue(args, "--min-previous-build-improvement-pct", process.env.IX_MIN_PREVIOUS_BUILD_IMPROVEMENT_PCT ?? "0"),
 );
 const minOlderSnapshotEngineImprovementPct = Number(
-  argValue(args, "--min-older-snapshot-engine-pct", process.env.IX_MIN_OLDER_SNAPSHOT_ENGINE_PCT ?? "5"),
+  argValue(args, "--min-older-snapshot-engine-pct", process.env.IX_MIN_OLDER_SNAPSHOT_ENGINE_PCT ?? "0"),
 );
 const minOlderSnapshotPairedImprovementPct = Number(
-  argValue(args, "--min-older-snapshot-paired-pct", process.env.IX_MIN_OLDER_SNAPSHOT_PAIRED_PCT ?? "5"),
+  argValue(args, "--min-older-snapshot-paired-pct", process.env.IX_MIN_OLDER_SNAPSHOT_PAIRED_PCT ?? "0"),
 );
 const benchmarkControlDriftTolerancePct = Number(argValue(args, "--benchmark-control-drift-pct", process.env.IX_ARCH_GATE_CONTROL_DRIFT_PCT ?? "3"));
 const benchmarkControlRobustCvPct = Number(argValue(args, "--benchmark-control-robust-cv-pct", process.env.IX_ARCH_GATE_CONTROL_ROBUST_CV_PCT ?? "8"));

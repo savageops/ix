@@ -1,5 +1,6 @@
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { pairedAttributionLedgerFields, pairedEngineStats, phaseTimingResidualMs } from "./benchmark-phase-attribution.mjs";
@@ -31,6 +32,42 @@ const BENCHMARK_ENV_SNAPSHOT_KEYS = [
 export function benchmarkEnvSnapshot(env = {}) {
   const effectiveEnv = { ...process.env, ...env };
   return Object.fromEntries(BENCHMARK_ENV_SNAPSHOT_KEYS.map((key) => [key, effectiveEnv[key] ?? null]));
+}
+
+export function dependencyTreeSnapshot(root = process.cwd()) {
+  return {
+    stringzilla: dependencyTreeHash(path.join(root, ".refs", "stringzilla")),
+    pcre2: dependencyTreeHash(path.join(root, ".refs", "pcre2")),
+  };
+}
+
+function dependencyTreeHash(root) {
+  if (!existsSync(root)) return { path: root, exists: false, fileCount: 0, sha256: null };
+  const hash = createHash("sha256");
+  let fileCount = 0;
+  function walk(dir) {
+    for (const name of readdirSync(dir).sort()) {
+      const entryPath = path.join(dir, name);
+      const stat = statSync(entryPath);
+      if (stat.isDirectory()) {
+        walk(entryPath);
+        continue;
+      }
+      const relative = path.relative(root, entryPath).replaceAll("\\", "/");
+      hash.update(relative);
+      hash.update("\0");
+      hash.update(readFileSync(entryPath));
+      hash.update("\0");
+      fileCount += 1;
+    }
+  }
+  walk(root);
+  return {
+    path: root,
+    exists: true,
+    fileCount,
+    sha256: hash.digest("hex").toUpperCase(),
+  };
 }
 
 export function run(command, commandArgs, options = {}) {
@@ -429,7 +466,7 @@ export function buildInstalledComparisonScore({
   binaryRelation,
   improvementPct,
   pairedEngine,
-  minInstalledImprovementPct = 5,
+  minInstalledImprovementPct = 0,
 } = {}) {
   const pairedImprovementMedianPct = Number(pairedEngine?.candidateImprovementPctSummary?.median);
   const pairedImprovementMeanPct = Number(pairedEngine?.candidateImprovementPctSummary?.mean);

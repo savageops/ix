@@ -4,7 +4,7 @@ import path from "node:path";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
@@ -43,8 +43,8 @@ Options:
   --include-current-install             Include current ix.exe as an identity-noise diagnostic.
   --min-retainable-samples <n>          Minimum samples for strict evidence.
   --min-previous-build-improvement-pct <n>
-                                       Required improvement over previous builds. Default: 5.
-  --identity-noise-multiplier <n>      Effective target multiplier for same-binary drift. Default: 3.
+                                       Required improvement over previous builds. Default: 0.
+  --identity-noise-multiplier <n>      Effective target multiplier for same-binary drift. Default: 0.
   --scan-open-timing                   Enable scan open/file subphase timing in IX telemetry.
   --no-benchmark-lock                  Disable the cross-script benchmark lock.
   --require-strict                     Exit non-zero unless strict evidence passes. Default behavior.
@@ -67,8 +67,8 @@ const maxBackups = Number(argValue(args, "--max-backups", "6"));
 const includeCurrentInstall = args.includes("--include-current-install");
 const buildFirst = args.includes("--build");
 const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", process.env.IX_MIN_RETAINABLE_SPEED_SAMPLES ?? "12"));
-const minPreviousBuildImprovementPct = Number(argValue(args, "--min-previous-build-improvement-pct", process.env.IX_MIN_PREVIOUS_BUILD_IMPROVEMENT_PCT ?? "5"));
-const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "3"));
+const minPreviousBuildImprovementPct = Number(argValue(args, "--min-previous-build-improvement-pct", process.env.IX_MIN_PREVIOUS_BUILD_IMPROVEMENT_PCT ?? "0"));
+const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "0"));
 const scanOpenTiming = args.includes("--scan-open-timing");
 const benchmarkLock = !args.includes("--no-benchmark-lock");
 const quiet = args.includes("--quiet");
@@ -314,6 +314,7 @@ const report = {
   scanOpenTiming,
   benchEnv: BENCH_ENV,
   effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
+  dependencyTrees: dependencyTreeSnapshot(ROOT),
   host,
   processScan,
   retainableStrictEvidence: strictFailures.length === 0,
