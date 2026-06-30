@@ -165,12 +165,12 @@ export function createPlanningGateValidation({
       }
       for (const file of [...chain.pending, ...chain.changelog]) {
         const state = planningStatusFor(root, file);
-        if (state?.placeholderEvidence) archivedDebt.push(`${file}: evidence still contains PLACEHOLDER`);
         if (file.startsWith(TODO_PENDING_ROOT) && state?.status === "done") {
           failures.push(`${file}: done file remains in pending`);
         }
-        if (file.startsWith(TODO_CHANGELOG_ROOT) && state?.status === "pending") {
-          archivedDebt.push(`${file}: pending file remains in changelog`);
+        if (file.startsWith(TODO_CHANGELOG_ROOT)) {
+          if (state?.placeholderEvidence) archivedDebt.push(`${file}: evidence still contains PLACEHOLDER`);
+          if (state?.status === "pending") archivedDebt.push(`${file}: pending file remains in changelog`);
         }
       }
       chains.push({
