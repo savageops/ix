@@ -200,6 +200,13 @@ export function createSpeedGateValidation({
     if (entry.strictRequired === true && entry.report.hashesMatch !== true && entry.report.promotionQualified !== true) {
       failures.push("installed_speed_compare: strict ok status requires repo promotion over installed");
     }
+    if (
+      entry.report.hashesMatch !== true &&
+      entry.report.scorecard?.netPositive !== true &&
+      entry.report.evidenceQuality?.usableForRuntimeMove === true
+    ) {
+      failures.push("installed_speed_compare: red installed-vs-repo scorecard cannot be usable runtime-move evidence");
+    }
     if (entry.strictRequired === true && Array.isArray(entry.report.requiredGateFailures) && entry.report.requiredGateFailures.length > 0) {
       failures.push("installed_speed_compare: strict ok status requires no required gate failure envelope");
     }

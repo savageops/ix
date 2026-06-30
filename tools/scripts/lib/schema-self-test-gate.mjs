@@ -1791,6 +1791,7 @@ export function runSchemaSelfTest({
     "installed_speed_compare: ok status requires parsed sample count to match requested samples",
     "installed_speed_compare: strict ok status requires the retained sample floor",
     "installed_speed_compare: strict ok status requires repo promotion over installed",
+    "installed_speed_compare: red installed-vs-repo scorecard cannot be usable runtime-move evidence",
     "installed_speed_compare: strict ok status requires no required gate failure envelope",
     "installed_speed_compare: ok status requires installed-vs-repo comparison evidence",
     "installed_speed_compare: ok status requires installed and repo binary hash evidence",
