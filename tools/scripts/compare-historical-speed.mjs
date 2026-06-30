@@ -4,7 +4,7 @@ import path from "node:path";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, routeParityEvaluation, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
@@ -29,6 +29,7 @@ Compares repo IX against native installed IX backups on the ripgrep linux
 benchsuite, with ripgrep measured first and route/match parity recorded.
 
 Options:
+  --build                               Build repo IX ReleaseFast before measuring.
   --samples <n>                         Samples per comparison. Default: 6.
   --threads <n>                         IX/ripgrep thread count. Default: 32.
   --identity-control-samples <n>        Same-binary control pairs. Default: min(12, samples).
@@ -64,6 +65,7 @@ const identityControlAttempts = Number(argValue(args, "--identity-control-attemp
 const identityControlEnabled = !args.includes("--no-identity-control");
 const maxBackups = Number(argValue(args, "--max-backups", "6"));
 const includeCurrentInstall = args.includes("--include-current-install");
+const buildFirst = args.includes("--build");
 const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", process.env.IX_MIN_RETAINABLE_SPEED_SAMPLES ?? "12"));
 const minPreviousBuildImprovementPct = Number(argValue(args, "--min-previous-build-improvement-pct", process.env.IX_MIN_PREVIOUS_BUILD_IMPROVEMENT_PCT ?? "5"));
 const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "3"));
@@ -75,6 +77,11 @@ const BENCH_ENV = {
   ...BASE_BENCH_ENV,
   IX_SCAN_OPEN_TIMING: scanOpenTiming ? "1" : "0",
 };
+
+function resolveZigExe() {
+  const local = path.join(os.homedir(), ".local", "zig", "zig-x86_64-windows-0.16.0", "zig.exe");
+  return existsSync(local) ? local : "zig";
+}
 
 function measurePairedHistory(history, ixArgs, effectivePreviousBuildImprovementPct) {
   const currentRuns = [];
@@ -236,9 +243,12 @@ if (!Number.isFinite(minRetainableSamples) || minRetainableSamples < 1) throw ne
 if (!Number.isFinite(minPreviousBuildImprovementPct) || minPreviousBuildImprovementPct < 0) throw new Error("--min-previous-build-improvement-pct must be a non-negative number");
 if (!Number.isFinite(identityNoiseMultiplier) || identityNoiseMultiplier < 0) throw new Error("--identity-noise-multiplier must be a non-negative number");
 if (!existsSync(corpus)) throw new Error(`corpus not found: ${corpus}`);
-if (!existsSync(repoIx)) throw new Error(`repo IX not found: ${repoIx}`);
 if (!existsSync(installDir)) throw new Error(`install dir not found: ${installDir}`);
 if (benchmarkLock) acquireBenchmarkLock({ script: "compare-historical-speed.mjs" });
+if (buildFirst) {
+  requireOk(run(resolveZigExe(), ["build", "-Doptimize=ReleaseFast", "--summary", "all"]), "ReleaseFast build");
+}
+if (!existsSync(repoIx)) throw new Error(`repo IX not found: ${repoIx}`);
 
 const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)];
 const hostBefore = hostSnapshot();
@@ -292,6 +302,7 @@ const report = {
   corpus,
   expression,
   samples,
+  buildFirst,
   identityControlSamples: identityControlEnabled ? identityControlSamples : 0,
   identityControlAttempts: identityControlEnabled ? identityControlAttempts : 0,
   minRetainableSamples,
