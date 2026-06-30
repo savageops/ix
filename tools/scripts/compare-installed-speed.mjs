@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { baseBenchEnv, defaultInstalledIxPath, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT_RIPGREP_LINUX_CORPUS } from "./lib/benchmark-config.mjs";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
@@ -8,16 +9,11 @@ import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildInstalledComparisonSco
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
-const DEFAULT_CORPUS = "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux";
-const DEFAULT_EXPR = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)";
-const DEFAULT_INSTALLED_IX = path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin", "ix.exe");
-const DEFAULT_REPO_IX = path.join(ROOT, "zig-out", "bin", "ix-zig.exe");
-const BENCH_STATE_DIR = path.join(os.tmpdir(), "ix-zig-speed-compare-state");
-const BASE_BENCH_ENV = {
-  IX_INDEX: "0",
-  IX_NEXUS: "0",
-  IX_STATE_DIR: BENCH_STATE_DIR,
-};
+const DEFAULT_CORPUS = DEFAULT_RIPGREP_LINUX_CORPUS;
+const DEFAULT_EXPR = DEFAULT_ALTERNATES_EXPRESSION;
+const DEFAULT_INSTALLED_IX = defaultInstalledIxPath();
+const DEFAULT_REPO_IX = defaultRepoIxPath(ROOT);
+const BASE_BENCH_ENV = baseBenchEnv("installed");
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
