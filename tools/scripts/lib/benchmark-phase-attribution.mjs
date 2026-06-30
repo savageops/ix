@@ -397,11 +397,15 @@ export function phaseLeakSummaryFromRounds(rounds) {
         candidateScanFileMsPerFileMedian: optionalNumber(sourceRound.candidateScanFileMsPerFileMedian),
         scanWorkDeltaMs: delta(sourceRound.candidateScanWorkMedianMs, sourceRound.baselineScanWorkMedianMs),
         scanOpenDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenMedianMs, sourceRound.baselineScanOpenMedianMs) : null,
+        scanOpenPathDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenPathMedianMs, sourceRound.baselineScanOpenPathMedianMs) : null,
+        scanOpenSyscallDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenSyscallMedianMs, sourceRound.baselineScanOpenSyscallMedianMs) : null,
         scanFileDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileMedianMs, sourceRound.baselineScanFileMedianMs) : null,
         scanFileMmapDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileMmapMedianMs, sourceRound.baselineScanFileMmapMedianMs) : null,
         scanFileFastCountDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileFastCountMedianMs, sourceRound.baselineScanFileFastCountMedianMs) : null,
         scanFileLineScanDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileLineScanMedianMs, sourceRound.baselineScanFileLineScanMedianMs) : null,
         scanOpenMsPerFileDelta: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenMsPerFileMedian, sourceRound.baselineScanOpenMsPerFileMedian) : null,
+        scanOpenPathMsPerFileDelta: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenPathMsPerFileMedian, sourceRound.baselineScanOpenPathMsPerFileMedian) : null,
+        scanOpenSyscallMsPerFileDelta: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenSyscallMsPerFileMedian, sourceRound.baselineScanOpenSyscallMsPerFileMedian) : null,
         scanFileMsPerFileDelta: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileMsPerFileMedian, sourceRound.baselineScanFileMsPerFileMedian) : null,
         baselineScanOpenSharePct,
         baselineScanFileSharePct,
@@ -420,12 +424,16 @@ export function phaseLeakSummaryFromRounds(rounds) {
         const candidateScanOpenShare = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenSharePct));
         const candidateScanFileShare = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileSharePct));
         const candidateScanOpenMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenMedianMs));
+        const candidateScanOpenPathMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenPathMedianMs));
+        const candidateScanOpenSyscallMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenSyscallMedianMs));
         const candidateScanFileMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileMedianMs));
         const candidateScanWorkMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanWorkMedianMs));
         const candidateScanFileMmapMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileMmapMedianMs));
         const candidateScanFileFastCountMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileFastCountMedianMs));
         const candidateScanFileLineScanMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileLineScanMedianMs));
         const candidateScanOpenMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenMsPerFileMedian));
+        const candidateScanOpenPathMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenPathMsPerFileMedian));
+        const candidateScanOpenSyscallMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenSyscallMsPerFileMedian));
         const candidateScanFileMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileMsPerFileMedian));
         const fileParityValues = candidateSplitRounds.map((round) => round.filesScannedParity);
         const filesScannedParity = fileParityValues.length === 0 || fileParityValues.some((value) => value == null)
@@ -504,12 +512,16 @@ export function phaseLeakSummaryFromRounds(rounds) {
           candidateScanOpenSharePct: candidateScanOpenShare,
           candidateScanFileSharePct: candidateScanFileShare,
           candidateScanOpenMedianMs,
+          candidateScanOpenPathMedianMs,
+          candidateScanOpenSyscallMedianMs,
           candidateScanFileMedianMs,
           candidateScanWorkMedianMs,
           candidateScanFileMmapMedianMs,
           candidateScanFileFastCountMedianMs,
           candidateScanFileLineScanMedianMs,
           candidateScanOpenMsPerFileMedian,
+          candidateScanOpenPathMsPerFileMedian,
+          candidateScanOpenSyscallMsPerFileMedian,
           candidateScanFileMsPerFileMedian,
           filesScannedParity,
           candidateTeddyShareOfScanFilePct: teddyShareOfScanFilePct,

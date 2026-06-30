@@ -4,7 +4,7 @@ import path from "node:path";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
@@ -46,6 +46,7 @@ Options:
                                        Required improvement over previous builds. Default: 0.
   --identity-noise-multiplier <n>      Effective target multiplier for same-binary drift. Default: 0.
   --scan-open-timing                   Enable scan open/file subphase timing in IX telemetry.
+  --linux-dominant-attribution         Enable Linux AMD ASIC register slow-file attribution in IX telemetry.
   --no-benchmark-lock                  Disable the cross-script benchmark lock.
   --require-strict                     Exit non-zero unless strict evidence passes. Default behavior.
   --no-require-strict                  Allow exploratory reports to exit zero when strict evidence fails.
@@ -70,12 +71,15 @@ const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", p
 const minPreviousBuildImprovementPct = Number(argValue(args, "--min-previous-build-improvement-pct", process.env.IX_MIN_PREVIOUS_BUILD_IMPROVEMENT_PCT ?? "0"));
 const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "0"));
 const scanOpenTiming = args.includes("--scan-open-timing");
+const linuxDominantAttribution = args.includes("--linux-dominant-attribution");
+const diagnosticAttributionMode = scanOpenTiming || linuxDominantAttribution;
 const benchmarkLock = !args.includes("--no-benchmark-lock");
 const quiet = args.includes("--quiet");
 const requireStrict = !args.includes("--no-require-strict");
 const BENCH_ENV = {
   ...BASE_BENCH_ENV,
   IX_SCAN_OPEN_TIMING: scanOpenTiming ? "1" : "0",
+  IX_LINUX_DOMINANT_ATTRIBUTION: linuxDominantAttribution ? "1" : "0",
 };
 
 function resolveZigExe() {
@@ -115,6 +119,10 @@ function measurePairedHistory(history, ixArgs, effectivePreviousBuildImprovement
     candidateLabel: "current",
   });
   const orderSummary = pairOrderSummary(pairOrder, { firstLabel: "current", secondLabel: "history" });
+  const orderStratified = orderStratifiedEngineStats(historical.samples, current.samples, pairOrder, {
+    baselineLabel: "history",
+    candidateLabel: "current",
+  });
   const matchParity =
     current.matchCounts.length === 1 &&
     historical.matchCounts.length === 1 &&
@@ -135,6 +143,7 @@ function measurePairedHistory(history, ixArgs, effectivePreviousBuildImprovement
     routeParityStatus: routes.status,
     routeParityAcceptable: routes.acceptable,
     pairOrderSummary: orderSummary,
+    orderStratifiedEngine: orderStratified,
     historyEngineMedianMs: historical.engineSummary.median,
     currentEngineMedianMs: current.engineSummary.median,
   });
@@ -154,6 +163,7 @@ function measurePairedHistory(history, ixArgs, effectivePreviousBuildImprovement
     routeParityAcceptable: routes.acceptable,
     pairOrder,
     pairOrderSummary: orderSummary,
+    orderStratifiedEngine: orderStratified,
     pairedEngine: paired,
     currentVsHistoryEngineRatio,
     currentEngineDeltaMs,
@@ -206,6 +216,7 @@ function strictEvidenceFailures(host, processScan, comparisons, identityControl)
     identityControlEnabled,
     requiredIdentitySamples: Math.min(12, samples),
   });
+  if (diagnosticAttributionMode) failures.push("diagnostic_attribution_run_not_retainable_evidence");
   const previousBuilds = comparisons.filter((comparison) => comparison.evidenceAuthority === "previous_build");
   if (previousBuilds.length === 0) failures.push("missing_previous_build_comparison");
   for (const comparison of previousBuilds) {
@@ -312,6 +323,8 @@ const report = {
   includeCurrentInstall,
   threads,
   scanOpenTiming,
+  linuxDominantAttribution,
+  diagnosticAttributionMode,
   benchEnv: BENCH_ENV,
   effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
   dependencyTrees: dependencyTreeSnapshot(ROOT),
@@ -336,7 +349,7 @@ mkdirSync(REPORT_DIR, { recursive: true });
 const outPath = path.join(REPORT_DIR, `${report.runId}.json`);
 writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 writeFileSync(LATEST_HISTORICAL_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-if (report.retainableStrictEvidence) {
+if (report.retainableStrictEvidence && !diagnosticAttributionMode) {
   writeFileSync(LATEST_RETAINABLE_HISTORICAL_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 }
 

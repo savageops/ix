@@ -4,7 +4,7 @@ import path from "node:path";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
@@ -42,6 +42,7 @@ Options:
                                   Required repo improvement over installed. Default: 0.
   --identity-noise-multiplier <n> Effective target multiplier for same-binary drift. Default: 0.
   --scan-open-timing              Enable scan open/file subphase timing in IX telemetry.
+  --linux-dominant-attribution    Enable Linux AMD ASIC register slow-file attribution in IX telemetry.
   --no-benchmark-lock             Disable the cross-script benchmark lock.
   --require-promotion             Exit non-zero unless repo is promotable over installed.
   --require-strict                Exit non-zero unless strict evidence passes. Default behavior.
@@ -69,9 +70,12 @@ const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", p
 const minInstalledImprovementPct = Number(argValue(args, "--min-installed-improvement-pct", process.env.IX_MIN_INSTALLED_IMPROVEMENT_PCT ?? "0"));
 const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "0"));
 const scanOpenTiming = args.includes("--scan-open-timing");
+const linuxDominantAttribution = args.includes("--linux-dominant-attribution");
+const diagnosticAttributionMode = scanOpenTiming || linuxDominantAttribution;
 const BENCH_ENV = {
   ...BASE_BENCH_ENV,
   IX_SCAN_OPEN_TIMING: scanOpenTiming ? "1" : "0",
+  IX_LINUX_DOMINANT_ATTRIBUTION: linuxDominantAttribution ? "1" : "0",
 };
 
 function resolveZigExe() {
@@ -122,6 +126,7 @@ function promotionFailures(host, processScan, installedHash, repoHash, installed
     identityControlEnabled,
     requiredIdentitySamples: Math.min(12, samples),
   });
+  if (diagnosticAttributionMode) failures.push("diagnostic_attribution_run_not_promotion_evidence");
   if (!installedRepoComparison.matchParity) failures.push("match_parity_failed");
   if (installedRepoComparison.routeParityAcceptable !== true) {
     failures.push(`route_parity_failed:${installedRepoComparison.routeParityStatus ?? "unknown"}`);
@@ -219,8 +224,18 @@ const installedRepoComparison = {
   repoScanWorkMedianMs: paired.repo.scanWorkSummary.median,
   installedScanOpenMedianMs: paired.installed.scanOpenSummary.median,
   repoScanOpenMedianMs: paired.repo.scanOpenSummary.median,
+  installedScanOpenPathMedianMs: paired.installed.scanOpenPathSummary?.median ?? null,
+  repoScanOpenPathMedianMs: paired.repo.scanOpenPathSummary?.median ?? null,
+  installedScanOpenSyscallMedianMs: paired.installed.scanOpenSyscallSummary?.median ?? null,
+  repoScanOpenSyscallMedianMs: paired.repo.scanOpenSyscallSummary?.median ?? null,
   installedScanFileMedianMs: paired.installed.scanFileSummary.median,
   repoScanFileMedianMs: paired.repo.scanFileSummary.median,
+  installedScanFileMmapMedianMs: paired.installed.scanFileMmapSummary?.median ?? null,
+  repoScanFileMmapMedianMs: paired.repo.scanFileMmapSummary?.median ?? null,
+  installedScanFileFastCountMedianMs: paired.installed.scanFileFastCountSummary?.median ?? null,
+  repoScanFileFastCountMedianMs: paired.repo.scanFileFastCountSummary?.median ?? null,
+  installedScanFileLineScanMedianMs: paired.installed.scanFileLineScanSummary?.median ?? null,
+  repoScanFileLineScanMedianMs: paired.repo.scanFileLineScanSummary?.median ?? null,
   installedAlternateFullScanCallsMedian: paired.installed.alternateFullScanCallsSummary.median,
   repoAlternateFullScanCallsMedian: paired.repo.alternateFullScanCallsSummary.median,
   installedAlternateFullScanBytesMedian: paired.installed.alternateFullScanBytesSummary.median,
@@ -251,6 +266,15 @@ installedRepoComparison.pairedEngine = pairedEngineStats(paired.installed.sample
   baselineLabel: "installed",
   candidateLabel: "repo",
 });
+installedRepoComparison.orderStratifiedEngine = orderStratifiedEngineStats(
+  paired.installed.samples,
+  paired.repo.samples,
+  paired.pairOrder,
+  {
+    baselineLabel: "installed",
+    candidateLabel: "repo",
+  },
+);
 installedRepoComparison.score = buildInstalledComparisonScore({
   comparison: installedRepoComparison,
   binaryRelation: installedRepoBinaryRelation,
@@ -304,6 +328,8 @@ const report = {
   identityControlAttempts: identityControlEnabled ? identityControlAttempts : 0,
   threads,
   scanOpenTiming,
+  linuxDominantAttribution,
+  diagnosticAttributionMode,
   benchEnv: BENCH_ENV,
   effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
   dependencyTrees: dependencyTreeSnapshot(ROOT),
@@ -325,7 +351,7 @@ const report = {
   roundLedger,
   ledgerSummary,
   promotionMode,
-  promotionQualified: promotionFailureList.length === 0,
+  promotionQualified: !diagnosticAttributionMode && promotionFailureList.length === 0,
   promotionFailures: promotionFailureList,
   requiredGateFailures,
 };

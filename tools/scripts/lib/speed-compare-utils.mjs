@@ -16,6 +16,7 @@ const BENCHMARK_ENV_SNAPSHOT_KEYS = [
   "IX_NEXUS",
   "IX_STATE_DIR",
   "IX_SCAN_OPEN_TIMING",
+  "IX_LINUX_DOMINANT_ATTRIBUTION",
   "IX_TEDDY_FINGERPRINT_OFFSET",
   "IX_TEDDY_RANGE_FINGERPRINT_OFFSET",
   "IX_LITERAL_ALTERNATES_COUNTER_CACHE",
@@ -299,6 +300,64 @@ function pairOrderScoreFields(summaryValue) {
   };
 }
 
+function median(values) {
+  const finite = finiteNumbers(values).sort((left, right) => left - right);
+  if (finite.length === 0) return null;
+  const middle = Math.floor(finite.length / 2);
+  return finite.length % 2 === 1 ? finite[middle] : (finite[middle - 1] + finite[middle]) / 2;
+}
+
+function improvementPct(baseline, candidate) {
+  const baselineNumber = Number(baseline);
+  const candidateNumber = Number(candidate);
+  if (!Number.isFinite(baselineNumber) || !Number.isFinite(candidateNumber) || baselineNumber === 0) return null;
+  return ((baselineNumber - candidateNumber) / baselineNumber) * 100;
+}
+
+export function orderStratifiedEngineStats(
+  baselineSamples,
+  candidateSamples,
+  pairOrder,
+  { baselineLabel = "baseline", candidateLabel = "candidate" } = {},
+) {
+  const firstStart = { baseline: [], candidate: [] };
+  const secondStart = { baseline: [], candidate: [] };
+  const count = Math.min(baselineSamples?.length ?? 0, candidateSamples?.length ?? 0, pairOrder?.length ?? 0);
+  for (let index = 0; index < count; index += 1) {
+    const order = String(pairOrder[index] ?? "");
+    if (order.startsWith(`${baselineLabel},`)) {
+      firstStart.baseline.push(baselineSamples[index]?.engineMs);
+      secondStart.candidate.push(candidateSamples[index]?.engineMs);
+    } else if (order.startsWith(`${candidateLabel},`)) {
+      firstStart.candidate.push(candidateSamples[index]?.engineMs);
+      secondStart.baseline.push(baselineSamples[index]?.engineMs);
+    }
+  }
+
+  const firstStartBaselineMedianMs = median(firstStart.baseline);
+  const firstStartCandidateMedianMs = median(firstStart.candidate);
+  const secondStartBaselineMedianMs = median(secondStart.baseline);
+  const secondStartCandidateMedianMs = median(secondStart.candidate);
+  const firstStartCandidateImprovementPct = improvementPct(firstStartBaselineMedianMs, firstStartCandidateMedianMs);
+  const secondStartCandidateImprovementPct = improvementPct(secondStartBaselineMedianMs, secondStartCandidateMedianMs);
+  const finiteImprovements = finiteNumbers([firstStartCandidateImprovementPct, secondStartCandidateImprovementPct]);
+
+  return {
+    baselineLabel,
+    candidateLabel,
+    count,
+    firstStartSampleCount: Math.min(firstStart.baseline.length, firstStart.candidate.length),
+    secondStartSampleCount: Math.min(secondStart.baseline.length, secondStart.candidate.length),
+    firstStartBaselineMedianMs,
+    firstStartCandidateMedianMs,
+    firstStartCandidateImprovementPct,
+    secondStartBaselineMedianMs,
+    secondStartCandidateMedianMs,
+    secondStartCandidateImprovementPct,
+    allStartPositionsNetPositive: finiteImprovements.length === 2 && finiteImprovements.every((value) => value >= 0),
+  };
+}
+
 function routeValuesAreObserved(values) {
   return Array.isArray(values) && values.some((value) => Number(value) !== 0);
 }
@@ -384,6 +443,10 @@ function stageTimingMedianFields(baseline, candidate) {
     candidateScanWorkMedianMs: candidate?.scanWorkSummary?.median ?? null,
     baselineScanOpenMedianMs: baseline?.scanOpenSummary?.median ?? null,
     candidateScanOpenMedianMs: candidate?.scanOpenSummary?.median ?? null,
+    baselineScanOpenPathMedianMs: baseline?.scanOpenPathSummary?.median ?? null,
+    candidateScanOpenPathMedianMs: candidate?.scanOpenPathSummary?.median ?? null,
+    baselineScanOpenSyscallMedianMs: baseline?.scanOpenSyscallSummary?.median ?? null,
+    candidateScanOpenSyscallMedianMs: candidate?.scanOpenSyscallSummary?.median ?? null,
     baselineScanFileMedianMs: baseline?.scanFileSummary?.median ?? null,
     candidateScanFileMedianMs: candidate?.scanFileSummary?.median ?? null,
     baselineScanFileMmapMedianMs: baseline?.scanFileMmapSummary?.median ?? null,
@@ -394,6 +457,10 @@ function stageTimingMedianFields(baseline, candidate) {
     candidateScanFileLineScanMedianMs: candidate?.scanFileLineScanSummary?.median ?? null,
     baselineScanOpenMsPerFileMedian: baseline?.scanOpenMsPerFileSummary?.median ?? null,
     candidateScanOpenMsPerFileMedian: candidate?.scanOpenMsPerFileSummary?.median ?? null,
+    baselineScanOpenPathMsPerFileMedian: baseline?.scanOpenPathMsPerFileSummary?.median ?? null,
+    candidateScanOpenPathMsPerFileMedian: candidate?.scanOpenPathMsPerFileSummary?.median ?? null,
+    baselineScanOpenSyscallMsPerFileMedian: baseline?.scanOpenSyscallMsPerFileSummary?.median ?? null,
+    candidateScanOpenSyscallMsPerFileMedian: candidate?.scanOpenSyscallMsPerFileSummary?.median ?? null,
     baselineScanFileMsPerFileMedian: baseline?.scanFileMsPerFileSummary?.median ?? null,
     candidateScanFileMsPerFileMedian: candidate?.scanFileMsPerFileSummary?.median ?? null,
     baselineFilesScanned,
@@ -502,8 +569,18 @@ export function buildInstalledComparisonScore({
     repoScanWorkMedianMs: comparison?.repoScanWorkMedianMs ?? null,
     installedScanOpenMedianMs: comparison?.installedScanOpenMedianMs ?? null,
     repoScanOpenMedianMs: comparison?.repoScanOpenMedianMs ?? null,
+    installedScanOpenPathMedianMs: comparison?.installedScanOpenPathMedianMs ?? null,
+    repoScanOpenPathMedianMs: comparison?.repoScanOpenPathMedianMs ?? null,
+    installedScanOpenSyscallMedianMs: comparison?.installedScanOpenSyscallMedianMs ?? null,
+    repoScanOpenSyscallMedianMs: comparison?.repoScanOpenSyscallMedianMs ?? null,
     installedScanFileMedianMs: comparison?.installedScanFileMedianMs ?? null,
     repoScanFileMedianMs: comparison?.repoScanFileMedianMs ?? null,
+    installedScanFileMmapMedianMs: comparison?.installedScanFileMmapMedianMs ?? null,
+    repoScanFileMmapMedianMs: comparison?.repoScanFileMmapMedianMs ?? null,
+    installedScanFileFastCountMedianMs: comparison?.installedScanFileFastCountMedianMs ?? null,
+    repoScanFileFastCountMedianMs: comparison?.repoScanFileFastCountMedianMs ?? null,
+    installedScanFileLineScanMedianMs: comparison?.installedScanFileLineScanMedianMs ?? null,
+    repoScanFileLineScanMedianMs: comparison?.repoScanFileLineScanMedianMs ?? null,
     installedAlternateFullScanCallsMedian: comparison?.installedAlternateFullScanCallsMedian ?? null,
     repoAlternateFullScanCallsMedian: comparison?.repoAlternateFullScanCallsMedian ?? null,
     installedAlternateFullScanBytesMedian: comparison?.installedAlternateFullScanBytesMedian ?? null,
@@ -521,6 +598,11 @@ export function buildInstalledComparisonScore({
     pairedRepoWinRate: pairedEngine?.candidateWinRate,
     pairedRepoImprovementMedianPct: Number.isFinite(pairedImprovementMedianPct) ? pairedImprovementMedianPct : null,
     pairedRepoImprovementMeanPct: Number.isFinite(pairedImprovementMeanPct) ? pairedImprovementMeanPct : null,
+    orderStratifiedFirstStartSampleCount: comparison?.orderStratifiedEngine?.firstStartSampleCount ?? null,
+    orderStratifiedSecondStartSampleCount: comparison?.orderStratifiedEngine?.secondStartSampleCount ?? null,
+    orderStratifiedFirstStartRepoImprovementPct: comparison?.orderStratifiedEngine?.firstStartCandidateImprovementPct ?? null,
+    orderStratifiedSecondStartRepoImprovementPct: comparison?.orderStratifiedEngine?.secondStartCandidateImprovementPct ?? null,
+    orderStratifiedAllStartPositionsNetPositive: comparison?.orderStratifiedEngine?.allStartPositionsNetPositive ?? null,
     ...pairedAttribution,
     ...routeScore,
     ...repairDirective,
@@ -591,8 +673,18 @@ export function buildInstalledScorecard({ score, binaryRelation } = {}) {
             repoScanWorkMedianMs: score?.repoScanWorkMedianMs,
             installedScanOpenMedianMs: score?.installedScanOpenMedianMs,
             repoScanOpenMedianMs: score?.repoScanOpenMedianMs,
+            installedScanOpenPathMedianMs: score?.installedScanOpenPathMedianMs,
+            repoScanOpenPathMedianMs: score?.repoScanOpenPathMedianMs,
+            installedScanOpenSyscallMedianMs: score?.installedScanOpenSyscallMedianMs,
+            repoScanOpenSyscallMedianMs: score?.repoScanOpenSyscallMedianMs,
             installedScanFileMedianMs: score?.installedScanFileMedianMs,
             repoScanFileMedianMs: score?.repoScanFileMedianMs,
+            installedScanFileMmapMedianMs: score?.installedScanFileMmapMedianMs,
+            repoScanFileMmapMedianMs: score?.repoScanFileMmapMedianMs,
+            installedScanFileFastCountMedianMs: score?.installedScanFileFastCountMedianMs,
+            repoScanFileFastCountMedianMs: score?.repoScanFileFastCountMedianMs,
+            installedScanFileLineScanMedianMs: score?.installedScanFileLineScanMedianMs,
+            repoScanFileLineScanMedianMs: score?.repoScanFileLineScanMedianMs,
             installedAlternateFullScanCallsMedian: score?.installedAlternateFullScanCallsMedian,
             repoAlternateFullScanCallsMedian: score?.repoAlternateFullScanCallsMedian,
             installedAlternateFullScanBytesMedian: score?.installedAlternateFullScanBytesMedian,
@@ -604,6 +696,9 @@ export function buildInstalledScorecard({ score, binaryRelation } = {}) {
             pairedRepoWinRate: score?.pairedRepoWinRate,
             pairedRepoImprovementMedianPct: score?.pairedRepoImprovementMedianPct,
             pairedRepoImprovementMeanPct: score?.pairedRepoImprovementMeanPct,
+            orderStratifiedFirstStartRepoImprovementPct: score?.orderStratifiedFirstStartRepoImprovementPct,
+            orderStratifiedSecondStartRepoImprovementPct: score?.orderStratifiedSecondStartRepoImprovementPct,
+            orderStratifiedAllStartPositionsNetPositive: score?.orderStratifiedAllStartPositionsNetPositive,
             pairedCandidateTeddyRangeImprovementMedianPct: score?.pairedCandidateTeddyRangeImprovementMedianPct,
             pairedCandidateTeddyRangeImprovementMeanPct: score?.pairedCandidateTeddyRangeImprovementMeanPct,
             pairedCandidateTeddyRangeWinRate: score?.pairedCandidateTeddyRangeWinRate,
@@ -658,8 +753,18 @@ export function buildInstalledRoundLedger({ comparison, score, binaryRelation, b
       candidateScanWorkMedianMs: comparison?.repoScanWorkMedianMs ?? null,
       baselineScanOpenMedianMs: comparison?.installedScanOpenMedianMs ?? null,
       candidateScanOpenMedianMs: comparison?.repoScanOpenMedianMs ?? null,
+      baselineScanOpenPathMedianMs: comparison?.installedScanOpenPathMedianMs ?? null,
+      candidateScanOpenPathMedianMs: comparison?.repoScanOpenPathMedianMs ?? null,
+      baselineScanOpenSyscallMedianMs: comparison?.installedScanOpenSyscallMedianMs ?? null,
+      candidateScanOpenSyscallMedianMs: comparison?.repoScanOpenSyscallMedianMs ?? null,
       baselineScanFileMedianMs: comparison?.installedScanFileMedianMs ?? null,
       candidateScanFileMedianMs: comparison?.repoScanFileMedianMs ?? null,
+      baselineScanFileMmapMedianMs: comparison?.installedScanFileMmapMedianMs ?? null,
+      candidateScanFileMmapMedianMs: comparison?.repoScanFileMmapMedianMs ?? null,
+      baselineScanFileFastCountMedianMs: comparison?.installedScanFileFastCountMedianMs ?? null,
+      candidateScanFileFastCountMedianMs: comparison?.repoScanFileFastCountMedianMs ?? null,
+      baselineScanFileLineScanMedianMs: comparison?.installedScanFileLineScanMedianMs ?? null,
+      candidateScanFileLineScanMedianMs: comparison?.repoScanFileLineScanMedianMs ?? null,
       baselineAlternateFullScanCallsMedian: comparison?.installedAlternateFullScanCallsMedian ?? null,
       candidateAlternateFullScanCallsMedian: comparison?.repoAlternateFullScanCallsMedian ?? null,
       baselineAlternateFullScanBytesMedian: comparison?.installedAlternateFullScanBytesMedian ?? null,
@@ -673,6 +778,11 @@ export function buildInstalledRoundLedger({ comparison, score, binaryRelation, b
       pairedCandidateWinRate: score?.pairedRepoWinRate,
       pairedCandidateImprovementMedianPct: score?.pairedRepoImprovementMedianPct,
       pairedCandidateImprovementMeanPct: score?.pairedRepoImprovementMeanPct,
+      orderStratifiedFirstStartSampleCount: score?.orderStratifiedFirstStartSampleCount,
+      orderStratifiedSecondStartSampleCount: score?.orderStratifiedSecondStartSampleCount,
+      orderStratifiedFirstStartCandidateImprovementPct: score?.orderStratifiedFirstStartRepoImprovementPct,
+      orderStratifiedSecondStartCandidateImprovementPct: score?.orderStratifiedSecondStartRepoImprovementPct,
+      orderStratifiedAllStartPositionsNetPositive: score?.orderStratifiedAllStartPositionsNetPositive,
       pairedCandidateDiscoverImprovementMedianPct: score?.pairedCandidateDiscoverImprovementMedianPct,
       pairedCandidateDiscoverImprovementMeanPct: score?.pairedCandidateDiscoverImprovementMeanPct,
       pairedCandidateDiscoverDeltaMedianMs: score?.pairedCandidateDiscoverDeltaMedianMs,
@@ -785,6 +895,7 @@ export function buildHistoricalComparisonScore({
   routeParityStatus,
   routeParityAcceptable,
   pairOrderSummary,
+  orderStratifiedEngine,
   historyEngineMedianMs,
   currentEngineMedianMs,
 } = {}) {
@@ -813,6 +924,11 @@ export function buildHistoricalComparisonScore({
     pairedCurrentWinRate: pairedEngine?.candidateWinRate,
     pairedCurrentImprovementMedianPct: Number.isFinite(pairedImprovementMedianPct) ? pairedImprovementMedianPct : null,
     pairedCurrentImprovementMeanPct: Number.isFinite(pairedImprovementMeanPct) ? pairedImprovementMeanPct : null,
+    orderStratifiedFirstStartSampleCount: orderStratifiedEngine?.firstStartSampleCount ?? null,
+    orderStratifiedSecondStartSampleCount: orderStratifiedEngine?.secondStartSampleCount ?? null,
+    orderStratifiedFirstStartCurrentImprovementPct: orderStratifiedEngine?.firstStartCandidateImprovementPct ?? null,
+    orderStratifiedSecondStartCurrentImprovementPct: orderStratifiedEngine?.secondStartCandidateImprovementPct ?? null,
+    orderStratifiedAllStartPositionsNetPositive: orderStratifiedEngine?.allStartPositionsNetPositive ?? null,
     ...pairedAttribution,
     ...routeScore,
     ...repairDirective,
@@ -865,6 +981,11 @@ export function buildHistoricalRoundLedger(comparisons) {
       comparison.score?.pairedCurrentImprovementMeanPct ??
       comparison.pairedEngine?.candidateImprovementPctSummary?.mean ??
       null,
+    orderStratifiedFirstStartSampleCount: comparison.score?.orderStratifiedFirstStartSampleCount,
+    orderStratifiedSecondStartSampleCount: comparison.score?.orderStratifiedSecondStartSampleCount,
+    orderStratifiedFirstStartCandidateImprovementPct: comparison.score?.orderStratifiedFirstStartCurrentImprovementPct,
+    orderStratifiedSecondStartCandidateImprovementPct: comparison.score?.orderStratifiedSecondStartCurrentImprovementPct,
+    orderStratifiedAllStartPositionsNetPositive: comparison.score?.orderStratifiedAllStartPositionsNetPositive,
     pairedCandidateDiscoverImprovementMedianPct: comparison.score?.pairedCandidateDiscoverImprovementMedianPct,
     pairedCandidateDiscoverImprovementMeanPct: comparison.score?.pairedCandidateDiscoverImprovementMeanPct,
     pairedCandidateDiscoverDeltaMedianMs: comparison.score?.pairedCandidateDiscoverDeltaMedianMs,
@@ -929,6 +1050,9 @@ export function buildHistoricalScorecard(comparisons) {
       pairedCurrentWinRate: comparison.score?.pairedCurrentWinRate ?? comparison.pairedEngine?.candidateWinRate,
       pairedCurrentImprovementMedianPct: comparison.score?.pairedCurrentImprovementMedianPct,
       pairedCurrentImprovementMeanPct: comparison.score?.pairedCurrentImprovementMeanPct,
+      orderStratifiedFirstStartCurrentImprovementPct: comparison.score?.orderStratifiedFirstStartCurrentImprovementPct,
+      orderStratifiedSecondStartCurrentImprovementPct: comparison.score?.orderStratifiedSecondStartCurrentImprovementPct,
+      orderStratifiedAllStartPositionsNetPositive: comparison.score?.orderStratifiedAllStartPositionsNetPositive,
       pairedCandidateDiscoverImprovementMedianPct: comparison.score?.pairedCandidateDiscoverImprovementMedianPct,
       pairedCandidateDiscoverImprovementMeanPct: comparison.score?.pairedCandidateDiscoverImprovementMeanPct,
       pairedCandidateDiscoverDeltaMedianMs: comparison.score?.pairedCandidateDiscoverDeltaMedianMs,
@@ -1518,6 +1642,7 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
   const density = report.stats?.fast_count_density ?? {};
   const timings = report.stats?.timings ?? {};
   const byteShard = report.stats?.byte_shard_kernel ?? {};
+  const linuxDominant = report.stats?.linux_dominant_file ?? {};
   const slowest = report.stats?.slowest ?? report.stats?.slowest_file ?? {};
   const slowestFiles = Array.isArray(report.stats?.slowest_files) ? report.stats.slowest_files : [];
   const byteShardStrategy = byteShard.strategy ?? "none";
@@ -1546,6 +1671,8 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
     engineResidualMs: phaseTimingResidualMs(timings, engineMs),
     scanWorkMsTotal: Number(timings.scan_work_ms_total ?? 0),
     scanOpenMsTotal: optionalNumber(timings.scan_open_ms_total),
+    scanOpenPathMsTotal: optionalNumber(timings.scan_open_path_ms_total),
+    scanOpenSyscallMsTotal: optionalNumber(timings.scan_open_syscall_ms_total),
     scanFileMsTotal: optionalNumber(timings.scan_file_ms_total),
     scanFileMmapMsTotal: optionalNumber(timings.scan_file_mmap_ms_total),
     scanFileFastCountMsTotal: optionalNumber(timings.scan_file_fast_count_ms_total),
@@ -1555,6 +1682,8 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
     matches: Number(report.stats?.matches_found ?? 0),
     filesScanned: Number(report.stats?.files_scanned ?? 0),
     scanOpenMsPerFile: msPerFile(timings.scan_open_ms_total, report.stats?.files_scanned),
+    scanOpenPathMsPerFile: msPerFile(timings.scan_open_path_ms_total, report.stats?.files_scanned),
+    scanOpenSyscallMsPerFile: msPerFile(timings.scan_open_syscall_ms_total, report.stats?.files_scanned),
     scanFileMsPerFile: msPerFile(timings.scan_file_ms_total, report.stats?.files_scanned),
     slowestPath: slowest.path ?? slowestFiles[0]?.path ?? "",
     slowestMs: Number(slowest.ms ?? slowest.duration_ms ?? slowestFiles[0]?.duration_ms ?? 0),
@@ -1581,6 +1710,15 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
     alternateCompiledRangeCalls,
     alternateCompiledRangeElapsedNsTotal,
     alternateCompiledRangeElapsedNsMax,
+    linuxDominantTargetClass: linuxDominant.target_class ?? null,
+    linuxDominantTargetedFilesScanned: optionalNumber(linuxDominant.targeted_files_scanned),
+    linuxDominantTargetedBytesScanned: optionalNumber(linuxDominant.targeted_bytes_scanned),
+    linuxDominantTargetedSlowestFiles: optionalNumber(linuxDominant.targeted_slowest_files),
+    linuxDominantTargetedSlowestBytes: optionalNumber(linuxDominant.targeted_slowest_bytes),
+    linuxDominantEligibleFiles: optionalNumber(linuxDominant.eligible_files),
+    linuxDominantActivatedFiles: optionalNumber(linuxDominant.activated_files),
+    linuxDominantMaxRangeCount: optionalNumber(linuxDominant.max_range_count),
+    linuxDominantMaxChunkBytes: optionalNumber(linuxDominant.max_chunk_bytes),
   };
 }
 
@@ -1598,11 +1736,15 @@ export function summarizeIxRuns(binaryPath, label, runs) {
     engineResidualSummary: summary(runs.map((entry) => entry.engineResidualMs)),
     scanWorkSummary: summary(runs.map((entry) => entry.scanWorkMsTotal)),
     scanOpenSummary: summary(runs.map((entry) => entry.scanOpenMsTotal)),
+    scanOpenPathSummary: optionalSummary(runs.map((entry) => entry.scanOpenPathMsTotal)),
+    scanOpenSyscallSummary: optionalSummary(runs.map((entry) => entry.scanOpenSyscallMsTotal)),
     scanFileSummary: summary(runs.map((entry) => entry.scanFileMsTotal)),
     scanFileMmapSummary: optionalSummary(runs.map((entry) => entry.scanFileMmapMsTotal)),
     scanFileFastCountSummary: optionalSummary(runs.map((entry) => entry.scanFileFastCountMsTotal)),
     scanFileLineScanSummary: optionalSummary(runs.map((entry) => entry.scanFileLineScanMsTotal)),
     scanOpenMsPerFileSummary: summary(runs.map((entry) => entry.scanOpenMsPerFile)),
+    scanOpenPathMsPerFileSummary: optionalSummary(runs.map((entry) => entry.scanOpenPathMsPerFile)),
+    scanOpenSyscallMsPerFileSummary: optionalSummary(runs.map((entry) => entry.scanOpenSyscallMsPerFile)),
     scanFileMsPerFileSummary: summary(runs.map((entry) => entry.scanFileMsPerFile)),
     slowestMsSummary: summary(runs.map((entry) => entry.slowestMs)),
     slowestBytesSummary: summary(runs.map((entry) => entry.slowestBytes)),
@@ -1643,5 +1785,14 @@ export function summarizeIxRuns(binaryPath, label, runs) {
     alternateCompiledRangeElapsedNsTotalSummary: summary(runs.map((entry) => entry.alternateCompiledRangeElapsedNsTotal)),
     alternateCompiledRangeElapsedNsMax: [...new Set(runs.map((entry) => entry.alternateCompiledRangeElapsedNsMax))],
     alternateCompiledRangeElapsedNsMaxSummary: summary(runs.map((entry) => entry.alternateCompiledRangeElapsedNsMax)),
+    linuxDominantTargetClass: [...new Set(runs.map((entry) => entry.linuxDominantTargetClass).filter(Boolean))],
+    linuxDominantTargetedFilesScannedSummary: optionalSummary(runs.map((entry) => entry.linuxDominantTargetedFilesScanned)),
+    linuxDominantTargetedBytesScannedSummary: optionalSummary(runs.map((entry) => entry.linuxDominantTargetedBytesScanned)),
+    linuxDominantTargetedSlowestFilesSummary: optionalSummary(runs.map((entry) => entry.linuxDominantTargetedSlowestFiles)),
+    linuxDominantTargetedSlowestBytesSummary: optionalSummary(runs.map((entry) => entry.linuxDominantTargetedSlowestBytes)),
+    linuxDominantEligibleFilesSummary: optionalSummary(runs.map((entry) => entry.linuxDominantEligibleFiles)),
+    linuxDominantActivatedFilesSummary: optionalSummary(runs.map((entry) => entry.linuxDominantActivatedFiles)),
+    linuxDominantMaxRangeCountSummary: optionalSummary(runs.map((entry) => entry.linuxDominantMaxRangeCount)),
+    linuxDominantMaxChunkBytesSummary: optionalSummary(runs.map((entry) => entry.linuxDominantMaxChunkBytes)),
   };
 }

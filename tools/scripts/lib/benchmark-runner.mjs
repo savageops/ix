@@ -493,6 +493,8 @@ function extractPhaseMs(report) {
     scan: Number(timings.scan_ms ?? 0),
     aggregate: Number(timings.aggregate_ms ?? 0),
     scanOpen: Number(timings.scan_open_ms_total ?? 0),
+    scanOpenPath: optionalNumber(timings.scan_open_path_ms_total),
+    scanOpenSyscall: optionalNumber(timings.scan_open_syscall_ms_total),
     scanFile: Number(timings.scan_file_ms_total ?? 0),
     scanFileMmap: optionalNumber(timings.scan_file_mmap_ms_total),
     scanFileFastCount: optionalNumber(timings.scan_file_fast_count_ms_total),
