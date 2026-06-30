@@ -58,6 +58,7 @@ const confirmRegressionSamples = Number(argValue(args, "--confirm-regression-sam
 const fingerprintCorpus = args.includes("--fingerprint-corpus");
 const fingerprintMaxBytes = Number(argValue(args, "--fingerprint-max-bytes", process.env.IX_ALTERNATES_FINGERPRINT_MAX_BYTES ?? String(128 * 1024 * 1024)));
 const teddyFingerprintOffsetEnv = process.env.IX_TEDDY_FINGERPRINT_OFFSET ?? null;
+const teddyRangeFingerprintOffsetEnv = process.env.IX_TEDDY_RANGE_FINGERPRINT_OFFSET ?? null;
 const caseInsensitive = !args.includes("--case-sensitive");
 const benchmarkLock = !args.includes("--no-benchmark-lock");
 const quiet = args.includes("--quiet");
@@ -1016,6 +1017,7 @@ const report = {
   requiredGateFailures,
   fingerprintAnalyses,
   teddyFingerprintOffsetEnv,
+  teddyRangeFingerprintOffsetEnv,
   optimizationTargets: targets,
   nextMoves,
 };

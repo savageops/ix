@@ -178,6 +178,12 @@ function parseIxReport(stdout) {
   }
 }
 
+function optionalNumber(value) {
+  if (value == null) return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
 function fileSha256(filePath) {
   return createHash("sha256").update(readFileSync(filePath)).digest("hex");
 }
@@ -488,6 +494,9 @@ function extractPhaseMs(report) {
     aggregate: Number(timings.aggregate_ms ?? 0),
     scanOpen: Number(timings.scan_open_ms_total ?? 0),
     scanFile: Number(timings.scan_file_ms_total ?? 0),
+    scanFileMmap: optionalNumber(timings.scan_file_mmap_ms_total),
+    scanFileFastCount: optionalNumber(timings.scan_file_fast_count_ms_total),
+    scanFileLineScan: optionalNumber(timings.scan_file_line_scan_ms_total),
     total: Number(timings.total_ms ?? 0),
   };
 }

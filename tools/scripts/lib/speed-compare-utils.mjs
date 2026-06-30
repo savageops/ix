@@ -153,6 +153,11 @@ export function summary(values) {
   };
 }
 
+function optionalSummary(values) {
+  const finite = finiteNumbers(values);
+  return finite.length === 0 ? null : summary(finite);
+}
+
 function finiteNumbers(values) {
   return values
     .filter((value) => value != null)
@@ -322,6 +327,12 @@ function stageTimingMedianFields(baseline, candidate) {
     candidateScanOpenMedianMs: candidate?.scanOpenSummary?.median ?? null,
     baselineScanFileMedianMs: baseline?.scanFileSummary?.median ?? null,
     candidateScanFileMedianMs: candidate?.scanFileSummary?.median ?? null,
+    baselineScanFileMmapMedianMs: baseline?.scanFileMmapSummary?.median ?? null,
+    candidateScanFileMmapMedianMs: candidate?.scanFileMmapSummary?.median ?? null,
+    baselineScanFileFastCountMedianMs: baseline?.scanFileFastCountSummary?.median ?? null,
+    candidateScanFileFastCountMedianMs: candidate?.scanFileFastCountSummary?.median ?? null,
+    baselineScanFileLineScanMedianMs: baseline?.scanFileLineScanSummary?.median ?? null,
+    candidateScanFileLineScanMedianMs: candidate?.scanFileLineScanSummary?.median ?? null,
     baselineScanOpenMsPerFileMedian: baseline?.scanOpenMsPerFileSummary?.median ?? null,
     candidateScanOpenMsPerFileMedian: candidate?.scanOpenMsPerFileSummary?.median ?? null,
     baselineScanFileMsPerFileMedian: baseline?.scanFileMsPerFileSummary?.median ?? null,
@@ -1477,6 +1488,9 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
     scanWorkMsTotal: Number(timings.scan_work_ms_total ?? 0),
     scanOpenMsTotal: optionalNumber(timings.scan_open_ms_total),
     scanFileMsTotal: optionalNumber(timings.scan_file_ms_total),
+    scanFileMmapMsTotal: optionalNumber(timings.scan_file_mmap_ms_total),
+    scanFileFastCountMsTotal: optionalNumber(timings.scan_file_fast_count_ms_total),
+    scanFileLineScanMsTotal: optionalNumber(timings.scan_file_line_scan_ms_total),
     aggregateMergeMs: Number(timings.aggregate_merge_ms ?? 0),
     aggregateFinalizeMs: Number(timings.aggregate_finalize_ms ?? 0),
     matches: Number(report.stats?.matches_found ?? 0),
@@ -1526,6 +1540,9 @@ export function summarizeIxRuns(binaryPath, label, runs) {
     scanWorkSummary: summary(runs.map((entry) => entry.scanWorkMsTotal)),
     scanOpenSummary: summary(runs.map((entry) => entry.scanOpenMsTotal)),
     scanFileSummary: summary(runs.map((entry) => entry.scanFileMsTotal)),
+    scanFileMmapSummary: optionalSummary(runs.map((entry) => entry.scanFileMmapMsTotal)),
+    scanFileFastCountSummary: optionalSummary(runs.map((entry) => entry.scanFileFastCountMsTotal)),
+    scanFileLineScanSummary: optionalSummary(runs.map((entry) => entry.scanFileLineScanMsTotal)),
     scanOpenMsPerFileSummary: summary(runs.map((entry) => entry.scanOpenMsPerFile)),
     scanFileMsPerFileSummary: summary(runs.map((entry) => entry.scanFileMsPerFile)),
     slowestMsSummary: summary(runs.map((entry) => entry.slowestMs)),
