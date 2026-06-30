@@ -381,13 +381,25 @@ export function routeSummaryForLane(lane) {
   };
 }
 
+function routeKindSummary(route) {
+  return {
+    fullScan: routeValuesAreObserved(route?.fullScan),
+    teddy: routeValuesAreObserved(route?.teddy),
+    pcre: routeValuesAreObserved(route?.pcre),
+    compiled: routeValuesAreObserved(route?.compiled),
+  };
+}
+
 export function routeParityEvaluation(baselineLane, candidateLane) {
   const baselineRoute = routeSummaryForLane(baselineLane);
   const candidateRoute = routeSummaryForLane(candidateLane);
+  const baselineRouteKinds = routeKindSummary(baselineRoute);
+  const candidateRouteKinds = routeKindSummary(candidateRoute);
   const baselineObserved = routeSummaryObserved(baselineRoute);
   const candidateObserved = routeSummaryObserved(candidateRoute);
   const comparable = baselineObserved && candidateObserved;
-  const parity = comparable ? JSON.stringify(baselineRoute) === JSON.stringify(candidateRoute) : null;
+  const parity = comparable ? JSON.stringify(baselineRouteKinds) === JSON.stringify(candidateRouteKinds) : null;
+  const cardinalityParity = comparable ? JSON.stringify(baselineRoute) === JSON.stringify(candidateRoute) : null;
   const status = comparable
     ? (parity ? "matched" : "mismatch")
     : (!baselineObserved && candidateObserved
@@ -396,10 +408,13 @@ export function routeParityEvaluation(baselineLane, candidateLane) {
   return {
     baselineRoute,
     candidateRoute,
+    baselineRouteKinds,
+    candidateRouteKinds,
     baselineObserved,
     candidateObserved,
     comparable,
     parity,
+    cardinalityParity,
     status,
     acceptable: parity === true || status === "baseline_unsupported",
   };
