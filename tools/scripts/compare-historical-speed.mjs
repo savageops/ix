@@ -4,7 +4,7 @@ import path from "node:path";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, buildHistoricalComparisonScore, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, routeParityEvaluation, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, routeParityEvaluation, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
@@ -302,6 +302,7 @@ const report = {
   threads,
   scanOpenTiming,
   benchEnv: BENCH_ENV,
+  effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
   host,
   processScan,
   retainableStrictEvidence: strictFailures.length === 0,

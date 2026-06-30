@@ -10,6 +10,28 @@ export { identityNoiseDiagnostics } from "./benchmark-noise-diagnostics.mjs";
 export const DEFAULT_ALTERNATES_EXPR = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)";
 const DEFAULT_BENCHMARK_LOCK_DIR = path.join(os.tmpdir(), "ix-zig-benchmark.lock");
 const DEFAULT_STALE_BENCHMARK_LOCK_MS = 6 * 60 * 60 * 1000;
+const BENCHMARK_ENV_SNAPSHOT_KEYS = [
+  "IX_INDEX",
+  "IX_NEXUS",
+  "IX_STATE_DIR",
+  "IX_SCAN_OPEN_TIMING",
+  "IX_TEDDY_FINGERPRINT_OFFSET",
+  "IX_TEDDY_RANGE_FINGERPRINT_OFFSET",
+  "IX_LITERAL_ALTERNATES_COUNTER_CACHE",
+  "IX_BLOCK_PRUNING_PROOF",
+  "IX_IDENTITY_CONTROL_ATTEMPTS",
+  "IX_MIN_RETAINABLE_SPEED_SAMPLES",
+  "IX_MIN_INSTALLED_IMPROVEMENT_PCT",
+  "IX_MIN_PREVIOUS_BUILD_IMPROVEMENT_PCT",
+  "IX_MIN_OLDER_SNAPSHOT_ENGINE_PCT",
+  "IX_MIN_OLDER_SNAPSHOT_PAIRED_PCT",
+  "IX_IDENTITY_NOISE_MULTIPLIER",
+];
+
+export function benchmarkEnvSnapshot(env = {}) {
+  const effectiveEnv = { ...process.env, ...env };
+  return Object.fromEntries(BENCHMARK_ENV_SNAPSHOT_KEYS.map((key) => [key, effectiveEnv[key] ?? null]));
+}
 
 export function run(command, commandArgs, options = {}) {
   const started = process.hrtime.bigint();

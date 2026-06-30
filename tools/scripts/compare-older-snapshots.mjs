@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
+import { benchmarkEnvSnapshot } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "older-snapshot-ladder");
@@ -108,6 +109,7 @@ function readLatestInstalledSummary() {
   return {
     runId: report.runId,
     sourceReportPath: existsSync(sourceReportPath) ? sourceReportPath : null,
+    sourceEffectiveBenchEnv: report.effectiveBenchEnv ?? null,
     strict: report.retainableStrictEvidence,
     promotion: report.promotionQualified,
     status: round.status ?? null,
@@ -349,6 +351,7 @@ const report = {
   nonRetainableRunnableSnapshots: runnable.length - retainable.length,
   skippedSnapshots: rounds.length - runnable.length,
   strictRequired: requireStrict,
+  effectiveBenchEnv: benchmarkEnvSnapshot(),
   retainableEvidence: failures.length === 0,
   failures,
   failureSummary: buildFailureSummary({ rounds, failures }),
