@@ -5,7 +5,7 @@ import { baseBenchEnv, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
@@ -262,6 +262,10 @@ const hostBefore = hostSnapshot();
 const processBefore = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV });
 const ripgrep = measureRipgrep({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
 const currentIdentity = { path: repoIx, sha256: fileHash(repoIx) };
+const installedIxPath = path.join(installDir, "ix.exe");
+const installedIdentity = existsSync(installedIxPath)
+  ? { path: installedIxPath, sha256: fileHash(installedIxPath) }
+  : { path: installedIxPath, sha256: null };
 const identityControl = measureSameBinaryIdentityControl({
   binaryPath: repoIx,
   ixArgs,
@@ -287,6 +291,13 @@ const scorecard = buildHistoricalScorecard(comparisons);
 const roundLedger = buildHistoricalRoundLedger(comparisons);
 const ledgerSummary = buildRoundLedgerSummary(roundLedger);
 const phaseLeakSummary = phaseLeakSummaryFromRounds(roundLedger);
+const historicalGateDiagnostic = buildHistoricalGateDiagnostic({
+  currentIdentity,
+  installedIdentity,
+  roundLedger,
+  scorecard,
+  strictEvidenceFailures: strictFailures,
+});
 const medians = {
   ripgrepCliMs: ripgrep.summary?.median ?? null,
   currentEngineMs: median(comparisons.map((comparison) => comparison.current?.engineSummary?.median)),
@@ -332,6 +343,7 @@ const report = {
   requiredGateFailures,
   ripgrep,
   currentIdentity,
+  installedIdentity,
   identityControl,
   comparisons,
   medians,
@@ -339,6 +351,7 @@ const report = {
   roundLedger,
   ledgerSummary,
   phaseLeakSummary,
+  historicalGateDiagnostic,
 };
 
 mkdirSync(REPORT_DIR, { recursive: true });
@@ -356,6 +369,8 @@ if (!quiet) {
     strictEvidenceFailures: report.strictEvidenceFailures,
     requiredGateFailures: report.requiredGateFailures,
     currentIdentity,
+    installedIdentity,
+    historicalGateDiagnostic,
     identityControl: report.identityControl ? {
       samples: report.identityControl.samples,
       firstEngineMedianMs: report.identityControl.first.engineSummary.median,

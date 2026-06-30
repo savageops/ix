@@ -1114,6 +1114,96 @@ export function buildHistoricalScorecard(comparisons) {
   };
 }
 
+function countHistoricalFailureClasses(rounds) {
+  const counts = {
+    engine: 0,
+    pairedMedian: 0,
+    pairedMean: 0,
+    pairedWinRate: 0,
+    matchParity: 0,
+    routeParity: 0,
+    teddyRoute: 0,
+    underTargetOnly: 0,
+  };
+  for (const round of rounds) {
+    const engineImprovementPct = Number(round?.engineImprovementPct);
+    const pairedMedianPct = Number(round?.pairedCandidateImprovementMedianPct);
+    const pairedMeanPct = Number(round?.pairedCandidateImprovementMeanPct);
+    const pairedWinRate = Number(round?.pairedCandidateWinRate);
+    const requiredImprovementPct = Number(round?.requiredImprovementPct ?? 0);
+    let classified = false;
+    if (Number.isFinite(engineImprovementPct) && engineImprovementPct < requiredImprovementPct) {
+      counts.engine += 1;
+      classified = true;
+    }
+    if (Number.isFinite(pairedMedianPct) && pairedMedianPct < requiredImprovementPct) {
+      counts.pairedMedian += 1;
+      classified = true;
+    }
+    if (Number.isFinite(pairedMeanPct) && pairedMeanPct < requiredImprovementPct) {
+      counts.pairedMean += 1;
+      classified = true;
+    }
+    if (Number.isFinite(pairedWinRate) && pairedWinRate <= 0.5) {
+      counts.pairedWinRate += 1;
+      classified = true;
+    }
+    if (round?.matchParity !== true) {
+      counts.matchParity += 1;
+      classified = true;
+    }
+    if (round?.routeParityAcceptable !== true) {
+      counts.routeParity += 1;
+      classified = true;
+    }
+    if (round?.teddyRouteObserved === true && round?.teddyRouteNetPositive !== true) {
+      counts.teddyRoute += 1;
+      classified = true;
+    }
+    if (!classified && round?.netPositive !== true) {
+      counts.underTargetOnly += 1;
+    }
+  }
+  return counts;
+}
+
+export function buildHistoricalGateDiagnostic({
+  currentIdentity,
+  installedIdentity,
+  roundLedger,
+  scorecard,
+  strictEvidenceFailures,
+} = {}) {
+  const rounds = Array.isArray(roundLedger) ? roundLedger : [];
+  const previousBuildRounds = rounds.filter((round) => round?.evidenceAuthority === "previous_build");
+  const losingRounds = previousBuildRounds.filter((round) => round?.netPositive !== true);
+  const candidateIsInstalledBinary =
+    typeof currentIdentity?.sha256 === "string" &&
+    typeof installedIdentity?.sha256 === "string" &&
+    currentIdentity.sha256 === installedIdentity.sha256;
+  const matchRouteParityStable = previousBuildRounds.length > 0 &&
+    previousBuildRounds.every((round) => round?.matchParity === true && round?.routeParityAcceptable === true);
+  const installedBinaryFailsHistoricalGate = candidateIsInstalledBinary && (
+    losingRounds.length > 0 ||
+    (Array.isArray(strictEvidenceFailures) && strictEvidenceFailures.length > 0) ||
+    scorecard?.netPositive === false
+  );
+  return {
+    candidateIsInstalledBinary,
+    installedIdentity: installedIdentity ?? null,
+    installedBinaryFailsHistoricalGate,
+    previousBuildRounds: previousBuildRounds.length,
+    losingRounds: losingRounds.length,
+    matchRouteParityStable,
+    failureClasses: countHistoricalFailureClasses(losingRounds),
+    interpretation: installedBinaryFailsHistoricalGate
+      ? "native_installed_candidate_failed_predecessor_ladder; treat as benchmark/ladder attribution input, not a source regression by itself"
+      : candidateIsInstalledBinary
+        ? "native_installed_candidate_passed_predecessor_ladder"
+        : "repo_candidate_historical_gate",
+  };
+}
+
 function historicalRoundRegressed(round) {
   return (
     Number(round.currentEngineImprovementPct) < 0 ||
