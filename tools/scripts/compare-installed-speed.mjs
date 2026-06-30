@@ -195,7 +195,6 @@ const processScan = { before: processBefore, after: processAfter };
 const installedHash = fileHash(installedIx);
 const repoHash = fileHash(repoIx);
 const strictFailures = strictEvidenceFailures(host, processScan, identityControl);
-const strictEvidenceQuality = evidenceQualityFromFailures(strictFailures);
 const installedRepoEngineDeltaPct =
   ((paired.installed.engineSummary.median - paired.repo.engineSummary.median) /
     paired.installed.engineSummary.median) *
@@ -294,6 +293,7 @@ const roundLedger = buildInstalledRoundLedger({
 });
 const ledgerSummary = buildRoundLedgerSummary(roundLedger);
 const promotionFailureList = promotionFailures(host, processScan, installedHash, repoHash, installedRepoComparison, identityControl);
+const evidenceQuality = evidenceQualityFromFailures([...strictFailures, ...promotionFailureList]);
 const requiredGateFailures = [];
 if (requireStrict && strictFailures.length > 0) {
   requiredGateFailures.push({
@@ -333,7 +333,7 @@ const report = {
   processScan,
   retainableStrictEvidence: strictFailures.length === 0,
   strictEvidenceFailures: strictFailures,
-  evidenceQuality: strictEvidenceQuality,
+  evidenceQuality,
   binaries,
   lanes: {
     ripgrep,
