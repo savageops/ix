@@ -2,6 +2,27 @@ import { runOneBenchmark } from "./lib/benchmark-runner.mjs";
 import { argValue } from "./lib/script-helpers.mjs";
 
 const args = process.argv.slice(2);
+if (args.includes("--help") || args.includes("-h")) {
+  console.log(`Usage: node tools/scripts/run-once-benchmark.mjs [options]
+
+Runs one IX/ripgrep benchmark scenario and writes the standard benchmark report.
+
+Options:
+  --expression <expr>             IX expression to search.
+  --corpus <path>                 Corpus path.
+  --profile <name>                Scenario/profile label. Default: single.
+  --ix-binary <path>              IX binary to measure.
+  --previous-ix-binary <path>     Optional previous IX comparator.
+  --rust-ix-binary <path>         Optional Rust IX comparator.
+  --paired-interleave             Interleave current and previous IX samples.
+  --threads <n>                   IX/ripgrep thread count.
+  --warmup <n>                    Warmup samples. Default: 1.
+  --samples <n>                   Measured samples. Default: 1.
+  --quiet                         Write reports without printing JSON.
+  --help, -h                      Print this help and exit without measuring.
+`);
+  process.exit(0);
+}
 const expression = argValue(args, "--expression", undefined);
 const corpus = argValue(args, "--corpus", undefined);
 const profile = argValue(args, "--profile", "single");
