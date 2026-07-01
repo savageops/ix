@@ -689,6 +689,89 @@ function diagnosticAttributionReport(filePath, currentHash) {
   };
 }
 
+function roundSpeedEvidence(round, candidateSha256 = null) {
+  return {
+    roundIndex: round.roundIndex ?? null,
+    baselineLabel: round.baselineLabel ?? null,
+    candidateLabel: round.candidateLabel ?? null,
+    status: round.status ?? null,
+    testedOneAtATime: round.testedOneAtATime === true,
+    netPositive: round.netPositive === true,
+    requiredImprovementPct: Number.isFinite(Number(round.requiredImprovementPct)) ? Number(round.requiredImprovementPct) : null,
+    baselineEngineMedianMs: Number.isFinite(Number(round.baselineEngineMedianMs)) ? Number(round.baselineEngineMedianMs) : null,
+    candidateEngineMedianMs: Number.isFinite(Number(round.candidateEngineMedianMs)) ? Number(round.candidateEngineMedianMs) : null,
+    engineImprovementPct: Number.isFinite(Number(round.engineImprovementPct)) ? Number(round.engineImprovementPct) : null,
+    pairedCandidateImprovementMedianPct: Number.isFinite(Number(round.pairedCandidateImprovementMedianPct)) ? Number(round.pairedCandidateImprovementMedianPct) : null,
+    pairedCandidateScanWorkImprovementMedianPct: Number.isFinite(Number(round.pairedCandidateScanWorkImprovementMedianPct)) ? Number(round.pairedCandidateScanWorkImprovementMedianPct) : null,
+    pairedCandidateTeddyRangeImprovementMedianPct: Number.isFinite(Number(round.pairedCandidateTeddyRangeImprovementMedianPct)) ? Number(round.pairedCandidateTeddyRangeImprovementMedianPct) : null,
+    pairedCandidateWinRate: Number.isFinite(Number(round.pairedCandidateWinRate)) ? Number(round.pairedCandidateWinRate) : null,
+    routeParity: round.routeParity === true,
+    matchParity: round.matchParity === true,
+    baselineSha256: round.baselineSha256 ?? null,
+    candidateSha256: round.candidateSha256 ?? candidateSha256,
+  };
+}
+
+function installedRoundEvidence(filePath) {
+  const report = readJson(filePath, null);
+  if (report == null) return null;
+  const rounds = Array.isArray(report.roundLedger) ? report.roundLedger : [];
+  return {
+    source: path.relative(ROOT, filePath),
+    runId: report.runId ?? null,
+    promotionQualified: report.promotionQualified === true,
+    retainableStrictEvidence: report.retainableStrictEvidence === true,
+    failures: Array.isArray(report.promotionFailures) ? report.promotionFailures : [],
+    rounds: rounds.map(roundSpeedEvidence),
+  };
+}
+
+function historicalRoundEvidence(report) {
+  const rounds = Array.isArray(report?.roundLedger) ? report.roundLedger : [];
+  const currentHashes = historicalComparisonHashes(report);
+  const currentHash = currentHashes.length === 1 ? currentHashes[0] : null;
+  return {
+    runId: report?.runId ?? null,
+    retainableStrictEvidence: report?.retainableStrictEvidence === true,
+    testedOneAtATime: report?.scorecard?.testedOneAtATime === true,
+    totalRounds: Number(report?.scorecard?.totalRounds ?? rounds.length),
+    netPositiveRounds: Number(report?.scorecard?.netPositiveRounds ?? rounds.filter((round) => round.netPositive === true).length),
+    regressionRoundCount: Number(report?.scorecard?.regressionRoundCount ?? rounds.filter((round) => round.netPositive !== true).length),
+    rounds: rounds.map((round) => roundSpeedEvidence(round, currentHash)),
+  };
+}
+
+function olderSnapshotRoundEvidence(filePath) {
+  const report = readJson(filePath, null);
+  if (report == null) return null;
+  const rounds = Array.isArray(report.rounds) ? report.rounds : [];
+  return {
+    source: path.relative(ROOT, filePath),
+    runId: report.runId ?? null,
+    retainableEvidence: report.retainableEvidence === true,
+    runnableSnapshots: Number(report.runnableSnapshots ?? rounds.filter((round) => round.runnable === true).length),
+    retainableSnapshots: Number(report.retainableSnapshots ?? rounds.filter((round) => round.status === "net_positive").length),
+    skippedSnapshots: Number(report.skippedSnapshots ?? rounds.filter((round) => round.status === "skipped" || round.runnable === false).length),
+    failures: Array.isArray(report.failures) ? report.failures : [],
+    rounds: rounds.map((round, index) => ({
+      roundIndex: index + 1,
+      snapshotLabel: round.label ?? round.snapshotLabel ?? round.baselineLabel ?? null,
+      status: round.status ?? null,
+      runnable: round.runnable === true,
+      retainable: round.status === "net_positive",
+      baselineEngineMedianMs: Number.isFinite(Number(round.baselineMedianMs)) ? Number(round.baselineMedianMs) : null,
+      candidateEngineMedianMs: Number.isFinite(Number(round.repoMedianMs)) ? Number(round.repoMedianMs) : null,
+      engineImprovementPct: Number.isFinite(Number(round.enginePct)) ? Number(round.enginePct) : null,
+      pairedCandidateImprovementMedianPct: Number.isFinite(Number(round.pairedPct)) ? Number(round.pairedPct) : null,
+      pairedCandidateWinRate: Number.isFinite(Number(round.winRate)) ? Number(round.winRate) : null,
+      routeParityStatus: round.routeParityStatus ?? null,
+      matchParity: round.matchParity === true,
+      baselineSha256: round.baseline?.sha256 ?? round.baselineSha256 ?? null,
+      candidateSha256: round.current?.sha256 ?? round.candidateSha256 ?? null,
+    })),
+  };
+}
+
 function currentSpeedStatus({ summary, historical, installedStatus, historicalDiagnosticStatus, historicalRetainableStatus, olderStatus }) {
   const losingRounds = Array.isArray(historical?.scorecard?.losingRounds)
     ? historical.scorecard.losingRounds
@@ -725,6 +808,11 @@ function currentSpeedStatus({ summary, historical, installedStatus, historicalDi
       retainableSnapshots: olderStatus.retainableSnapshots,
       runnableSnapshots: olderStatus.runnableSnapshots,
       skippedSnapshots: olderStatus.skippedSnapshots,
+    },
+    actualSearchSpeedEvidence: {
+      installedVsCurrent: installedRoundEvidence(LATEST_RETAINABLE_INSTALLED_PATH) ?? installedRoundEvidence(LATEST_INSTALLED_PATH),
+      recentPredecessorsVsCurrent: historicalRoundEvidence(historical),
+      olderSnapshotsVsCurrent: olderSnapshotRoundEvidence(LATEST_OLDER_SNAPSHOT_PATH),
     },
     finalizationAllowed:
       installedStatus.status === "promotable_current" &&
