@@ -519,13 +519,14 @@ function candidateMoves(summary, leakSummary, quality) {
       id: "packed_nibble_shuffle_teddy_kernel",
       status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (teddyGainNeedsLeakRepair ? "allowed_after_whole_engine_leak_attribution" : "allowed_next"),
       owner: "src/core/literal_alternates.zig::nextTeddyCandidate with an optional narrow src/core/simd.zig primitive",
-      reason: `${teddyReason} Current Teddy path still compares each branch vector independently; research and contract require a packed SIMD/Shufti-style candidate extractor. Do not repeat prior rejected shapes: range-level C FFI packed helper, inline Zig VPSHUFB nibble tables, branch-count unrolling, single-load shifted equality masks, or scan-open pairing without reducing confirmation/line-loop work.`,
+      reason: `${teddyReason} Current Teddy path still compares each branch vector independently; research and contract require a packed SIMD/Shufti-style candidate extractor. Do not repeat prior rejected shapes: range-level C FFI packed helper, inline Zig VPSHUFB nibble tables, branch-count unrolling, single-load shifted equality masks, fingerprint-byte confirmation skips, or scan-open pairing without reducing confirmation/line-loop work.`,
       expectedGainScore: teddyGainNeedsLeakRepair ? 1 : 2.5 + negativePressure,
       blockedImplementationShapes: [
         "range_level_c_ffi_packed_teddy_helper",
         "inline_zig_vpshufb_nibble_tables",
         "branch4_unrolled_equality_kernel",
         "branch_mask_candidate_verification",
+        "fingerprint_verified_byte_confirmation_skip",
         "single_load_shifted_equality_mask",
         "single_load_shifted_mask_plus_large_first_read",
       ],
@@ -602,6 +603,22 @@ function candidateMoves(summary, leakSummary, quality) {
       reason: "Returning the matched branch mask from Teddy candidate extraction reduced installed Teddy-range time, but the added candidate bookkeeping failed the recent predecessor ladder with 0/4 net-positive rounds and Teddy regressions against the newest two backups.",
       expectedGainScore: 0,
       proofCommand: "historical-speed-2026-07-01T01-52-11-644Z.json",
+    },
+    {
+      id: "offset3_fingerprint_selector_without_packed_kernel",
+      status: "rejected",
+      owner: "src/core/literal_alternates.zig::teddyRangeFingerprintOffsetOverride",
+      reason: "A no-code installed-vs-current probe with IX_TEDDY_RANGE_FINGERPRINT_OFFSET=3 preserved route and match parity but failed promotion: repo median 603.5326 ms was slower than installed 599.1414 ms, paired median was -6.8536%, and win rate was 0.4167. Moving the fingerprint window without a lower-cost packed verifier is not a promotable speed move.",
+      expectedGainScore: 0,
+      proofCommand: "installed-speed-2026-07-01T07-11-15-156Z.json",
+    },
+    {
+      id: "fingerprint_verified_byte_confirmation_skip",
+      status: "rejected",
+      owner: "src/core/literal_alternates.zig::countTeddyPrefix3 and firstMatchingBranchLen",
+      reason: "Skipping the already-proven three fingerprint bytes during post-candidate confirmation preserved Zig tests and ReleaseFast build, but failed installed-vs-current promotion: repo median 630.4795 ms was slower than installed 594.4936 ms, paired median was -6.0879%, and win rate was 0.3333. A promotable confirmation change must reduce the candidate loop itself or carry bucket identity, not add a new confirmation helper around the current candidate stream.",
+      expectedGainScore: 0,
+      proofCommand: "installed-speed-2026-07-01T07-14-48-344Z.json",
     },
     {
       id: "branch4_unrolled_equality_kernel",
@@ -858,9 +875,11 @@ function requiredKernelProof(engineeringMove) {
       "single_load_shifted_mask_plus_large_first_read",
       "branch4_unrolled_equality_kernel",
       "branch_mask_candidate_verification",
+      "fingerprint_verified_byte_confirmation_skip",
       "inline_zig_vpshufb_nibble_tables",
       "range_level_c_ffi_packed_teddy_helper",
       "offset_only_fingerprint_selector",
+      "offset3_fingerprint_selector_without_packed_kernel",
       "scalar_post_candidate_secondary_filter",
     ],
     sourceReferences: [
@@ -882,7 +901,21 @@ function nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers) {
     return null;
   }
 
-  const installed = speedProofPointers?.latestInstalled ?? null;
+  const retainableInstalled = speedProofPointers?.latestInstalled ?? null;
+  const diagnosticInstalled = speedProofPointers?.latestInstalledDiagnostic ?? null;
+  const installed = retainableInstalled?.freshForCurrentBinary === true ? retainableInstalled : diagnosticInstalled;
+  if (installed?.status === "stale_current_binary") {
+    return {
+      id: "retainable_runtime_probe",
+      status: "blocked_by_stale_installed_promotion_evidence",
+      owner: "tools/scripts/compare-installed-speed.mjs",
+      reason: "Fresh diagnostic attribution exists, but the installed-vs-current promotion evidence points at a stale repo binary. Rerun the strict installed promotion gate for the current binary before selecting any runtime repair.",
+      sourceDiagnosticRunId: latestDiagnosticAttribution.evaluatedHistoricalRunId ?? null,
+      installedRunId: installed.runId ?? null,
+      installedStatus: installed.status,
+      proofCommand: INSTALLED_SPEED_STRICT_COMMAND,
+    };
+  }
   if (installed?.status === "promotion_failed") {
     return {
       id: "retainable_runtime_probe",
