@@ -155,6 +155,25 @@ export function summarizeAlternateRoute(route) {
   };
 }
 
+export function alternatesRepeatEvidenceFailures(repeatedEvidence) {
+  if (!isPlainObject(repeatedEvidence)) return ["missing"];
+  const comparableReportCount = Number(repeatedEvidence.comparableReportCount ?? 0);
+  if (!Number.isFinite(comparableReportCount)) return ["invalid_comparable_report_count"];
+  if (comparableReportCount <= 0) return [];
+  if (repeatedEvidence.stable === true) return [];
+  const branches = Array.isArray(repeatedEvidence.branches) ? repeatedEvidence.branches : [];
+  if (branches.length === 0) return ["missing_branch_evidence"];
+  return branches
+    .filter((branch) => branch?.stable !== true)
+    .map((branch) => {
+      const branchCount = Number.isFinite(Number(branch?.branchCount)) ? Number(branch.branchCount) : "missing";
+      const issues = Array.isArray(branch?.issues) && branch.issues.length > 0
+        ? branch.issues.join(",")
+        : "unknown";
+      return `branch_${branchCount}:${issues}`;
+    });
+}
+
 export function createAlternatesGateValidation({
   minRetainableSpeedSamples,
   validateHostPreflightSkipRemediation,
@@ -223,6 +242,10 @@ export function createAlternatesGateValidation({
     }
     if (Array.isArray(entry.report.requiredGateFailures) && entry.report.requiredGateFailures.length > 0) {
       failures.push("alternates_decision: ok status requires no required gate failure envelope");
+    }
+    const repeatFailures = alternatesRepeatEvidenceFailures(entry.report.repeatedEvidence);
+    if (repeatFailures.length > 0) {
+      failures.push(`alternates_decision: repeat stability evidence must be stable (${repeatFailures.join(";")})`);
     }
     if (Array.isArray(entry.report.comparisons)) {
       const candidateRegressions = entry.report.comparisons.filter((comparison) =>
@@ -583,6 +606,7 @@ export function createAlternatesDecisionGateLane({
       optimizationTargets: Array.isArray(latest.optimizationTargets) ? latest.optimizationTargets : [],
       nextMoves: Array.isArray(latest.nextMoves) ? latest.nextMoves : [],
       requiredGateFailures: latest.requiredGateFailures ?? [],
+      repeatedEvidence: latest.repeatedEvidence ?? null,
       identityControls: latest.identityControls ?? null,
     };
     const laneFailures = [];
@@ -602,6 +626,10 @@ export function createAlternatesDecisionGateLane({
     }
     if (Array.isArray(parsed.requiredGateFailures) && parsed.requiredGateFailures.length > 0) {
       laneFailures.push("alternates decision has required gate failures");
+    }
+    const repeatFailures = alternatesRepeatEvidenceFailures(parsed.repeatedEvidence);
+    if (repeatFailures.length > 0) {
+      laneFailures.push(`alternates decision repeat stability evidence must be stable (${repeatFailures.join(";")})`);
     }
     if (!isPlainObject(parsed.scorecard)) {
       laneFailures.push("alternates decision requires branch scorecard");

@@ -737,6 +737,22 @@ function repeatStability(comparisons) {
   };
 }
 
+function repeatStabilityFailures(repeatedEvidence) {
+  if (!repeatedEvidence || Number(repeatedEvidence.comparableReportCount ?? 0) <= 0) return [];
+  if (repeatedEvidence.stable === true) return [];
+  const branches = Array.isArray(repeatedEvidence.branches) ? repeatedEvidence.branches : [];
+  if (branches.length === 0) return ["repeat_instability:missing_branch_evidence"];
+  return branches
+    .filter((branch) => branch?.stable !== true)
+    .map((branch) => {
+      const branchCount = Number.isFinite(Number(branch?.branchCount)) ? Number(branch.branchCount) : "missing";
+      const issues = Array.isArray(branch?.issues) && branch.issues.length > 0
+        ? branch.issues.join(",")
+        : "unknown";
+      return `repeat_instability:branch_${branchCount}:${issues}`;
+    });
+}
+
 function nextMovesForTargets(targets) {
   return targets.map((target) => {
     const route = target.candidateRoute;
@@ -817,8 +833,10 @@ function requiredDecisionFailures({
   contracts,
   identityControls,
   installedPromotionTarget,
+  repeatedEvidence,
 }) {
   const failures = [...benchmarkHostFailures(host)];
+  failures.push(...repeatStabilityFailures(repeatedEvidence));
   if (!baselinePath) failures.push("missing_baseline");
   if (relation === "same_binary") failures.push("same_binary:identity_noise_only");
   for (const comparison of comparisons) {
@@ -1205,6 +1223,7 @@ const requiredFailureList = requiredDecisionFailures({
   contracts,
   identityControls,
   installedPromotionTarget,
+  repeatedEvidence,
 });
 const requiredGateFailures = requiredFailureList.length > 0
   ? [
