@@ -12,6 +12,8 @@ const LATEST_RETAINABLE_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "late
 const INSTALLED_REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
 const LATEST_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-installed-speed.json");
 const LATEST_RETAINABLE_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-retainable-installed-speed.json");
+const OLDER_SNAPSHOT_REPORT_DIR = path.join(ROOT, "tools", "reports", "older-snapshot-ladder");
+const LATEST_OLDER_SNAPSHOT_PATH = path.join(OLDER_SNAPSHOT_REPORT_DIR, "latest-older-snapshot-ladder.json");
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "teddy-kernel-decision");
 const DEFAULT_CURRENT_IX = path.join(ROOT, "zig-out", "bin", process.platform === "win32" ? "ix-zig.exe" : "ix-zig");
 const REQUIRED_INSTALLED_THREADS = 32;
@@ -244,6 +246,47 @@ function installedPointerStatus(filePath, currentHash) {
     repoSha256,
     installedPath,
     threads: Number.isFinite(threads) ? threads : null,
+  };
+}
+
+function olderSnapshotPointerStatus(filePath) {
+  if (!existsSync(filePath)) {
+    return {
+      path: path.relative(ROOT, filePath),
+      exists: false,
+      status: "missing",
+      runId: null,
+      timestamp: null,
+      retainableEvidence: false,
+      retainableSnapshots: 0,
+      runnableSnapshots: 0,
+      skippedSnapshots: 0,
+      failureCount: null,
+    };
+  }
+
+  const pointer = readJson(filePath, {});
+  const rounds = Array.isArray(pointer.rounds) ? pointer.rounds : [];
+  const failures = Array.isArray(pointer.failures) ? pointer.failures : [];
+  const retainableEvidence = pointer.retainableEvidence === true;
+  const retainableSnapshots = Number(pointer.retainableSnapshots ?? rounds.filter((round) => round.status === "net_positive").length);
+  const runnableSnapshots = Number(pointer.runnableSnapshots ?? rounds.filter((round) => round.runnable === true).length);
+  const skippedSnapshots = Number(pointer.skippedSnapshots ?? rounds.filter((round) => round.runnable === false || round.status === "skipped").length);
+  let status = "retainable_current";
+  if (!retainableEvidence) status = "strict_failed";
+  else if (retainableSnapshots < Number(pointer.targetRetainableSnapshots ?? 1)) status = "insufficient_retainable_snapshots";
+
+  return {
+    path: path.relative(ROOT, filePath),
+    exists: true,
+    status,
+    runId: pointer.runId ?? null,
+    timestamp: pointer.timestamp ?? pointer.generatedAt ?? null,
+    retainableEvidence,
+    retainableSnapshots: Number.isFinite(retainableSnapshots) ? retainableSnapshots : 0,
+    runnableSnapshots: Number.isFinite(runnableSnapshots) ? runnableSnapshots : 0,
+    skippedSnapshots: Number.isFinite(skippedSnapshots) ? skippedSnapshots : 0,
+    failureCount: failures.length,
   };
 }
 
@@ -646,6 +689,50 @@ function diagnosticAttributionReport(filePath, currentHash) {
   };
 }
 
+function currentSpeedStatus({ summary, historical, installedStatus, historicalDiagnosticStatus, historicalRetainableStatus, olderStatus }) {
+  const losingRounds = Array.isArray(historical?.scorecard?.losingRounds)
+    ? historical.scorecard.losingRounds
+    : [];
+  const underTargetRounds = Array.isArray(historical?.scorecard?.underTargetRounds)
+    ? historical.scorecard.underTargetRounds
+    : [];
+  return {
+    installed: {
+      status: installedStatus.status,
+      runId: installedStatus.runId,
+      promotionQualified: installedStatus.promotionQualified,
+      retainableStrictEvidence: installedStatus.retainableStrictEvidence,
+    },
+    recentPredecessors: {
+      status: historicalDiagnosticStatus.status,
+      runId: historicalDiagnosticStatus.runId,
+      retainableStrictEvidence: historicalDiagnosticStatus.retainableStrictEvidence,
+      requiredRetainableStatus: historicalRetainableStatus.status,
+      requiredRetainableRunId: historicalRetainableStatus.runId,
+      netPositiveRounds: Number(historical?.scorecard?.netPositiveRounds ?? summary.netPositiveRounds ?? 0),
+      totalRounds: Number(historical?.scorecard?.totalRounds ?? summary.count ?? 0),
+      regressionRoundCount: Number(historical?.scorecard?.regressionRoundCount ?? losingRounds.length),
+      underTargetRoundCount: Number(historical?.scorecard?.underTargetRoundCount ?? underTargetRounds.length),
+      worstEngineImprovementPct: summary.worstEngineImprovementPct,
+      averagePairedEngineMedianPct: summary.averagePairedEngineMedianPct,
+      averagePairedScanWorkMedianPct: summary.averagePairedScanWorkMedianPct,
+      averagePairedTeddyMedianPct: summary.averagePairedTeddyMedianPct,
+    },
+    olderSnapshots: {
+      status: olderStatus.status,
+      runId: olderStatus.runId,
+      retainableEvidence: olderStatus.retainableEvidence,
+      retainableSnapshots: olderStatus.retainableSnapshots,
+      runnableSnapshots: olderStatus.runnableSnapshots,
+      skippedSnapshots: olderStatus.skippedSnapshots,
+    },
+    finalizationAllowed:
+      installedStatus.status === "promotable_current" &&
+      historicalRetainableStatus.status === "retainable_current" &&
+      olderStatus.status === "retainable_current",
+  };
+}
+
 if (!existsSync(reportPath)) {
   throw new Error(`historical report not found: ${reportPath}`);
 }
@@ -672,7 +759,16 @@ const speedProofPointers = {
   latestRetainable: historicalPointerStatus(LATEST_RETAINABLE_HISTORICAL_PATH, currentIxSha256),
   latestInstalledDiagnostic: installedPointerStatus(LATEST_INSTALLED_PATH, currentIxSha256),
   latestInstalled: installedPointerStatus(LATEST_RETAINABLE_INSTALLED_PATH, currentIxSha256),
+  latestOlderSnapshots: olderSnapshotPointerStatus(LATEST_OLDER_SNAPSHOT_PATH),
 };
+const benchmarkStatus = currentSpeedStatus({
+  summary,
+  historical,
+  installedStatus: speedProofPointers.latestInstalled,
+  historicalDiagnosticStatus: speedProofPointers.latestDiagnostic,
+  historicalRetainableStatus: speedProofPointers.latestRetainable,
+  olderStatus: speedProofPointers.latestOlderSnapshots,
+});
 const promotionAllowed =
   historical.scorecard?.netPositive === true &&
   summary.matchParity === true &&
@@ -683,7 +779,8 @@ const promotionAllowed =
   summary.netPositiveRounds === summary.count &&
   quality.usableForRuntimeMove === true &&
   speedProofPointers.latestRetainable.status === "retainable_current" &&
-  speedProofPointers.latestInstalled.status === "promotable_current";
+  speedProofPointers.latestInstalled.status === "promotable_current" &&
+  speedProofPointers.latestOlderSnapshots.status === "retainable_current";
 const finalizationGate = {
   speedRegressionFinalizationAllowed: promotionAllowed,
   requiredRetainablePointer: speedProofPointers.latestRetainable,
@@ -696,6 +793,8 @@ const finalizationGate = {
     : (
         speedProofPointers.latestInstalled.status !== "promotable_current"
           ? `no current installed-vs-repo promotion proof (${speedProofPointers.latestInstalled.status}); run the installed speed gate before finalizing code changes`
+          : speedProofPointers.latestOlderSnapshots.status !== "retainable_current"
+          ? `no current older-snapshot proof (${speedProofPointers.latestOlderSnapshots.status}); run the older-snapshot speed gate before finalizing code changes`
           : speedProofPointers.latestRetainable.status === "retainable_current"
           ? "current retainable strict proof exists, but the selected report is not net-positive enough for runtime promotion"
           : `no current retainable strict speed proof (${speedProofPointers.latestRetainable.status}); run the strict speed gate before finalizing code changes`
@@ -740,6 +839,7 @@ const report = {
     speedGate: SPEED_PROMOTION_COMMAND,
   },
   noRuntimePromotionReason,
+  benchmarkStatus,
   scorecard: historical.scorecard ?? null,
   summary,
   leakSummary,
