@@ -264,7 +264,13 @@ if (teddyGainNeedsLeakRepair) {
   }
   if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
     const split = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit;
-    if (decision.nextEngineeringMove?.id !== expectedScanWorkNextMove(split, evidenceQuality)) {
+    const expectedRuntimeMove = expectedScanWorkNextMove(split, evidenceQuality);
+    const evidenceBlocked =
+      typeof decision.nextEngineeringMove?.status === "string" &&
+      decision.nextEngineeringMove.status.startsWith("blocked_by_") &&
+      decision.nextEvidenceMove?.id === decision.nextEngineeringMove?.id &&
+      decision.nextRuntimeMove?.id === expectedRuntimeMove;
+    if (!evidenceBlocked && decision.nextEngineeringMove?.id !== expectedRuntimeMove) {
       failures.push("decision must expose the proved leak owner as next engineering move");
     }
   }

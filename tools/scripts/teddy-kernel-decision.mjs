@@ -999,6 +999,10 @@ const speedProofPointers = {
 const selectedInstalledPointer = selectedInstalledPointerStatus(speedProofPointers);
 const selectedInstalledPath = selectedInstalledPointer?.path ? path.resolve(ROOT, selectedInstalledPointer.path) : LATEST_INSTALLED_PATH;
 const evidenceMove = nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers);
+const effectiveEngineeringMove =
+  evidenceMove?.status?.startsWith("blocked_by_") === true
+    ? evidenceMove
+    : engineeringMove;
 const benchmarkStatus = currentSpeedStatus({
   summary,
   historical,
@@ -1094,7 +1098,7 @@ const report = {
   nextEvidenceMove: evidenceMove,
   nextAllowedMove: moves.find((move) => move.status === "allowed_next") ?? null,
   nextRuntimeMove: engineeringMove,
-  nextEngineeringMove: engineeringMove,
+  nextEngineeringMove: effectiveEngineeringMove,
 };
 
 mkdirSync(path.dirname(outPath), { recursive: true });
