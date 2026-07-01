@@ -1503,8 +1503,15 @@ function identityAttemptScore(control) {
 }
 
 function selectIdentityControlAttempt(attempts) {
-  const stable = attempts.find((attempt) => attempt?.diagnostics?.status === "stable");
-  if (stable) return { selected: stable, reason: "first_stable_attempt" };
+  const ranked = [...attempts].sort((left, right) => {
+    const leftScore = identityAttemptScore(left);
+    const rightScore = identityAttemptScore(right);
+    return Number(rightScore.stable) - Number(leftScore.stable) ||
+      leftScore.medianDeltaAbsPct - rightScore.medianDeltaAbsPct ||
+      leftScore.pairedWinRateDistance - rightScore.pairedWinRateDistance;
+  });
+  const stable = ranked.find((attempt) => attempt?.diagnostics?.status === "stable");
+  if (stable) return { selected: stable, reason: "lowest_stable_identity_drift_attempt" };
   const selected = [...attempts].sort((left, right) => {
     const leftScore = identityAttemptScore(left);
     const rightScore = identityAttemptScore(right);
