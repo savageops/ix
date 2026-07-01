@@ -5,7 +5,7 @@ import { baseBenchEnv, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, binarySnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, binarySnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, measureIxOnce, measureRipgrep, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
@@ -102,7 +102,9 @@ function measurePairedHistory(history, ixArgs, effectivePreviousBuildImprovement
 
   const current = summarizeIxRuns(repoIx, "repo-current", currentRuns);
   const historical = summarizeIxRuns(history.path, history.label, historyRuns);
-  const sameBinary = current.sha256 === historical.sha256;
+  const currentIdentity = binarySnapshot(repoIx);
+  const sameBinary = currentIdentity.executableSha256 != null &&
+    currentIdentity.executableSha256 === history.executableSha256;
   const currentVsHistoryEngineRatio = current.engineSummary.median / historical.engineSummary.median;
   const currentEngineDeltaMs = current.engineSummary.median - historical.engineSummary.median;
   const currentEngineImprovementPct = Number.isFinite(currentVsHistoryEngineRatio)
@@ -149,6 +151,7 @@ function measurePairedHistory(history, ixArgs, effectivePreviousBuildImprovement
     label: history.label,
     path: history.path,
     sha256: historical.sha256,
+    executableSha256: history.executableSha256 ?? null,
     relation: sameBinary ? "same_binary" : "different_binary",
     current,
     historical,
@@ -213,10 +216,11 @@ function backupCandidates() {
   const seen = new Set();
   const unique = [];
   for (const candidate of candidates) {
-    const sha256 = fileHash(candidate.path);
-    if (seen.has(sha256)) continue;
-    seen.add(sha256);
-    unique.push({ ...candidate, sha256, roundIndex: unique.length + 1 });
+    const identity = binarySnapshot(candidate.path);
+    const executableSha256 = identity.executableSha256 ?? identity.sha256;
+    if (seen.has(executableSha256)) continue;
+    seen.add(executableSha256);
+    unique.push({ ...candidate, sha256: identity.sha256, executableSha256, identity, roundIndex: unique.length + 1 });
     if (unique.length >= maxBackups) break;
   }
   return unique;

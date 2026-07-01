@@ -5,7 +5,7 @@ import { baseBenchEnv, defaultInstalledIxPath, defaultRepoIxPath, DEFAULT_ALTERN
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, binarySnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, binarySnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, measureIxOnce, measureRipgrep, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
@@ -210,14 +210,20 @@ const processAfter = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV });
 const hostAfter = hostSnapshot();
 const host = { before: hostBefore, after: hostAfter };
 const processScan = { before: processBefore, after: processAfter };
-const installedHash = fileHash(installedIx);
-const repoHash = fileHash(repoIx);
+const binaries = {
+  installed: binarySnapshot(installedIx),
+  repo: binarySnapshot(repoIx),
+};
+const installedHash = binaries.installed.sha256;
+const repoHash = binaries.repo.sha256;
+const installedExecutableHash = binaries.installed.executableSha256 ?? installedHash;
+const repoExecutableHash = binaries.repo.executableSha256 ?? repoHash;
 const strictFailures = strictEvidenceFailures(host, processScan, identityControl);
 const installedRepoEngineDeltaPct =
   ((paired.installed.engineSummary.median - paired.repo.engineSummary.median) /
     paired.installed.engineSummary.median) *
   100;
-const installedRepoBinaryRelation = installedHash === repoHash ? "same_binary" : "different_binary";
+const installedRepoBinaryRelation = installedExecutableHash === repoExecutableHash ? "same_binary" : "different_binary";
 const promotionMode = installedRepoBinaryRelation === "same_binary" ? "current_install_identity" : "candidate_vs_installed";
 const installedRepoRoute = routeParityEvaluation(paired.installed, paired.repo);
 const installedRepoComparison = {
@@ -318,10 +324,6 @@ const scorecard = buildInstalledScorecard({
   score: installedRepoComparison.score,
   binaryRelation: installedRepoBinaryRelation,
 });
-const binaries = {
-  installed: binarySnapshot(installedIx),
-  repo: binarySnapshot(repoIx),
-};
 const roundLedger = buildInstalledRoundLedger({
   comparison: installedRepoComparison,
   score: installedRepoComparison.score,
@@ -329,7 +331,7 @@ const roundLedger = buildInstalledRoundLedger({
   binaries,
 });
 const ledgerSummary = buildRoundLedgerSummary(roundLedger);
-const promotionFailureList = promotionFailures(host, processScan, installedHash, repoHash, installedRepoComparison, identityControl);
+const promotionFailureList = promotionFailures(host, processScan, installedExecutableHash, repoExecutableHash, installedRepoComparison, identityControl);
 const evidenceQuality = evidenceQualityFromFailures([...strictFailures, ...promotionFailureList]);
 const requiredGateFailures = [];
 if (requireStrict && strictFailures.length > 0) {

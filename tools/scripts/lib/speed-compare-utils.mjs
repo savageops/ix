@@ -45,7 +45,7 @@ export function dependencyTreeSnapshot(root = process.cwd()) {
 export function binarySnapshot(binaryPath) {
   const resolved = path.resolve(binaryPath);
   if (!existsSync(resolved)) {
-    return { path: resolved, exists: false, sizeBytes: null, sha256: null, pe: null };
+    return { path: resolved, exists: false, sizeBytes: null, sha256: null, executableSha256: null, pe: null };
   }
   const stat = statSync(resolved);
   const bytes = readFileSync(resolved);
@@ -54,23 +54,36 @@ export function binarySnapshot(binaryPath) {
     exists: true,
     sizeBytes: stat.size,
     sha256: fileHash(resolved),
+    executableSha256: executableHash(bytes),
     pe: peSnapshot(bytes),
   };
 }
 
-function peSnapshot(bytes) {
+function executableHash(bytes) {
+  const normalized = Buffer.from(bytes);
+  const pe = peLayout(normalized);
+  if (pe == null) return createHash("sha256").update(normalized).digest("hex").toUpperCase();
+
+  // PE timestamps and Zig/LLD build IDs change across equivalent rebuilds.
+  // They do not describe executable search behavior, so zero them before
+  // comparing benchmark candidates for identity-noise classification.
+  normalized.fill(0, pe.coffTimestampOffset, pe.coffTimestampOffset + 4);
+  const buildId = pe.sections.find((section) => section.name === ".buildid");
+  if (buildId != null && buildId.rawPointer + buildId.rawSize <= normalized.length) {
+    normalized.fill(0, buildId.rawPointer, buildId.rawPointer + buildId.rawSize);
+  }
+  return createHash("sha256").update(normalized).digest("hex").toUpperCase();
+}
+
+function peLayout(bytes) {
   if (bytes.length < 0x40 || bytes[0] !== 0x4d || bytes[1] !== 0x5a) return null;
   const peOffset = bytes.readUInt32LE(0x3c);
   if (peOffset + 24 > bytes.length) return null;
   if (bytes[peOffset] !== 0x50 || bytes[peOffset + 1] !== 0x45 || bytes[peOffset + 2] !== 0 || bytes[peOffset + 3] !== 0) return null;
-  const machine = bytes.readUInt16LE(peOffset + 4);
   const sectionCount = bytes.readUInt16LE(peOffset + 6);
-  const timestamp = bytes.readUInt32LE(peOffset + 8);
   const optionalHeaderSize = bytes.readUInt16LE(peOffset + 20);
-  const characteristics = bytes.readUInt16LE(peOffset + 22);
   const optionalHeaderOffset = peOffset + 24;
   if (optionalHeaderOffset + optionalHeaderSize > bytes.length) return null;
-  const optionalMagic = bytes.readUInt16LE(optionalHeaderOffset);
   const sectionOffset = optionalHeaderOffset + optionalHeaderSize;
   const sections = [];
   for (let index = 0; index < sectionCount; index += 1) {
@@ -87,12 +100,30 @@ function peSnapshot(bytes) {
     });
   }
   return {
+    peOffset,
+    coffTimestampOffset: peOffset + 8,
+    sections,
+  };
+}
+
+function peSnapshot(bytes) {
+  const layout = peLayout(bytes);
+  if (layout == null) return null;
+  const peOffset = layout.peOffset;
+  const machine = bytes.readUInt16LE(peOffset + 4);
+  const sectionCount = bytes.readUInt16LE(peOffset + 6);
+  const timestamp = bytes.readUInt32LE(peOffset + 8);
+  const optionalHeaderSize = bytes.readUInt16LE(peOffset + 20);
+  const characteristics = bytes.readUInt16LE(peOffset + 22);
+  const optionalHeaderOffset = peOffset + 24;
+  const optionalMagic = bytes.readUInt16LE(optionalHeaderOffset);
+  return {
     machine,
     sectionCount,
     timestamp,
     optionalMagic,
     characteristics,
-    sections,
+    sections: layout.sections,
   };
 }
 
