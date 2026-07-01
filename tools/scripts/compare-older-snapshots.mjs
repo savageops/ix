@@ -8,6 +8,7 @@ const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "older-snapshot-ladder");
 const DEFAULT_BASELINE_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare", "tmp-baselines");
 const COMPARE_SCRIPT = path.join(ROOT, "tools", "scripts", "compare-installed-speed.mjs");
+const CHILD_LATEST_PATH = path.join(REPORT_DIR, "latest-child-installed-speed.json");
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -101,8 +102,7 @@ function snapshotCandidates() {
   return candidates.slice(0, maxCandidates);
 }
 
-function readLatestInstalledSummary() {
-  const reportPath = path.join(ROOT, "tools", "reports", "manual-speed-compare", "latest-installed-speed.json");
+function readLatestInstalledSummary(reportPath) {
   const report = JSON.parse(readFileSync(reportPath, "utf8").replace(/^\uFEFF/, ""));
   const sourceReportPath = path.join(ROOT, "tools", "reports", "manual-speed-compare", `${report.runId}.json`);
   const round = report.ledgerSummary?.rounds?.[0] ?? {};
@@ -169,6 +169,7 @@ function runSnapshot(candidate, index) {
     "--identity-control-attempts", String(identityControlAttempts),
     "--min-retainable-samples", String(minRetainableSamples),
     "--installed-ix", candidate.path,
+    "--latest-path", CHILD_LATEST_PATH,
     "--quiet",
   ];
   if (!childBenchmarkLock) compareArgs.push("--no-benchmark-lock");
@@ -195,7 +196,7 @@ function runSnapshot(candidate, index) {
     ...candidate,
     runnable: true,
     elapsedMs,
-    ...readLatestInstalledSummary(),
+    ...readLatestInstalledSummary(CHILD_LATEST_PATH),
   };
 }
 

@@ -33,6 +33,8 @@ Options:
   --expression <expr>             Search expression.
   --installed-ix <path>           Native installed IX path.
   --repo-ix <path>                Repo IX binary path.
+  --latest-path <path>            Latest-report pointer path. Default:
+                                  tools/reports/manual-speed-compare/latest-installed-speed.json.
   --min-retainable-samples <n>    Minimum samples for strict evidence.
   --min-installed-improvement-pct <n>
                                   Required repo improvement over installed. Default: 0.
@@ -52,6 +54,7 @@ const corpus = argValue(args, "--corpus", DEFAULT_CORPUS);
 const expression = argValue(args, "--expression", DEFAULT_EXPR);
 const installedIx = argValue(args, "--installed-ix", DEFAULT_INSTALLED_IX);
 const repoIx = argValue(args, "--repo-ix", DEFAULT_REPO_IX);
+const latestPath = path.resolve(argValue(args, "--latest-path", path.join(REPORT_DIR, "latest-installed-speed.json")));
 const samples = Number(argValue(args, "--samples", "12"));
 const threads = Number(argValue(args, "--threads", "32"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
@@ -386,7 +389,8 @@ report.deltasPct = {
 mkdirSync(REPORT_DIR, { recursive: true });
 const outPath = path.join(REPORT_DIR, `${report.runId}.json`);
 writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-writeFileSync(path.join(REPORT_DIR, "latest-installed-speed.json"), `${JSON.stringify(report, null, 2)}\n`, "utf8");
+mkdirSync(path.dirname(latestPath), { recursive: true });
+writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 
 if (!quiet) {
   console.log(JSON.stringify({ outPath, retainableStrictEvidence: report.retainableStrictEvidence, promotionQualified: report.promotionQualified, binaries: report.binaries, medians: {
