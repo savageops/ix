@@ -9,6 +9,8 @@ const ROOT = process.cwd();
 const HISTORICAL_REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
 const LATEST_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-historical-speed.json");
 const LATEST_RETAINABLE_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-retainable-historical-speed.json");
+const INSTALLED_REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
+const LATEST_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-installed-speed.json");
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "teddy-kernel-decision");
 const DEFAULT_CURRENT_IX = path.join(ROOT, "zig-out", "bin", process.platform === "win32" ? "ix-zig.exe" : "ix-zig");
 const TEDDY_CONTRACT = path.join(ROOT, ".docs", "research", "2026-06-12-teddy-literal-alternates-contract.md");
@@ -27,10 +29,12 @@ const HISTORICAL_SPEED_SCAN_OPEN_STRICT_COMMAND =
   "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --require-strict --scan-open-timing";
 const OLDER_SNAPSHOT_PROOF_COMMAND =
   "node tools/scripts/compare-older-snapshots.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --min-retainable-samples 12 --max-snapshots 2 --target-retainable-snapshots 2 --min-engine-improvement-pct 5 --min-paired-improvement-pct 5 --require-strict --quiet";
+const INSTALLED_SPEED_STRICT_COMMAND =
+  "node tools/scripts/compare-installed-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --min-retainable-samples 12 --require-strict --require-promotion --quiet";
 const SPEED_DIAGNOSTIC_COMMAND = `${HISTORICAL_SPEED_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 const SPEED_LEAK_ATTRIBUTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 const SPEED_SCAN_OPEN_PROMOTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
-const SPEED_PROMOTION_COMMAND = `${HISTORICAL_SPEED_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
+const SPEED_PROMOTION_COMMAND = `${INSTALLED_SPEED_STRICT_COMMAND} && ${HISTORICAL_SPEED_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -160,6 +164,57 @@ function historicalPointerStatus(filePath, currentHash) {
     freshForCurrentBinary,
     retainableStrictEvidence,
     strictEvidenceFailureCount: strictEvidenceFailures.length,
+  };
+}
+
+function installedPointerStatus(filePath, currentHash) {
+  if (!existsSync(filePath)) {
+    return {
+      path: path.relative(ROOT, filePath),
+      exists: false,
+      status: "missing",
+      runId: null,
+      timestamp: null,
+      freshForCurrentBinary: false,
+      retainableStrictEvidence: false,
+      promotionQualified: false,
+      promotionFailureCount: null,
+      repoSha256: null,
+      installedPath: null,
+    };
+  }
+
+  const pointer = readJson(filePath, {});
+  const repoSha256 = pointer.binaries?.repo?.sha256 ?? null;
+  const installedPath = pointer.binaries?.installed?.path ?? null;
+  const normalizedInstalledPath = String(installedPath ?? "").replaceAll("\\", "/").toLowerCase();
+  const freshForCurrentBinary = currentHash != null && repoSha256 === currentHash;
+  const nativeInstalledBaseline =
+    normalizedInstalledPath.includes("/appdata/local/programs/iex/bin/ix.exe") &&
+    !normalizedInstalledPath.includes("/tmp-baselines/");
+  const retainableStrictEvidence = pointer.retainableStrictEvidence === true;
+  const promotionQualified = pointer.promotionQualified === true;
+  const promotionFailures = Array.isArray(pointer.promotionFailures)
+    ? pointer.promotionFailures
+    : [];
+  let status = "promotable_current";
+  if (!freshForCurrentBinary) status = "stale_current_binary";
+  else if (!nativeInstalledBaseline) status = "wrong_baseline";
+  else if (!retainableStrictEvidence) status = "strict_failed";
+  else if (!promotionQualified) status = "promotion_failed";
+
+  return {
+    path: path.relative(ROOT, filePath),
+    exists: true,
+    status,
+    runId: pointer.runId ?? null,
+    timestamp: pointer.timestamp ?? null,
+    freshForCurrentBinary,
+    retainableStrictEvidence,
+    promotionQualified,
+    promotionFailureCount: promotionFailures.length,
+    repoSha256,
+    installedPath,
   };
 }
 
@@ -532,6 +587,7 @@ const policy = preservationPolicy(summary, leakSummary, quality, engineeringMove
 const speedProofPointers = {
   latestDiagnostic: historicalPointerStatus(LATEST_HISTORICAL_PATH, currentIxSha256),
   latestRetainable: historicalPointerStatus(LATEST_RETAINABLE_HISTORICAL_PATH, currentIxSha256),
+  latestInstalled: installedPointerStatus(LATEST_INSTALLED_PATH, currentIxSha256),
 };
 const promotionAllowed =
   historical.scorecard?.netPositive === true &&
@@ -542,16 +598,20 @@ const promotionAllowed =
   summary.fullScanMatchesParity === true &&
   summary.netPositiveRounds === summary.count &&
   quality.usableForRuntimeMove === true &&
-  speedProofPointers.latestRetainable.status === "retainable_current";
+  speedProofPointers.latestRetainable.status === "retainable_current" &&
+  speedProofPointers.latestInstalled.status === "promotable_current";
 const finalizationGate = {
   speedRegressionFinalizationAllowed: promotionAllowed,
   requiredRetainablePointer: speedProofPointers.latestRetainable,
+  requiredInstalledPointer: speedProofPointers.latestInstalled,
   latestDiagnosticPointer: speedProofPointers.latestDiagnostic,
   requiredProofCommand: SPEED_PROMOTION_COMMAND,
   blocker: promotionAllowed
     ? null
     : (
-        speedProofPointers.latestRetainable.status === "retainable_current"
+        speedProofPointers.latestInstalled.status !== "promotable_current"
+          ? `no current installed-vs-repo promotion proof (${speedProofPointers.latestInstalled.status}); run the installed speed gate before finalizing code changes`
+          : speedProofPointers.latestRetainable.status === "retainable_current"
           ? "current retainable strict proof exists, but the selected report is not net-positive enough for runtime promotion"
           : `no current retainable strict speed proof (${speedProofPointers.latestRetainable.status}); run the strict speed gate before finalizing code changes`
       ),
@@ -559,6 +619,9 @@ const finalizationGate = {
 const noRuntimePromotionReason = (() => {
   if (!evidenceFresh) return "historical report candidate hash does not match the current repo binary";
   if (promotionAllowed) return null;
+  if (speedProofPointers.latestInstalled.status !== "promotable_current") {
+    return "no current installed-vs-repo promotion proof exists for the repo binary; finalization must run and pass the installed speed gate";
+  }
   if (speedProofPointers.latestRetainable.status !== "retainable_current") {
     return "no current retainable strict speed proof exists for the repo binary; finalization must run and pass the strict predecessor speed gate";
   }
@@ -585,6 +648,7 @@ const report = {
   speedProofPointers,
   finalizationGate,
   proofCommands: {
+    installedStrictSpeed: INSTALLED_SPEED_STRICT_COMMAND,
     historicalSpeed: HISTORICAL_SPEED_DIAGNOSTIC_COMMAND,
     historicalStrictSpeed: HISTORICAL_SPEED_STRICT_COMMAND,
     olderSnapshots: OLDER_SNAPSHOT_PROOF_COMMAND,

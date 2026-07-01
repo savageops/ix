@@ -75,9 +75,28 @@ function rejectedMoveIds(decision) {
 function validateTeddyDecision(decision, evidence) {
   const failures = [];
   const rejectedIds = rejectedMoveIds(decision);
+  const installedPointer = decision.speedProofPointers?.latestInstalled ?? decision.finalizationGate?.requiredInstalledPointer ?? null;
   if (evidence.exitCode !== 0) failures.push("teddy kernel decision script failed");
   if (decision.evidenceFresh !== true) failures.push("teddy kernel decision requires historical evidence for the current repo binary");
   if (decision.promotionAllowed === true) failures.push("teddy kernel decision should not promote a non-net-positive historical report");
+  if (installedPointer == null || typeof installedPointer !== "object") {
+    failures.push("teddy kernel decision requires installed-vs-repo speed proof pointer");
+  }
+  if (installedPointer?.status !== "promotable_current") {
+    if (decision.promotionAllowed === true) failures.push("teddy kernel decision allows promotion without installed-vs-repo promotion proof");
+    if (decision.finalizationGate?.speedRegressionFinalizationAllowed === true) {
+      failures.push("teddy kernel decision allows finalization without installed-vs-repo promotion proof");
+    }
+    if (!String(decision.finalizationGate?.requiredProofCommand ?? "").includes("compare-installed-speed.mjs")) {
+      failures.push("teddy kernel finalization gate requires installed speed proof command");
+    }
+    if (!String(decision.finalizationGate?.requiredProofCommand ?? "").includes("--require-promotion")) {
+      failures.push("teddy kernel finalization gate requires installed promotion flag");
+    }
+    if (!String(decision.finalizationGate?.blocker ?? "").includes("installed-vs-repo promotion proof")) {
+      failures.push("teddy kernel finalization blocker must name installed-vs-repo promotion proof");
+    }
+  }
   if (decision.summary?.matchParity !== true) failures.push("teddy kernel decision requires match parity");
   if (decision.summary?.routeParity !== true) failures.push("teddy kernel decision requires route parity");
   if (Number(decision.summary?.count ?? 0) < 1) failures.push("teddy kernel decision requires historical rounds");
