@@ -52,7 +52,6 @@ function expectedTeddyNextMove(decision) {
   }
   if (
     mixedTeddyGainNeedsLeakRepair(decision) &&
-    decision?.leakSummary?.nextRepairTarget === "scanWork" &&
     ["scan_file_residual_hotspot_attribution", "scan_open_path_pressure_attribution"].includes(expectedScanWorkRepairMove(decision))
   ) {
     return expectedScanWorkNextMove(decision);
@@ -178,8 +177,13 @@ function validateTeddyDecision(decision, evidence) {
       failures.push("teddy kernel decision must route mixed Teddy/engine evidence to the proved repair owner");
     }
     if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
-      const split = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit;
-      if (decision.nextEngineeringMove?.id !== expectedScanWorkNextMove(decision)) {
+      const expectedRuntimeMove = expectedScanWorkNextMove(decision);
+      const evidenceBlocked =
+        typeof decision.nextEngineeringMove?.status === "string" &&
+        decision.nextEngineeringMove.status.startsWith("blocked_by_") &&
+        decision.nextEvidenceMove?.id === decision.nextEngineeringMove?.id &&
+        decision.nextRuntimeMove?.id === expectedRuntimeMove;
+      if (!evidenceBlocked && decision.nextEngineeringMove?.id !== expectedRuntimeMove) {
         failures.push("teddy kernel decision must expose the proved leak owner as the next engineering move");
       }
     }

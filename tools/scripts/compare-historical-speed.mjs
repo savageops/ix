@@ -11,6 +11,7 @@ const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
 const LATEST_HISTORICAL_PATH = path.join(REPORT_DIR, "latest-historical-speed.json");
 const LATEST_RETAINABLE_HISTORICAL_PATH = path.join(REPORT_DIR, "latest-retainable-historical-speed.json");
+const LATEST_FAILED_HISTORICAL_PATH = path.join(REPORT_DIR, "latest-failed-historical-speed.json");
 const DEFAULT_CORPUS = DEFAULT_RIPGREP_LINUX_CORPUS;
 const DEFAULT_EXPR = DEFAULT_ALTERNATES_EXPRESSION;
 const DEFAULT_INSTALL_DIR = DEFAULT_NATIVE_INSTALL_DIR;
@@ -381,6 +382,8 @@ writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 writeFileSync(LATEST_HISTORICAL_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 if (report.retainableStrictEvidence && !diagnosticAttributionMode) {
   writeFileSync(LATEST_RETAINABLE_HISTORICAL_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+} else if (!diagnosticAttributionMode) {
+  writeFileSync(LATEST_FAILED_HISTORICAL_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 }
 
 if (!quiet) {

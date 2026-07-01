@@ -340,7 +340,6 @@ const expectedNextMove = evidenceBlockedByNoise
   ? "benchmark_host_noise_control"
   : (
       teddyGainNeedsLeakRepair &&
-      decision.leakSummary?.nextRepairTarget === "scanWork" &&
       ["scan_file_residual_hotspot_attribution", "scan_open_path_pressure_attribution"].includes(expectedScanWorkRepairMove(decision.leakSummary?.leakAttribution?.currentOnlyScanSplit))
         ? expectedScanWorkNextMove(decision.leakSummary?.leakAttribution?.currentOnlyScanSplit, evidenceQuality)
         : (teddyGainNeedsLeakRepair ? "whole_engine_leak_attribution" : "packed_nibble_shuffle_teddy_kernel")

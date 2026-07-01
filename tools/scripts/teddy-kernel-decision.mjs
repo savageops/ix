@@ -9,6 +9,7 @@ const ROOT = process.cwd();
 const HISTORICAL_REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
 const LATEST_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-historical-speed.json");
 const LATEST_RETAINABLE_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-retainable-historical-speed.json");
+const LATEST_FAILED_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-failed-historical-speed.json");
 const INSTALLED_REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
 const LATEST_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-installed-speed.json");
 const LATEST_RETAINABLE_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-retainable-installed-speed.json");
@@ -515,12 +516,10 @@ function candidateMoves(summary, leakSummary, quality) {
     summary.routeParity === true;
   const scanOpenDominatesLeak =
     teddyGainNeedsLeakRepair &&
-    leakSummary?.nextRepairTarget === "scanWork" &&
     leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen" &&
     leakSummary?.leakAttribution?.currentOnlyScanSplit?.regressingCandidateSubphase !== "scanFile";
   const scanFileResidualRegresses =
     teddyGainNeedsLeakRepair &&
-    leakSummary?.nextRepairTarget === "scanWork" &&
     leakSummary?.leakAttribution?.currentOnlyScanSplit?.regressingCandidateSubphase === "scanFile";
   const filesScannedParityStatus = (() => {
     const value = leakSummary?.leakAttribution?.currentOnlyScanSplit?.filesScannedParity;
@@ -550,7 +549,7 @@ function candidateMoves(summary, leakSummary, quality) {
       id: "whole_engine_leak_attribution",
       status: benchmarkNoiseBlocked
         ? "blocked_by_benchmark_noise"
-        : (scanOpenDominatesLeak ? "satisfied_by_scan_open_split" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win")),
+        : (scanOpenDominatesLeak ? "satisfied_by_scan_open_split" : (scanFileResidualRegresses ? "satisfied_by_scan_file_split" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win"))),
       owner: "tools/scripts/compare-historical-speed.mjs plus src/core/search.zig phase telemetry",
       reason: teddyGainNeedsLeakRepair
         ? `Latest historical evidence shows Teddy attribution is positive while whole-engine evidence still has a losing round; preserve the Teddy gain and isolate ${leakSummary?.nextRepairTarget ?? "discovery, scheduling, scan bookkeeping, or reporting"} overhead before changing the Teddy kernel again. Current averaged phase medians: discover=${summary.averagePairedDiscoverMedianPct}%, scan=${summary.averagePairedScanMedianPct}%, scanWork=${summary.averagePairedScanWorkMedianPct}%, teddy=${summary.averagePairedTeddyMedianPct}%. Worst round=${leakSummary?.worstRound?.baselineLabel ?? "unknown"}.`
@@ -1084,6 +1083,7 @@ const latestNativeInstalledReportPath = selectRetainableFreshNativeInstalledRepo
 const speedProofPointers = {
   latestDiagnostic: historicalPointerStatus(LATEST_HISTORICAL_PATH, currentIxSha256),
   latestRetainable: historicalPointerStatus(LATEST_RETAINABLE_HISTORICAL_PATH, currentIxSha256),
+  latestFailedStrict: historicalPointerStatus(LATEST_FAILED_HISTORICAL_PATH, currentIxSha256),
   latestInstalledDiagnostic: installedPointerStatus(latestNativeInstalledReportPath, currentIxSha256),
   latestInstalled: installedPointerStatus(LATEST_RETAINABLE_INSTALLED_PATH, currentIxSha256),
   latestOlderSnapshots: olderSnapshotPointerStatus(LATEST_OLDER_SNAPSHOT_PATH),
@@ -1138,6 +1138,7 @@ const finalizationGate = {
   latestInstalledDiagnosticPointer: speedProofPointers.latestInstalledDiagnostic,
   selectedInstalledPointer,
   latestDiagnosticPointer: speedProofPointers.latestDiagnostic,
+  latestFailedStrictPointer: speedProofPointers.latestFailedStrict,
   requiredProofCommand: SPEED_PROMOTION_COMMAND,
   blocker: promotionAllowed
     ? null
