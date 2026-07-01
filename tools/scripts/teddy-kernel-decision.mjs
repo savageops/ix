@@ -226,6 +226,15 @@ function installedPointerStatus(filePath, currentHash) {
   const promotionFailures = Array.isArray(pointer.promotionFailures)
     ? pointer.promotionFailures
     : [];
+  const installedEngineMedianMs = Number(pointer.installedRepoComparison?.installedEngineMedianMs);
+  const repoEngineMedianMs = Number(pointer.installedRepoComparison?.repoEngineMedianMs);
+  const installedEngineVsRepoEnginePct = Number(pointer.deltasPct?.installedEngineVsRepoEngine);
+  const installedRound = Array.isArray(pointer.roundLedger) ? pointer.roundLedger[0] : null;
+  const installedPairedImprovementMedianPct = Number(installedRound?.pairedCandidateImprovementMedianPct);
+  const repoPairedWinRate = Number(installedRound?.pairedCandidateWinRate);
+  const ripgrepCliMedianMs = Number(pointer.lanes?.ripgrep?.summary?.median);
+  const ripgrepNoMmapCliMedianMs = Number(pointer.lanes?.ripgrepMmapComparison?.never?.summary?.median);
+  const ripgrepFastestMmapMode = pointer.lanes?.ripgrepMmapComparison?.fastest ?? null;
   let status = "promotable_current";
   if (!freshForCurrentBinary) status = "stale_current_binary";
   else if (!canonicalThreadConfig) status = "wrong_thread_config";
@@ -243,6 +252,17 @@ function installedPointerStatus(filePath, currentHash) {
     retainableStrictEvidence,
     promotionQualified,
     promotionFailureCount: promotionFailures.length,
+    promotionFailures,
+    promotionDeficit: {
+      installedEngineMedianMs: Number.isFinite(installedEngineMedianMs) ? installedEngineMedianMs : null,
+      repoEngineMedianMs: Number.isFinite(repoEngineMedianMs) ? repoEngineMedianMs : null,
+      installedEngineVsRepoEnginePct: Number.isFinite(installedEngineVsRepoEnginePct) ? installedEngineVsRepoEnginePct : null,
+      installedPairedImprovementMedianPct: Number.isFinite(installedPairedImprovementMedianPct) ? installedPairedImprovementMedianPct : null,
+      repoPairedWinRate: Number.isFinite(repoPairedWinRate) ? repoPairedWinRate : null,
+      ripgrepCliMedianMs: Number.isFinite(ripgrepCliMedianMs) ? ripgrepCliMedianMs : null,
+      ripgrepNoMmapCliMedianMs: Number.isFinite(ripgrepNoMmapCliMedianMs) ? ripgrepNoMmapCliMedianMs : null,
+      ripgrepFastestMmapMode,
+    },
     repoSha256,
     installedPath,
     threads: Number.isFinite(threads) ? threads : null,
