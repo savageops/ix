@@ -34,6 +34,9 @@ Options:
   --baseline-ix <path>                Optional baseline IX binary path.
   --max-regression-pct <n>            Allowed candidate regression percent. Default: 0.
   --confirm-regression-samples <n>    Samples required to confirm a regression. Default: 24.
+  --installed-promotion-deficit-report <path>
+                                      Optional installed-speed or Teddy decision report that supplies
+                                      the promotion deficit the focused candidate must clear.
   --fingerprint-corpus                Rank Teddy fingerprint windows by corpus candidate counts.
   --fingerprint-max-bytes <n>         Corpus bytes to inspect for fingerprint analysis. Default: 134217728.
   --case-sensitive                    Disable default case-insensitive expressions.
@@ -46,6 +49,7 @@ Options:
 const corpus = argValue(args, "--corpus", DEFAULT_CORPUS);
 const ixBinary = argValue(args, "--ix-binary", DEFAULT_IX);
 const baselineIxBinary = argValue(args, "--baseline-ix", "");
+const installedPromotionDeficitReport = argValue(args, "--installed-promotion-deficit-report", "");
 const samples = Number(argValue(args, "--samples", "5"));
 const threads = Number(argValue(args, "--threads", "32"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
@@ -129,6 +133,71 @@ function parseIxReport(stdout) {
   const trimmed = stdout.trim();
   if (!trimmed) throw new Error("IX produced empty stdout");
   return JSON.parse(trimmed);
+}
+
+function readJsonReport(filePath) {
+  if (!filePath) return null;
+  if (!existsSync(filePath)) throw new Error(`installed promotion deficit report not found: ${filePath}`);
+  return JSON.parse(readFileSync(filePath, "utf8"));
+}
+
+function extractPromotionDeficit(report) {
+  const installedRepoComparison = report?.installedRepoComparison;
+  if (
+    installedRepoComparison &&
+    Number.isFinite(Number(installedRepoComparison.installedEngineMedianMs)) &&
+    Number.isFinite(Number(installedRepoComparison.repoEngineMedianMs))
+  ) {
+    return {
+      installedEngineMedianMs: installedRepoComparison.installedEngineMedianMs,
+      repoEngineMedianMs: installedRepoComparison.repoEngineMedianMs,
+      installedEngineVsRepoEnginePct: installedRepoComparison.installedEngineDeltaPct,
+      installedPairedImprovementMedianPct: installedRepoComparison.pairedEngine?.candidateImprovementPctSummary?.median,
+      repoPairedWinRate: installedRepoComparison.pairedEngine?.candidateWinRate,
+      ripgrepCliMedianMs: report?.lanes?.ripgrep?.summary?.median,
+      ripgrepNoMmapCliMedianMs: report?.lanes?.ripgrepMmapComparison?.never?.summary?.median,
+      ripgrepFastestMmapMode: report?.lanes?.ripgrepMmapComparison?.fastest?.mmapMode ?? report?.lanes?.ripgrepMmapComparison?.fastest ?? null,
+    };
+  }
+  const candidates = [
+    report?.promotionDeficit,
+    report?.speedProofPointers?.latestInstalledDiagnostic?.promotionDeficit,
+    report?.speedProofPointers?.selectedInstalledPointer?.promotionDeficit,
+    report?.finalizationGate?.latestInstalledDiagnosticPointer?.promotionDeficit,
+    report?.finalizationGate?.selectedInstalledPointer?.promotionDeficit,
+  ];
+  return candidates.find((candidate) =>
+    candidate &&
+    Number.isFinite(Number(candidate.installedEngineMedianMs)) &&
+    Number.isFinite(Number(candidate.repoEngineMedianMs))
+  ) ?? null;
+}
+
+function installedPromotionTargetFromReport(filePath) {
+  const report = readJsonReport(filePath);
+  if (report == null) return null;
+  const deficit = extractPromotionDeficit(report);
+  if (deficit == null) {
+    throw new Error(`installed promotion deficit report has no promotionDeficit: ${filePath}`);
+  }
+  return {
+    reportPath: filePath,
+    sourceRunId: report.runId ?? null,
+    installedEngineMedianMs: Number(deficit.installedEngineMedianMs),
+    repoEngineMedianMs: Number(deficit.repoEngineMedianMs),
+    installedEngineVsRepoEnginePct: Number.isFinite(Number(deficit.installedEngineVsRepoEnginePct))
+      ? Number(deficit.installedEngineVsRepoEnginePct)
+      : null,
+    installedPairedImprovementMedianPct: Number.isFinite(Number(deficit.installedPairedImprovementMedianPct))
+      ? Number(deficit.installedPairedImprovementMedianPct)
+      : null,
+    repoPairedWinRate: Number.isFinite(Number(deficit.repoPairedWinRate))
+      ? Number(deficit.repoPairedWinRate)
+      : null,
+    ripgrepCliMedianMs: Number.isFinite(Number(deficit.ripgrepCliMedianMs)) ? Number(deficit.ripgrepCliMedianMs) : null,
+    ripgrepNoMmapCliMedianMs: Number.isFinite(Number(deficit.ripgrepNoMmapCliMedianMs)) ? Number(deficit.ripgrepNoMmapCliMedianMs) : null,
+    ripgrepFastestMmapMode: deficit.ripgrepFastestMmapMode ?? null,
+  };
 }
 
 function fileSha256(filePath) {
@@ -609,6 +678,7 @@ function requiredDecisionFailures({
   comparisons,
   contracts,
   identityControls,
+  installedPromotionTarget,
 }) {
   const failures = [...benchmarkHostFailures(host)];
   if (!baselinePath) failures.push("missing_baseline");
@@ -657,6 +727,25 @@ function requiredDecisionFailures({
   }
   for (const contract of contracts) {
     if (contract.passed !== true) failures.push(`route_contract_failed:${contract.id}:branch_${contract.branchCount}`);
+  }
+  if (installedPromotionTarget != null) {
+    const targetMedian = Number(installedPromotionTarget.installedEngineMedianMs);
+    for (const comparison of comparisons) {
+      if (comparison.evidenceAuthority !== "candidate_vs_baseline") continue;
+      const branch = comparison.branchCount;
+      const candidateMedian = Number(comparison.candidateEngineMedianMs);
+      const pairedImprovement = Number(comparison.pairedEngine?.candidateImprovementPctSummary?.median);
+      const winRate = Number(comparison.pairedEngine?.candidateWinRate);
+      if (!Number.isFinite(candidateMedian) || candidateMedian >= targetMedian) {
+        failures.push(`installed_promotion_deficit_not_cleared:branch_${branch}:candidate_${Number.isFinite(candidateMedian) ? candidateMedian : "missing"}>=installed_${targetMedian}`);
+      }
+      if (!Number.isFinite(pairedImprovement) || pairedImprovement < 0) {
+        failures.push(`installed_promotion_paired_deficit_not_cleared:branch_${branch}:${Number.isFinite(pairedImprovement) ? pairedImprovement : "missing"}<0`);
+      }
+      if (!Number.isFinite(winRate) || winRate <= 0.5) {
+        failures.push(`installed_promotion_win_majority_missing:branch_${branch}:${Number.isFinite(winRate) ? winRate : "missing"}`);
+      }
+    }
   }
   return failures;
 }
@@ -802,6 +891,9 @@ if (benchmarkLock) acquireBenchmarkLock({ script: "alternates-decision-table.mjs
 const hostBefore = hostSnapshot();
 const ixBinarySha256 = fileSha256(ixBinary);
 const baselineIxBinarySha256 = baselineIxBinary.length > 0 ? fileSha256(baselineIxBinary) : null;
+const installedPromotionTarget = installedPromotionDeficitReport.length > 0
+  ? installedPromotionTargetFromReport(installedPromotionDeficitReport)
+  : null;
 const binaryRelation = baselineIxBinarySha256 === null
   ? "unpaired"
   : ixBinarySha256 === baselineIxBinarySha256
@@ -972,6 +1064,7 @@ const requiredFailureList = requiredDecisionFailures({
   comparisons,
   contracts,
   identityControls,
+  installedPromotionTarget,
 });
 const requiredGateFailures = requiredFailureList.length > 0
   ? [
@@ -992,6 +1085,7 @@ const report = {
   corpus,
   ixBinary,
   baselineIxBinary: baselineIxBinary.length > 0 ? baselineIxBinary : null,
+  installedPromotionTarget,
   binaryHashes: {
     candidateSha256: ixBinarySha256,
     baselineSha256: baselineIxBinarySha256,
