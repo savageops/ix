@@ -76,11 +76,15 @@ function validateTeddyDecision(decision, evidence) {
   const failures = [];
   const rejectedIds = rejectedMoveIds(decision);
   const installedPointer = decision.speedProofPointers?.latestInstalled ?? decision.finalizationGate?.requiredInstalledPointer ?? null;
+  const installedDiagnosticPointer = decision.speedProofPointers?.latestInstalledDiagnostic ?? decision.finalizationGate?.latestInstalledDiagnosticPointer ?? null;
   if (evidence.exitCode !== 0) failures.push("teddy kernel decision script failed");
   if (decision.evidenceFresh !== true) failures.push("teddy kernel decision requires historical evidence for the current repo binary");
   if (decision.promotionAllowed === true) failures.push("teddy kernel decision should not promote a non-net-positive historical report");
   if (installedPointer == null || typeof installedPointer !== "object") {
-    failures.push("teddy kernel decision requires installed-vs-repo speed proof pointer");
+    failures.push("teddy kernel decision requires retainable installed-vs-repo speed proof pointer");
+  }
+  if (installedDiagnosticPointer == null || typeof installedDiagnosticPointer !== "object") {
+    failures.push("teddy kernel decision requires diagnostic installed-vs-repo speed proof pointer");
   }
   if (installedPointer?.status !== "promotable_current") {
     if (decision.promotionAllowed === true) failures.push("teddy kernel decision allows promotion without installed-vs-repo promotion proof");

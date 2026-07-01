@@ -9,6 +9,7 @@ import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildInstalledComparisonSco
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
+const LATEST_RETAINABLE_INSTALLED_PATH = path.join(REPORT_DIR, "latest-retainable-installed-speed.json");
 const DEFAULT_CORPUS = DEFAULT_RIPGREP_LINUX_CORPUS;
 const DEFAULT_EXPR = DEFAULT_ALTERNATES_EXPRESSION;
 const DEFAULT_INSTALLED_IX = defaultInstalledIxPath();
@@ -35,6 +36,8 @@ Options:
   --repo-ix <path>                Repo IX binary path.
   --latest-path <path>            Latest-report pointer path. Default:
                                   tools/reports/manual-speed-compare/latest-installed-speed.json.
+                                  Clean strict runs also update
+                                  tools/reports/manual-speed-compare/latest-retainable-installed-speed.json.
   --min-retainable-samples <n>    Minimum samples for strict evidence.
   --min-installed-improvement-pct <n>
                                   Required repo improvement over installed. Default: 0.
@@ -80,6 +83,12 @@ const BENCH_ENV = {
 function resolveZigExe() {
   const local = path.join(os.homedir(), ".local", "zig", "zig-x86_64-windows-0.16.0", "zig.exe");
   return existsSync(local) ? local : "zig";
+}
+
+function nativeInstalledBaselinePath(filePath) {
+  const normalizedPath = String(filePath ?? "").replaceAll("\\", "/").toLowerCase();
+  return normalizedPath.includes("/appdata/local/programs/iex/bin/ix.exe") &&
+    !normalizedPath.includes("/tmp-baselines/");
 }
 
 function measurePairedIx() {
@@ -391,6 +400,9 @@ const outPath = path.join(REPORT_DIR, `${report.runId}.json`);
 writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 mkdirSync(path.dirname(latestPath), { recursive: true });
 writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+if (report.retainableStrictEvidence && !diagnosticAttributionMode && nativeInstalledBaselinePath(installedIx)) {
+  writeFileSync(LATEST_RETAINABLE_INSTALLED_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+}
 
 if (!quiet) {
   console.log(JSON.stringify({ outPath, retainableStrictEvidence: report.retainableStrictEvidence, promotionQualified: report.promotionQualified, binaries: report.binaries, medians: {

@@ -11,6 +11,7 @@ const LATEST_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-historic
 const LATEST_RETAINABLE_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-retainable-historical-speed.json");
 const INSTALLED_REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
 const LATEST_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-installed-speed.json");
+const LATEST_RETAINABLE_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-retainable-installed-speed.json");
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "teddy-kernel-decision");
 const DEFAULT_CURRENT_IX = path.join(ROOT, "zig-out", "bin", process.platform === "win32" ? "ix-zig.exe" : "ix-zig");
 const TEDDY_CONTRACT = path.join(ROOT, ".docs", "research", "2026-06-12-teddy-literal-alternates-contract.md");
@@ -595,7 +596,8 @@ const policy = preservationPolicy(summary, leakSummary, quality, engineeringMove
 const speedProofPointers = {
   latestDiagnostic: historicalPointerStatus(LATEST_HISTORICAL_PATH, currentIxSha256),
   latestRetainable: historicalPointerStatus(LATEST_RETAINABLE_HISTORICAL_PATH, currentIxSha256),
-  latestInstalled: installedPointerStatus(LATEST_INSTALLED_PATH, currentIxSha256),
+  latestInstalledDiagnostic: installedPointerStatus(LATEST_INSTALLED_PATH, currentIxSha256),
+  latestInstalled: installedPointerStatus(LATEST_RETAINABLE_INSTALLED_PATH, currentIxSha256),
 };
 const promotionAllowed =
   historical.scorecard?.netPositive === true &&
@@ -612,6 +614,7 @@ const finalizationGate = {
   speedRegressionFinalizationAllowed: promotionAllowed,
   requiredRetainablePointer: speedProofPointers.latestRetainable,
   requiredInstalledPointer: speedProofPointers.latestInstalled,
+  latestInstalledDiagnosticPointer: speedProofPointers.latestInstalledDiagnostic,
   latestDiagnosticPointer: speedProofPointers.latestDiagnostic,
   requiredProofCommand: SPEED_PROMOTION_COMMAND,
   blocker: promotionAllowed

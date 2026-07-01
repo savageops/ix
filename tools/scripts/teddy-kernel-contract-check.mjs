@@ -132,6 +132,7 @@ if (decision.promotionAllowed === true) failures.push("decision unexpectedly all
 const retainablePointer = decision.speedProofPointers?.latestRetainable ?? decision.finalizationGate?.requiredRetainablePointer ?? null;
 const diagnosticPointer = decision.speedProofPointers?.latestDiagnostic ?? decision.finalizationGate?.latestDiagnosticPointer ?? null;
 const installedPointer = decision.speedProofPointers?.latestInstalled ?? decision.finalizationGate?.requiredInstalledPointer ?? null;
+const installedDiagnosticPointer = decision.speedProofPointers?.latestInstalledDiagnostic ?? decision.finalizationGate?.latestInstalledDiagnosticPointer ?? null;
 const retainablePointerReady = retainablePointer?.status === "retainable_current";
 const installedPointerReady = installedPointer?.status === "promotable_current";
 if (diagnosticPointer == null || typeof diagnosticPointer !== "object") {
@@ -141,7 +142,10 @@ if (retainablePointer == null || typeof retainablePointer !== "object") {
   failures.push("decision lacks latest retainable speed proof pointer");
 }
 if (installedPointer == null || typeof installedPointer !== "object") {
-  failures.push("decision lacks latest installed-vs-repo speed proof pointer");
+  failures.push("decision lacks latest retainable installed-vs-repo speed proof pointer");
+}
+if (installedDiagnosticPointer == null || typeof installedDiagnosticPointer !== "object") {
+  failures.push("decision lacks latest diagnostic installed-vs-repo speed proof pointer");
 }
 if (decision.finalizationGate?.requiredProofCommand == null ||
     !normalized(String(decision.finalizationGate.requiredProofCommand)).includes("compare-installed-speed.mjs") ||
