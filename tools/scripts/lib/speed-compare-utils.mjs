@@ -42,6 +42,60 @@ export function dependencyTreeSnapshot(root = process.cwd()) {
   };
 }
 
+export function binarySnapshot(binaryPath) {
+  const resolved = path.resolve(binaryPath);
+  if (!existsSync(resolved)) {
+    return { path: resolved, exists: false, sizeBytes: null, sha256: null, pe: null };
+  }
+  const stat = statSync(resolved);
+  const bytes = readFileSync(resolved);
+  return {
+    path: resolved,
+    exists: true,
+    sizeBytes: stat.size,
+    sha256: fileHash(resolved),
+    pe: peSnapshot(bytes),
+  };
+}
+
+function peSnapshot(bytes) {
+  if (bytes.length < 0x40 || bytes[0] !== 0x4d || bytes[1] !== 0x5a) return null;
+  const peOffset = bytes.readUInt32LE(0x3c);
+  if (peOffset + 24 > bytes.length) return null;
+  if (bytes[peOffset] !== 0x50 || bytes[peOffset + 1] !== 0x45 || bytes[peOffset + 2] !== 0 || bytes[peOffset + 3] !== 0) return null;
+  const machine = bytes.readUInt16LE(peOffset + 4);
+  const sectionCount = bytes.readUInt16LE(peOffset + 6);
+  const timestamp = bytes.readUInt32LE(peOffset + 8);
+  const optionalHeaderSize = bytes.readUInt16LE(peOffset + 20);
+  const characteristics = bytes.readUInt16LE(peOffset + 22);
+  const optionalHeaderOffset = peOffset + 24;
+  if (optionalHeaderOffset + optionalHeaderSize > bytes.length) return null;
+  const optionalMagic = bytes.readUInt16LE(optionalHeaderOffset);
+  const sectionOffset = optionalHeaderOffset + optionalHeaderSize;
+  const sections = [];
+  for (let index = 0; index < sectionCount; index += 1) {
+    const offset = sectionOffset + index * 40;
+    if (offset + 40 > bytes.length) break;
+    const nul = bytes.indexOf(0, offset);
+    const nameEnd = nul >= offset && nul < offset + 8 ? nul : offset + 8;
+    sections.push({
+      name: bytes.subarray(offset, nameEnd).toString("ascii"),
+      virtualSize: bytes.readUInt32LE(offset + 8),
+      virtualAddress: bytes.readUInt32LE(offset + 12),
+      rawSize: bytes.readUInt32LE(offset + 16),
+      rawPointer: bytes.readUInt32LE(offset + 20),
+    });
+  }
+  return {
+    machine,
+    sectionCount,
+    timestamp,
+    optionalMagic,
+    characteristics,
+    sections,
+  };
+}
+
 function dependencyTreeHash(root) {
   if (!existsSync(root)) return { path: root, exists: false, fileCount: 0, sha256: null };
   const hash = createHash("sha256");
@@ -1882,10 +1936,12 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
 }
 
 export function summarizeIxRuns(binaryPath, label, runs) {
+  const binary = binarySnapshot(binaryPath);
   return {
     label,
     path: binaryPath,
-    sha256: fileHash(binaryPath),
+    sha256: binary.sha256,
+    binary,
     samples: runs,
     cliSummary: summary(runs.map((entry) => entry.cliMs)),
     engineSummary: summary(runs.map((entry) => entry.engineMs)),
