@@ -249,6 +249,14 @@ function installedPointerStatus(filePath, currentHash) {
   };
 }
 
+function selectedInstalledPointerStatus(speedProofPointers) {
+  const retainable = speedProofPointers?.latestInstalled ?? null;
+  const diagnostic = speedProofPointers?.latestInstalledDiagnostic ?? null;
+  if (retainable?.status === "promotable_current") return retainable;
+  if (diagnostic?.freshForCurrentBinary === true && diagnostic?.status !== "missing") return diagnostic;
+  return retainable ?? diagnostic ?? null;
+}
+
 function olderSnapshotPointerStatus(filePath) {
   if (!existsSync(filePath)) {
     return {
@@ -807,7 +815,7 @@ function olderSnapshotRoundEvidence(filePath) {
   };
 }
 
-function currentSpeedStatus({ summary, historical, installedStatus, historicalDiagnosticStatus, historicalRetainableStatus, olderStatus }) {
+function currentSpeedStatus({ summary, historical, installedStatus, installedEvidencePath, historicalDiagnosticStatus, historicalRetainableStatus, olderStatus }) {
   const losingRounds = Array.isArray(historical?.scorecard?.losingRounds)
     ? historical.scorecard.losingRounds
     : [];
@@ -845,7 +853,7 @@ function currentSpeedStatus({ summary, historical, installedStatus, historicalDi
       skippedSnapshots: olderStatus.skippedSnapshots,
     },
     actualSearchSpeedEvidence: {
-      installedVsCurrent: installedRoundEvidence(LATEST_RETAINABLE_INSTALLED_PATH) ?? installedRoundEvidence(LATEST_INSTALLED_PATH),
+      installedVsCurrent: installedRoundEvidence(installedEvidencePath) ?? installedRoundEvidence(LATEST_RETAINABLE_INSTALLED_PATH) ?? installedRoundEvidence(LATEST_INSTALLED_PATH),
       recentPredecessorsVsCurrent: historicalRoundEvidence(historical),
       olderSnapshotsVsCurrent: olderSnapshotRoundEvidence(LATEST_OLDER_SNAPSHOT_PATH),
     },
@@ -988,11 +996,14 @@ const speedProofPointers = {
   latestInstalled: installedPointerStatus(LATEST_RETAINABLE_INSTALLED_PATH, currentIxSha256),
   latestOlderSnapshots: olderSnapshotPointerStatus(LATEST_OLDER_SNAPSHOT_PATH),
 };
+const selectedInstalledPointer = selectedInstalledPointerStatus(speedProofPointers);
+const selectedInstalledPath = selectedInstalledPointer?.path ? path.resolve(ROOT, selectedInstalledPointer.path) : LATEST_INSTALLED_PATH;
 const evidenceMove = nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers);
 const benchmarkStatus = currentSpeedStatus({
   summary,
   historical,
-  installedStatus: speedProofPointers.latestInstalled,
+  installedStatus: selectedInstalledPointer,
+  installedEvidencePath: selectedInstalledPath,
   historicalDiagnosticStatus: speedProofPointers.latestDiagnostic,
   historicalRetainableStatus: speedProofPointers.latestRetainable,
   olderStatus: speedProofPointers.latestOlderSnapshots,
@@ -1007,20 +1018,21 @@ const promotionAllowed =
   summary.netPositiveRounds === summary.count &&
   quality.usableForRuntimeMove === true &&
   speedProofPointers.latestRetainable.status === "retainable_current" &&
-  speedProofPointers.latestInstalled.status === "promotable_current" &&
+  selectedInstalledPointer?.status === "promotable_current" &&
   speedProofPointers.latestOlderSnapshots.status === "retainable_current";
 const finalizationGate = {
   speedRegressionFinalizationAllowed: promotionAllowed,
   requiredRetainablePointer: speedProofPointers.latestRetainable,
   requiredInstalledPointer: speedProofPointers.latestInstalled,
   latestInstalledDiagnosticPointer: speedProofPointers.latestInstalledDiagnostic,
+  selectedInstalledPointer,
   latestDiagnosticPointer: speedProofPointers.latestDiagnostic,
   requiredProofCommand: SPEED_PROMOTION_COMMAND,
   blocker: promotionAllowed
     ? null
     : (
-        speedProofPointers.latestInstalled.status !== "promotable_current"
-          ? `no current installed-vs-repo promotion proof (${speedProofPointers.latestInstalled.status}); run the installed speed gate before finalizing code changes`
+        selectedInstalledPointer?.status !== "promotable_current"
+          ? `no current installed-vs-repo promotion proof (${selectedInstalledPointer?.status ?? "missing"}); run the installed speed gate before finalizing code changes`
           : speedProofPointers.latestOlderSnapshots.status !== "retainable_current"
           ? `no current older-snapshot proof (${speedProofPointers.latestOlderSnapshots.status}); run the older-snapshot speed gate before finalizing code changes`
           : speedProofPointers.latestRetainable.status === "retainable_current"
@@ -1031,7 +1043,7 @@ const finalizationGate = {
 const noRuntimePromotionReason = (() => {
   if (!evidenceFresh) return "historical report candidate hash does not match the current repo binary";
   if (promotionAllowed) return null;
-  if (speedProofPointers.latestInstalled.status !== "promotable_current") {
+  if (selectedInstalledPointer?.status !== "promotable_current") {
     return "no current installed-vs-repo promotion proof exists for the repo binary; finalization must run and pass the installed speed gate";
   }
   if (speedProofPointers.latestRetainable.status !== "retainable_current") {
