@@ -47,6 +47,11 @@ function normalized(text) {
   return text.replaceAll("\\", "/").toLowerCase();
 }
 
+function finiteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number);
+}
+
 function installedReportStatus(filePath, currentHash) {
   if (!existsSync(filePath)) return null;
   const report = readJson(filePath);
@@ -199,6 +204,33 @@ if (installedDiagnosticPointer?.freshForCurrentBinary === true) {
   if (newestInstalledDiagnostic != null &&
       installedDiagnosticPointer.runId !== newestInstalledDiagnostic.runId) {
     failures.push(`decision installed diagnostic pointer must select newest retainable fresh native report: ${newestInstalledDiagnostic.runId}`);
+  }
+  if (installedDiagnosticPointer.status === "promotion_failed") {
+    const deficit = installedDiagnosticPointer.promotionDeficit ?? null;
+    const promotionFailures = Array.isArray(installedDiagnosticPointer.promotionFailures)
+      ? installedDiagnosticPointer.promotionFailures
+      : [];
+    if (promotionFailures.length === 0) {
+      failures.push("decision installed diagnostic pointer must expose promotion failure strings");
+    }
+    if (deficit == null || typeof deficit !== "object" || Array.isArray(deficit)) {
+      failures.push("decision installed diagnostic pointer must expose promotion deficit details");
+    } else {
+      for (const field of [
+        "installedEngineMedianMs",
+        "repoEngineMedianMs",
+        "installedEngineVsRepoEnginePct",
+        "installedPairedImprovementMedianPct",
+        "repoPairedWinRate",
+      ]) {
+        if (!finiteNumber(deficit[field])) {
+          failures.push(`decision installed diagnostic promotion deficit missing numeric field: ${field}`);
+        }
+      }
+      if (!finiteNumber(deficit.ripgrepCliMedianMs) && !finiteNumber(deficit.ripgrepNoMmapCliMedianMs)) {
+        failures.push("decision installed diagnostic promotion deficit must expose a ripgrep comparator median");
+      }
+    }
   }
 }
 if (diagnosticPointer?.freshForCurrentBinary === true) {
