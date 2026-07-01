@@ -64,6 +64,9 @@ function subphaseTimingPresent(openMs, fileMs) {
   return (Number.isFinite(open) && open > 0) || (Number.isFinite(file) && file > 0);
 }
 
+const PAIRED_TIMING_BASIS = "paired_samples";
+const AGGREGATE_TIMING_BASIS = "median_of_report_medians";
+
 function optionalSummary(values) {
   const finite = finiteNumbers(values);
   return finite.length === 0 ? null : summary(finite);
@@ -375,6 +378,8 @@ export function phaseLeakSummaryFromRounds(rounds) {
         targetPhase: nextRepairTarget,
         targetPhaseMedianPct: Number.isFinite(Number(phase.pairedMedianPct)) ? Number(phase.pairedMedianPct) : null,
         targetPhaseDeltaMs: Number.isFinite(Number(phase.pairedDeltaMedianMs)) ? Number(phase.pairedDeltaMedianMs) : null,
+        targetPhaseDeltaBasis: PAIRED_TIMING_BASIS,
+        subphaseDeltaBasis: AGGREGATE_TIMING_BASIS,
         baselineScanWorkMedianMs: optionalNumber(sourceRound.baselineScanWorkMedianMs),
         baselineScanOpenMedianMs: optionalNumber(sourceRound.baselineScanOpenMedianMs),
         baselineScanFileMedianMs: optionalNumber(sourceRound.baselineScanFileMedianMs),
@@ -508,6 +513,11 @@ export function phaseLeakSummaryFromRounds(rounds) {
           predecessorSplitRoundCount: predecessorSplitRounds.length,
           predecessorSplitMissingCount: targetRounds.length - predecessorSplitRounds.length,
           predecessorComparisonLimited: predecessorSplitRounds.length < targetRounds.length,
+          timingBasis: {
+            targetPhaseDeltas: PAIRED_TIMING_BASIS,
+            candidateSubphaseMedians: AGGREGATE_TIMING_BASIS,
+            scanFileResidual: "candidate_current_only_aggregate_medians_minus_route_elapsed_medians",
+          },
           dominantCandidateSubphase,
           regressingCandidateSubphase: regressingCandidateSubphase?.name ?? null,
           regressingCandidateSubphaseMedianPct: Number.isFinite(Number(regressingCandidateSubphase?.pairedMedianPct)) ? Number(regressingCandidateSubphase.pairedMedianPct) : null,
@@ -569,6 +579,12 @@ export function phaseLeakSummaryFromRounds(rounds) {
   return {
     averages,
     deltaMsAverages,
+    timingBasis: {
+      phaseLeakAverages: PAIRED_TIMING_BASIS,
+      targetPhaseDeltas: PAIRED_TIMING_BASIS,
+      scanOpenScanFileMedians: AGGREGATE_TIMING_BASIS,
+      note: "paired sample deltas decide regressions; aggregate timing medians are diagnostic owner hints and may disagree with paired deltas under scheduler or filesystem variance",
+    },
     negativeAverages,
     repairTargets,
     leakingPhaseCounts,
