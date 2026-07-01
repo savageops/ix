@@ -226,6 +226,9 @@ function installedPointerStatus(filePath, currentHash) {
   const promotionFailures = Array.isArray(pointer.promotionFailures)
     ? pointer.promotionFailures
     : [];
+  const diagnosticAttributionMode =
+    pointer.diagnosticAttributionMode === true ||
+    promotionFailures.includes("diagnostic_attribution_run_not_promotion_evidence");
   const installedEngineMedianMs = Number(pointer.installedRepoComparison?.installedEngineMedianMs);
   const repoEngineMedianMs = Number(pointer.installedRepoComparison?.repoEngineMedianMs);
   const installedEngineVsRepoEnginePct = Number(pointer.deltasPct?.installedEngineVsRepoEngine);
@@ -239,6 +242,7 @@ function installedPointerStatus(filePath, currentHash) {
   if (!freshForCurrentBinary) status = "stale_current_binary";
   else if (!canonicalThreadConfig) status = "wrong_thread_config";
   else if (!nativeInstalledBaseline) status = "wrong_baseline";
+  else if (diagnosticAttributionMode) status = "diagnostic_only";
   else if (!retainableStrictEvidence) status = "strict_failed";
   else if (!promotionQualified) status = "promotion_failed";
 
@@ -249,6 +253,7 @@ function installedPointerStatus(filePath, currentHash) {
     runId: pointer.runId ?? null,
     timestamp: pointer.timestamp ?? null,
     freshForCurrentBinary,
+    diagnosticAttributionMode,
     retainableStrictEvidence,
     promotionQualified,
     promotionFailureCount: promotionFailures.length,
@@ -288,7 +293,8 @@ function selectRetainableFreshNativeInstalledReport(currentHash) {
       entry.status.threads === REQUIRED_INSTALLED_THREADS &&
       entry.status.retainableStrictEvidence === true &&
       entry.status.status !== "wrong_baseline" &&
-      entry.status.status !== "wrong_thread_config")
+      entry.status.status !== "wrong_thread_config" &&
+      entry.status.status !== "diagnostic_only")
     .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
   return candidates[0]?.path ?? null;
 }
@@ -297,7 +303,7 @@ function selectedInstalledPointerStatus(speedProofPointers) {
   const retainable = speedProofPointers?.latestInstalled ?? null;
   const diagnostic = speedProofPointers?.latestInstalledDiagnostic ?? null;
   if (retainable?.status === "promotable_current") return retainable;
-  if (diagnostic?.freshForCurrentBinary === true && diagnostic?.status !== "missing") return diagnostic;
+  if (diagnostic?.freshForCurrentBinary === true && !["missing", "diagnostic_only"].includes(diagnostic?.status)) return diagnostic;
   return retainable ?? diagnostic ?? null;
 }
 

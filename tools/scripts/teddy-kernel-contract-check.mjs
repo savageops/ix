@@ -58,6 +58,10 @@ function installedReportStatus(filePath, currentHash) {
   const repoSha256 = report.binaries?.repo?.sha256 ?? null;
   const installedPath = report.binaries?.installed?.path ?? null;
   const threads = Number(report.threads);
+  const promotionFailures = Array.isArray(report.promotionFailures) ? report.promotionFailures : [];
+  const diagnosticAttributionMode =
+    report.diagnosticAttributionMode === true ||
+    promotionFailures.includes("diagnostic_attribution_run_not_promotion_evidence");
   const normalizedInstalledPath = normalized(String(installedPath ?? ""));
   const nativeInstalledBaseline =
     normalizedInstalledPath.includes("/appdata/local/programs/iex/bin/ix.exe") &&
@@ -68,6 +72,7 @@ function installedReportStatus(filePath, currentHash) {
     timestamp: report.timestamp ?? null,
     freshForCurrentBinary: currentHash != null && repoSha256 === currentHash,
     retainableStrictEvidence: report.retainableStrictEvidence === true,
+    diagnosticAttributionMode,
     nativeInstalledBaseline,
     canonicalThreadConfig: threads === REQUIRED_INSTALLED_THREADS,
     installedPath,
@@ -84,6 +89,7 @@ function newestRetainableFreshNativeInstalledReport(currentHash) {
     .filter((status) =>
       status?.freshForCurrentBinary === true &&
       status.retainableStrictEvidence === true &&
+      status.diagnosticAttributionMode !== true &&
       status.nativeInstalledBaseline === true &&
       status.canonicalThreadConfig === true)
     .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
