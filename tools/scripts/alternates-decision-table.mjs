@@ -640,6 +640,103 @@ function preservationTargets(comparisons) {
     );
 }
 
+function signOf(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number === 0) return 0;
+  return number > 0 ? 1 : -1;
+}
+
+function reportComparableToCurrent(report) {
+  return (
+    report?.binaryHashes?.candidateSha256 === ixBinarySha256 &&
+    report?.binaryHashes?.baselineSha256 === baselineIxBinarySha256 &&
+    report?.samples === samples &&
+    report?.identityControlSamples === (identityControlEnabled ? identityControlSamples : 0) &&
+    report?.identityControlAttempts === (identityControlEnabled ? identityControlAttempts : 0) &&
+    report?.teddyFingerprintOffsetEnv === teddyFingerprintOffsetEnv &&
+    report?.teddyRangeFingerprintOffsetEnv === teddyRangeFingerprintOffsetEnv &&
+    JSON.stringify(report?.branchCounts) === JSON.stringify(branchCounts)
+  );
+}
+
+function loadComparableReports(limit = 6) {
+  if (!existsSync(REPORT_DIR)) return [];
+  return readdirSync(REPORT_DIR)
+    .filter((name) => /^alternates-decision-.*\.json$/.test(name))
+    .map((name) => {
+      const filePath = path.join(REPORT_DIR, name);
+      return { name, filePath, mtimeMs: statSync(filePath).mtimeMs };
+    })
+    .sort((left, right) => right.mtimeMs - left.mtimeMs)
+    .map((entry) => {
+      try {
+        return { ...entry, report: readJsonReport(entry.filePath) };
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry) => entry?.report && reportComparableToCurrent(entry.report))
+    .slice(0, limit);
+}
+
+function repeatStability(comparisons) {
+  const priorReports = loadComparableReports();
+  const priorRows = priorReports.flatMap((entry) =>
+    (entry.report.comparisons ?? []).map((comparison) => ({
+      runId: entry.report.runId ?? entry.name,
+      timestamp: entry.report.timestamp ?? null,
+      branchCount: comparison.branchCount,
+      candidateEngineImprovementPct: comparison.score?.candidateEngineImprovementPct ?? null,
+      pairedCandidateImprovementMedianPct: comparison.score?.pairedCandidateImprovementMedianPct ?? null,
+      pairedCandidateWinRate: comparison.score?.pairedCandidateWinRate ?? null,
+      pairedCandidateTeddyRangeImprovementMedianPct: comparison.score?.pairedCandidateTeddyRangeImprovementMedianPct ?? null,
+      netPositive: comparison.score?.netPositive === true,
+      teddyRouteNetPositive: comparison.score?.teddyRouteNetPositive === true,
+    }))
+  );
+  const branches = comparisons.map((comparison) => {
+    const current = {
+      branchCount: comparison.branchCount,
+      candidateEngineImprovementPct: comparison.score?.candidateEngineImprovementPct ?? null,
+      pairedCandidateImprovementMedianPct: comparison.score?.pairedCandidateImprovementMedianPct ?? null,
+      pairedCandidateWinRate: comparison.score?.pairedCandidateWinRate ?? null,
+      pairedCandidateTeddyRangeImprovementMedianPct: comparison.score?.pairedCandidateTeddyRangeImprovementMedianPct ?? null,
+      netPositive: comparison.score?.netPositive === true,
+      teddyRouteNetPositive: comparison.score?.teddyRouteNetPositive === true,
+    };
+    const prior = priorRows.filter((row) => Number(row.branchCount) === Number(comparison.branchCount));
+    const engineSign = signOf(current.candidateEngineImprovementPct);
+    const pairedSign = signOf(current.pairedCandidateImprovementMedianPct);
+    const teddySign = signOf(current.pairedCandidateTeddyRangeImprovementMedianPct);
+    const issues = [];
+    if (prior.some((row) => signOf(row.candidateEngineImprovementPct) !== 0 && signOf(row.candidateEngineImprovementPct) !== engineSign)) {
+      issues.push("engine_improvement_sign_changed");
+    }
+    if (prior.some((row) => signOf(row.pairedCandidateImprovementMedianPct) !== 0 && signOf(row.pairedCandidateImprovementMedianPct) !== pairedSign)) {
+      issues.push("paired_improvement_sign_changed");
+    }
+    if (prior.some((row) => signOf(row.pairedCandidateTeddyRangeImprovementMedianPct) !== 0 && signOf(row.pairedCandidateTeddyRangeImprovementMedianPct) !== teddySign)) {
+      issues.push("teddy_route_improvement_sign_changed");
+    }
+    if (prior.some((row) => row.netPositive !== current.netPositive)) {
+      issues.push("net_positive_classification_changed");
+    }
+    return {
+      branchCount: comparison.branchCount,
+      stable: issues.length === 0,
+      issues,
+      current,
+      prior,
+    };
+  });
+  return {
+    comparableReportCount: priorReports.length,
+    comparableRunIds: priorReports.map((entry) => entry.report.runId ?? entry.name),
+    stable: branches.every((entry) => entry.stable),
+    branches,
+  };
+}
+
 function nextMovesForTargets(targets) {
   return targets.map((target) => {
     const route = target.candidateRoute;
@@ -1098,6 +1195,7 @@ const roundLedger = buildAlternatesRoundLedger(comparisons);
 const contracts = routeContracts(comparisons);
 const targets = optimizationTargets(comparisons);
 const preserveTargets = preservationTargets(comparisons);
+const repeatedEvidence = repeatStability(comparisons);
 const nextMoves = nextMovesForTargets(targets);
 const requiredFailureList = requiredDecisionFailures({
   host: { before: hostBefore, after: hostAfter },
@@ -1156,6 +1254,7 @@ const report = {
   teddyRangeFingerprintOffsetEnv,
   optimizationTargets: targets,
   preservationTargets: preserveTargets,
+  repeatedEvidence,
   nextMoves,
 };
 
@@ -1178,6 +1277,7 @@ if (!quiet) {
       routeElapsedAuthority: target.candidateRouteElapsedAuthority,
     })),
     preservationTargets: preserveTargets,
+    repeatedEvidence,
     routeContracts: contracts,
     requiredGateFailures,
     fingerprintAnalyses,
