@@ -475,9 +475,15 @@ function candidateMoves(summary, leakSummary, quality) {
     {
       id: "packed_nibble_shuffle_teddy_kernel",
       status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (teddyGainNeedsLeakRepair ? "allowed_after_whole_engine_leak_attribution" : "allowed_next"),
-      owner: "src/core/search.zig::nextTeddyLiteralAlternatesCandidate or a narrow src/core/simd.zig helper",
-      reason: `${teddyReason} Current Teddy path still compares each branch vector independently; research and contract require a packed SIMD/Shufti-style candidate extractor.`,
+      owner: "src/core/literal_alternates.zig::nextTeddyCandidate with an optional narrow src/core/simd.zig primitive",
+      reason: `${teddyReason} Current Teddy path still compares each branch vector independently; research and contract require a packed SIMD/Shufti-style candidate extractor. Do not repeat prior rejected shapes: range-level C FFI packed helper, inline Zig VPSHUFB nibble tables, or branch-count unrolling without reducing confirmation/line-loop work.`,
       expectedGainScore: teddyGainNeedsLeakRepair ? 1 : 2.5 + negativePressure,
+      blockedImplementationShapes: [
+        "range_level_c_ffi_packed_teddy_helper",
+        "inline_zig_vpshufb_nibble_tables",
+        "branch4_unrolled_equality_kernel",
+        "branch_mask_candidate_verification",
+      ],
       proofCommand: SPEED_PROMOTION_COMMAND,
     },
     {
@@ -559,6 +565,22 @@ function candidateMoves(summary, leakSummary, quality) {
       reason: "Special-casing branch_count == 4 by unrolling the existing equality-vector branch loop preserved correctness and ReleaseFast build, but failed installed-vs-repo promotion: repo median 591.4168 ms was slower than installed 586.3894 ms, paired median was -0.0240%, and win rate stayed 0.5. The retained path must remove candidate or confirmation work, not only unroll the current comparisons.",
       expectedGainScore: 0,
       proofCommand: "installed-speed-2026-07-01T02-39-20-182Z.json",
+    },
+    {
+      id: "range_level_c_ffi_packed_teddy_helper",
+      status: "rejected",
+      owner: "src/core/literal_alternates.zig::countLogicalLinesRange and C SIMD helper boundary",
+      reason: "The packed Teddy contract records the range-level C FFI helper as rejected: crossing the Zig/C boundary at range granularity did not clear the older-build proof gate. A retainable packed kernel must either be a lower-overhead primitive or reduce surrounding line-loop/confirmation work enough to pay for the SIMD extractor.",
+      expectedGainScore: 0,
+      proofCommand: ".docs/research/2026-06-13-packed-teddy-kernel-proof-contract.md",
+    },
+    {
+      id: "inline_zig_vpshufb_nibble_tables",
+      status: "rejected",
+      owner: "src/core/literal_alternates.zig::nextTeddyCandidate",
+      reason: "The packed Teddy contract records inline Zig VPSHUFB nibble tables as rejected: direct shuffle-table substitution was too instruction-heavy for the current 2-8 branch envelope. The next candidate must reduce adjacent loads, confirmation, or range work instead of replaying the same shuffle shape.",
+      expectedGainScore: 0,
+      proofCommand: ".docs/research/2026-06-13-packed-teddy-kernel-proof-contract.md",
     },
   ];
   return moves.sort((left, right) => Number(right.expectedGainScore) - Number(left.expectedGainScore));
