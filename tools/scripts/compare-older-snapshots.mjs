@@ -44,6 +44,7 @@ Options:
   --dry-run                       Print selected snapshots and write no benchmark report.
   --no-child-benchmark-lock       Forward --no-benchmark-lock to child comparators.
                                   Use only from an outer benchmark gate.
+  --child-timeout-ms <n>          Per-snapshot comparator timeout. Default: 180000.
   --quiet                         Suppress per-snapshot console summary.
   --help, -h                      Print this help.
 `);
@@ -68,6 +69,7 @@ const newestFirst = args.includes("--newest-first");
 const requireStrict = args.includes("--require-strict");
 const dryRun = args.includes("--dry-run");
 const childBenchmarkLock = !args.includes("--no-child-benchmark-lock");
+const childTimeoutMs = Number(argValue(args, "--child-timeout-ms", process.env.IX_OLDER_SNAPSHOT_CHILD_TIMEOUT_MS ?? "180000"));
 const quiet = args.includes("--quiet");
 
 if (!existsSync(COMPARE_SCRIPT)) throw new Error(`compare script not found: ${COMPARE_SCRIPT}`);
@@ -83,6 +85,7 @@ if (targetRetainableSnapshots !== Infinity && (!Number.isFinite(targetRetainable
 if (maxCandidates !== Infinity && (!Number.isFinite(maxCandidates) || maxCandidates < 1)) throw new Error("--max-candidates must be a positive number");
 if (!Number.isFinite(minEngineImprovementPct)) throw new Error("--min-engine-improvement-pct must be a finite number");
 if (!Number.isFinite(minPairedImprovementPct)) throw new Error("--min-paired-improvement-pct must be a finite number");
+if (!Number.isFinite(childTimeoutMs) || childTimeoutMs < 1000) throw new Error("--child-timeout-ms must be at least 1000");
 
 function snapshotCandidates() {
   const candidates = readdirSync(baselineDir)
@@ -177,10 +180,13 @@ function runSnapshot(candidate, index) {
   const child = spawnSync(process.execPath, compareArgs, {
     cwd: ROOT,
     encoding: "utf8",
+    timeout: childTimeoutMs,
+    killSignal: "SIGKILL",
     windowsHide: true,
   });
   const elapsedMs = Date.now() - started;
   if (child.status !== 0) {
+    const timedOut = child.error?.code === "ETIMEDOUT";
     return {
       index,
       ...candidate,
@@ -188,7 +194,8 @@ function runSnapshot(candidate, index) {
       strict: false,
       status: "skipped",
       elapsedMs,
-      error: child.stderr?.trim() || child.stdout?.trim() || `compare exited ${child.status}`,
+      timedOut,
+      error: child.stderr?.trim() || child.stdout?.trim() || (timedOut ? `child comparator timed out after ${childTimeoutMs} ms` : `compare exited ${child.status}`),
     };
   }
   return {
@@ -340,6 +347,7 @@ const report = {
   identityControlSamples,
   identityControlAttempts,
   minRetainableSamples,
+  childTimeoutMs,
   maxSnapshots: maxSnapshots === Infinity ? null : maxSnapshots,
   targetRetainableSnapshots: targetRetainableSnapshots === Infinity ? null : targetRetainableSnapshots,
   maxCandidates: maxCandidates === Infinity ? null : maxCandidates,
