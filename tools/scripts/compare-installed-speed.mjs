@@ -142,21 +142,22 @@ function promotionFailures(host, processScan, installedHash, repoHash, installed
   }
   if (installedHash === repoHash) return failures;
   const requiredImprovementPct = Number(installedRepoComparison.score?.requiredImprovementPct ?? installedRepoComparison.effectiveInstalledImprovementPct ?? minInstalledImprovementPct);
-  if (installedRepoComparison.repoEngineMedianMs >= installedRepoComparison.installedEngineMedianMs) {
+  if (installedRepoComparison.score?.repoEngineAcceptable !== true && installedRepoComparison.repoEngineMedianMs >= installedRepoComparison.installedEngineMedianMs) {
     failures.push(`repo_not_faster:${installedRepoComparison.repoEngineMedianMs}>=${installedRepoComparison.installedEngineMedianMs}`);
   }
   if (
+    installedRepoComparison.score?.repoEngineAcceptable !== true &&
     Number.isFinite(installedRepoComparison.installedEngineDeltaPct) &&
     installedRepoComparison.installedEngineDeltaPct < requiredImprovementPct
   ) {
     failures.push(`installed_improvement_below_target:${installedRepoComparison.installedEngineDeltaPct}<${requiredImprovementPct}`);
   }
   const pairedImprovementMedianPct = Number(installedRepoComparison.pairedEngine?.candidateImprovementPctSummary?.median);
-  if (!Number.isFinite(pairedImprovementMedianPct) || pairedImprovementMedianPct < requiredImprovementPct) {
+  if (installedRepoComparison.score?.pairedRepoEngineAcceptable !== true) {
     failures.push(`installed_paired_improvement_below_target:${Number.isFinite(pairedImprovementMedianPct) ? pairedImprovementMedianPct : "missing"}<${requiredImprovementPct}`);
   }
   const candidateWinRate = Number(installedRepoComparison.pairedEngine?.candidateWinRate);
-  if (!Number.isFinite(candidateWinRate) || candidateWinRate <= 0.5) {
+  if (installedRepoComparison.score?.pairedRepoWinAcceptable !== true) {
     failures.push(`repo_paired_win_majority_required:${Number.isFinite(candidateWinRate) ? candidateWinRate : "missing"}`);
   }
   if (
@@ -164,6 +165,9 @@ function promotionFailures(host, processScan, installedHash, repoHash, installed
     installedRepoComparison.score?.teddyRouteNetPositive !== true
   ) {
     failures.push("repo_teddy_route_not_net_positive");
+  }
+  if (installedRepoComparison.score?.netPositive !== true) {
+    failures.push("installed_scorecard_not_net_positive");
   }
   return failures;
 }

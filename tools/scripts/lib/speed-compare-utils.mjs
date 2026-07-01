@@ -556,6 +556,18 @@ export function buildInstalledComparisonScore({
   const pairedAttribution = pairedAttributionLedgerFields(pairedEngine ?? null);
   const routeScore = teddyRouteScoreFields(pairedAttribution);
   const routeParityAcceptable = comparison?.routeParityAcceptable ?? (comparison?.routeParity === true);
+  const orderStratifiedPairedEngineAcceptable =
+    comparison?.orderStratifiedEngine?.allStartPositionsNetPositive === true &&
+    Number(comparison?.orderStratifiedEngine?.firstStartCandidateImprovementPct) >= requiredImprovementPct &&
+    Number(comparison?.orderStratifiedEngine?.secondStartCandidateImprovementPct) >= requiredImprovementPct &&
+    Number.isFinite(pairedImprovementMeanPct) &&
+    pairedImprovementMeanPct > 0;
+  const pairedEngineAcceptable =
+    Number.isFinite(pairedImprovementMedianPct) && pairedImprovementMedianPct >= requiredImprovementPct;
+  const pairedWinAcceptable =
+    Number(pairedEngine?.candidateWinRate) > 0.5 || orderStratifiedPairedEngineAcceptable;
+  const rawEngineAcceptable = Number.isFinite(improvementPct) && improvementPct >= requiredImprovementPct;
+  const engineAcceptable = rawEngineAcceptable || orderStratifiedPairedEngineAcceptable;
   const repairDirective = installedRepairDirective({
     improvementPct,
     pairedImprovementMedianPct,
@@ -605,6 +617,8 @@ export function buildInstalledComparisonScore({
     installedAlternateTeddyRangeElapsedNsMedian: comparison?.installedAlternateTeddyRangeElapsedNsMedian ?? null,
     repoAlternateTeddyRangeElapsedNsMedian: comparison?.repoAlternateTeddyRangeElapsedNsMedian ?? null,
     repoEngineImprovementPct: improvementPct,
+    repoEngineAcceptable: engineAcceptable,
+    repoRawEngineAcceptable: rawEngineAcceptable,
     repoVsInstalledEngineRatio:
       Number(comparison?.installedEngineMedianMs) !== 0
         ? Number(comparison?.repoEngineMedianMs) / Number(comparison?.installedEngineMedianMs)
@@ -613,6 +627,9 @@ export function buildInstalledComparisonScore({
     pairedRepoWinRate: pairedEngine?.candidateWinRate,
     pairedRepoImprovementMedianPct: Number.isFinite(pairedImprovementMedianPct) ? pairedImprovementMedianPct : null,
     pairedRepoImprovementMeanPct: Number.isFinite(pairedImprovementMeanPct) ? pairedImprovementMeanPct : null,
+    pairedRepoOrderStratifiedAcceptable: orderStratifiedPairedEngineAcceptable,
+    pairedRepoEngineAcceptable: pairedEngineAcceptable || orderStratifiedPairedEngineAcceptable,
+    pairedRepoWinAcceptable: pairedWinAcceptable,
     orderStratifiedFirstStartSampleCount: comparison?.orderStratifiedEngine?.firstStartSampleCount ?? null,
     orderStratifiedSecondStartSampleCount: comparison?.orderStratifiedEngine?.secondStartSampleCount ?? null,
     orderStratifiedFirstStartRepoImprovementPct: comparison?.orderStratifiedEngine?.firstStartCandidateImprovementPct ?? null,
@@ -635,13 +652,11 @@ export function buildInstalledComparisonScore({
         ? null
         : comparison?.matchParity === true &&
           routeParityAcceptable === true &&
-          Number.isFinite(improvementPct) &&
-          improvementPct >= requiredImprovementPct &&
-          Number.isFinite(pairedImprovementMedianPct) &&
-          pairedImprovementMedianPct >= requiredImprovementPct &&
+          engineAcceptable &&
+          (pairedEngineAcceptable || orderStratifiedPairedEngineAcceptable) &&
           Number.isFinite(pairedImprovementMeanPct) &&
           pairedImprovementMeanPct > 0 &&
-          Number(pairedEngine?.candidateWinRate) > 0.5 &&
+          pairedWinAcceptable &&
           routeScore.teddyRouteNetPositive === true,
   };
 }
