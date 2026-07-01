@@ -543,7 +543,9 @@ function candidateMoves(summary, leakSummary, quality) {
         ? benchmarkNoiseControlReason(quality)
         : "Latest historical evidence has no host, identity-control, process, or sample-size noise blocker.",
       expectedGainScore: benchmarkNoiseBlocked ? 10 + benchmarkNoiseFailures(quality).length : 0,
-      proofCommand: SPEED_DIAGNOSTIC_COMMAND,
+      proofCommand: teddyGainNeedsLeakRepair && leakSummary?.nextRepairTarget === "scanWork"
+        ? SPEED_LEAK_ATTRIBUTION_COMMAND
+        : SPEED_DIAGNOSTIC_COMMAND,
     },
     {
       id: "whole_engine_leak_attribution",
