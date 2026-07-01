@@ -102,9 +102,10 @@ function selectFreshHistoricalReport(currentHash) {
         timestamp: report.timestamp ?? null,
         runId: report.runId ?? name.replace(/\.json$/, ""),
         fresh: reportMatchesCurrentBinary(report, currentHash),
+        diagnostic: report.diagnosticAttributionMode === true,
       };
     })
-    .filter((entry) => entry.fresh)
+    .filter((entry) => entry.fresh && !entry.diagnostic)
     .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
   return candidates[0]?.path ?? null;
 }
@@ -121,6 +122,7 @@ function latestHistoricalReports(limit = 8) {
         runId: report.runId ?? name.replace(/\.json$/, ""),
         timestamp: report.timestamp ?? null,
         scorecard: report.scorecard ?? null,
+        diagnosticAttributionMode: report.diagnosticAttributionMode === true,
         roundCount: Array.isArray(report.roundLedger) ? report.roundLedger.length : 0,
         candidateHashes: historicalComparisonHashes(report),
         freshForCurrentBinary: reportMatchesCurrentBinary(report, currentIxSha256),
