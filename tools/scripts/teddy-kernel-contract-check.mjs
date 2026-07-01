@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
 
@@ -6,6 +6,8 @@ const ROOT = process.cwd();
 const DEFAULT_CONTRACT = path.join(ROOT, ".docs", "research", "2026-06-13-packed-teddy-kernel-proof-contract.md");
 const DEFAULT_DECISION = path.join(ROOT, "tools", "reports", "teddy-kernel-decision", "latest-teddy-kernel-decision.json");
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "teddy-kernel-contract");
+const INSTALLED_REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
+const REQUIRED_INSTALLED_THREADS = 32;
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -43,6 +45,42 @@ function includesAll(haystack, needles) {
 
 function normalized(text) {
   return text.replaceAll("\\", "/").toLowerCase();
+}
+
+function installedReportStatus(filePath, currentHash) {
+  if (!existsSync(filePath)) return null;
+  const report = readJson(filePath);
+  const repoSha256 = report.binaries?.repo?.sha256 ?? null;
+  const installedPath = report.binaries?.installed?.path ?? null;
+  const threads = Number(report.threads);
+  const normalizedInstalledPath = normalized(String(installedPath ?? ""));
+  const nativeInstalledBaseline =
+    normalizedInstalledPath.includes("/appdata/local/programs/iex/bin/ix.exe") &&
+    !normalizedInstalledPath.includes("/tmp-baselines/");
+  return {
+    path: path.relative(ROOT, filePath),
+    runId: report.runId ?? path.basename(filePath, ".json"),
+    timestamp: report.timestamp ?? null,
+    freshForCurrentBinary: currentHash != null && repoSha256 === currentHash,
+    nativeInstalledBaseline,
+    canonicalThreadConfig: threads === REQUIRED_INSTALLED_THREADS,
+    installedPath,
+    repoSha256,
+    threads: Number.isFinite(threads) ? threads : null,
+  };
+}
+
+function newestFreshNativeInstalledReport(currentHash) {
+  if (!existsSync(INSTALLED_REPORT_DIR) || currentHash == null) return null;
+  const candidates = readdirSync(INSTALLED_REPORT_DIR)
+    .filter((name) => /^installed-speed-.*\.json$/.test(name))
+    .map((name) => installedReportStatus(path.join(INSTALLED_REPORT_DIR, name), currentHash))
+    .filter((status) =>
+      status?.freshForCurrentBinary === true &&
+      status.nativeInstalledBaseline === true &&
+      status.canonicalThreadConfig === true)
+    .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
+  return candidates[0] ?? null;
 }
 
 const failures = [];
@@ -154,6 +192,11 @@ if (installedDiagnosticPointer?.freshForCurrentBinary === true) {
   }
   if (installedDiagnosticPath.includes("/tmp-baselines/")) {
     failures.push("decision installed diagnostic pointer must not use tmp-baselines");
+  }
+  const newestInstalledDiagnostic = newestFreshNativeInstalledReport(decision.currentIxSha256 ?? null);
+  if (newestInstalledDiagnostic != null &&
+      installedDiagnosticPointer.runId !== newestInstalledDiagnostic.runId) {
+    failures.push(`decision installed diagnostic pointer must select newest fresh native report: ${newestInstalledDiagnostic.runId}`);
   }
 }
 if (diagnosticPointer?.freshForCurrentBinary === true) {
