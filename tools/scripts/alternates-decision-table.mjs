@@ -599,6 +599,47 @@ function optimizationTargets(comparisons) {
     );
 }
 
+function preservationTargets(comparisons) {
+  return comparisons
+    .filter((comparison) =>
+      comparison.evidenceAuthority === "candidate_vs_baseline" &&
+      comparison.matchParity === true &&
+      comparison.score?.candidateEngineImprovementPct > 0 &&
+      comparison.score?.pairedCandidateImprovementMedianPct > 0 &&
+      comparison.score?.pairedCandidateWinRate > 0.5 &&
+      comparison.score?.teddyRouteObserved === true &&
+      comparison.score?.teddyRouteNetPositive !== true
+    )
+    .map((comparison) => ({
+      branchCount: comparison.branchCount,
+      expression: comparison.expression,
+      status: "preserve_engine_gain_repair_route_deficit",
+      preservedGain: {
+        candidateEngineMedianMs: comparison.candidateEngineMedianMs,
+        baselineEngineMedianMs: comparison.baselineEngineMedianMs,
+        candidateEngineImprovementPct: comparison.score.candidateEngineImprovementPct,
+        pairedCandidateImprovementMedianPct: comparison.score.pairedCandidateImprovementMedianPct,
+        pairedCandidateWinRate: comparison.score.pairedCandidateWinRate,
+      },
+      routeDeficit: {
+        route: "teddy",
+        pairedCandidateTeddyRangeImprovementMedianPct: comparison.score.pairedCandidateTeddyRangeImprovementMedianPct,
+        pairedCandidateTeddyRangeDeltaMedianMs: comparison.score.pairedCandidateTeddyRangeDeltaMedianMs,
+        pairedCandidateTeddyRangeWinRate: comparison.score.pairedCandidateTeddyRangeWinRate,
+        candidateTeddyElapsedMedianMs: comparison.candidateTeddyElapsedMedianMs,
+        baselineTeddyElapsedMedianMs: comparison.baselineTeddyElapsedMedianMs,
+      },
+      mechanism: "preserve the selector or scheduling condition that wins whole-engine time, then reduce Teddy-route work before promotion",
+      proofCommand: focusedProofCommand(comparison.branchCount),
+      researchBasis: TEDDY_REFERENCE_BASIS,
+      selectorFeatures: comparison.selectorFeatures,
+    }))
+    .sort((left, right) =>
+      (right.preservedGain.pairedCandidateImprovementMedianPct - left.preservedGain.pairedCandidateImprovementMedianPct) ||
+      (right.preservedGain.candidateEngineImprovementPct - left.preservedGain.candidateEngineImprovementPct)
+    );
+}
+
 function nextMovesForTargets(targets) {
   return targets.map((target) => {
     const route = target.candidateRoute;
@@ -1056,6 +1097,7 @@ const scorecard = buildAlternatesScorecard(comparisons);
 const roundLedger = buildAlternatesRoundLedger(comparisons);
 const contracts = routeContracts(comparisons);
 const targets = optimizationTargets(comparisons);
+const preserveTargets = preservationTargets(comparisons);
 const nextMoves = nextMovesForTargets(targets);
 const requiredFailureList = requiredDecisionFailures({
   host: { before: hostBefore, after: hostAfter },
@@ -1113,6 +1155,7 @@ const report = {
   teddyFingerprintOffsetEnv,
   teddyRangeFingerprintOffsetEnv,
   optimizationTargets: targets,
+  preservationTargets: preserveTargets,
   nextMoves,
 };
 
@@ -1134,6 +1177,7 @@ if (!quiet) {
       routeSharePct: target.candidateRouteEngineSharePct,
       routeElapsedAuthority: target.candidateRouteElapsedAuthority,
     })),
+    preservationTargets: preserveTargets,
     routeContracts: contracts,
     requiredGateFailures,
     fingerprintAnalyses,

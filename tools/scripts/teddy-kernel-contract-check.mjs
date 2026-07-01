@@ -278,11 +278,20 @@ if (decision.finalizationGate?.speedRegressionFinalizationAllowed !== decision.p
 if (!installedPointerReady) {
   if (decision.promotionAllowed === true) failures.push("decision allows promotion without current installed-vs-repo promotion proof");
   if (decision.finalizationGate?.speedRegressionFinalizationAllowed === true) failures.push("decision allows finalization without current installed-vs-repo promotion proof");
-  if (!String(decision.finalizationGate?.blocker ?? "").includes("no current installed-vs-repo promotion proof")) {
-    failures.push("decision finalization gate must name missing/stale installed-vs-repo promotion proof as blocker");
+  const blocker = String(decision.finalizationGate?.blocker ?? "");
+  const noRuntimeReason = String(decision.noRuntimePromotionReason ?? "");
+  const installedProofStateNamed =
+    blocker.includes("no current installed-vs-repo promotion proof") ||
+    blocker.includes("installed-vs-repo promotion proof is stale") ||
+    blocker.includes("current installed-vs-repo promotion proof exists and failed");
+  const installedReasonStateNamed =
+    noRuntimeReason.includes("no current installed-vs-repo promotion proof") ||
+    noRuntimeReason.includes("current installed-vs-repo promotion proof exists and failed");
+  if (!installedProofStateNamed) {
+    failures.push("decision finalization gate must name missing/stale/failed installed-vs-repo promotion proof as blocker");
   }
-  if (!String(decision.noRuntimePromotionReason ?? "").includes("no current installed-vs-repo promotion proof")) {
-    failures.push("decision no-runtime reason must name missing installed-vs-repo promotion proof");
+  if (!installedReasonStateNamed) {
+    failures.push("decision no-runtime reason must name missing or failed installed-vs-repo promotion proof");
   }
 }
 if (!retainablePointerReady) {
