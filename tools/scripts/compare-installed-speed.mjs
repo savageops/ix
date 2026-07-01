@@ -15,6 +15,7 @@ const DEFAULT_EXPR = DEFAULT_ALTERNATES_EXPRESSION;
 const DEFAULT_INSTALLED_IX = defaultInstalledIxPath();
 const DEFAULT_REPO_IX = defaultRepoIxPath(ROOT);
 const BASE_BENCH_ENV = baseBenchEnv("installed");
+const RETAINABLE_INSTALLED_THREADS = 32;
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -400,7 +401,8 @@ const outPath = path.join(REPORT_DIR, `${report.runId}.json`);
 writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 mkdirSync(path.dirname(latestPath), { recursive: true });
 writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
-if (report.retainableStrictEvidence && !diagnosticAttributionMode && nativeInstalledBaselinePath(installedIx)) {
+const retainableInstalledThreadConfig = threads === RETAINABLE_INSTALLED_THREADS;
+if (report.retainableStrictEvidence && !diagnosticAttributionMode && nativeInstalledBaselinePath(installedIx) && retainableInstalledThreadConfig) {
   writeFileSync(LATEST_RETAINABLE_INSTALLED_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 }
 

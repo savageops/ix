@@ -14,6 +14,7 @@ const LATEST_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-installed-
 const LATEST_RETAINABLE_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-retainable-installed-speed.json");
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "teddy-kernel-decision");
 const DEFAULT_CURRENT_IX = path.join(ROOT, "zig-out", "bin", process.platform === "win32" ? "ix-zig.exe" : "ix-zig");
+const REQUIRED_INSTALLED_THREADS = 32;
 const TEDDY_CONTRACT = path.join(ROOT, ".docs", "research", "2026-06-12-teddy-literal-alternates-contract.md");
 const INSECT_SIMD_RESEARCH = path.join(ROOT, ".docs", "research", "insect-simd-multipattern-prefilter-20260613.json");
 const INSECT_ATTRIBUTION_RESEARCH = path.join(ROOT, ".docs", "research", "insect-performance-attribution-next-20260613.json");
@@ -184,14 +185,17 @@ function installedPointerStatus(filePath, currentHash) {
       promotionFailureCount: null,
       repoSha256: null,
       installedPath: null,
+      threads: null,
     };
   }
 
   const pointer = readJson(filePath, {});
   const repoSha256 = pointer.binaries?.repo?.sha256 ?? null;
   const installedPath = pointer.binaries?.installed?.path ?? null;
+  const threads = Number(pointer.threads);
   const normalizedInstalledPath = String(installedPath ?? "").replaceAll("\\", "/").toLowerCase();
   const freshForCurrentBinary = currentHash != null && repoSha256 === currentHash;
+  const canonicalThreadConfig = threads === REQUIRED_INSTALLED_THREADS;
   const nativeInstalledBaseline =
     normalizedInstalledPath.includes("/appdata/local/programs/iex/bin/ix.exe") &&
     !normalizedInstalledPath.includes("/tmp-baselines/");
@@ -202,6 +206,7 @@ function installedPointerStatus(filePath, currentHash) {
     : [];
   let status = "promotable_current";
   if (!freshForCurrentBinary) status = "stale_current_binary";
+  else if (!canonicalThreadConfig) status = "wrong_thread_config";
   else if (!nativeInstalledBaseline) status = "wrong_baseline";
   else if (!retainableStrictEvidence) status = "strict_failed";
   else if (!promotionQualified) status = "promotion_failed";
@@ -218,6 +223,7 @@ function installedPointerStatus(filePath, currentHash) {
     promotionFailureCount: promotionFailures.length,
     repoSha256,
     installedPath,
+    threads: Number.isFinite(threads) ? threads : null,
   };
 }
 
