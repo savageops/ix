@@ -410,7 +410,7 @@ writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 mkdirSync(path.dirname(latestPath), { recursive: true });
 writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 const retainableInstalledThreadConfig = threads === RETAINABLE_INSTALLED_THREADS;
-if (report.retainableStrictEvidence && report.promotionQualified && !diagnosticAttributionMode && nativeInstalledBaselinePath(installedIx) && retainableInstalledThreadConfig) {
+if (requireStrict && report.retainableStrictEvidence && report.promotionQualified && !diagnosticAttributionMode && nativeInstalledBaselinePath(installedIx) && retainableInstalledThreadConfig) {
   writeFileSync(LATEST_RETAINABLE_INSTALLED_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 }
 
