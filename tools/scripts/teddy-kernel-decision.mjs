@@ -839,6 +839,40 @@ function currentSpeedStatus({ summary, historical, installedStatus, historicalDi
   };
 }
 
+function requiredKernelProof(engineeringMove) {
+  if (engineeringMove?.id !== "packed_nibble_shuffle_teddy_kernel") return null;
+  return {
+    owner: "src/core/literal_alternates.zig::TeddyPlan and nextTeddyCandidate",
+    requiredMechanism: "packed_bucket_carrying_candidate_masks",
+    reason: "The last retained-lane experiments showed route-local Teddy gains are not enough. A promotable kernel must carry bucket identity through candidate extraction so confirmation narrows before firstMatchingBranchLen-style broad verification, or must otherwise prove reduced confirmation/line-loop work.",
+    mustProve: [
+      "candidate extraction produces bucket-bearing masks or an equivalent narrowed verification token",
+      "confirmation checks only branches in the surviving bucket or proves an equivalent lower-cost verifier",
+      "route, match, full-scan calls, full-scan bytes, and full-scan matches remain unchanged",
+      "installed-vs-current promotion passes with paired median and win-rate non-negative",
+      "recent predecessor ladder passes one build at a time",
+      "older snapshot ladder remains retainable",
+    ],
+    rejectedShortcuts: [
+      "single_load_shifted_equality_mask",
+      "single_load_shifted_mask_plus_large_first_read",
+      "branch4_unrolled_equality_kernel",
+      "branch_mask_candidate_verification",
+      "inline_zig_vpshufb_nibble_tables",
+      "range_level_c_ffi_packed_teddy_helper",
+      "offset_only_fingerprint_selector",
+      "scalar_post_candidate_secondary_filter",
+    ],
+    sourceReferences: [
+      ".refs/aho-corasick/src/packed/teddy/generic.rs::Mask::members3",
+      ".refs/aho-corasick/src/packed/teddy/generic.rs::Teddy::verify64",
+      ".refs/aho-corasick/src/packed/teddy/generic.rs::SlimMaskBuilder::from_teddy",
+      ".refs/aho-corasick/src/packed/teddy/README.md",
+      ".docs/research/insect-teddy-single-load-shifted-masks-20260701.json",
+    ],
+  };
+}
+
 if (!existsSync(reportPath)) {
   throw new Error(`historical report not found: ${reportPath}`);
 }
@@ -956,6 +990,7 @@ const report = {
   recentHistoricalReports: latestHistoricalReports(),
   candidateMoves: moves,
   rejectedIds,
+  requiredKernelProof: requiredKernelProof(engineeringMove),
   nextAllowedMove: moves.find((move) => move.status === "allowed_next") ?? null,
   nextEngineeringMove: engineeringMove,
 };
