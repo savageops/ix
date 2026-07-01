@@ -5,7 +5,7 @@ import { baseBenchEnv, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
@@ -280,6 +280,7 @@ const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threa
 const hostBefore = hostSnapshot();
 const processBefore = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV });
 const ripgrep = measureRipgrep({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
+const ripgrepMmapComparison = measureRipgrepMmapComparison({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
 const currentIdentity = { path: repoIx, sha256: fileHash(repoIx) };
 const installedIxPath = path.join(installDir, "ix.exe");
 const installedIdentity = existsSync(installedIxPath)
@@ -319,6 +320,8 @@ const historicalGateDiagnostic = buildHistoricalGateDiagnostic({
 });
 const medians = {
   ripgrepCliMs: ripgrep.summary?.median ?? null,
+  ripgrepNoMmapCliMs: ripgrepMmapComparison?.never?.summary?.median ?? null,
+  ripgrepFastestMmapMode: ripgrepMmapComparison?.fastest ?? null,
   currentEngineMs: median(comparisons.map((comparison) => comparison.current?.engineSummary?.median)),
   previousBuildEngineMs: median(comparisons
     .filter((comparison) => comparison.evidenceAuthority === "previous_build")
@@ -361,6 +364,7 @@ const report = {
   evidenceQuality: strictEvidenceQuality,
   requiredGateFailures,
   ripgrep,
+  ripgrepMmapComparison,
   currentIdentity,
   installedIdentity,
   identityControl,
@@ -401,6 +405,8 @@ if (!quiet) {
     } : null,
     evidenceQuality: report.evidenceQuality,
     ripgrepMedianMs: ripgrep.summary.median,
+    ripgrepNoMmapMedianMs: ripgrepMmapComparison?.never?.summary?.median ?? null,
+    ripgrepFastestMmapMode: ripgrepMmapComparison?.fastest ?? null,
     medians,
     comparisons: comparisons.map((comparison) => ({
       label: comparison.label,

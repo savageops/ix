@@ -1707,13 +1707,12 @@ export function parseIxReport(stdout) {
   return JSON.parse(text);
 }
 
-export function inferRipgrepArgs({ expression, defaultExpression = DEFAULT_ALTERNATES_EXPR, corpus, threads }) {
+export function inferRipgrepArgs({ expression, defaultExpression = DEFAULT_ALTERNATES_EXPR, corpus, threads, mmapMode = "force" }) {
   if (expression === defaultExpression) {
-    return [
+    const args = [
       "--color=never",
       "--threads",
       String(threads),
-      "--mmap",
       "--fixed-strings",
       "--ignore-case",
       "-e",
@@ -1726,19 +1725,43 @@ export function inferRipgrepArgs({ expression, defaultExpression = DEFAULT_ALTER
       "CFG_BME_EVT",
       corpus,
     ];
+    if (mmapMode === "force") args.splice(3, 0, "--mmap");
+    else if (mmapMode === "never") args.splice(3, 0, "--no-mmap");
+    else if (mmapMode !== "auto") throw new Error(`unsupported ripgrep mmap mode: ${mmapMode}`);
+    return args;
   }
   return ["--color=never", "--threads", String(threads), expression, corpus];
 }
 
-export function measureRipgrep({ expression, defaultExpression = DEFAULT_ALTERNATES_EXPR, corpus, threads, samples, env }) {
-  const args = inferRipgrepArgs({ expression, defaultExpression, corpus, threads });
+export function measureRipgrep({ expression, defaultExpression = DEFAULT_ALTERNATES_EXPR, corpus, threads, samples, env, mmapMode = "force", label = "ripgrep" }) {
+  const args = inferRipgrepArgs({ expression, defaultExpression, corpus, threads, mmapMode });
   const runs = [];
   for (let sample = 1; sample <= samples; sample += 1) {
     const result = run("rg", args, { env });
     if (result.exitCode !== 0 && result.exitCode !== 1) requireOk(result, `ripgrep sample ${sample}`);
     runs.push({ sample, durationMs: result.durationMs, exitCode: result.exitCode });
   }
-  return { command: "rg", args, samples: runs, summary: summary(runs.map((entry) => entry.durationMs)) };
+  return { command: "rg", label, mmapMode, args, samples: runs, summary: summary(runs.map((entry) => entry.durationMs)) };
+}
+
+export function measureRipgrepMmapComparison({ expression, defaultExpression = DEFAULT_ALTERNATES_EXPR, corpus, threads, samples, env }) {
+  if (expression !== defaultExpression) return null;
+  const force = measureRipgrep({ expression, defaultExpression, corpus, threads, samples, env, mmapMode: "force", label: "ripgrep-mmap" });
+  const never = measureRipgrep({ expression, defaultExpression, corpus, threads, samples, env, mmapMode: "never", label: "ripgrep-no-mmap" });
+  const forceMedian = Number(force.summary?.median);
+  const neverMedian = Number(never.summary?.median);
+  const noMmapImprovementPct =
+    Number.isFinite(forceMedian) && forceMedian !== 0 && Number.isFinite(neverMedian)
+      ? ((forceMedian - neverMedian) / forceMedian) * 100
+      : null;
+  return {
+    force,
+    never,
+    fastest: Number.isFinite(forceMedian) && Number.isFinite(neverMedian)
+      ? (neverMedian < forceMedian ? "never" : "force")
+      : null,
+    noMmapImprovementPct,
+  };
 }
 
 export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {

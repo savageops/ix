@@ -5,7 +5,7 @@ import { baseBenchEnv, defaultInstalledIxPath, defaultRepoIxPath, DEFAULT_ALTERN
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, fileHash, measureIxOnce, measureRipgrep, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
@@ -186,6 +186,7 @@ if (!existsSync(repoIx)) throw new Error(`repo IX not found: ${repoIx}`);
 const hostBefore = hostSnapshot();
 const processBefore = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV });
 const ripgrep = measureRipgrep({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
+const ripgrepMmapComparison = measureRipgrepMmapComparison({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
 const identityControl = measureSameBinaryIdentityControl({
   binaryPath: repoIx,
   ixArgs: ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)],
@@ -369,6 +370,7 @@ const report = {
   binaries,
   lanes: {
     ripgrep,
+    ripgrepMmapComparison,
     identityControl,
     installed: paired.installed,
     repo: paired.repo,
@@ -394,6 +396,8 @@ report.deltasPct = {
     ((report.lanes.repo.cliSummary.median - report.lanes.ripgrep.summary.median) /
       report.lanes.ripgrep.summary.median) *
     100,
+  ripgrepNoMmapVsForcedMmap:
+    report.lanes.ripgrepMmapComparison?.noMmapImprovementPct ?? null,
 };
 
 mkdirSync(REPORT_DIR, { recursive: true });
@@ -409,6 +413,8 @@ if (report.retainableStrictEvidence && report.promotionQualified && !diagnosticA
 if (!quiet) {
   console.log(JSON.stringify({ outPath, retainableStrictEvidence: report.retainableStrictEvidence, promotionQualified: report.promotionQualified, binaries: report.binaries, medians: {
     ripgrepCliMs: report.lanes.ripgrep.summary.median,
+    ripgrepNoMmapCliMs: report.lanes.ripgrepMmapComparison?.never?.summary?.median ?? null,
+    ripgrepFastestMmapMode: report.lanes.ripgrepMmapComparison?.fastest ?? null,
     installedCliMs: report.lanes.installed.cliSummary.median,
     installedEngineMs: report.lanes.installed.engineSummary.median,
     repoCliMs: report.lanes.repo.cliSummary.median,

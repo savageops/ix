@@ -62,6 +62,7 @@ function installedReportStatus(filePath, currentHash) {
     runId: report.runId ?? path.basename(filePath, ".json"),
     timestamp: report.timestamp ?? null,
     freshForCurrentBinary: currentHash != null && repoSha256 === currentHash,
+    retainableStrictEvidence: report.retainableStrictEvidence === true,
     nativeInstalledBaseline,
     canonicalThreadConfig: threads === REQUIRED_INSTALLED_THREADS,
     installedPath,
@@ -70,13 +71,14 @@ function installedReportStatus(filePath, currentHash) {
   };
 }
 
-function newestFreshNativeInstalledReport(currentHash) {
+function newestRetainableFreshNativeInstalledReport(currentHash) {
   if (!existsSync(INSTALLED_REPORT_DIR) || currentHash == null) return null;
   const candidates = readdirSync(INSTALLED_REPORT_DIR)
     .filter((name) => /^installed-speed-.*\.json$/.test(name))
     .map((name) => installedReportStatus(path.join(INSTALLED_REPORT_DIR, name), currentHash))
     .filter((status) =>
       status?.freshForCurrentBinary === true &&
+      status.retainableStrictEvidence === true &&
       status.nativeInstalledBaseline === true &&
       status.canonicalThreadConfig === true)
     .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
@@ -193,10 +195,10 @@ if (installedDiagnosticPointer?.freshForCurrentBinary === true) {
   if (installedDiagnosticPath.includes("/tmp-baselines/")) {
     failures.push("decision installed diagnostic pointer must not use tmp-baselines");
   }
-  const newestInstalledDiagnostic = newestFreshNativeInstalledReport(decision.currentIxSha256 ?? null);
+  const newestInstalledDiagnostic = newestRetainableFreshNativeInstalledReport(decision.currentIxSha256 ?? null);
   if (newestInstalledDiagnostic != null &&
       installedDiagnosticPointer.runId !== newestInstalledDiagnostic.runId) {
-    failures.push(`decision installed diagnostic pointer must select newest fresh native report: ${newestInstalledDiagnostic.runId}`);
+    failures.push(`decision installed diagnostic pointer must select newest retainable fresh native report: ${newestInstalledDiagnostic.runId}`);
   }
 }
 if (diagnosticPointer?.freshForCurrentBinary === true) {
