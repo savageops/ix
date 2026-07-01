@@ -277,6 +277,12 @@ function validateTeddyDecision(decision, evidence) {
   if (!rejectedIds.has("parallel_first_read_positional_transplant")) {
     failures.push("teddy kernel decision must reject parallel first-read positional transplant");
   }
+  if (!rejectedIds.has("cached_fingerprint_vectors_in_teddy_plan")) {
+    failures.push("teddy kernel decision must reject cached fingerprint vectors in TeddyPlan");
+  }
+  if (!rejectedIds.has("per_call_hoisted_splat_vectors")) {
+    failures.push("teddy kernel decision must reject per-call hoisted splat vectors");
+  }
   if (decision.researchBasis?.contractSignals?.requiresPackedSimdExtractor !== true) {
     failures.push("teddy kernel decision must cite packed-SIMD extractor contract");
   }
