@@ -439,6 +439,14 @@ function candidateMoves(summary, leakSummary, quality) {
       expectedGainScore: 0,
       proofCommand: "alternates-decision-2026-06-13T09-56-05-637Z.json",
     },
+    {
+      id: "branch_mask_candidate_verification",
+      status: "rejected",
+      owner: "src/core/literal_alternates.zig::nextTeddyCandidate and countTeddyPrefix3",
+      reason: "Returning the matched branch mask from Teddy candidate extraction reduced installed Teddy-range time, but the added candidate bookkeeping failed the recent predecessor ladder with 0/4 net-positive rounds and Teddy regressions against the newest two backups.",
+      expectedGainScore: 0,
+      proofCommand: "historical-speed-2026-07-01T01-52-11-644Z.json",
+    },
   ];
   return moves.sort((left, right) => Number(right.expectedGainScore) - Number(left.expectedGainScore));
 }
