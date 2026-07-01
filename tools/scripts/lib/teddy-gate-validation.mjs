@@ -104,6 +104,19 @@ function validateTeddyDecision(decision, evidence) {
       if (diagnosticAttribution.nextRepairTarget == null) {
         failures.push("teddy kernel diagnostic attribution summary must expose the next repair target");
       }
+      if (diagnosticAttribution.nextRepairTarget === "scanFile") {
+        const split = diagnosticAttribution.leakSummary?.leakAttribution?.currentOnlyScanSplit ?? null;
+        if (!isPlainObject(split)) {
+          failures.push("teddy kernel scanFile diagnostic attribution requires current-only scan-file component split");
+        } else {
+          if (split.regressingCandidateSubphase !== "scanFile") {
+            failures.push("teddy kernel scanFile diagnostic attribution must identify scanFile as the regressing subphase");
+          }
+          if (!["teddyRange", "alternateFullScan", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)) {
+            failures.push("teddy kernel scanFile diagnostic attribution must name dominant scan-file component");
+          }
+        }
+      }
     }
   }
   if (installedPointer?.status !== "promotable_current") {

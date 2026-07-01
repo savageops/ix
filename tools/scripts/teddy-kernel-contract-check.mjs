@@ -164,6 +164,19 @@ if (diagnosticPointer?.freshForCurrentBinary === true) {
     if (diagnosticAttribution.nextRepairTarget == null) {
       failures.push("decision diagnostic attribution summary must expose next repair target");
     }
+    if (diagnosticAttribution.nextRepairTarget === "scanFile") {
+      const split = diagnosticAttribution.leakSummary?.leakAttribution?.currentOnlyScanSplit ?? null;
+      if (split == null || typeof split !== "object" || Array.isArray(split)) {
+        failures.push("decision scanFile diagnostic attribution must include current-only scan-file component split");
+      } else {
+        if (split.regressingCandidateSubphase !== "scanFile") {
+          failures.push("decision scanFile diagnostic attribution must identify scanFile as the regressing subphase");
+        }
+        if (!["teddyRange", "alternateFullScan", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)) {
+          failures.push("decision scanFile diagnostic attribution must name dominant scan-file component");
+        }
+      }
+    }
   }
 }
 if (decision.finalizationGate?.requiredProofCommand == null ||

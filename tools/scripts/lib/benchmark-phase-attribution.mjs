@@ -424,7 +424,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
         scanFileShareDeltaPct: baselineScanSplitPresent ? delta(candidateScanFileSharePct, baselineScanFileSharePct) : null,
       };
     });
-  const currentOnlyScanSplit = nextRepairTarget === "scanWork"
+  const currentOnlyScanSplit = ["scanWork", "scanFile"].includes(nextRepairTarget)
     ? (() => {
         const candidateSplitRounds = targetRounds.filter((round) =>
           subphaseTimingPresent(round.candidateScanOpenMedianMs, round.candidateScanFileMedianMs)
@@ -547,10 +547,10 @@ export function phaseLeakSummaryFromRounds(rounds) {
           candidateSlowestPathHotspots,
           candidateSlowestPathClasses,
           interpretation: candidateSplitRounds.length === 0
-            ? "scanWork is leaking, but current split telemetry is unavailable; rerun with --scan-open-timing"
+            ? `${nextRepairTarget} is leaking, but current split telemetry is unavailable; rerun with --scan-open-timing`
             : (predecessorSplitRounds.length < targetRounds.length
-                ? "scanWork is leaking; predecessor split telemetry is incomplete, so use current-only scanOpen/scanFile shares to choose the next owner"
-                : "scanWork is leaking; predecessor and candidate scanOpen/scanFile split telemetry are comparable"),
+                ? `${nextRepairTarget} is leaking; predecessor split telemetry is incomplete, so use current-only scanOpen/scanFile shares to choose the next owner`
+                : `${nextRepairTarget} is leaking; predecessor and candidate scanOpen/scanFile split telemetry are comparable`),
         };
       })()
     : null;
@@ -571,11 +571,17 @@ export function phaseLeakSummaryFromRounds(rounds) {
         reason: "scanWork is leaking; use current-only scanOpen/scanFile medians when predecessor builds lack those counters",
         commandSuffix: "--scan-open-timing",
       }
-    : (nextRepairTarget == null ? null : {
-        id: `measure_${nextRepairTarget}_leak`,
-        reason: `${nextRepairTarget} is the current whole-engine leak target`,
-        commandSuffix: null,
-      });
+    : (nextRepairTarget === "scanFile" && currentOnlyScanSplit == null
+      ? {
+          id: "split_scan_file_components",
+          reason: "scanFile is leaking; rerun with scan-open timing to expose scanFile residual and route shares",
+          commandSuffix: "--scan-open-timing",
+        }
+      : (nextRepairTarget == null ? null : {
+          id: `measure_${nextRepairTarget}_leak`,
+          reason: `${nextRepairTarget} is the current whole-engine leak target`,
+          commandSuffix: null,
+        }));
   return {
     averages,
     deltaMsAverages,
