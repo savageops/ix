@@ -289,8 +289,13 @@ function blockedByBenchmarkNoise(quality) {
   return benchmarkNoiseFailures(quality).length > 0;
 }
 
+function diagnosticAttributionOnly(quality) {
+  return (quality?.comparisonFailures ?? []).includes("diagnostic_attribution_run_not_retainable_evidence");
+}
+
 function candidateMoves(summary, leakSummary, quality) {
   const benchmarkNoiseBlocked = blockedByBenchmarkNoise(quality);
+  const diagnosticOnly = diagnosticAttributionOnly(quality);
   const teddyPressure = Number(summary.averagePairedTeddyMedianPct ?? 0);
   const enginePressure = Number(summary.averagePairedEngineMedianPct ?? 0);
   const scanPressure = Number(summary.averagePairedScanMedianPct ?? 0);
@@ -347,15 +352,31 @@ function candidateMoves(summary, leakSummary, quality) {
     },
     {
       id: "scan_open_path_pressure_attribution",
-      status: benchmarkNoiseBlocked ? "blocked_by_benchmark_noise" : (scanOpenDominatesLeak ? "allowed_next" : (scanFileResidualRegresses ? "blocked_by_scan_file_regression" : "waiting_for_scan_open_split")),
+      status: benchmarkNoiseBlocked
+        ? "blocked_by_benchmark_noise"
+        : (diagnosticOnly && scanOpenDominatesLeak
+            ? "diagnostic_only"
+            : (scanOpenDominatesLeak ? "allowed_next" : (scanFileResidualRegresses ? "blocked_by_scan_file_regression" : "waiting_for_scan_open_split"))),
       owner: "src/core/search.zig::scanFileIntoShardTimed and scanFileIntoShardMonoTimed",
       reason: scanOpenDominatesLeak
-        ? `Scan-open timing split is now present and identifies the file-open wrapper as the dominant candidate subphase under file-count parity=${filesScannedParityStatus}: scanOpen median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMedianMs?.median}ms, scanOpen per file=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMsPerFileMedian?.median}ms, scanFile median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanFileMedianMs?.median}ms. The next runtime candidate must reduce open-path pressure per file, not chase scanned-file count, before touching the Teddy kernel.`
+        ? `Scan-open timing split is now present and identifies the file-open wrapper as the dominant candidate subphase under file-count parity=${filesScannedParityStatus}: scanOpen median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMedianMs?.median}ms, scanOpen per file=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMsPerFileMedian?.median}ms, scanFile median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanFileMedianMs?.median}ms. ${diagnosticOnly ? "This report is diagnostic-only, so it may guide the next proof run but must not directly authorize a runtime patch." : "The next runtime candidate must reduce open-path pressure per file, not chase scanned-file count, before touching the Teddy kernel."}`
         : (scanFileResidualRegresses
             ? `Scan-open owns the largest current scan-work share, but scanFile is the measured regressing subphase: scanFile paired=${leakSummary.leakAttribution.currentOnlyScanSplit.regressingCandidateSubphaseMedianPct}%, scanFile delta=${leakSummary.leakAttribution.currentOnlyScanSplit.regressingCandidateSubphaseDeltaMs}ms. Do not chase open-path pressure until scan-file residual/hotspots are repaired or disproven.`
             : "Run historical proof with --scan-open-timing before choosing an open-path, scan-file, or Teddy-kernel repair."),
       expectedGainScore: scanOpenDominatesLeak ? 4 + Math.max(0, -enginePressure) : 0,
       proofCommand: SPEED_SCAN_OPEN_PROMOTION_COMMAND,
+    },
+    {
+      id: "retainable_scan_open_runtime_probe",
+      status: benchmarkNoiseBlocked
+        ? "blocked_by_benchmark_noise"
+        : (diagnosticOnly && scanOpenDominatesLeak ? "allowed_next" : "waiting_for_diagnostic_scan_open_split"),
+      owner: "tools/scripts/compare-historical-speed.mjs retainable predecessor gate",
+      reason: diagnosticOnly && scanOpenDominatesLeak
+        ? "A scan-open-timing run found open-path pressure, but diagnostic attribution is deliberately non-retainable evidence. Before touching scanFileIntoShardTimed, prove the current binary under the normal strict predecessor gate so runtime work is selected from production-shaped timing, not instrumentation-shaped timing."
+        : "Use only after a diagnostic scan-open split identifies open-path pressure from a report that cannot itself authorize runtime changes.",
+      expectedGainScore: diagnosticOnly && scanOpenDominatesLeak ? 5 + Math.max(0, -enginePressure) : 0,
+      proofCommand: SPEED_PROMOTION_COMMAND,
     },
     {
       id: "scan_file_residual_hotspot_attribution",
@@ -462,7 +483,9 @@ function mixedTeddyGainNeedsLeakRepair(summary, leakSummary) {
 function nextEngineeringMove(moves, summary, leakSummary) {
   const scanFileResidual = moves.find((move) => move.id === "scan_file_residual_hotspot_attribution") ?? null;
   const scanOpenPressure = moves.find((move) => move.id === "scan_open_path_pressure_attribution") ?? null;
+  const retainableScanOpenProbe = moves.find((move) => move.id === "retainable_scan_open_runtime_probe") ?? null;
   const wholeEngineLeak = moves.find((move) => move.id === "whole_engine_leak_attribution") ?? null;
+  if (retainableScanOpenProbe?.status === "allowed_next") return retainableScanOpenProbe;
   if (scanFileResidual?.status === "allowed_next") return scanFileResidual;
   if (scanOpenPressure?.status === "allowed_next") return scanOpenPressure;
   if (mixedTeddyGainNeedsLeakRepair(summary, leakSummary)) return wholeEngineLeak;

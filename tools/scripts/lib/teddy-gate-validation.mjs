@@ -27,11 +27,23 @@ function evidenceBlockedByBenchmarkNoise(decision) {
   return benchmarkNoiseFailures(decision).length > 0;
 }
 
+function diagnosticAttributionOnly(decision) {
+  return (decision?.evidenceQuality?.comparisonFailures ?? []).includes("diagnostic_attribution_run_not_retainable_evidence");
+}
+
 function expectedScanWorkRepairMove(decision) {
   const split = decision?.leakSummary?.leakAttribution?.currentOnlyScanSplit;
   if (split?.regressingCandidateSubphase === "scanFile") return "scan_file_residual_hotspot_attribution";
   if (split?.dominantCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
   return "whole_engine_leak_attribution";
+}
+
+function expectedScanWorkNextMove(decision) {
+  const split = decision?.leakSummary?.leakAttribution?.currentOnlyScanSplit;
+  if (diagnosticAttributionOnly(decision) && split?.dominantCandidateSubphase === "scanOpen" && split?.regressingCandidateSubphase !== "scanFile") {
+    return "retainable_scan_open_runtime_probe";
+  }
+  return expectedScanWorkRepairMove(decision);
 }
 
 function expectedTeddyNextMove(decision) {
@@ -43,7 +55,7 @@ function expectedTeddyNextMove(decision) {
     decision?.leakSummary?.nextRepairTarget === "scanWork" &&
     ["scan_file_residual_hotspot_attribution", "scan_open_path_pressure_attribution"].includes(expectedScanWorkRepairMove(decision))
   ) {
-    return expectedScanWorkRepairMove(decision);
+    return expectedScanWorkNextMove(decision);
   }
   return mixedTeddyGainNeedsLeakRepair(decision)
     ? "whole_engine_leak_attribution"
@@ -51,7 +63,7 @@ function expectedTeddyNextMove(decision) {
 }
 
 function expectedTeddyRepairMove(decision) {
-  return expectedScanWorkRepairMove(decision);
+  return expectedScanWorkNextMove(decision);
 }
 
 function rejectedMoveIds(decision) {
@@ -111,12 +123,13 @@ function validateTeddyDecision(decision, evidence) {
     }
     if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
       const split = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit;
-      if (decision.nextEngineeringMove?.id !== expectedScanWorkRepairMove(decision)) {
+      if (decision.nextEngineeringMove?.id !== expectedScanWorkNextMove(decision)) {
         failures.push("teddy kernel decision must expose the proved leak owner as the next engineering move");
       }
     }
     if (
       decision.leakSummary?.nextRepairTarget === "scanWork" &&
+      !diagnosticAttributionOnly(decision) &&
       !String(decision.nextAllowedMove?.proofCommand ?? "").includes("--scan-open-timing")
     ) {
       failures.push("scanWork leak attribution proof command must enable scan-open timing");
@@ -159,10 +172,10 @@ function validateTeddyDecision(decision, evidence) {
           split.dominantCandidateSubphase === "scanOpen" &&
           split.regressingCandidateSubphase !== "scanFile" &&
           !decision.candidateMoves?.some((move) =>
-            move?.id === "scan_open_path_pressure_attribution" &&
+            move?.id === (diagnosticAttributionOnly(decision) ? "retainable_scan_open_runtime_probe" : "scan_open_path_pressure_attribution") &&
             move?.status === "allowed_next")
         ) {
-          failures.push("scanOpen-dominant leak attribution must route to scan-open path pressure");
+          failures.push("scanOpen-dominant leak attribution must route to the correct retainable proof or scan-open pressure move");
         }
         if (
           split.dominantCandidateSubphase === "scanOpen" &&

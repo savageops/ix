@@ -171,13 +171,22 @@ function expectedScanWorkRepairMove(split) {
   if (split?.dominantCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
   return "whole_engine_leak_attribution";
 }
+function diagnosticAttributionOnly(quality) {
+  return (quality?.comparisonFailures ?? []).includes("diagnostic_attribution_run_not_retainable_evidence");
+}
+function expectedScanWorkNextMove(split, quality) {
+  if (diagnosticAttributionOnly(quality) && split?.dominantCandidateSubphase === "scanOpen" && split?.regressingCandidateSubphase !== "scanFile") {
+    return "retainable_scan_open_runtime_probe";
+  }
+  return expectedScanWorkRepairMove(split);
+}
 const expectedNextMove = evidenceBlockedByNoise
   ? "benchmark_host_noise_control"
   : (
       teddyGainNeedsLeakRepair &&
       decision.leakSummary?.nextRepairTarget === "scanWork" &&
       ["scan_file_residual_hotspot_attribution", "scan_open_path_pressure_attribution"].includes(expectedScanWorkRepairMove(decision.leakSummary?.leakAttribution?.currentOnlyScanSplit))
-        ? expectedScanWorkRepairMove(decision.leakSummary?.leakAttribution?.currentOnlyScanSplit)
+        ? expectedScanWorkNextMove(decision.leakSummary?.leakAttribution?.currentOnlyScanSplit, evidenceQuality)
         : (teddyGainNeedsLeakRepair ? "whole_engine_leak_attribution" : "packed_nibble_shuffle_teddy_kernel")
     );
 if (decision.nextAllowedMove?.id !== expectedNextMove) {
@@ -194,18 +203,19 @@ if (teddyGainNeedsLeakRepair) {
   if (decision.preservationPolicy?.preserveTeddyGain !== true) {
     failures.push("decision preservation policy must protect the positive Teddy gain");
   }
-  const expectedRepairMove = expectedScanWorkRepairMove(decision.leakSummary?.leakAttribution?.currentOnlyScanSplit);
+  const expectedRepairMove = expectedScanWorkNextMove(decision.leakSummary?.leakAttribution?.currentOnlyScanSplit, evidenceQuality);
   if (decision.preservationPolicy?.nextEngineeringMoveId !== expectedRepairMove) {
     failures.push("decision preservation policy must route engineering repair to the proved repair owner");
   }
   if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
     const split = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit;
-    if (decision.nextEngineeringMove?.id !== expectedScanWorkRepairMove(split)) {
+    if (decision.nextEngineeringMove?.id !== expectedScanWorkNextMove(split, evidenceQuality)) {
       failures.push("decision must expose the proved leak owner as next engineering move");
     }
   }
   if (
     decision.leakSummary?.nextRepairTarget === "scanWork" &&
+    !diagnosticAttributionOnly(evidenceQuality) &&
     !String(decision.nextAllowedMove?.proofCommand ?? "").includes("--scan-open-timing")
   ) {
     failures.push("decision scanWork leak attribution proof command must enable scan-open timing");
@@ -248,10 +258,10 @@ if (teddyGainNeedsLeakRepair) {
         split.dominantCandidateSubphase === "scanOpen" &&
         split.regressingCandidateSubphase !== "scanFile" &&
         !decision.candidateMoves?.some((move) =>
-          move?.id === "scan_open_path_pressure_attribution" &&
+          move?.id === (diagnosticAttributionOnly(evidenceQuality) ? "retainable_scan_open_runtime_probe" : "scan_open_path_pressure_attribution") &&
           move?.status === "allowed_next")
       ) {
-        failures.push("decision scanOpen-dominant leak attribution must route to scan-open path pressure");
+        failures.push("decision scanOpen-dominant leak attribution must route to the correct retainable proof or scan-open pressure move");
       }
       if (
         split.dominantCandidateSubphase === "scanOpen" &&
