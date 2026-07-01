@@ -23,6 +23,11 @@ function ripgrepWindowRegressionPct(window) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
+function previousIxPairingStartsWithPredecessor(window) {
+  const pairOrder = window?.metrics?.previousIxPairing?.pairOrder;
+  return Array.isArray(pairOrder) && pairOrder[0] === "previous,current";
+}
+
 export function ripgrepProofSummary(windows) {
   const present = windows.filter(isPlainObject);
   const fixedPasses = present.filter((window) => window.ok === true).length;
@@ -120,6 +125,13 @@ export function validateRipgrepLane(entry, failures) {
   });
   if (unbalancedPairedWindow) {
     failures.push("ripgrep_12_sample: paired previous-build evidence requires balanced alternating pair order");
+  }
+  const currentFirstPairedWindow = windowKeys.some((key) => {
+    const window = entry[key];
+    return isPlainObject(window) && window.pairedOk === true && !previousIxPairingStartsWithPredecessor(window);
+  });
+  if (currentFirstPairedWindow) {
+    failures.push("ripgrep_12_sample: paired previous-build evidence must run predecessor before current in the first pair");
   }
   const noisyHostPass = windowKeys.some((key) => {
     const window = entry[key];

@@ -151,6 +151,7 @@ function readLatestInstalledSummary(reportPath) {
     },
     routeParityStatus: report.installedRepoComparison?.routeParityStatus ?? null,
     matchParity: report.installedRepoComparison?.matchParity ?? null,
+    pairOrder: report.installedRepoComparison?.pairOrder ?? null,
     pairOrderSummary: report.installedRepoComparison?.pairOrderSummary ?? null,
     pairedEngine: report.installedRepoComparison?.pairedEngine
       ? {

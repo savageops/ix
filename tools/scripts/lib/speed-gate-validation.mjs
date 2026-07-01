@@ -42,6 +42,10 @@ function historicalPairOrderStartsWithPredecessor(comparison) {
   return Array.isArray(comparison?.pairOrder) && comparison.pairOrder[0] === "history,current";
 }
 
+function olderSnapshotPairOrderStartsWithPredecessor(round) {
+  return Array.isArray(round?.pairOrder) && round.pairOrder[0] === "installed,repo";
+}
+
 function identityControlAttemptsComplete(identityControl) {
   const attemptsRequested = Number(identityControl?.attemptsRequested);
   const attemptsRun = Number(identityControl?.attemptsRun);
@@ -677,6 +681,9 @@ export function createSpeedGateValidation({
       }
       if (round.matchParity !== true) {
         failures.push(`older_snapshot_ladder: runnable round requires match parity diagnostics: ${round.label ?? "unknown"}`);
+      }
+      if (!olderSnapshotPairOrderStartsWithPredecessor(round)) {
+        failures.push(`older_snapshot_ladder: runnable round must run predecessor before current in the first pair: ${round.label ?? "unknown"}`);
       }
       if (!pairOrderSummaryIsBalanced(round.pairOrderSummary, round.pairedEngine?.count ?? entry.report.samples)) {
         failures.push(`older_snapshot_ladder: runnable round requires balanced pair-order diagnostics: ${round.label ?? "unknown"}`);

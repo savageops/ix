@@ -588,14 +588,14 @@ function measurePairedIxSearch(currentBinaryPath, previousBinaryPath, context, m
   const previousRuns = [];
   const pairOrder = [];
   for (let i = 0; i < samples; i += 1) {
-    const currentFirst = i % 2 === 0;
-    pairOrder.push(currentFirst ? "current,previous" : "previous,current");
-    if (currentFirst) {
-      currentRuns.push(measuredIxEntry(currentBinaryPath, currentArgs, runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions), i));
+    const previousFirst = i % 2 === 0;
+    pairOrder.push(previousFirst ? "previous,current" : "current,previous");
+    if (previousFirst) {
       previousRuns.push(measuredIxEntry(resolvedPreviousBinaryPath, previousArgs, runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions), i));
+      currentRuns.push(measuredIxEntry(currentBinaryPath, currentArgs, runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions), i));
     } else {
-      previousRuns.push(measuredIxEntry(resolvedPreviousBinaryPath, previousArgs, runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions), i));
       currentRuns.push(measuredIxEntry(currentBinaryPath, currentArgs, runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions), i));
+      previousRuns.push(measuredIxEntry(resolvedPreviousBinaryPath, previousArgs, runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions), i));
     }
   }
 
@@ -603,9 +603,9 @@ function measurePairedIxSearch(currentBinaryPath, previousBinaryPath, context, m
     current: summarizeIxEntries(currentBinaryPath, currentArgs, currentRuns),
     previous: summarizeIxEntries(resolvedPreviousBinaryPath, previousArgs, previousRuns),
     pairing: {
-      mode: "interleaved_current_previous",
+      mode: "interleaved_previous_current",
       pairOrder,
-      pairOrderSummary: pairOrderSummary(pairOrder, { firstLabel: "current", secondLabel: "previous" }),
+      pairOrderSummary: pairOrderSummary(pairOrder, { firstLabel: "previous", secondLabel: "current" }),
     },
   };
 }
