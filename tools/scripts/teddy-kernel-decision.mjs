@@ -448,6 +448,29 @@ function blockedByBenchmarkNoise(quality) {
   return benchmarkNoiseFailures(quality).length > 0;
 }
 
+function benchmarkNoiseControlReason(quality) {
+  const hostFailures = quality.hostFailures ?? [];
+  const identityFailures = quality.identityFailures ?? [];
+  const processFailures = quality.processFailures ?? [];
+  const sampleFailures = quality.sampleFailures ?? [];
+  const counts =
+    `hostFailures=${hostFailures.length}, identityFailures=${identityFailures.length}, ` +
+    `processFailures=${processFailures.length}, sampleFailures=${sampleFailures.length}`;
+  if (identityFailures.length > 0 && hostFailures.length === 0 && processFailures.length === 0 && sampleFailures.length === 0) {
+    return `Latest report is not suitable for a runtime code decision: ${counts}. Preserve the current runtime slice, rerun same-binary identity controls under a quieter benchmark envelope, and only act on sub-percent scanWork deltas after identity drift and paired-lane skew clear.`;
+  }
+  if (hostFailures.length > 0) {
+    return `Latest report is not suitable for a runtime code decision: ${counts}. Preserve the current runtime slice, clear the benchmark host preflight issues, and only then act on sub-percent scanWork deltas.`;
+  }
+  if (processFailures.length > 0) {
+    return `Latest report is not suitable for a runtime code decision: ${counts}. Preserve the current runtime slice, clean IX process state, and rerun before using speed attribution.`;
+  }
+  if (sampleFailures.length > 0) {
+    return `Latest report is not suitable for a runtime code decision: ${counts}. Preserve the current runtime slice and rerun with enough retained samples before using speed attribution.`;
+  }
+  return `Latest report is not suitable for a runtime code decision: ${counts}. Preserve the current runtime slice, rerun the benchmark control gate, and only then act on sub-percent scanWork deltas.`;
+}
+
 function diagnosticAttributionOnly(quality) {
   return (quality?.comparisonFailures ?? []).includes("diagnostic_attribution_run_not_retainable_evidence");
 }
@@ -490,9 +513,9 @@ function candidateMoves(summary, leakSummary, quality) {
     {
       id: "benchmark_host_noise_control",
       status: benchmarkNoiseBlocked ? "allowed_next" : "satisfied",
-      owner: "tools/scripts/compare-historical-speed.mjs host preflight plus benchmark environment",
+      owner: "tools/scripts/compare-historical-speed.mjs host preflight plus same-binary identity control",
       reason: benchmarkNoiseBlocked
-        ? `Latest report is not suitable for a runtime code decision: hostFailures=${quality.hostFailures.length}, identityFailures=${quality.identityFailures.length}, processFailures=${quality.processFailures?.length ?? 0}, sampleFailures=${quality.sampleFailures?.length ?? 0}. Preserve the current runtime slice, rerun under a clean host, and only then act on sub-percent scanWork deltas.`
+        ? benchmarkNoiseControlReason(quality)
         : "Latest historical evidence has no host, identity-control, process, or sample-size noise blocker.",
       expectedGainScore: benchmarkNoiseBlocked ? 10 + benchmarkNoiseFailures(quality).length : 0,
       proofCommand: SPEED_DIAGNOSTIC_COMMAND,
