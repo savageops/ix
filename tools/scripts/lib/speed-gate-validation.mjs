@@ -38,6 +38,10 @@ function comparatorStateReportsClean(reports) {
   });
 }
 
+function historicalPairOrderStartsWithPredecessor(comparison) {
+  return Array.isArray(comparison?.pairOrder) && comparison.pairOrder[0] === "history,current";
+}
+
 function identityControlAttemptsComplete(identityControl) {
   const attemptsRequested = Number(identityControl?.attemptsRequested);
   const attemptsRun = Number(identityControl?.attemptsRun);
@@ -472,6 +476,9 @@ export function createSpeedGateValidation({
         failures.push("historical_speed_compare: strict ok status requires paired win majority over every previous build");
       }
       if (comparison?.evidenceAuthority === "previous_build") {
+        if (!historicalPairOrderStartsWithPredecessor(comparison)) {
+          failures.push("historical_speed_compare: previous-build comparisons must run predecessor before current in the first pair");
+        }
         if (!pairOrderSummaryIsBalanced(comparison.pairOrderSummary, comparison.pairedEngine?.count ?? entry.report.samples)) {
           failures.push("historical_speed_compare: previous-build comparisons require balanced alternating pair order");
         }
