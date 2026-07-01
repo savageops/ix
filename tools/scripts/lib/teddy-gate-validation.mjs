@@ -86,6 +86,26 @@ function validateTeddyDecision(decision, evidence) {
   if (installedDiagnosticPointer == null || typeof installedDiagnosticPointer !== "object") {
     failures.push("teddy kernel decision requires diagnostic installed-vs-repo speed proof pointer");
   }
+  const diagnosticPointer = decision.speedProofPointers?.latestDiagnostic ?? decision.finalizationGate?.latestDiagnosticPointer ?? null;
+  if (diagnosticPointer?.freshForCurrentBinary === true) {
+    const diagnosticAttribution = decision.latestDiagnosticAttribution ?? null;
+    if (!isPlainObject(diagnosticAttribution)) {
+      failures.push("teddy kernel decision requires latest diagnostic attribution summary");
+    } else {
+      if (diagnosticAttribution.freshForCurrentBinary !== true) {
+        failures.push("teddy kernel diagnostic attribution summary must be fresh for the current binary");
+      }
+      if (diagnosticAttribution.diagnosticAttributionMode !== true) {
+        failures.push("teddy kernel diagnostic attribution summary must come from a diagnostic attribution report");
+      }
+      if (diagnosticAttribution.usableForRuntimeMove !== false) {
+        failures.push("teddy kernel diagnostic attribution summary must remain non-promotional");
+      }
+      if (diagnosticAttribution.nextRepairTarget == null) {
+        failures.push("teddy kernel diagnostic attribution summary must expose the next repair target");
+      }
+    }
+  }
   if (installedPointer?.status !== "promotable_current") {
     if (decision.promotionAllowed === true) failures.push("teddy kernel decision allows promotion without installed-vs-repo promotion proof");
     if (decision.finalizationGate?.speedRegressionFinalizationAllowed === true) {

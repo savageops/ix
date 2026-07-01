@@ -111,6 +111,26 @@ function selectFreshHistoricalReport(currentHash) {
   return candidates[0]?.path ?? null;
 }
 
+function selectFreshDiagnosticHistoricalReport(currentHash) {
+  if (!existsSync(HISTORICAL_REPORT_DIR) || currentHash == null) return null;
+  const candidates = readdirSync(HISTORICAL_REPORT_DIR)
+    .filter((name) => /^historical-speed-.*\.json$/.test(name))
+    .map((name) => {
+      const fullPath = path.join(HISTORICAL_REPORT_DIR, name);
+      const report = readJson(fullPath, {});
+      return {
+        path: fullPath,
+        timestamp: report.timestamp ?? null,
+        runId: report.runId ?? name.replace(/\.json$/, ""),
+        fresh: reportMatchesCurrentBinary(report, currentHash),
+        diagnostic: report.diagnosticAttributionMode === true,
+      };
+    })
+    .filter((entry) => entry.fresh && entry.diagnostic)
+    .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
+  return candidates[0]?.path ?? null;
+}
+
 function latestHistoricalReports(limit = 8) {
   if (!existsSync(HISTORICAL_REPORT_DIR)) return [];
   return readdirSync(HISTORICAL_REPORT_DIR)
@@ -582,6 +602,28 @@ function preservationPolicy(summary, leakSummary, quality, engineeringMove) {
   };
 }
 
+function diagnosticAttributionReport(filePath, currentHash) {
+  if (filePath == null || !existsSync(filePath)) return null;
+  const diagnostic = readJson(filePath, {});
+  const diagnosticRounds = Array.isArray(diagnostic.roundLedger) ? diagnostic.roundLedger : [];
+  const diagnosticLeakSummary = phaseLeakSummaryFromRounds(diagnosticRounds);
+  return {
+    inputReport: path.relative(ROOT, filePath),
+    evaluatedHistoricalRunId: diagnostic.runId ?? null,
+    timestamp: diagnostic.timestamp ?? null,
+    freshForCurrentBinary: reportMatchesCurrentBinary(diagnostic, currentHash),
+    diagnosticAttributionMode: diagnostic.diagnosticAttributionMode === true,
+    retainableStrictEvidence: diagnostic.retainableStrictEvidence === true,
+    usableForRuntimeMove: false,
+    reason: "diagnostic attribution is owner-selection evidence only; it cannot authorize runtime promotion or finalization",
+    scorecard: diagnostic.scorecard ?? null,
+    evidenceQuality: evidenceQuality(diagnostic),
+    leakSummary: diagnosticLeakSummary,
+    nextRepairTarget: diagnosticLeakSummary?.nextRepairTarget ?? null,
+    nextProbe: diagnosticLeakSummary?.leakAttribution?.nextProbe ?? null,
+  };
+}
+
 if (!existsSync(reportPath)) {
   throw new Error(`historical report not found: ${reportPath}`);
 }
@@ -601,6 +643,8 @@ const moves = candidateMoves(summary, leakSummary, quality);
 const rejectedIds = moves.filter((move) => move.status === "rejected").map((move) => move.id);
 const engineeringMove = nextEngineeringMove(moves, summary, leakSummary);
 const policy = preservationPolicy(summary, leakSummary, quality, engineeringMove);
+const diagnosticReportPath = selectFreshDiagnosticHistoricalReport(currentIxSha256);
+const latestDiagnosticAttribution = diagnosticAttributionReport(diagnosticReportPath, currentIxSha256);
 const speedProofPointers = {
   latestDiagnostic: historicalPointerStatus(LATEST_HISTORICAL_PATH, currentIxSha256),
   latestRetainable: historicalPointerStatus(LATEST_RETAINABLE_HISTORICAL_PATH, currentIxSha256),
@@ -677,6 +721,7 @@ const report = {
   scorecard: historical.scorecard ?? null,
   summary,
   leakSummary,
+  latestDiagnosticAttribution,
   preservationPolicy: policy,
   evidenceQuality: quality,
   researchBasis: basis,

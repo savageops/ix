@@ -147,6 +147,25 @@ if (installedPointer == null || typeof installedPointer !== "object") {
 if (installedDiagnosticPointer == null || typeof installedDiagnosticPointer !== "object") {
   failures.push("decision lacks latest diagnostic installed-vs-repo speed proof pointer");
 }
+if (diagnosticPointer?.freshForCurrentBinary === true) {
+  const diagnosticAttribution = decision.latestDiagnosticAttribution ?? null;
+  if (diagnosticAttribution == null || typeof diagnosticAttribution !== "object" || Array.isArray(diagnosticAttribution)) {
+    failures.push("decision lacks latest diagnostic attribution summary");
+  } else {
+    if (diagnosticAttribution.freshForCurrentBinary !== true) {
+      failures.push("decision diagnostic attribution summary must be fresh for current binary");
+    }
+    if (diagnosticAttribution.diagnosticAttributionMode !== true) {
+      failures.push("decision diagnostic attribution summary must come from a diagnostic attribution report");
+    }
+    if (diagnosticAttribution.usableForRuntimeMove !== false) {
+      failures.push("decision diagnostic attribution summary must remain non-promotional");
+    }
+    if (diagnosticAttribution.nextRepairTarget == null) {
+      failures.push("decision diagnostic attribution summary must expose next repair target");
+    }
+  }
+}
 if (decision.finalizationGate?.requiredProofCommand == null ||
     !normalized(String(decision.finalizationGate.requiredProofCommand)).includes("compare-installed-speed.mjs") ||
     !normalized(String(decision.finalizationGate.requiredProofCommand)).includes("compare-historical-speed.mjs") ||
