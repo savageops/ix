@@ -147,6 +147,15 @@ if (installedPointer == null || typeof installedPointer !== "object") {
 if (installedDiagnosticPointer == null || typeof installedDiagnosticPointer !== "object") {
   failures.push("decision lacks latest diagnostic installed-vs-repo speed proof pointer");
 }
+if (installedDiagnosticPointer?.freshForCurrentBinary === true) {
+  const installedDiagnosticPath = normalized(String(installedDiagnosticPointer.installedPath ?? ""));
+  if (!installedDiagnosticPath.includes("/appdata/local/programs/iex/bin/ix.exe")) {
+    failures.push("decision installed diagnostic pointer must use the native AppData install path");
+  }
+  if (installedDiagnosticPath.includes("/tmp-baselines/")) {
+    failures.push("decision installed diagnostic pointer must not use tmp-baselines");
+  }
+}
 if (diagnosticPointer?.freshForCurrentBinary === true) {
   const diagnosticAttribution = decision.latestDiagnosticAttribution ?? null;
   if (diagnosticAttribution == null || typeof diagnosticAttribution !== "object" || Array.isArray(diagnosticAttribution)) {

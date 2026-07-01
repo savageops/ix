@@ -249,6 +249,29 @@ function installedPointerStatus(filePath, currentHash) {
   };
 }
 
+function selectFreshNativeInstalledReport(currentHash) {
+  if (!existsSync(INSTALLED_REPORT_DIR) || currentHash == null) return null;
+  const candidates = readdirSync(INSTALLED_REPORT_DIR)
+    .filter((name) => /^installed-speed-.*\.json$/.test(name))
+    .map((name) => {
+      const fullPath = path.join(INSTALLED_REPORT_DIR, name);
+      const status = installedPointerStatus(fullPath, currentHash);
+      return {
+        path: fullPath,
+        timestamp: status.timestamp ?? null,
+        runId: status.runId ?? name.replace(/\.json$/, ""),
+        status,
+      };
+    })
+    .filter((entry) =>
+      entry.status.freshForCurrentBinary === true &&
+      entry.status.threads === REQUIRED_INSTALLED_THREADS &&
+      entry.status.status !== "wrong_baseline" &&
+      entry.status.status !== "wrong_thread_config")
+    .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
+  return candidates[0]?.path ?? null;
+}
+
 function selectedInstalledPointerStatus(speedProofPointers) {
   const retainable = speedProofPointers?.latestInstalled ?? null;
   const diagnostic = speedProofPointers?.latestInstalledDiagnostic ?? null;
@@ -989,10 +1012,11 @@ const engineeringMove = nextEngineeringMove(moves, summary, leakSummary);
 const policy = preservationPolicy(summary, leakSummary, quality, engineeringMove);
 const diagnosticReportPath = selectFreshDiagnosticHistoricalReport(currentIxSha256);
 const latestDiagnosticAttribution = diagnosticAttributionReport(diagnosticReportPath, currentIxSha256);
+const latestNativeInstalledReportPath = selectFreshNativeInstalledReport(currentIxSha256) ?? LATEST_INSTALLED_PATH;
 const speedProofPointers = {
   latestDiagnostic: historicalPointerStatus(LATEST_HISTORICAL_PATH, currentIxSha256),
   latestRetainable: historicalPointerStatus(LATEST_RETAINABLE_HISTORICAL_PATH, currentIxSha256),
-  latestInstalledDiagnostic: installedPointerStatus(LATEST_INSTALLED_PATH, currentIxSha256),
+  latestInstalledDiagnostic: installedPointerStatus(latestNativeInstalledReportPath, currentIxSha256),
   latestInstalled: installedPointerStatus(LATEST_RETAINABLE_INSTALLED_PATH, currentIxSha256),
   latestOlderSnapshots: olderSnapshotPointerStatus(LATEST_OLDER_SNAPSHOT_PATH),
 };
