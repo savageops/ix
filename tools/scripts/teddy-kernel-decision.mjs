@@ -523,6 +523,14 @@ function candidateMoves(summary, leakSummary, quality) {
       expectedGainScore: 0,
       proofCommand: "historical-speed-2026-07-01T01-52-11-644Z.json",
     },
+    {
+      id: "branch4_unrolled_equality_kernel",
+      status: "rejected",
+      owner: "src/core/literal_alternates.zig::nextTeddyCandidate",
+      reason: "Special-casing branch_count == 4 by unrolling the existing equality-vector branch loop preserved correctness and ReleaseFast build, but failed installed-vs-repo promotion: repo median 591.4168 ms was slower than installed 586.3894 ms, paired median was -0.0240%, and win rate stayed 0.5. The retained path must remove candidate or confirmation work, not only unroll the current comparisons.",
+      expectedGainScore: 0,
+      proofCommand: "installed-speed-2026-07-01T02-39-20-182Z.json",
+    },
   ];
   return moves.sort((left, right) => Number(right.expectedGainScore) - Number(left.expectedGainScore));
 }
