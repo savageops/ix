@@ -873,6 +873,46 @@ function requiredKernelProof(engineeringMove) {
   };
 }
 
+function nextEvidenceMove(latestDiagnosticAttribution) {
+  if (
+    latestDiagnosticAttribution?.freshForCurrentBinary !== true ||
+    latestDiagnosticAttribution?.diagnosticAttributionMode !== true ||
+    latestDiagnosticAttribution?.usableForRuntimeMove !== false
+  ) {
+    return null;
+  }
+
+  const target = latestDiagnosticAttribution.nextRepairTarget ?? null;
+  if (target === "scanOpen") {
+    return {
+      id: "retainable_scan_open_runtime_probe",
+      status: "allowed_next_evidence",
+      owner: "tools/scripts/compare-historical-speed.mjs retainable predecessor gate",
+      reason: "Fresh diagnostic attribution found scanOpen pressure, but diagnostic attribution is non-promotional. Run the normal strict installed, predecessor, and older-snapshot gates before selecting any scanOpen runtime repair.",
+      sourceDiagnosticRunId: latestDiagnosticAttribution.evaluatedHistoricalRunId ?? null,
+      proofCommand: SPEED_PROMOTION_COMMAND,
+    };
+  }
+  if (target === "scanFile") {
+    return {
+      id: "retainable_scan_file_runtime_probe",
+      status: "allowed_next_evidence",
+      owner: "tools/scripts/compare-historical-speed.mjs retainable predecessor gate",
+      reason: "Fresh diagnostic attribution found scanFile pressure, but diagnostic attribution is non-promotional. Run the normal strict installed, predecessor, and older-snapshot gates before selecting any scanFile runtime repair.",
+      sourceDiagnosticRunId: latestDiagnosticAttribution.evaluatedHistoricalRunId ?? null,
+      proofCommand: SPEED_PROMOTION_COMMAND,
+    };
+  }
+  return {
+    id: "retainable_runtime_probe",
+    status: "allowed_next_evidence",
+    owner: "tools/scripts/compare-historical-speed.mjs retainable predecessor gate",
+    reason: "Fresh diagnostic attribution exists, but it cannot authorize runtime promotion. Run the normal strict installed, predecessor, and older-snapshot gates before selecting a runtime repair.",
+    sourceDiagnosticRunId: latestDiagnosticAttribution.evaluatedHistoricalRunId ?? null,
+    proofCommand: SPEED_PROMOTION_COMMAND,
+  };
+}
+
 if (!existsSync(reportPath)) {
   throw new Error(`historical report not found: ${reportPath}`);
 }
@@ -894,6 +934,7 @@ const engineeringMove = nextEngineeringMove(moves, summary, leakSummary);
 const policy = preservationPolicy(summary, leakSummary, quality, engineeringMove);
 const diagnosticReportPath = selectFreshDiagnosticHistoricalReport(currentIxSha256);
 const latestDiagnosticAttribution = diagnosticAttributionReport(diagnosticReportPath, currentIxSha256);
+const evidenceMove = nextEvidenceMove(latestDiagnosticAttribution);
 const speedProofPointers = {
   latestDiagnostic: historicalPointerStatus(LATEST_HISTORICAL_PATH, currentIxSha256),
   latestRetainable: historicalPointerStatus(LATEST_RETAINABLE_HISTORICAL_PATH, currentIxSha256),
@@ -991,7 +1032,9 @@ const report = {
   candidateMoves: moves,
   rejectedIds,
   requiredKernelProof: requiredKernelProof(engineeringMove),
+  nextEvidenceMove: evidenceMove,
   nextAllowedMove: moves.find((move) => move.status === "allowed_next") ?? null,
+  nextRuntimeMove: engineeringMove,
   nextEngineeringMove: engineeringMove,
 };
 
