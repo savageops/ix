@@ -88,14 +88,14 @@ function measurePairedHistory(history, ixArgs, effectivePreviousBuildImprovement
   const historyRuns = [];
   const pairOrder = [];
   for (let pair = 0; pair < samples; pair += 1) {
-    const currentFirst = pair % 2 === 0;
-    pairOrder.push(currentFirst ? "current,history" : "history,current");
-    if (currentFirst) {
-      currentRuns.push(measureIxOnce(repoIx, ixArgs, currentRuns.length + 1, { env: BENCH_ENV }));
+    const historyFirst = pair % 2 === 0;
+    pairOrder.push(historyFirst ? "history,current" : "current,history");
+    if (historyFirst) {
       historyRuns.push(measureIxOnce(history.path, ixArgs, historyRuns.length + 1, { env: BENCH_ENV }));
+      currentRuns.push(measureIxOnce(repoIx, ixArgs, currentRuns.length + 1, { env: BENCH_ENV }));
     } else {
-      historyRuns.push(measureIxOnce(history.path, ixArgs, historyRuns.length + 1, { env: BENCH_ENV }));
       currentRuns.push(measureIxOnce(repoIx, ixArgs, currentRuns.length + 1, { env: BENCH_ENV }));
+      historyRuns.push(measureIxOnce(history.path, ixArgs, historyRuns.length + 1, { env: BENCH_ENV }));
     }
   }
 
@@ -114,7 +114,7 @@ function measurePairedHistory(history, ixArgs, effectivePreviousBuildImprovement
     baselineLabel: "historical",
     candidateLabel: "current",
   });
-  const orderSummary = pairOrderSummary(pairOrder, { firstLabel: "current", secondLabel: "history" });
+  const orderSummary = pairOrderSummary(pairOrder, { firstLabel: "history", secondLabel: "current" });
   const orderStratified = orderStratifiedEngineStats(historical.samples, current.samples, pairOrder, {
     baselineLabel: "history",
     candidateLabel: "current",
