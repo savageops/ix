@@ -873,13 +873,27 @@ function requiredKernelProof(engineeringMove) {
   };
 }
 
-function nextEvidenceMove(latestDiagnosticAttribution) {
+function nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers) {
   if (
     latestDiagnosticAttribution?.freshForCurrentBinary !== true ||
     latestDiagnosticAttribution?.diagnosticAttributionMode !== true ||
     latestDiagnosticAttribution?.usableForRuntimeMove !== false
   ) {
     return null;
+  }
+
+  const installed = speedProofPointers?.latestInstalled ?? null;
+  if (installed?.status === "promotion_failed") {
+    return {
+      id: "retainable_runtime_probe",
+      status: "blocked_by_installed_promotion_failure",
+      owner: "tools/scripts/compare-installed-speed.mjs",
+      reason: `Fresh diagnostic attribution found ${latestDiagnosticAttribution.nextRepairTarget ?? "runtime"} pressure, but the strict installed-vs-current promotion gate already failed for the current binary. Do not rerun the same evidence step or choose a runtime repair from diagnostic-only data; change the runtime candidate or benchmark owner first, then rerun installed promotion.`,
+      sourceDiagnosticRunId: latestDiagnosticAttribution.evaluatedHistoricalRunId ?? null,
+      installedRunId: installed.runId ?? null,
+      installedStatus: installed.status,
+      proofCommand: INSTALLED_SPEED_STRICT_COMMAND,
+    };
   }
 
   const target = latestDiagnosticAttribution.nextRepairTarget ?? null;
@@ -934,7 +948,6 @@ const engineeringMove = nextEngineeringMove(moves, summary, leakSummary);
 const policy = preservationPolicy(summary, leakSummary, quality, engineeringMove);
 const diagnosticReportPath = selectFreshDiagnosticHistoricalReport(currentIxSha256);
 const latestDiagnosticAttribution = diagnosticAttributionReport(diagnosticReportPath, currentIxSha256);
-const evidenceMove = nextEvidenceMove(latestDiagnosticAttribution);
 const speedProofPointers = {
   latestDiagnostic: historicalPointerStatus(LATEST_HISTORICAL_PATH, currentIxSha256),
   latestRetainable: historicalPointerStatus(LATEST_RETAINABLE_HISTORICAL_PATH, currentIxSha256),
@@ -942,6 +955,7 @@ const speedProofPointers = {
   latestInstalled: installedPointerStatus(LATEST_RETAINABLE_INSTALLED_PATH, currentIxSha256),
   latestOlderSnapshots: olderSnapshotPointerStatus(LATEST_OLDER_SNAPSHOT_PATH),
 };
+const evidenceMove = nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers);
 const benchmarkStatus = currentSpeedStatus({
   summary,
   historical,
