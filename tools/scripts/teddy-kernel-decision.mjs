@@ -1092,6 +1092,21 @@ const promotionAllowed =
   speedProofPointers.latestRetainable.status === "retainable_current" &&
   selectedInstalledPointer?.status === "promotable_current" &&
   speedProofPointers.latestOlderSnapshots.status === "retainable_current";
+
+function installedPromotionBlocker(pointer) {
+  const status = pointer?.status ?? "missing";
+  if (status === "promotion_failed") {
+    const failures = Array.isArray(pointer?.promotionFailures) && pointer.promotionFailures.length > 0
+      ? `: ${pointer.promotionFailures.join("; ")}`
+      : "";
+    return `current installed-vs-repo promotion proof exists and failed (${pointer?.runId ?? "unknown run"})${failures}; change the runtime candidate or benchmark owner before rerunning promotion`;
+  }
+  if (status === "stale_current_binary") {
+    return `installed-vs-repo promotion proof is stale for the current repo binary (${pointer?.runId ?? "unknown run"}); rerun the installed speed gate before finalizing code changes`;
+  }
+  return `no current installed-vs-repo promotion proof (${status}); run the installed speed gate before finalizing code changes`;
+}
+
 const finalizationGate = {
   speedRegressionFinalizationAllowed: promotionAllowed,
   requiredRetainablePointer: speedProofPointers.latestRetainable,
@@ -1104,7 +1119,7 @@ const finalizationGate = {
     ? null
     : (
         selectedInstalledPointer?.status !== "promotable_current"
-          ? `no current installed-vs-repo promotion proof (${selectedInstalledPointer?.status ?? "missing"}); run the installed speed gate before finalizing code changes`
+          ? installedPromotionBlocker(selectedInstalledPointer)
           : speedProofPointers.latestOlderSnapshots.status !== "retainable_current"
           ? `no current older-snapshot proof (${speedProofPointers.latestOlderSnapshots.status}); run the older-snapshot speed gate before finalizing code changes`
           : speedProofPointers.latestRetainable.status === "retainable_current"
@@ -1116,7 +1131,9 @@ const noRuntimePromotionReason = (() => {
   if (!evidenceFresh) return "historical report candidate hash does not match the current repo binary";
   if (promotionAllowed) return null;
   if (selectedInstalledPointer?.status !== "promotable_current") {
-    return "no current installed-vs-repo promotion proof exists for the repo binary; finalization must run and pass the installed speed gate";
+    return selectedInstalledPointer?.status === "promotion_failed"
+      ? "current installed-vs-repo promotion proof exists and failed; finalization requires a changed runtime candidate or benchmark owner followed by a passing installed speed gate"
+      : "no current installed-vs-repo promotion proof exists for the repo binary; finalization must run and pass the installed speed gate";
   }
   if (speedProofPointers.latestRetainable.status !== "retainable_current") {
     return "no current retainable strict speed proof exists for the repo binary; finalization must run and pass the strict predecessor speed gate";
