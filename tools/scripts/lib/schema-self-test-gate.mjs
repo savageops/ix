@@ -1,6 +1,7 @@
 export function runSchemaSelfTest({
   stateDir,
   outPath,
+  classifyHostForBenchmark,
   validateReport,
   validateBenchmarkHostPreflightLane,
   validateBenchmarkLockLane,
@@ -312,6 +313,36 @@ export function runSchemaSelfTest({
     },
     failures,
   );
+  const assertionFailures = [];
+  if (typeof classifyHostForBenchmark !== "function") {
+    assertionFailures.push("benchmark host classifier self-test requires classifyHostForBenchmark");
+  } else {
+    const hostNoiseConfig = {
+      activeCpuMinSec: 0.05,
+      activeCpuHeavySec: 0.25,
+      largeProcessWorkingSetBytes: 1024,
+      benchmarkProcessNames: ["node"],
+    };
+    const largeResident = classifyHostForBenchmark({
+      topProcessesByWorkingSet: [{ Id: 7, ProcessName: "LM Studio", WorkingSet64: 2048 }],
+      activeCpuProcesses: [],
+      totalMemBytes: 16 * 1024 * 1024,
+      freeMemBytes: 16 * 1024 * 1024,
+    }, hostNoiseConfig);
+    if (!largeResident.issues.some((issue) => issue.id === "large_resident_workload" && issue.severity === "warning")) {
+      assertionFailures.push("benchmark host classifier must warn on large resident non-benchmark workloads");
+    }
+    const activeCpu = classifyHostForBenchmark({
+      topProcessesByWorkingSet: [],
+      activeCpuProcesses: [{ Id: 8, ProcessName: "chrome", CpuDeltaSec: 0.5 }],
+      activeCpuSampleMs: 750,
+      totalMemBytes: 16 * 1024 * 1024,
+      freeMemBytes: 16 * 1024 * 1024,
+    }, hostNoiseConfig);
+    if (!activeCpu.issues.some((issue) => issue.id === "active_cpu_workload" && issue.severity === "warning")) {
+      assertionFailures.push("benchmark host classifier must warn on active CPU non-benchmark workloads");
+    }
+  }
   validateBenchmarkLockLane(
     {
       id: "benchmark_lock",
@@ -1929,9 +1960,10 @@ export function runSchemaSelfTest({
   ];
   const missing = required.filter((needle) => !failures.includes(needle));
   const report = {
-    status: missing.length === 0 ? "ok" : "failed",
+    status: missing.length === 0 && assertionFailures.length === 0 ? "ok" : "failed",
     mode: "schema-self-test",
     checkedFailures: failures,
+    assertionFailures,
     required,
     missing,
   };

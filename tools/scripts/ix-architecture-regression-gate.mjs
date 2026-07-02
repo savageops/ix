@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { hostSnapshot } from "./lib/benchmark-runner.mjs";
+import { classifyHostForBenchmark, hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { createBenchmarkAdmission } from "./lib/benchmark-admission.mjs";
 import {
   createAlternatesDecisionGateLane,
@@ -288,6 +288,7 @@ if (schemaSelfTest) {
   runSchemaSelfTest({
     stateDir,
     outPath,
+    classifyHostForBenchmark,
     validateReport,
     validateBenchmarkHostPreflightLane,
     validateBenchmarkLockLane,

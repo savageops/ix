@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { classifyHotspot, computeRatio, computeSpeedupPct, summarizeSeries } from "./metrics.mjs";
 import { pairOrderSummary } from "./speed-compare-utils.mjs";
+import { benchmarkHostNoiseConfig } from "./benchmark-config.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports");
@@ -343,21 +344,12 @@ function elevationSnapshot() {
   return { checked: false, isAdmin: null, reason: "powershell_admin_check_failed" };
 }
 
-function classifyHostForBenchmark(snapshot) {
+export function classifyHostForBenchmark(snapshot, config = benchmarkHostNoiseConfig()) {
   const issues = [];
-  const activeCpuMinSec = 0.05;
-  const activeCpuHeavySec = 0.25;
-  const largeProcessWorkingSetBytes = 4 * 1024 * 1024 * 1024;
-  const benchmarkProcessNames = new Set([
-    "ix",
-    "iex",
-    "ix-zig",
-    "node",
-    "powershell",
-    "pwsh",
-    "conhost",
-    "windowsterminal",
-  ]);
+  const activeCpuMinSec = config.activeCpuMinSec;
+  const activeCpuHeavySec = config.activeCpuHeavySec;
+  const largeProcessWorkingSetBytes = config.largeProcessWorkingSetBytes;
+  const benchmarkProcessNames = new Set(config.benchmarkProcessNames);
   const processName = (entry) => String(entry?.ProcessName ?? "").toLowerCase();
   const isBenchmarkProcess = (entry) => benchmarkProcessNames.has(processName(entry));
   const powerName = snapshot.powerScheme?.name?.toLowerCase?.() ?? "";

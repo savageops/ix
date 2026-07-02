@@ -10,6 +10,21 @@ export const EXPERIMENTAL_BENCH_ENV_KEYS = [
   "IX_LITERAL_ALTERNATES_COUNTER_CACHE",
   "IX_BLOCK_PRUNING_PROOF",
 ];
+export const BENCHMARK_HOST_NOISE_DEFAULTS = {
+  activeCpuMinSec: 0.05,
+  activeCpuHeavySec: 0.25,
+  largeProcessWorkingSetBytes: 4 * 1024 * 1024 * 1024,
+};
+export const BENCHMARK_PROCESS_NAMES = [
+  "ix",
+  "iex",
+  "ix-zig",
+  "node",
+  "powershell",
+  "pwsh",
+  "conhost",
+  "windowsterminal",
+];
 
 export function defaultRepoIxPath(root) {
   return path.join(root, "zig-out", "bin", process.platform === "win32" ? "ix-zig.exe" : "ix-zig");
@@ -46,4 +61,21 @@ export function hasExperimentalBenchEnv(reportOrEnv = process.env) {
     const value = env?.[key];
     return value != null && value !== "";
   });
+}
+
+function finitePositiveNumber(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+export function benchmarkHostNoiseConfig(env = process.env) {
+  return {
+    activeCpuMinSec: finitePositiveNumber(env.IX_BENCH_HOST_ACTIVE_CPU_MIN_SEC, BENCHMARK_HOST_NOISE_DEFAULTS.activeCpuMinSec),
+    activeCpuHeavySec: finitePositiveNumber(env.IX_BENCH_HOST_ACTIVE_CPU_HEAVY_SEC, BENCHMARK_HOST_NOISE_DEFAULTS.activeCpuHeavySec),
+    largeProcessWorkingSetBytes: finitePositiveNumber(
+      env.IX_BENCH_HOST_LARGE_WORKING_SET_BYTES,
+      BENCHMARK_HOST_NOISE_DEFAULTS.largeProcessWorkingSetBytes,
+    ),
+    benchmarkProcessNames: BENCHMARK_PROCESS_NAMES,
+  };
 }
