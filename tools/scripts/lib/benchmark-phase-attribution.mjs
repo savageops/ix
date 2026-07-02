@@ -533,6 +533,12 @@ export function phaseLeakSummaryFromRounds(rounds) {
             candidateSubphaseMedians: AGGREGATE_TIMING_BASIS,
             scanFileResidual: "candidate_current_only_aggregate_medians_minus_route_elapsed_medians",
           },
+          scanFileResidualEvidence: {
+            basis: "aggregate_worker_time_minus_nested_route_elapsed_medians",
+            directlyMeasured: false,
+            usableForRuntimePatch: false,
+            requiredNextProof: "isolate_mmap_open_bookkeeping_line_walk_before_runtime_patch",
+          },
           dominantCandidateSubphase,
           regressingCandidateSubphase: regressingCandidateSubphase?.name ?? null,
           regressingCandidateSubphaseMedianPct: Number.isFinite(Number(regressingCandidateSubphase?.pairedMedianPct)) ? Number(regressingCandidateSubphase.pairedMedianPct) : null,

@@ -60,6 +60,19 @@ function finiteNumber(value) {
   return Number.isFinite(number);
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function scanFileResidualEvidenceValid(split) {
+  const evidence = split?.scanFileResidualEvidence;
+  return isPlainObject(evidence) &&
+    evidence.basis === "aggregate_worker_time_minus_nested_route_elapsed_medians" &&
+    evidence.directlyMeasured === false &&
+    evidence.usableForRuntimePatch === false &&
+    evidence.requiredNextProof === "isolate_mmap_open_bookkeeping_line_walk_before_runtime_patch";
+}
+
 function executableSha256File(filePath) {
   if (!existsSync(filePath)) return null;
   return executableHash(readFileSync(filePath));
@@ -350,6 +363,9 @@ if (diagnosticPointer?.freshForCurrentBinary === true && diagnosticPointer.diagn
         if (!["teddyRange", "alternateFullScan", "scanFileFastCount", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)) {
           failures.push("decision scanFile diagnostic attribution must name dominant scan-file component");
         }
+        if (split.dominantCandidateScanFileComponent === "scanFileResidual" && !scanFileResidualEvidenceValid(split)) {
+          failures.push("decision scanFile residual diagnostic attribution must identify derived non-runtime-patch evidence");
+        }
       }
     }
   }
@@ -612,6 +628,12 @@ if (teddyGainNeedsLeakRepair) {
         !Array.isArray(split.candidateSlowestPathHotspots)
       ) {
         failures.push("decision scanFile residual attribution must include candidate slowest-path hotspots");
+      }
+      if (
+        split.dominantCandidateScanFileComponent === "scanFileResidual" &&
+        !scanFileResidualEvidenceValid(split)
+      ) {
+        failures.push("decision scanFile residual attribution must include explicit derived non-runtime-patch evidence metadata");
       }
     }
   }

@@ -5,6 +5,15 @@ function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function scanFileResidualEvidenceValid(split) {
+  const evidence = split?.scanFileResidualEvidence;
+  return isPlainObject(evidence) &&
+    evidence.basis === "aggregate_worker_time_minus_nested_route_elapsed_medians" &&
+    evidence.directlyMeasured === false &&
+    evidence.usableForRuntimePatch === false &&
+    evidence.requiredNextProof === "isolate_mmap_open_bookkeeping_line_walk_before_runtime_patch";
+}
+
 function mixedTeddyGainNeedsLeakRepair(decision) {
   return (
     decision?.leakSummary?.diagnosis === "preserve_positive_teddy_gain_and_repair_whole_engine_leak" &&
@@ -145,6 +154,9 @@ function validateTeddyDecision(decision, evidence) {
           }
           if (!["teddyRange", "alternateFullScan", "scanFileFastCount", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)) {
             failures.push("teddy kernel scanFile diagnostic attribution must name dominant scan-file component");
+          }
+          if (split.dominantCandidateScanFileComponent === "scanFileResidual" && !scanFileResidualEvidenceValid(split)) {
+            failures.push("teddy kernel scanFile residual diagnostic attribution must identify derived non-runtime-patch evidence");
           }
         }
       }
@@ -321,6 +333,12 @@ function validateTeddyDecision(decision, evidence) {
           !Array.isArray(split.candidateSlowestPathHotspots)
         ) {
           failures.push("scanFile residual attribution requires candidate slowest-path hotspots");
+        }
+        if (
+          split.dominantCandidateScanFileComponent === "scanFileResidual" &&
+          !scanFileResidualEvidenceValid(split)
+        ) {
+          failures.push("scanFile residual attribution requires explicit derived non-runtime-patch evidence metadata");
         }
       }
     }
