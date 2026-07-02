@@ -189,6 +189,22 @@ function focusedRepoExecutableHashes(report) {
   return [...new Set([...identityHashes, ...roundHashes].filter(Boolean))];
 }
 
+function focusedConfirmationFanout(expression) {
+  const match = /^re:\(\?i\)\((.*)\)$/.exec(String(expression ?? "")) ??
+    /^re:\((.*)\)$/.exec(String(expression ?? "")) ??
+    /^\((.*)\)$/.exec(String(expression ?? ""));
+  if (match == null) return null;
+  const branches = match[1].split("|").filter((branch) => branch.length > 0);
+  if (branches.length < 2) return null;
+  const foldedStarts = new Set(branches.map((branch) => branch[0].toLowerCase()));
+  return {
+    branchCount: branches.length,
+    distinctFoldedStartBytes: foldedStarts.size,
+    firstByteVerifierFanoutMax: branches.length === foldedStarts.size ? 1 : null,
+    bucketVerifierExpectedUseful: branches.length !== foldedStarts.size,
+  };
+}
+
 function focusedSlowestStatus(filePath, currentHash) {
   if (!existsSync(filePath)) {
     return {
@@ -224,6 +240,7 @@ function focusedSlowestStatus(filePath, currentHash) {
       pointer.failureSummary.some((failure) => failure?.id === "diagnostic_attribution_run_not_promotion_evidence"));
   const teddyMedianPct = Number(pointer.averages?.pairedCandidateTeddyRangeImprovementMedianPct);
   const teddyRouteNetPositive = Number.isFinite(teddyMedianPct) && teddyMedianPct >= 0;
+  const confirmationFanout = focusedConfirmationFanout(pointer.expression);
   let status = "focused_teddy_nonnegative";
   if (!freshForCurrentBinary) status = "stale_current_binary";
   else if (!retainableFocusedEvidence || experimentalFocusedEvidence) status = "diagnostic_only";
@@ -239,6 +256,7 @@ function focusedSlowestStatus(filePath, currentHash) {
     expression: pointer.expression ?? null,
     baselineKind: pointer.baselineKind ?? null,
     buildFirst: pointer.buildFirst === true,
+    confirmationFanout,
     retainableFocusedEvidence,
     experimentalFocusedEvidence,
     freshForCurrentBinary,
@@ -733,6 +751,8 @@ function candidateMoves(summary, leakSummary, quality, focusedSlowest) {
     summary.fullScanBytesParity === true &&
     summary.fullScanMatchesParity === true;
   const focusedSlowestTeddyNegative = focusedSlowest?.status === "focused_teddy_negative";
+  const focusedVerifierFanoutUseful = focusedSlowest?.confirmationFanout?.bucketVerifierExpectedUseful !== false;
+  const focusedSlowestTeddyActionable = focusedSlowestTeddyNegative && focusedVerifierFanoutUseful;
   const focusedSlowestTeddyPressure = Math.max(
     0,
     -Number(focusedSlowest?.averages?.pairedCandidateTeddyRangeImprovementMedianPct ?? 0),
@@ -799,12 +819,14 @@ function candidateMoves(summary, leakSummary, quality, focusedSlowest) {
       id: "focused_slowest_teddy_regression_attribution",
       status: benchmarkNoiseBlocked
         ? "blocked_by_benchmark_noise"
-        : (focusedSlowestTeddyNegative ? "allowed_next" : "waiting_for_focused_teddy_regression"),
+        : (focusedSlowestTeddyActionable ? "allowed_next" : (focusedSlowestTeddyNegative ? "blocked_by_verifier_fanout_irrelevant" : "waiting_for_focused_teddy_regression")),
       owner: "src/core/literal_alternates.zig::nextTeddyCandidate and focused slowest ASIC header lane",
       reason: focusedSlowestTeddyNegative
-        ? `Fresh focused slowest-file evidence (${focusedSlowest.runId ?? "unknown run"}) is retainable and Teddy-negative against baseline=${focusedSlowest.baselineKind ?? "unknown"} on ${focusedSlowest.corpus ?? "unknown corpus"}: paired Teddy median=${focusedSlowest.averages?.pairedCandidateTeddyRangeImprovementMedianPct}%, paired engine median=${focusedSlowest.averages?.pairedRepoImprovementMedianPct}%, engine raw=${focusedSlowest.averages?.repoEngineImprovementPct}%. Broad scan-file residual attribution is insufficient until this slowest-file Teddy lane is repaired or disproven.`
+        ? (focusedVerifierFanoutUseful
+            ? `Fresh focused slowest-file evidence (${focusedSlowest.runId ?? "unknown run"}) is retainable and Teddy-negative against baseline=${focusedSlowest.baselineKind ?? "unknown"} on ${focusedSlowest.corpus ?? "unknown corpus"}: paired Teddy median=${focusedSlowest.averages?.pairedCandidateTeddyRangeImprovementMedianPct}%, paired engine median=${focusedSlowest.averages?.pairedRepoImprovementMedianPct}%, engine raw=${focusedSlowest.averages?.repoEngineImprovementPct}%. Broad scan-file residual attribution is insufficient until this slowest-file Teddy lane is repaired or disproven.`
+            : `Fresh focused slowest-file evidence (${focusedSlowest.runId ?? "unknown run"}) is Teddy-negative, but the focused expression has distinct folded first bytes and existing confirmation already narrows to one branch per candidate. Bucket-verifier repair is not expected to reduce this lane; route the next implementation toward scan-file residual or a true packed candidate extractor, not branch-mask verification.`)
         : "Use only when a current-binary focused slowest-file run proves the dominant slow file is Teddy-negative.",
-      expectedGainScore: focusedSlowestTeddyNegative ? 7 + focusedSlowestTeddyPressure : 0,
+      expectedGainScore: focusedSlowestTeddyActionable ? 7 + focusedSlowestTeddyPressure : 0,
       proofCommand: `node tools/scripts/compare-focused-slowest-speed.mjs --build --rounds 6 --samples 12 --threads 32 --quiet && ${SPEED_PROMOTION_COMMAND}`,
     },
     {

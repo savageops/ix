@@ -416,7 +416,8 @@ function focusedSlowestTeddyNegative(decision) {
     focused.status === "focused_teddy_negative" &&
     focused.freshForCurrentBinary === true &&
     focused.retainableFocusedEvidence === true &&
-    focused.experimentalFocusedEvidence !== true
+    focused.experimentalFocusedEvidence !== true &&
+    focused.confirmationFanout?.bucketVerifierExpectedUseful !== false
   );
 }
 function expectedScanWorkRepairMove(split) {
