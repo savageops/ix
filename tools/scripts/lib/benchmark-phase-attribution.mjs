@@ -61,7 +61,7 @@ function nsToMs(value) {
 function subphaseTimingPresent(openMs, fileMs) {
   const open = Number(openMs);
   const file = Number(fileMs);
-  return (Number.isFinite(open) && open > 0) || (Number.isFinite(file) && file > 0);
+  return Number.isFinite(open) && open > 0 && Number.isFinite(file) && file > 0;
 }
 
 const PAIRED_TIMING_BASIS = "paired_samples";

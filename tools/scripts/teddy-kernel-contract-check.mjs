@@ -563,13 +563,17 @@ if (teddyGainNeedsLeakRepair) {
     if (split == null || typeof split !== "object" || Array.isArray(split)) {
       failures.push("decision scanWork leak attribution must include current-only scanOpen/scanFile split summary");
     } else {
+      const splitUnavailable =
+        Number(split.candidateSplitRoundCount ?? 0) === 0 &&
+        String(split.interpretation ?? "").includes("split telemetry is unavailable") &&
+        String(decision.nextAllowedMove?.proofCommand ?? "").includes("--scan-open-timing");
       if (Number(split.targetRoundCount ?? 0) < 1) {
         failures.push("decision scanWork leak attribution must include target rounds");
       }
-      if (Number(split.candidateSplitRoundCount ?? 0) < Number(split.targetRoundCount ?? 0)) {
+      if (!splitUnavailable && Number(split.candidateSplitRoundCount ?? 0) < Number(split.targetRoundCount ?? 0)) {
         failures.push("decision scanWork leak attribution must have candidate split telemetry for every target round");
       }
-      if (!["scanOpen", "scanFile"].includes(split.dominantCandidateSubphase)) {
+      if (!splitUnavailable && !["scanOpen", "scanFile"].includes(split.dominantCandidateSubphase)) {
         failures.push("decision scanWork leak attribution must name dominant candidate subphase");
       }
       if (split.regressingCandidateSubphase != null && !["scanOpen", "scanFile"].includes(split.regressingCandidateSubphase)) {
