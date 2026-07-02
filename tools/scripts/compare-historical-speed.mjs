@@ -283,7 +283,7 @@ if (!existsSync(repoIx)) throw new Error(`repo IX not found: ${repoIx}`);
 
 const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)];
 const hostBefore = hostSnapshot();
-const processBefore = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV });
+const processBefore = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV, cleanupOwned: true });
 const ripgrep = measureRipgrep({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
 const ripgrepMmapComparison = measureRipgrepMmapComparison({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
 const currentIdentity = binarySnapshot(repoIx);
@@ -304,7 +304,7 @@ const effectivePreviousBuildImprovementPct = effectiveImprovementTargetPct({
   noiseMultiplier: identityNoiseMultiplier,
 });
 const comparisons = backupCandidates().map((candidate) => measurePairedHistory(candidate, ixArgs, effectivePreviousBuildImprovementPct));
-const processAfter = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV });
+const processAfter = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV, cleanupOwned: true });
 const hostAfter = hostSnapshot();
 const host = { before: hostBefore, after: hostAfter };
 const processScan = { before: processBefore, after: processAfter };

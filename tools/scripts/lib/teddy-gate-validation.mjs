@@ -31,16 +31,40 @@ function diagnosticAttributionOnly(decision) {
   return (decision?.evidenceQuality?.comparisonFailures ?? []).includes("diagnostic_attribution_run_not_retainable_evidence");
 }
 
+function activeAttributionDecision(decision) {
+  if (
+    decision?.nextEvidenceMove?.status === "allowed_next_evidence" &&
+    isPlainObject(decision?.latestDiagnosticAttribution) &&
+    decision.latestDiagnosticAttribution.freshForCurrentBinary === true &&
+    decision.latestDiagnosticAttribution.diagnosticAttributionMode === true &&
+    decision.latestDiagnosticAttribution.usableForRuntimeMove === false
+  ) {
+    return {
+      ...decision,
+      leakSummary: decision.latestDiagnosticAttribution.leakSummary,
+      evidenceQuality: decision.latestDiagnosticAttribution.evidenceQuality,
+    };
+  }
+  return decision;
+}
+
 function expectedScanWorkRepairMove(decision) {
   const split = decision?.leakSummary?.leakAttribution?.currentOnlyScanSplit;
+  const target = decision?.nextRepairTarget ?? decision?.leakSummary?.nextRepairTarget ?? null;
+  if (target === "scanFile") return "scan_file_residual_hotspot_attribution";
+  if (target === "scanOpen") return "scan_open_path_pressure_attribution";
   if (split?.regressingCandidateSubphase === "scanFile") return "scan_file_residual_hotspot_attribution";
-  if (split?.dominantCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
+  if (split?.regressingCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
   return "whole_engine_leak_attribution";
 }
 
 function expectedScanWorkNextMove(decision) {
   const split = decision?.leakSummary?.leakAttribution?.currentOnlyScanSplit;
-  if (diagnosticAttributionOnly(decision) && split?.dominantCandidateSubphase === "scanOpen" && split?.regressingCandidateSubphase !== "scanFile") {
+  const target = decision?.nextRepairTarget ?? decision?.leakSummary?.nextRepairTarget ?? null;
+  if (diagnosticAttributionOnly(decision) && target === "scanOpen") {
+    return "retainable_scan_open_runtime_probe";
+  }
+  if (diagnosticAttributionOnly(decision) && split?.regressingCandidateSubphase === "scanOpen") {
     return "retainable_scan_open_runtime_probe";
   }
   return expectedScanWorkRepairMove(decision);
@@ -50,11 +74,15 @@ function expectedTeddyNextMove(decision) {
   if (evidenceBlockedByBenchmarkNoise(decision)) {
     return "benchmark_host_noise_control";
   }
+  const attributionDecision = activeAttributionDecision(decision);
+  const target = attributionDecision?.nextRepairTarget ?? attributionDecision?.leakSummary?.nextRepairTarget ?? null;
+  if (target === "scanOpen") return expectedScanWorkNextMove(attributionDecision);
+  if (target === "scanFile") return expectedScanWorkNextMove(attributionDecision);
   if (
     mixedTeddyGainNeedsLeakRepair(decision) &&
-    ["scan_file_residual_hotspot_attribution", "scan_open_path_pressure_attribution"].includes(expectedScanWorkRepairMove(decision))
+    ["scan_file_residual_hotspot_attribution", "scan_open_path_pressure_attribution"].includes(expectedScanWorkRepairMove(attributionDecision))
   ) {
-    return expectedScanWorkNextMove(decision);
+    return expectedScanWorkNextMove(attributionDecision);
   }
   return mixedTeddyGainNeedsLeakRepair(decision)
     ? "whole_engine_leak_attribution"
@@ -62,7 +90,7 @@ function expectedTeddyNextMove(decision) {
 }
 
 function expectedTeddyRepairMove(decision) {
-  return expectedScanWorkNextMove(decision);
+  return expectedScanWorkNextMove(activeAttributionDecision(decision));
 }
 
 function rejectedMoveIds(decision) {
@@ -111,7 +139,7 @@ function validateTeddyDecision(decision, evidence) {
           if (split.regressingCandidateSubphase !== "scanFile") {
             failures.push("teddy kernel scanFile diagnostic attribution must identify scanFile as the regressing subphase");
           }
-          if (!["teddyRange", "alternateFullScan", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)) {
+          if (!["teddyRange", "alternateFullScan", "scanFileFastCount", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)) {
             failures.push("teddy kernel scanFile diagnostic attribution must name dominant scan-file component");
           }
         }
@@ -189,7 +217,7 @@ function validateTeddyDecision(decision, evidence) {
     }
     if (
       decision.leakSummary?.nextRepairTarget === "scanWork" &&
-      !diagnosticAttributionOnly(decision) &&
+      !diagnosticAttributionOnly(activeAttributionDecision(decision)) &&
       !String(decision.nextAllowedMove?.proofCommand ?? "").includes("--scan-open-timing")
     ) {
       failures.push("scanWork leak attribution proof command must enable scan-open timing");
@@ -253,7 +281,7 @@ function validateTeddyDecision(decision, evidence) {
         }
         if (
           split.dominantCandidateSubphase === "scanFile" &&
-          !["teddyRange", "alternateFullScan", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
+          !["teddyRange", "alternateFullScan", "scanFileFastCount", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
         ) {
           failures.push("scanFile leak attribution requires a dominant candidate scan-file component");
         }

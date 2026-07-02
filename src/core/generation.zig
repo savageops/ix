@@ -773,9 +773,10 @@ test "generation root helper uses canonical state directory outside scanned root
 }
 
 test "generation manifest publish exposes only replaced visible manifest" {
-    const root = ".zig-cache\\ix-generation-publish-test";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
 
     const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 9);
     defer paths.deinit(std.testing.allocator);
@@ -789,7 +790,12 @@ test "generation manifest publish exposes only replaced visible manifest" {
 }
 
 test "generation manifest publish rejects empty manifest body" {
-    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, ".zig-cache\\ix-generation-empty-publish-test", 1);
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 1);
     defer paths.deinit(std.testing.allocator);
 
     try std.testing.expectError(error.EmptyGenerationManifest, publishManifestBytes(std.testing.io, paths, ""));
@@ -894,9 +900,10 @@ test "generation gc planner deduplicates and refuses invalid current epoch" {
 }
 
 test "generation payload publish writes catalog postings and manifest through epoch directory" {
-    const root = ".zig-cache\\ix-generation-payload-publish-test";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
 
     const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 13);
     defer paths.deinit(std.testing.allocator);
@@ -924,9 +931,10 @@ test "generation payload publish writes catalog postings and manifest through ep
 }
 
 test "generation payload validation rejects missing published segment" {
-    const root = ".zig-cache\\ix-generation-missing-payload-test";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
 
     const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 61);
     defer paths.deinit(std.testing.allocator);
@@ -949,9 +957,10 @@ test "generation payload validation rejects missing published segment" {
 }
 
 test "generation payload validation rejects checksum mismatch" {
-    const root = ".zig-cache\\ix-generation-checksum-payload-test";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
 
     const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 62);
     defer paths.deinit(std.testing.allocator);
@@ -976,9 +985,10 @@ test "generation payload validation rejects checksum mismatch" {
 }
 
 test "generation payload validation streams segment bytes without whole payload allocation" {
-    const root = ".zig-cache\\ix-generation-stream-validation-test";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
 
     const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 63);
     defer paths.deinit(std.testing.allocator);
@@ -1013,9 +1023,10 @@ test "generation payload validation streams segment bytes without whole payload 
 }
 
 test "generation compacted publish writes canonical catalog and postings payloads" {
-    const root = ".zig-cache\\ix-generation-compacted-publish-test";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
 
     const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 14);
     defer paths.deinit(std.testing.allocator);
@@ -1048,9 +1059,10 @@ test "generation compacted publish rejects missing segment payloads" {
 }
 
 test "generation publish retains prior reader pinned epoch" {
-    const root = ".zig-cache\\ix-generation-retention-test";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
 
     const first_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 21);
     defer first_paths.deinit(std.testing.allocator);
@@ -1075,9 +1087,10 @@ test "generation publish retains prior reader pinned epoch" {
 }
 
 test "failed generation publish leaves prior generation active" {
-    const root = ".zig-cache\\ix-generation-partial-publish-test";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
 
     const first_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 31);
     defer first_paths.deinit(std.testing.allocator);
@@ -1102,9 +1115,10 @@ test "failed generation publish leaves prior generation active" {
 }
 
 test "search adoption guard pins complete current generation or falls back" {
-    const root = ".zig-cache\\ix-generation-adoption-guard-test";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
 
     const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 41);
     defer paths.deinit(std.testing.allocator);
@@ -1125,9 +1139,10 @@ test "search adoption guard pins complete current generation or falls back" {
 }
 
 test "current generation pin survives refresh while new epoch publishes" {
-    const root = ".zig-cache\\ix-generation-concurrent-read-smoke-test";
-    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
-    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
 
     const first_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 51);
     defer first_paths.deinit(std.testing.allocator);

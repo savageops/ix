@@ -488,6 +488,11 @@ function measureIxSearch(binaryPath, context, measureOptions) {
 
 function extractPhaseMs(report) {
   const timings = report?.stats?.timings ?? {};
+  const byteShard = report?.stats?.byte_shard_kernel ?? {};
+  const byteShardRangeElapsedNsTotal = Number(byteShard.range_elapsed_ns_total ?? 0);
+  const scanFileFastCountMsTotal = optionalNumber(timings.scan_file_fast_count_ms_total) ?? (
+    byteShardRangeElapsedNsTotal > 0 ? byteShardRangeElapsedNsTotal / 1_000_000 : null
+  );
   return {
     discover: Number(timings.discover_ms ?? 0),
     scan: Number(timings.scan_ms ?? 0),
@@ -497,7 +502,7 @@ function extractPhaseMs(report) {
     scanOpenSyscall: optionalNumber(timings.scan_open_syscall_ms_total),
     scanFile: Number(timings.scan_file_ms_total ?? 0),
     scanFileMmap: optionalNumber(timings.scan_file_mmap_ms_total),
-    scanFileFastCount: optionalNumber(timings.scan_file_fast_count_ms_total),
+    scanFileFastCount: scanFileFastCountMsTotal,
     scanFileLineScan: optionalNumber(timings.scan_file_line_scan_ms_total),
     total: Number(timings.total_ms ?? 0),
   };

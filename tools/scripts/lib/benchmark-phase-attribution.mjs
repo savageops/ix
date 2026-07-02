@@ -452,23 +452,29 @@ export function phaseLeakSummaryFromRounds(rounds) {
           const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
           const teddyMs = nsToMs(sourceRound.candidateAlternateTeddyRangeElapsedNsMedian);
           const fullScanMs = nsToMs(sourceRound.candidateAlternateFullScanElapsedNsMedian);
-          const residualAfterTeddyMs = delta(round.candidateScanFileMedianMs, teddyMs);
-          const residualMs = fullScanMs == null ? residualAfterTeddyMs : delta(residualAfterTeddyMs, fullScanMs);
+          const fastCountMs = optionalNumber(round.candidateScanFileFastCountMedianMs);
+          const routeMs = fastCountMs ?? (
+            fullScanMs == null ? teddyMs : delta((teddyMs ?? 0) + fullScanMs, 0)
+          );
+          const residualMs = routeMs == null ? round.candidateScanFileMedianMs : delta(round.candidateScanFileMedianMs, routeMs);
           return {
             roundIndex: round.roundIndex,
             baselineLabel: round.baselineLabel,
             candidateScanFileMedianMs: round.candidateScanFileMedianMs,
             candidateTeddyRangeMedianMs: teddyMs,
             candidateAlternateFullScanMedianMs: fullScanMs,
+            candidateScanFileFastCountMedianMs: fastCountMs,
             candidateScanFileResidualMedianMs: residualMs,
             candidateTeddyShareOfScanFilePct: ratioPct(teddyMs, round.candidateScanFileMedianMs),
             candidateAlternateFullScanShareOfScanFilePct: ratioPct(fullScanMs, round.candidateScanFileMedianMs),
+            candidateScanFileFastCountShareOfScanFilePct: ratioPct(fastCountMs, round.candidateScanFileMedianMs),
             candidateScanFileResidualSharePct: ratioPct(residualMs, round.candidateScanFileMedianMs),
           };
         });
         const scanFileResidualMedianMs = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileResidualMedianMs));
         const teddyShareOfScanFilePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateTeddyShareOfScanFilePct));
         const alternateFullScanShareOfScanFilePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateAlternateFullScanShareOfScanFilePct));
+        const fastCountShareOfScanFilePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileFastCountShareOfScanFilePct));
         const alternateFullScanMedianMs = optionalSummary(scanFileResidualRounds.map((round) => round.candidateAlternateFullScanMedianMs));
         const scanFileResidualSharePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileResidualSharePct));
         const candidateSlowestPathHotspots = topWeightedEntries(candidateSplitRounds.flatMap((round) => {
@@ -501,6 +507,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
             Number(left.pairedMedianPct) - Number(right.pairedMedianPct)
           )[0] ?? null;
         const dominantCandidateScanFileComponent = [
+          { name: "scanFileFastCount", share: fastCountShareOfScanFilePct },
           { name: "teddyRange", share: teddyShareOfScanFilePct },
           { name: "alternateFullScan", share: alternateFullScanShareOfScanFilePct },
           { name: "scanFileResidual", share: scanFileResidualSharePct },
@@ -540,6 +547,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
           filesScannedParity,
           candidateTeddyShareOfScanFilePct: teddyShareOfScanFilePct,
           candidateAlternateFullScanShareOfScanFilePct: alternateFullScanShareOfScanFilePct,
+          candidateScanFileFastCountShareOfScanFilePct: fastCountShareOfScanFilePct,
           candidateAlternateFullScanMedianMs: alternateFullScanMedianMs,
           candidateScanFileResidualSharePct: scanFileResidualSharePct,
           candidateScanFileResidualMedianMs: scanFileResidualMedianMs,

@@ -1,5 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
+import { DEFAULT_RIPGREP_LINUX_CORPUS, hasExperimentalBenchEnv } from "./lib/benchmark-config.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
 
 const ROOT = process.cwd();
@@ -8,6 +10,8 @@ const DEFAULT_DECISION = path.join(ROOT, "tools", "reports", "teddy-kernel-decis
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "teddy-kernel-contract");
 const INSTALLED_REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
 const REQUIRED_INSTALLED_THREADS = 32;
+const REQUIRED_INSTALLED_SAMPLES = 12;
+const REQUIRED_INSTALLED_RETAINABLE_SAMPLES = 12;
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -52,17 +56,69 @@ function finiteNumber(value) {
   return Number.isFinite(number);
 }
 
-function installedReportStatus(filePath, currentHash) {
+function executableSha256File(filePath) {
+  if (!existsSync(filePath)) return null;
+  return executableHash(readFileSync(filePath));
+}
+
+function executableHash(bytes) {
+  const normalized = Buffer.from(bytes);
+  const pe = peLayout(normalized);
+  if (pe == null) return createHash("sha256").update(normalized).digest("hex").toUpperCase();
+  normalized.fill(0, pe.coffTimestampOffset, pe.coffTimestampOffset + 4);
+  const buildId = pe.sections.find((section) => section.name === ".buildid");
+  if (buildId != null && buildId.rawPointer + buildId.rawSize <= normalized.length) {
+    normalized.fill(0, buildId.rawPointer, buildId.rawPointer + buildId.rawSize);
+  }
+  return createHash("sha256").update(normalized).digest("hex").toUpperCase();
+}
+
+function peLayout(bytes) {
+  if (bytes.length < 0x40 || bytes[0] !== 0x4d || bytes[1] !== 0x5a) return null;
+  const peOffset = bytes.readUInt32LE(0x3c);
+  if (peOffset + 24 > bytes.length) return null;
+  if (bytes[peOffset] !== 0x50 || bytes[peOffset + 1] !== 0x45 || bytes[peOffset + 2] !== 0 || bytes[peOffset + 3] !== 0) return null;
+  const sectionCount = bytes.readUInt16LE(peOffset + 6);
+  const optionalHeaderSize = bytes.readUInt16LE(peOffset + 20);
+  const optionalHeaderOffset = peOffset + 24;
+  if (optionalHeaderOffset + optionalHeaderSize > bytes.length) return null;
+  const sectionOffset = optionalHeaderOffset + optionalHeaderSize;
+  const sections = [];
+  for (let index = 0; index < sectionCount; index += 1) {
+    const offset = sectionOffset + index * 40;
+    if (offset + 40 > bytes.length) break;
+    const nul = bytes.indexOf(0, offset);
+    const nameEnd = nul >= offset && nul < offset + 8 ? nul : offset + 8;
+    sections.push({
+      name: bytes.subarray(offset, nameEnd).toString("ascii"),
+      rawSize: bytes.readUInt32LE(offset + 16),
+      rawPointer: bytes.readUInt32LE(offset + 20),
+    });
+  }
+  return { coffTimestampOffset: peOffset + 8, sections };
+}
+
+function installedReportStatus(filePath, currentHash, currentExecutableHash = null) {
   if (!existsSync(filePath)) return null;
   const report = readJson(filePath);
   const repoSha256 = report.binaries?.repo?.sha256 ?? null;
+  const installedExecutableSha256 = report.binaries?.installed?.executableSha256 ?? report.binaries?.installed?.sha256 ?? null;
+  const repoExecutableSha256 = report.binaries?.repo?.executableSha256 ?? report.binaries?.repo?.sha256 ?? null;
   const installedPath = report.binaries?.installed?.path ?? null;
+  const currentInstalledExecutableSha256 = installedPath != null ? executableSha256File(installedPath) : null;
   const threads = Number(report.threads);
+  const samples = Number(report.samples);
+  const minRetainableSamples = Number(report.minRetainableSamples);
   const promotionFailures = Array.isArray(report.promotionFailures) ? report.promotionFailures : [];
+  const experimentalEnvMode = hasExperimentalBenchEnv(report);
   const diagnosticAttributionMode =
     report.diagnosticAttributionMode === true ||
+    report.scanOpenTiming === true ||
+    report.linuxDominantAttribution === true ||
+    experimentalEnvMode ||
     promotionFailures.includes("diagnostic_attribution_run_not_promotion_evidence");
   const normalizedInstalledPath = normalized(String(installedPath ?? ""));
+  const canonicalCorpus = normalized(String(report.corpus ?? "")) === normalized(DEFAULT_RIPGREP_LINUX_CORPUS);
   const nativeInstalledBaseline =
     normalizedInstalledPath.includes("/appdata/local/programs/iex/bin/ix.exe") &&
     !normalizedInstalledPath.includes("/tmp-baselines/");
@@ -70,28 +126,54 @@ function installedReportStatus(filePath, currentHash) {
     path: path.relative(ROOT, filePath),
     runId: report.runId ?? path.basename(filePath, ".json"),
     timestamp: report.timestamp ?? null,
-    freshForCurrentBinary: currentHash != null && repoSha256 === currentHash,
+    freshForCurrentBinary:
+      currentExecutableHash != null && repoExecutableSha256 != null
+        ? repoExecutableSha256 === currentExecutableHash
+        : (currentHash != null && repoSha256 === currentHash),
+    freshForInstalledBinary:
+      installedExecutableSha256 != null &&
+      currentInstalledExecutableSha256 != null &&
+      installedExecutableSha256 === currentInstalledExecutableSha256,
+    sameExecutableBinary:
+      installedExecutableSha256 != null &&
+      repoExecutableSha256 != null &&
+      installedExecutableSha256 === repoExecutableSha256,
     retainableStrictEvidence: report.retainableStrictEvidence === true,
     diagnosticAttributionMode,
+    experimentalEnvMode,
     nativeInstalledBaseline,
     canonicalThreadConfig: threads === REQUIRED_INSTALLED_THREADS,
+    canonicalSampleConfig:
+      samples >= REQUIRED_INSTALLED_SAMPLES &&
+      minRetainableSamples >= REQUIRED_INSTALLED_RETAINABLE_SAMPLES,
+    canonicalCorpus,
     installedPath,
     repoSha256,
+    installedExecutableSha256,
+    repoExecutableSha256,
+    currentInstalledExecutableSha256,
     threads: Number.isFinite(threads) ? threads : null,
+    samples: Number.isFinite(samples) ? samples : null,
+    minRetainableSamples: Number.isFinite(minRetainableSamples) ? minRetainableSamples : null,
+    corpus: report.corpus ?? null,
   };
 }
 
-function newestRetainableFreshNativeInstalledReport(currentHash) {
-  if (!existsSync(INSTALLED_REPORT_DIR) || currentHash == null) return null;
+function newestRetainableFreshNativeInstalledReport(currentHash, currentExecutableHash = null) {
+  if (!existsSync(INSTALLED_REPORT_DIR) || (currentHash == null && currentExecutableHash == null)) return null;
   const candidates = readdirSync(INSTALLED_REPORT_DIR)
     .filter((name) => /^installed-speed-.*\.json$/.test(name))
-    .map((name) => installedReportStatus(path.join(INSTALLED_REPORT_DIR, name), currentHash))
+    .map((name) => installedReportStatus(path.join(INSTALLED_REPORT_DIR, name), currentHash, currentExecutableHash))
     .filter((status) =>
       status?.freshForCurrentBinary === true &&
+      status.freshForInstalledBinary === true &&
+      status.sameExecutableBinary !== true &&
       status.retainableStrictEvidence === true &&
       status.diagnosticAttributionMode !== true &&
       status.nativeInstalledBaseline === true &&
-      status.canonicalThreadConfig === true)
+      status.canonicalThreadConfig === true &&
+      status.canonicalSampleConfig === true &&
+      status.canonicalCorpus === true)
     .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
   return candidates[0] ?? null;
 }
@@ -206,7 +288,7 @@ if (installedDiagnosticPointer?.freshForCurrentBinary === true) {
   if (installedDiagnosticPath.includes("/tmp-baselines/")) {
     failures.push("decision installed diagnostic pointer must not use tmp-baselines");
   }
-  const newestInstalledDiagnostic = newestRetainableFreshNativeInstalledReport(decision.currentIxSha256 ?? null);
+  const newestInstalledDiagnostic = newestRetainableFreshNativeInstalledReport(decision.currentIxSha256 ?? null, decision.currentIxExecutableSha256 ?? null);
   if (newestInstalledDiagnostic != null &&
       installedDiagnosticPointer.runId !== newestInstalledDiagnostic.runId) {
     failures.push(`decision installed diagnostic pointer must select newest retainable fresh native report: ${newestInstalledDiagnostic.runId}`);
@@ -239,7 +321,7 @@ if (installedDiagnosticPointer?.freshForCurrentBinary === true) {
     }
   }
 }
-if (diagnosticPointer?.freshForCurrentBinary === true) {
+if (diagnosticPointer?.freshForCurrentBinary === true && diagnosticPointer.diagnosticAttributionMode === true) {
   const diagnosticAttribution = decision.latestDiagnosticAttribution ?? null;
   if (diagnosticAttribution == null || typeof diagnosticAttribution !== "object" || Array.isArray(diagnosticAttribution)) {
     failures.push("decision lacks latest diagnostic attribution summary");
@@ -264,7 +346,7 @@ if (diagnosticPointer?.freshForCurrentBinary === true) {
         if (split.regressingCandidateSubphase !== "scanFile") {
           failures.push("decision scanFile diagnostic attribution must identify scanFile as the regressing subphase");
         }
-        if (!["teddyRange", "alternateFullScan", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)) {
+        if (!["teddyRange", "alternateFullScan", "scanFileFastCount", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)) {
           failures.push("decision scanFile diagnostic attribution must name dominant scan-file component");
         }
       }
@@ -289,10 +371,12 @@ if (!installedPointerReady) {
   const installedProofStateNamed =
     blocker.includes("no current installed-vs-repo promotion proof") ||
     blocker.includes("installed-vs-repo promotion proof is stale") ||
-    blocker.includes("current installed-vs-repo promotion proof exists and failed");
+    blocker.includes("current installed-vs-repo promotion proof exists and failed") ||
+    blocker.includes("identity-noise evidence");
   const installedReasonStateNamed =
     noRuntimeReason.includes("no current installed-vs-repo promotion proof") ||
-    noRuntimeReason.includes("current installed-vs-repo promotion proof exists and failed");
+    noRuntimeReason.includes("current installed-vs-repo promotion proof exists and failed") ||
+    noRuntimeReason.includes("identity-noise evidence");
   if (!installedProofStateNamed) {
     failures.push("decision finalization gate must name missing/stale/failed installed-vs-repo promotion proof as blocker");
   }
@@ -322,30 +406,92 @@ const benchmarkNoiseFailures = [
   ...(evidenceQuality.sampleFailures ?? []),
 ];
 const evidenceBlockedByNoise = benchmarkNoiseFailures.length > 0;
+function focusedSlowestTeddyNegative(decision) {
+  const focused = decision?.focusedSlowestEvidence ?? null;
+  return (
+    focused != null &&
+    typeof focused === "object" &&
+    !Array.isArray(focused) &&
+    focused.status === "focused_teddy_negative" &&
+    focused.freshForCurrentBinary === true &&
+    focused.retainableFocusedEvidence === true &&
+    focused.experimentalFocusedEvidence !== true
+  );
+}
 function expectedScanWorkRepairMove(split) {
   if (split?.regressingCandidateSubphase === "scanFile") return "scan_file_residual_hotspot_attribution";
-  if (split?.dominantCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
+  if (split?.regressingCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
   return "whole_engine_leak_attribution";
 }
 function diagnosticAttributionOnly(quality) {
   return (quality?.comparisonFailures ?? []).includes("diagnostic_attribution_run_not_retainable_evidence");
 }
-function expectedScanWorkNextMove(split, quality) {
-  if (diagnosticAttributionOnly(quality) && split?.dominantCandidateSubphase === "scanOpen" && split?.regressingCandidateSubphase !== "scanFile") {
+function activeAttribution(decision) {
+  if (
+    decision?.nextEvidenceMove?.status === "allowed_next_evidence" &&
+    decision?.latestDiagnosticAttribution != null &&
+    typeof decision.latestDiagnosticAttribution === "object" &&
+    !Array.isArray(decision.latestDiagnosticAttribution) &&
+    decision.latestDiagnosticAttribution.freshForCurrentBinary === true &&
+    decision.latestDiagnosticAttribution.diagnosticAttributionMode === true &&
+    decision.latestDiagnosticAttribution.usableForRuntimeMove === false
+  ) {
+    return {
+      split: decision.latestDiagnosticAttribution.leakSummary?.leakAttribution?.currentOnlyScanSplit,
+      quality: decision.latestDiagnosticAttribution.evidenceQuality ?? {},
+      target: decision.latestDiagnosticAttribution.nextRepairTarget ?? decision.latestDiagnosticAttribution.leakSummary?.nextRepairTarget ?? null,
+    };
+  }
+  return {
+    split: decision?.leakSummary?.leakAttribution?.currentOnlyScanSplit,
+    quality: decision?.evidenceQuality ?? {},
+    target: decision?.leakSummary?.nextRepairTarget ?? null,
+  };
+}
+function expectedScanWorkNextMove(split, quality, target = null) {
+  if (diagnosticAttributionOnly(quality) && target === "scanOpen") {
+    return "retainable_scan_open_runtime_probe";
+  }
+  if (target === "scanOpen") return "scan_open_path_pressure_attribution";
+  if (target === "scanFile") return "scan_file_residual_hotspot_attribution";
+  if (diagnosticAttributionOnly(quality) && split?.regressingCandidateSubphase === "scanOpen") {
     return "retainable_scan_open_runtime_probe";
   }
   return expectedScanWorkRepairMove(split);
 }
+function expectedActiveRepairMove(attribution) {
+  return expectedScanWorkNextMove(attribution.split, attribution.quality, attribution.target);
+}
+function expectedActiveRepairOwner(attribution) {
+  if (attribution.target === "scanOpen") return "scan_open_path_pressure_attribution";
+  if (attribution.target === "scanFile") return "scan_file_residual_hotspot_attribution";
+  return expectedScanWorkRepairMove(attribution.split);
+}
+const activeExpectedAttribution = activeAttribution(decision);
+const focusedTeddyNegative = focusedSlowestTeddyNegative(decision);
 const expectedNextMove = evidenceBlockedByNoise
   ? "benchmark_host_noise_control"
   : (
+      focusedTeddyNegative
+        ? "focused_slowest_teddy_regression_attribution"
+        :
+      ["scanOpen", "scanFile"].includes(activeExpectedAttribution.target)
+        ? expectedActiveRepairMove(activeExpectedAttribution)
+        :
       teddyGainNeedsLeakRepair &&
-      ["scan_file_residual_hotspot_attribution", "scan_open_path_pressure_attribution"].includes(expectedScanWorkRepairMove(decision.leakSummary?.leakAttribution?.currentOnlyScanSplit))
-        ? expectedScanWorkNextMove(decision.leakSummary?.leakAttribution?.currentOnlyScanSplit, evidenceQuality)
+      ["scan_file_residual_hotspot_attribution", "scan_open_path_pressure_attribution"].includes(expectedActiveRepairOwner(activeExpectedAttribution))
+        ? expectedActiveRepairMove(activeExpectedAttribution)
         : (teddyGainNeedsLeakRepair ? "whole_engine_leak_attribution" : "packed_nibble_shuffle_teddy_kernel")
     );
-if (decision.nextAllowedMove?.id !== expectedNextMove) {
+const evidenceBlockedMove =
+  typeof decision.nextAllowedMove?.status === "string" &&
+  decision.nextAllowedMove.status.startsWith("blocked_by_") &&
+  ["retainable_runtime_probe", "retainable_scan_open_runtime_probe", "retainable_scan_file_runtime_probe"].includes(decision.nextAllowedMove?.id);
+if (!evidenceBlockedMove && decision.nextAllowedMove?.id !== expectedNextMove) {
   failures.push(`decision next move expected ${expectedNextMove}`);
+}
+if (evidenceBlockedMove && !String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-installed-speed.mjs")) {
+  failures.push("blocked runtime evidence move must route to installed speed proof");
 }
 if (teddyGainNeedsLeakRepair &&
     !evidenceBlockedByNoise &&
@@ -358,13 +504,16 @@ if (teddyGainNeedsLeakRepair) {
   if (decision.preservationPolicy?.preserveTeddyGain !== true) {
     failures.push("decision preservation policy must protect the positive Teddy gain");
   }
-  const expectedRepairMove = expectedScanWorkNextMove(decision.leakSummary?.leakAttribution?.currentOnlyScanSplit, evidenceQuality);
+  const expectedRepairMove = focusedTeddyNegative
+    ? "focused_slowest_teddy_regression_attribution"
+    : expectedActiveRepairMove(activeExpectedAttribution);
   if (decision.preservationPolicy?.nextEngineeringMoveId !== expectedRepairMove) {
     failures.push("decision preservation policy must route engineering repair to the proved repair owner");
   }
   if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
-    const split = decision.leakSummary?.leakAttribution?.currentOnlyScanSplit;
-    const expectedRuntimeMove = expectedScanWorkNextMove(split, evidenceQuality);
+    const expectedRuntimeMove = focusedTeddyNegative
+      ? "focused_slowest_teddy_regression_attribution"
+      : expectedActiveRepairMove(activeExpectedAttribution);
     const evidenceBlocked =
       typeof decision.nextEngineeringMove?.status === "string" &&
       decision.nextEngineeringMove.status.startsWith("blocked_by_") &&
@@ -376,7 +525,8 @@ if (teddyGainNeedsLeakRepair) {
   }
   if (
     decision.leakSummary?.nextRepairTarget === "scanWork" &&
-    !diagnosticAttributionOnly(evidenceQuality) &&
+    !focusedTeddyNegative &&
+    !diagnosticAttributionOnly(activeExpectedAttribution.quality) &&
     !String(decision.nextAllowedMove?.proofCommand ?? "").includes("--scan-open-timing")
   ) {
     failures.push("decision scanWork leak attribution proof command must enable scan-open timing");
@@ -440,7 +590,7 @@ if (teddyGainNeedsLeakRepair) {
       }
       if (
         split.dominantCandidateSubphase === "scanFile" &&
-        !["teddyRange", "alternateFullScan", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
+        !["teddyRange", "alternateFullScan", "scanFileFastCount", "scanFileResidual"].includes(split.dominantCandidateScanFileComponent)
       ) {
         failures.push("decision scanFile leak attribution must name dominant candidate scan-file component");
       }
@@ -459,6 +609,13 @@ if (teddyGainNeedsLeakRepair) {
     }
   }
 }
+if (
+  !evidenceBlockedMove &&
+  ["scanOpen", "scanFile"].includes(activeExpectedAttribution.target) &&
+  !String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-historical-speed.mjs")
+) {
+  failures.push("decision runtime attribution move must include historical-speed proof command");
+}
 if (evidenceBlockedByNoise &&
     !decision.candidateMoves?.some((move) =>
       move?.id === "whole_engine_leak_attribution" &&
@@ -473,8 +630,11 @@ if (decision.summary?.routeParity !== true) failures.push("decision summary lack
 if (decision.summary?.fullScanCallsParity !== true) failures.push("decision summary lacks alternates full-scan call parity");
 if (decision.summary?.fullScanBytesParity !== true) failures.push("decision summary lacks alternates full-scan byte parity");
 if (decision.summary?.fullScanMatchesParity !== true) failures.push("decision summary lacks alternates full-scan match parity");
-if (!String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-historical-speed.mjs")) {
+if (!evidenceBlockedMove && !String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-historical-speed.mjs")) {
   failures.push("decision next move lacks historical-speed proof command");
+}
+if (evidenceBlockedMove && !String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-installed-speed.mjs")) {
+  failures.push("blocked decision next move lacks installed-speed proof command");
 }
 const decisionProofText = normalized([
   decision.proofCommands?.installedStrictSpeed,
@@ -555,7 +715,8 @@ const report = {
     path: path.relative(ROOT, decisionPath),
     runId: decision.runId ?? null,
     evaluatedHistoricalRunId: decision.evaluatedHistoricalRunId ?? null,
-    currentIxSha256: decision.currentIxSha256 ?? null,
+  currentIxSha256: decision.currentIxSha256 ?? null,
+  currentIxExecutableSha256: decision.currentIxExecutableSha256 ?? null,
     evidenceFresh: decision.evidenceFresh === true,
     promotionAllowed: decision.promotionAllowed === true,
     speedProofPointers: decision.speedProofPointers ?? null,

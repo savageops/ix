@@ -846,10 +846,12 @@ export function buildInstalledRoundLedger({ comparison, score, binaryRelation, b
       testedOneAtATime: score?.testedOneAtATime === true,
       baselineLabel: score?.baselineLabel,
       candidateLabel: score?.candidateLabel,
-      baselinePath: binaries?.installed?.path ?? null,
-      candidatePath: binaries?.repo?.path ?? null,
-      baselineSha256: binaries?.installed?.sha256 ?? null,
-      candidateSha256: binaries?.repo?.sha256 ?? null,
+    baselinePath: binaries?.installed?.path ?? null,
+    candidatePath: binaries?.repo?.path ?? null,
+    baselineSha256: binaries?.installed?.sha256 ?? null,
+    candidateSha256: binaries?.repo?.sha256 ?? null,
+    baselineExecutableSha256: binaries?.installed?.executableSha256 ?? null,
+    candidateExecutableSha256: binaries?.repo?.executableSha256 ?? null,
       binaryRelation,
       evidenceAuthority: score?.evidenceAuthority ?? comparison?.evidenceAuthority,
       requiredImprovementPct: score?.requiredImprovementPct,
@@ -1077,6 +1079,9 @@ export function buildHistoricalRoundLedger(comparisons) {
     candidateLabel: comparison.score?.candidateLabel ?? "repo-current",
       baselinePath: comparison.path ?? null,
       baselineSha256: comparison.sha256 ?? null,
+      baselineExecutableSha256: comparison.executableSha256 ?? null,
+      candidateSha256: comparison.current?.sha256 ?? null,
+      candidateExecutableSha256: comparison.current?.executableSha256 ?? null,
       binaryRelation: comparison.relation,
       evidenceAuthority: comparison.score?.evidenceAuthority ?? comparison.evidenceAuthority,
       requiredImprovementPct: comparison.score?.requiredImprovementPct ?? comparison.minPreviousBuildImprovementPct,
@@ -1713,6 +1718,107 @@ function summarizeProcessReport(report) {
   };
 }
 
+function normalizeWindowsPath(value) {
+  return path.resolve(String(value ?? "")).replaceAll("\\", "/").toLowerCase();
+}
+
+function processMatchesBenchmarkBinary(entry, ixBinary) {
+  if (!ixBinary) return false;
+  const target = normalizeWindowsPath(ixBinary);
+  const executable = String(entry.ExecutablePath ?? "");
+  if (executable && normalizeWindowsPath(executable) === target) return true;
+  const commandLine = String(entry.CommandLine ?? "").replaceAll("\\", "/").toLowerCase();
+  return commandLine.includes(target);
+}
+
+function cleanupBenchmarkOwnedIxProcesses({ matched, ixBinary, label }) {
+  if (process.platform !== "win32") {
+    return {
+      attempted: false,
+      reason: "non_windows",
+      killed: [],
+      skipped: [],
+      failures: [],
+    };
+  }
+
+  const entries = Array.isArray(matched) ? matched : [];
+  const owned = entries.filter((entry) => processMatchesBenchmarkBinary(entry, ixBinary));
+  const skipped = entries
+    .filter((entry) => !processMatchesBenchmarkBinary(entry, ixBinary))
+    .map((entry) => ({
+      processId: Number(entry.ProcessId ?? 0),
+      name: entry.Name ?? null,
+      executablePath: entry.ExecutablePath ?? null,
+      reason: "not_repo_benchmark_binary",
+    }));
+  if (owned.length === 0) {
+    return {
+      attempted: false,
+      reason: entries.length === 0 ? "no_matches" : "no_repo_benchmark_owned_matches",
+      killed: [],
+      skipped,
+      failures: [],
+    };
+  }
+
+  const ids = owned
+    .map((entry) => Number(entry.ProcessId ?? 0))
+    .filter((pid) => Number.isInteger(pid) && pid > 0);
+  const script = [
+    `$ids = @(${ids.join(",")})`,
+    "$killed = @()",
+    "$failures = @()",
+    "foreach ($id in $ids) {",
+    "  try {",
+    "    Stop-Process -Id $id -Force -ErrorAction Stop",
+    "    $killed += $id",
+    "  } catch {",
+    "    $failures += ([pscustomobject]@{ ProcessId = $id; Error = $_.Exception.Message })",
+    "  }",
+    "}",
+    "[pscustomobject]@{ Killed = $killed; Failures = $failures } | ConvertTo-Json -Compress",
+  ].join("\n");
+  const result = run("powershell", ["-NoProfile", "-Command", script]);
+  if (result.exitCode !== 0) {
+    return {
+      attempted: true,
+      label,
+      killed: [],
+      skipped,
+      failures: [`${label}:cleanup_command_failed`],
+      stderr: result.stderr.trim(),
+      stdout: result.stdout.trim(),
+    };
+  }
+  try {
+    const parsed = JSON.parse(result.stdout || "{}");
+    const killed = Array.isArray(parsed.Killed)
+      ? parsed.Killed.map(Number)
+      : (parsed.Killed == null ? [] : [Number(parsed.Killed)]);
+    const failures = Array.isArray(parsed.Failures)
+      ? parsed.Failures
+      : (parsed.Failures == null ? [] : [parsed.Failures]);
+    return {
+      attempted: true,
+      label,
+      killed,
+      skipped,
+      failures: failures.length > 0 ? failures.map((failure) => `${label}:cleanup_failed:${failure.ProcessId ?? "unknown"}`) : [],
+      details: failures,
+    };
+  } catch {
+    return {
+      attempted: true,
+      label,
+      killed: [],
+      skipped,
+      failures: [`${label}:cleanup_invalid_json`],
+      stdout: result.stdout.trim(),
+    };
+  }
+}
+
 function scanIxProcessState({ ixBinary, env, label }) {
   if (!ixBinary || !existsSync(ixBinary)) {
     return {
@@ -1762,11 +1868,11 @@ function scanIxProcessState({ ixBinary, env, label }) {
   }
 }
 
-export function scanIxProcesses({ ixBinary, env } = {}) {
+export function scanIxProcesses({ ixBinary, env, cleanupOwned = false } = {}) {
   const script = [
     "$matches = Get-CimInstance Win32_Process |",
     "  Where-Object { $_.ProcessId -ne $PID -and $_.Name -match '^(ix|iex|ix-zig|__ix_indexd|__ix_nexus)(\\.exe)?$' } |",
-    "  Select-Object ProcessId,Name,CommandLine,WorkingSetSize",
+    "  Select-Object ProcessId,Name,ExecutablePath,CommandLine,WorkingSetSize",
     "if ($null -eq $matches) { '[]' } else { $matches | ConvertTo-Json -Compress }",
   ].join("\n");
   const result = run("powershell", ["-NoProfile", "-Command", script]);
@@ -1795,16 +1901,21 @@ export function scanIxProcesses({ ixBinary, env } = {}) {
       command: result.command,
       stateReports,
       failures: stateFailures,
+      cleanup: cleanupBenchmarkOwnedIxProcesses({ matched: [], ixBinary, label: "process_scan" }),
     };
   }
   const parsed = JSON.parse(stdout);
   const matched = Array.isArray(parsed) ? parsed : [parsed];
+  const cleanup = cleanupOwned
+    ? cleanupBenchmarkOwnedIxProcesses({ matched, ixBinary, label: "process_scan" })
+    : null;
   return {
     ok: stateFailures.length === 0,
     matched,
     command: result.command,
     stateReports,
-    failures: stateFailures,
+    cleanup,
+    failures: [...stateFailures, ...(cleanup?.failures ?? [])],
   };
 }
 
@@ -1895,6 +2006,9 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
   const alternateTeddyRangeElapsedNsMax = derivedRouteTiming && alternateTeddyRangeCalls > 0 ? byteShardRangeElapsedNsMax : Number(density.alternate_teddy_range_elapsed_ns_max ?? 0);
   const alternateCompiledRangeElapsedNsTotal = derivedRouteTiming && alternateCompiledRangeCalls > 0 ? byteShardRangeElapsedNsTotal : Number(density.alternate_compiled_range_elapsed_ns_total ?? 0);
   const alternateCompiledRangeElapsedNsMax = derivedRouteTiming && alternateCompiledRangeCalls > 0 ? byteShardRangeElapsedNsMax : Number(density.alternate_compiled_range_elapsed_ns_max ?? 0);
+  const scanFileFastCountMsTotal = optionalNumber(timings.scan_file_fast_count_ms_total) ?? (
+    byteShardRangeElapsedNsTotal > 0 ? byteShardRangeElapsedNsTotal / 1_000_000 : null
+  );
   const engineMs = Number(report.stats?.timings?.total_ms ?? result.durationMs);
   return {
     sample,
@@ -1910,7 +2024,7 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
     scanOpenSyscallMsTotal: optionalNumber(timings.scan_open_syscall_ms_total),
     scanFileMsTotal: optionalNumber(timings.scan_file_ms_total),
     scanFileMmapMsTotal: optionalNumber(timings.scan_file_mmap_ms_total),
-    scanFileFastCountMsTotal: optionalNumber(timings.scan_file_fast_count_ms_total),
+    scanFileFastCountMsTotal,
     scanFileLineScanMsTotal: optionalNumber(timings.scan_file_line_scan_ms_total),
     aggregateMergeMs: Number(timings.aggregate_merge_ms ?? 0),
     aggregateFinalizeMs: Number(timings.aggregate_finalize_ms ?? 0),
@@ -1972,6 +2086,7 @@ export function summarizeIxRuns(binaryPath, label, runs) {
     label,
     path: binaryPath,
     sha256: binary.sha256,
+    executableSha256: binary.executableSha256,
     binary,
     samples: runs,
     cliSummary: summary(runs.map((entry) => entry.cliMs)),

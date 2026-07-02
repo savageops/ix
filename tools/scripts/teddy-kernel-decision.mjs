@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
+import { DEFAULT_RIPGREP_LINUX_CORPUS, hasExperimentalBenchEnv } from "./lib/benchmark-config.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
 import { phaseLeakSummaryFromRounds } from "./lib/speed-compare-utils.mjs";
 
@@ -13,6 +14,8 @@ const LATEST_FAILED_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-f
 const INSTALLED_REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
 const LATEST_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-installed-speed.json");
 const LATEST_RETAINABLE_INSTALLED_PATH = path.join(INSTALLED_REPORT_DIR, "latest-retainable-installed-speed.json");
+const FOCUSED_SLOWEST_REPORT_DIR = path.join(ROOT, "tools", "reports", "focused-slowest-speed");
+const LATEST_FOCUSED_SLOWEST_PATH = path.join(FOCUSED_SLOWEST_REPORT_DIR, "latest-focused-slowest-speed.json");
 const OLDER_SNAPSHOT_REPORT_DIR = path.join(ROOT, "tools", "reports", "older-snapshot-ladder");
 const LATEST_OLDER_SNAPSHOT_PATH = path.join(OLDER_SNAPSHOT_REPORT_DIR, "latest-older-snapshot-ladder.json");
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "teddy-kernel-decision");
@@ -40,6 +43,8 @@ const SPEED_DIAGNOSTIC_COMMAND = `${HISTORICAL_SPEED_DIAGNOSTIC_COMMAND} && ${OL
 const SPEED_LEAK_ATTRIBUTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 const SPEED_SCAN_OPEN_PROMOTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 const SPEED_PROMOTION_COMMAND = `${INSTALLED_SPEED_STRICT_COMMAND} && ${HISTORICAL_SPEED_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
+const REQUIRED_INSTALLED_SAMPLES = 12;
+const REQUIRED_INSTALLED_RETAINABLE_SAMPLES = 12;
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -61,6 +66,7 @@ Options:
 
 const currentIx = argValue(args, "--current-ix", DEFAULT_CURRENT_IX);
 const currentIxSha256 = sha256File(currentIx);
+const currentIxExecutableSha256 = executableSha256File(currentIx);
 const explicitReportPath = argValue(args, "--report", "");
 const reportSelection = explicitReportPath.length > 0 ? "explicit" : "newest_fresh_current_binary";
 const reportPath = explicitReportPath.length > 0
@@ -83,15 +89,160 @@ function sha256File(filePath) {
   return createHash("sha256").update(readFileSync(filePath)).digest("hex").toUpperCase();
 }
 
+function normalizedPathText(text) {
+  return String(text ?? "").replaceAll("\\", "/").toLowerCase();
+}
+
+function executableSha256File(filePath) {
+  if (!existsSync(filePath)) return null;
+  return executableHash(readFileSync(filePath));
+}
+
+function executableHash(bytes) {
+  const normalized = Buffer.from(bytes);
+  const pe = peLayout(normalized);
+  if (pe == null) return createHash("sha256").update(normalized).digest("hex").toUpperCase();
+  normalized.fill(0, pe.coffTimestampOffset, pe.coffTimestampOffset + 4);
+  const buildId = pe.sections.find((section) => section.name === ".buildid");
+  if (buildId != null && buildId.rawPointer + buildId.rawSize <= normalized.length) {
+    normalized.fill(0, buildId.rawPointer, buildId.rawPointer + buildId.rawSize);
+  }
+  return createHash("sha256").update(normalized).digest("hex").toUpperCase();
+}
+
+function peLayout(bytes) {
+  if (bytes.length < 0x40 || bytes[0] !== 0x4d || bytes[1] !== 0x5a) return null;
+  const peOffset = bytes.readUInt32LE(0x3c);
+  if (peOffset + 24 > bytes.length) return null;
+  if (bytes[peOffset] !== 0x50 || bytes[peOffset + 1] !== 0x45 || bytes[peOffset + 2] !== 0 || bytes[peOffset + 3] !== 0) return null;
+  const sectionCount = bytes.readUInt16LE(peOffset + 6);
+  const optionalHeaderSize = bytes.readUInt16LE(peOffset + 20);
+  const optionalHeaderOffset = peOffset + 24;
+  if (optionalHeaderOffset + optionalHeaderSize > bytes.length) return null;
+  const sectionOffset = optionalHeaderOffset + optionalHeaderSize;
+  const sections = [];
+  for (let index = 0; index < sectionCount; index += 1) {
+    const offset = sectionOffset + index * 40;
+    if (offset + 40 > bytes.length) break;
+    const nul = bytes.indexOf(0, offset);
+    const nameEnd = nul >= offset && nul < offset + 8 ? nul : offset + 8;
+    sections.push({
+      name: bytes.subarray(offset, nameEnd).toString("ascii"),
+      rawSize: bytes.readUInt32LE(offset + 16),
+      rawPointer: bytes.readUInt32LE(offset + 20),
+    });
+  }
+  return { coffTimestampOffset: peOffset + 8, sections };
+}
+
 function historicalComparisonHashes(report) {
   return Array.isArray(report?.comparisons)
     ? [...new Set(report.comparisons.map((comparison) => comparison?.current?.sha256).filter(Boolean))]
     : [];
 }
 
-function reportMatchesCurrentBinary(report, currentHash) {
+function historicalComparisonExecutableHashes(report) {
+  const comparisonHashes = Array.isArray(report?.comparisons)
+    ? report.comparisons.map((comparison) =>
+        comparison?.current?.executableSha256 ??
+        comparison?.current?.binary?.executableSha256 ??
+        comparison?.candidateExecutableSha256 ??
+        null)
+    : [];
+  const ledgerHashes = Array.isArray(report?.roundLedger)
+    ? report.roundLedger.map((round) => round?.candidateExecutableSha256).filter(Boolean)
+    : [];
+  const binaryHash = report?.binaries?.repo?.executableSha256 ?? null;
+  return [...new Set([...comparisonHashes, ...ledgerHashes, binaryHash].filter(Boolean))];
+}
+
+function reportMatchesCurrentBinary(report, currentHash, currentExecutableHash = currentIxExecutableSha256) {
+  const executableHashes = historicalComparisonExecutableHashes(report);
+  if (currentExecutableHash != null && executableHashes.length > 0) {
+    return executableHashes.every((hash) => hash === currentExecutableHash);
+  }
   const hashes = historicalComparisonHashes(report);
   return currentHash != null && hashes.length > 0 && hashes.every((hash) => hash === currentHash);
+}
+
+function focusedRepoHashes(report) {
+  const identityHashes = Array.isArray(report?.binaryIdentity?.repoHashes)
+    ? report.binaryIdentity.repoHashes
+    : [];
+  const roundHashes = Array.isArray(report?.roundsDetail)
+    ? report.roundsDetail.map((round) => round?.repoHash).filter(Boolean)
+    : [];
+  return [...new Set([...identityHashes, ...roundHashes].filter(Boolean))];
+}
+
+function focusedRepoExecutableHashes(report) {
+  const identityHashes = Array.isArray(report?.binaryIdentity?.repoExecutableHashes)
+    ? report.binaryIdentity.repoExecutableHashes
+    : [];
+  const roundHashes = Array.isArray(report?.roundsDetail)
+    ? report.roundsDetail.map((round) => round?.repoExecutableHash).filter(Boolean)
+    : [];
+  return [...new Set([...identityHashes, ...roundHashes].filter(Boolean))];
+}
+
+function focusedSlowestStatus(filePath, currentHash) {
+  if (!existsSync(filePath)) {
+    return {
+      path: path.relative(ROOT, filePath),
+      exists: false,
+      status: "missing",
+      runId: null,
+      timestamp: null,
+      corpus: null,
+      retainableFocusedEvidence: false,
+      freshForCurrentBinary: false,
+      teddyRouteNetPositive: false,
+      averages: null,
+      failureSummary: null,
+      binaryIdentity: null,
+    };
+  }
+
+  const pointer = readJson(filePath, {});
+  const repoHashes = focusedRepoHashes(pointer);
+  const repoExecutableHashes = focusedRepoExecutableHashes(pointer);
+  const freshForCurrentBinary =
+    currentIxExecutableSha256 != null && repoExecutableHashes.length > 0
+      ? repoExecutableHashes.every((hash) => hash === currentIxExecutableSha256)
+      : (currentHash != null &&
+          repoHashes.length > 0 &&
+          repoHashes.every((hash) => hash === currentHash));
+  const retainableFocusedEvidence = pointer.retainableFocusedEvidence === true;
+  const experimentalFocusedEvidence =
+    pointer.experimentalFocusedEvidence === true ||
+    pointer.evidenceQuality === "diagnostic_experimental_env" ||
+    (Array.isArray(pointer.failureSummary) &&
+      pointer.failureSummary.some((failure) => failure?.id === "diagnostic_attribution_run_not_promotion_evidence"));
+  const teddyMedianPct = Number(pointer.averages?.pairedCandidateTeddyRangeImprovementMedianPct);
+  const teddyRouteNetPositive = Number.isFinite(teddyMedianPct) && teddyMedianPct >= 0;
+  let status = "focused_teddy_nonnegative";
+  if (!freshForCurrentBinary) status = "stale_current_binary";
+  else if (!retainableFocusedEvidence || experimentalFocusedEvidence) status = "diagnostic_only";
+  else if (!teddyRouteNetPositive) status = "focused_teddy_negative";
+
+  return {
+    path: path.relative(ROOT, filePath),
+    exists: true,
+    status,
+    runId: pointer.runId ?? null,
+    timestamp: pointer.timestamp ?? null,
+    corpus: pointer.corpus ?? null,
+    expression: pointer.expression ?? null,
+    retainableFocusedEvidence,
+    experimentalFocusedEvidence,
+    freshForCurrentBinary,
+    repoHashes,
+    repoExecutableHashes,
+    teddyRouteNetPositive,
+    averages: pointer.averages ?? null,
+    failureSummary: pointer.failureSummary ?? null,
+    binaryIdentity: pointer.binaryIdentity ?? null,
+  };
 }
 
 function selectFreshHistoricalReport(currentHash) {
@@ -209,15 +360,34 @@ function installedPointerStatus(filePath, currentHash) {
       repoSha256: null,
       installedPath: null,
       threads: null,
+      samples: null,
+      minRetainableSamples: null,
     };
   }
 
   const pointer = readJson(filePath, {});
   const repoSha256 = pointer.binaries?.repo?.sha256 ?? null;
+  const installedExecutableSha256 = pointer.binaries?.installed?.executableSha256 ?? pointer.binaries?.installed?.sha256 ?? null;
+  const repoExecutableSha256 = pointer.binaries?.repo?.executableSha256 ?? pointer.binaries?.repo?.sha256 ?? null;
   const installedPath = pointer.binaries?.installed?.path ?? null;
+  const currentInstalledExecutableSha256 = installedPath != null ? executableSha256File(installedPath) : null;
   const threads = Number(pointer.threads);
-  const normalizedInstalledPath = String(installedPath ?? "").replaceAll("\\", "/").toLowerCase();
-  const freshForCurrentBinary = currentHash != null && repoSha256 === currentHash;
+  const samples = Number(pointer.samples);
+  const minRetainableSamples = Number(pointer.minRetainableSamples);
+  const normalizedInstalledPath = normalizedPathText(installedPath);
+  const canonicalCorpus = normalizedPathText(pointer.corpus) === normalizedPathText(DEFAULT_RIPGREP_LINUX_CORPUS);
+  const freshForCurrentBinary =
+    currentIxExecutableSha256 != null && repoExecutableSha256 != null
+      ? repoExecutableSha256 === currentIxExecutableSha256
+      : (currentHash != null && repoSha256 === currentHash);
+  const freshForInstalledBinary =
+    installedExecutableSha256 != null &&
+    currentInstalledExecutableSha256 != null &&
+    installedExecutableSha256 === currentInstalledExecutableSha256;
+  const sameExecutableBinary =
+    installedExecutableSha256 != null &&
+    repoExecutableSha256 != null &&
+    installedExecutableSha256 === repoExecutableSha256;
   const canonicalThreadConfig = threads === REQUIRED_INSTALLED_THREADS;
   const nativeInstalledBaseline =
     normalizedInstalledPath.includes("/appdata/local/programs/iex/bin/ix.exe") &&
@@ -227,8 +397,12 @@ function installedPointerStatus(filePath, currentHash) {
   const promotionFailures = Array.isArray(pointer.promotionFailures)
     ? pointer.promotionFailures
     : [];
+  const experimentalEnvMode = hasExperimentalBenchEnv(pointer);
   const diagnosticAttributionMode =
     pointer.diagnosticAttributionMode === true ||
+    pointer.scanOpenTiming === true ||
+    pointer.linuxDominantAttribution === true ||
+    experimentalEnvMode ||
     promotionFailures.includes("diagnostic_attribution_run_not_promotion_evidence");
   const installedEngineMedianMs = Number(pointer.installedRepoComparison?.installedEngineMedianMs);
   const repoEngineMedianMs = Number(pointer.installedRepoComparison?.repoEngineMedianMs);
@@ -239,8 +413,11 @@ function installedPointerStatus(filePath, currentHash) {
   const ripgrepCliMedianMs = Number(pointer.lanes?.ripgrep?.summary?.median);
   const ripgrepNoMmapCliMedianMs = Number(pointer.lanes?.ripgrepMmapComparison?.never?.summary?.median);
   const ripgrepFastestMmapMode = pointer.lanes?.ripgrepMmapComparison?.fastest ?? null;
+  const identityNoiseSummary = pointer.identityNoiseSummary ?? null;
   let status = "promotable_current";
   if (!freshForCurrentBinary) status = "stale_current_binary";
+  else if (!freshForInstalledBinary) status = "stale_installed_binary";
+  else if (sameExecutableBinary) status = "same_binary";
   else if (!canonicalThreadConfig) status = "wrong_thread_config";
   else if (!nativeInstalledBaseline) status = "wrong_baseline";
   else if (diagnosticAttributionMode) status = "diagnostic_only";
@@ -254,7 +431,11 @@ function installedPointerStatus(filePath, currentHash) {
     runId: pointer.runId ?? null,
     timestamp: pointer.timestamp ?? null,
     freshForCurrentBinary,
+    freshForInstalledBinary,
+    sameExecutableBinary,
     diagnosticAttributionMode,
+    experimentalEnvMode,
+    nativeInstalledBaseline,
     retainableStrictEvidence,
     promotionQualified,
     promotionFailureCount: promotionFailures.length,
@@ -269,13 +450,22 @@ function installedPointerStatus(filePath, currentHash) {
       ripgrepNoMmapCliMedianMs: Number.isFinite(ripgrepNoMmapCliMedianMs) ? ripgrepNoMmapCliMedianMs : null,
       ripgrepFastestMmapMode,
     },
+    identityNoiseSummary,
     repoSha256,
+    currentRepoExecutableSha256: currentIxExecutableSha256,
+    installedExecutableSha256,
+    repoExecutableSha256,
+    currentInstalledExecutableSha256,
     installedPath,
     threads: Number.isFinite(threads) ? threads : null,
+    samples: Number.isFinite(samples) ? samples : null,
+    minRetainableSamples: Number.isFinite(minRetainableSamples) ? minRetainableSamples : null,
+    corpus: pointer.corpus ?? null,
+    canonicalCorpus,
   };
 }
 
-function selectRetainableFreshNativeInstalledReport(currentHash) {
+function selectStrictFreshNativeInstalledReport(currentHash) {
   if (!existsSync(INSTALLED_REPORT_DIR) || currentHash == null) return null;
   const candidates = readdirSync(INSTALLED_REPORT_DIR)
     .filter((name) => /^installed-speed-.*\.json$/.test(name))
@@ -291,10 +481,14 @@ function selectRetainableFreshNativeInstalledReport(currentHash) {
     })
     .filter((entry) =>
       entry.status.freshForCurrentBinary === true &&
+      entry.status.freshForInstalledBinary === true &&
       entry.status.threads === REQUIRED_INSTALLED_THREADS &&
+      entry.status.samples >= REQUIRED_INSTALLED_SAMPLES &&
+      entry.status.minRetainableSamples >= REQUIRED_INSTALLED_RETAINABLE_SAMPLES &&
+      entry.status.nativeInstalledBaseline === true &&
+      entry.status.canonicalCorpus === true &&
       entry.status.retainableStrictEvidence === true &&
-      entry.status.status !== "wrong_baseline" &&
-      entry.status.status !== "wrong_thread_config" &&
+      entry.status.status !== "same_binary" &&
       entry.status.status !== "diagnostic_only")
     .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
   return candidates[0]?.path ?? null;
@@ -502,7 +696,7 @@ function diagnosticAttributionOnly(quality) {
   return (quality?.comparisonFailures ?? []).includes("diagnostic_attribution_run_not_retainable_evidence");
 }
 
-function candidateMoves(summary, leakSummary, quality) {
+function candidateMoves(summary, leakSummary, quality, focusedSlowest) {
   const benchmarkNoiseBlocked = blockedByBenchmarkNoise(quality);
   const diagnosticOnly = diagnosticAttributionOnly(quality);
   const teddyPressure = Number(summary.averagePairedTeddyMedianPct ?? 0);
@@ -516,8 +710,11 @@ function candidateMoves(summary, leakSummary, quality) {
     summary.routeParity === true;
   const scanOpenDominatesLeak =
     teddyGainNeedsLeakRepair &&
-    leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen" &&
-    leakSummary?.leakAttribution?.currentOnlyScanSplit?.regressingCandidateSubphase !== "scanFile";
+    leakSummary?.leakAttribution?.currentOnlyScanSplit?.dominantCandidateSubphase === "scanOpen";
+  const scanOpenRegresses =
+    leakSummary?.nextRepairTarget === "scanOpen" ||
+    leakSummary?.leakAttribution?.targetPhase === "scanOpen" ||
+    leakSummary?.leakAttribution?.currentOnlyScanSplit?.regressingCandidateSubphase === "scanOpen";
   const scanFileResidualRegresses =
     teddyGainNeedsLeakRepair &&
     leakSummary?.leakAttribution?.currentOnlyScanSplit?.regressingCandidateSubphase === "scanFile";
@@ -531,6 +728,11 @@ function candidateMoves(summary, leakSummary, quality) {
     summary.fullScanCallsParity === true &&
     summary.fullScanBytesParity === true &&
     summary.fullScanMatchesParity === true;
+  const focusedSlowestTeddyNegative = focusedSlowest?.status === "focused_teddy_negative";
+  const focusedSlowestTeddyPressure = Math.max(
+    0,
+    -Number(focusedSlowest?.averages?.pairedCandidateTeddyRangeImprovementMedianPct ?? 0),
+  );
   const teddyReason = fullScanVolumeStable
     ? "Current route, match, and alternates full-scan volumes are stable across older-build rounds; the next retainable move must reduce alternate_teddy_range_elapsed_ns or scan work, not merely reroute or hoist parser work."
     : "Alternates full-scan volume changed across historical rounds; attribution must explain route volume before a runtime search change is promotable.";
@@ -551,7 +753,7 @@ function candidateMoves(summary, leakSummary, quality) {
       id: "whole_engine_leak_attribution",
       status: benchmarkNoiseBlocked
         ? "blocked_by_benchmark_noise"
-        : (scanOpenDominatesLeak ? "satisfied_by_scan_open_split" : (scanFileResidualRegresses ? "satisfied_by_scan_file_split" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win"))),
+        : (scanOpenRegresses ? "satisfied_by_scan_open_split" : (scanFileResidualRegresses ? "satisfied_by_scan_file_split" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win"))),
       owner: "tools/scripts/compare-historical-speed.mjs plus src/core/search.zig phase telemetry",
       reason: teddyGainNeedsLeakRepair
         ? `Latest historical evidence shows Teddy attribution is positive while whole-engine evidence still has a losing round; preserve the Teddy gain and isolate ${leakSummary?.nextRepairTarget ?? "discovery, scheduling, scan bookkeeping, or reporting"} overhead before changing the Teddy kernel again. Current averaged phase medians: discover=${summary.averagePairedDiscoverMedianPct}%, scan=${summary.averagePairedScanMedianPct}%, scanWork=${summary.averagePairedScanWorkMedianPct}%, teddy=${summary.averagePairedTeddyMedianPct}%. Worst round=${leakSummary?.worstRound?.baselineLabel ?? "unknown"}.`
@@ -563,29 +765,43 @@ function candidateMoves(summary, leakSummary, quality) {
       id: "scan_open_path_pressure_attribution",
       status: benchmarkNoiseBlocked
         ? "blocked_by_benchmark_noise"
-        : (diagnosticOnly && scanOpenDominatesLeak
+        : (diagnosticOnly && scanOpenRegresses
             ? "diagnostic_only"
-            : (scanOpenDominatesLeak ? "allowed_next" : (scanFileResidualRegresses ? "blocked_by_scan_file_regression" : "waiting_for_scan_open_split"))),
+            : (scanOpenRegresses ? "allowed_next" : (scanFileResidualRegresses ? "blocked_by_scan_file_regression" : "waiting_for_scan_open_split"))),
       owner: "src/core/search.zig::scanFileIntoShardTimed and scanFileIntoShardMonoTimed",
-      reason: scanOpenDominatesLeak
-        ? `Scan-open timing split is now present and identifies the file-open wrapper as the dominant candidate subphase under file-count parity=${filesScannedParityStatus}: scanOpen median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMedianMs?.median}ms, scanOpen per file=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanOpenMsPerFileMedian?.median}ms, scanFile median=${leakSummary.leakAttribution.currentOnlyScanSplit.candidateScanFileMedianMs?.median}ms. ${diagnosticOnly ? "This report is diagnostic-only, so it may guide the next proof run but must not directly authorize a runtime patch." : "The next runtime candidate must reduce open-path pressure per file, not chase scanned-file count, before touching the Teddy kernel."}`
+      reason: scanOpenRegresses
+        ? `Scan-open timing identifies the file-open wrapper as the current repair target under file-count parity=${filesScannedParityStatus}: scanOpen median=${leakSummary.leakAttribution?.currentOnlyScanSplit?.candidateScanOpenMedianMs?.median ?? leakSummary.leakAttribution?.targetRounds?.[0]?.candidateScanOpenMedianMs}ms, scanOpen per file=${leakSummary.leakAttribution?.currentOnlyScanSplit?.candidateScanOpenMsPerFileMedian?.median ?? leakSummary.leakAttribution?.targetRounds?.[0]?.candidateScanOpenMsPerFileMedian}ms, scanFile median=${leakSummary.leakAttribution?.currentOnlyScanSplit?.candidateScanFileMedianMs?.median ?? leakSummary.leakAttribution?.targetRounds?.[0]?.candidateScanFileMedianMs}ms. ${diagnosticOnly ? "This report is diagnostic-only, so it may guide the next proof run but must not directly authorize a runtime patch." : "The next runtime candidate must reduce open-path pressure per file, not chase scanned-file count, before touching the Teddy kernel."}`
         : (scanFileResidualRegresses
             ? `Scan-open owns the largest current scan-work share, but scanFile is the measured regressing subphase: scanFile paired=${leakSummary.leakAttribution.currentOnlyScanSplit.regressingCandidateSubphaseMedianPct}%, scanFile delta=${leakSummary.leakAttribution.currentOnlyScanSplit.regressingCandidateSubphaseDeltaMs}ms. Do not chase open-path pressure until scan-file residual/hotspots are repaired or disproven.`
-            : "Run historical proof with --scan-open-timing before choosing an open-path, scan-file, or Teddy-kernel repair."),
-      expectedGainScore: scanOpenDominatesLeak ? 4 + Math.max(0, -enginePressure) : 0,
+            : (scanOpenDominatesLeak
+                ? "Scan-open owns the largest current scan-work share, but it is not the measured regressing subphase. Keep attribution open instead of routing a runtime patch to open-path pressure."
+                : "Run historical proof with --scan-open-timing before choosing an open-path, scan-file, or Teddy-kernel repair.")),
+      expectedGainScore: scanOpenRegresses ? 4 + Math.max(0, -enginePressure) : 0,
       proofCommand: SPEED_SCAN_OPEN_PROMOTION_COMMAND,
     },
     {
       id: "retainable_scan_open_runtime_probe",
       status: benchmarkNoiseBlocked
         ? "blocked_by_benchmark_noise"
-        : (diagnosticOnly && scanOpenDominatesLeak ? "allowed_next" : "waiting_for_diagnostic_scan_open_split"),
+        : (diagnosticOnly && scanOpenRegresses ? "allowed_next" : "waiting_for_diagnostic_scan_open_split"),
       owner: "tools/scripts/compare-historical-speed.mjs retainable predecessor gate",
-      reason: diagnosticOnly && scanOpenDominatesLeak
+      reason: diagnosticOnly && scanOpenRegresses
         ? "A scan-open-timing run found open-path pressure, but diagnostic attribution is deliberately non-retainable evidence. Before touching scanFileIntoShardTimed, prove the current binary under the normal strict predecessor gate so runtime work is selected from production-shaped timing, not instrumentation-shaped timing."
         : "Use only after a diagnostic scan-open split identifies open-path pressure from a report that cannot itself authorize runtime changes.",
-      expectedGainScore: diagnosticOnly && scanOpenDominatesLeak ? 5 + Math.max(0, -enginePressure) : 0,
+      expectedGainScore: diagnosticOnly && scanOpenRegresses ? 5 + Math.max(0, -enginePressure) : 0,
       proofCommand: SPEED_PROMOTION_COMMAND,
+    },
+    {
+      id: "focused_slowest_teddy_regression_attribution",
+      status: benchmarkNoiseBlocked
+        ? "blocked_by_benchmark_noise"
+        : (focusedSlowestTeddyNegative ? "allowed_next" : "waiting_for_focused_teddy_regression"),
+      owner: "src/core/literal_alternates.zig::nextTeddyCandidate and focused slowest ASIC header lane",
+      reason: focusedSlowestTeddyNegative
+        ? `Fresh focused slowest-file evidence (${focusedSlowest.runId ?? "unknown run"}) is current-binary retainable and Teddy-negative on ${focusedSlowest.corpus ?? "unknown corpus"}: paired Teddy median=${focusedSlowest.averages?.pairedCandidateTeddyRangeImprovementMedianPct}%, paired engine median=${focusedSlowest.averages?.pairedRepoImprovementMedianPct}%, engine raw=${focusedSlowest.averages?.repoEngineImprovementPct}%. Broad scan-file residual attribution is insufficient until this slowest-file Teddy lane is repaired or disproven.`
+        : "Use only when a current-binary focused slowest-file run proves the dominant slow file is Teddy-negative.",
+      expectedGainScore: focusedSlowestTeddyNegative ? 7 + focusedSlowestTeddyPressure : 0,
+      proofCommand: `node tools/scripts/compare-focused-slowest-speed.mjs --rounds 3 --samples 12 --threads 32 --quiet && ${SPEED_PROMOTION_COMMAND}`,
     },
     {
       id: "scan_file_residual_hotspot_attribution",
@@ -773,11 +989,15 @@ function mixedTeddyGainNeedsLeakRepair(summary, leakSummary) {
 }
 
 function nextEngineeringMove(moves, summary, leakSummary) {
+  const benchmarkNoiseControl = moves.find((move) => move.id === "benchmark_host_noise_control") ?? null;
+  const focusedSlowestTeddy = moves.find((move) => move.id === "focused_slowest_teddy_regression_attribution") ?? null;
   const scanFileResidual = moves.find((move) => move.id === "scan_file_residual_hotspot_attribution") ?? null;
   const scanOpenPressure = moves.find((move) => move.id === "scan_open_path_pressure_attribution") ?? null;
   const retainableScanOpenProbe = moves.find((move) => move.id === "retainable_scan_open_runtime_probe") ?? null;
   const wholeEngineLeak = moves.find((move) => move.id === "whole_engine_leak_attribution") ?? null;
+  if (benchmarkNoiseControl?.status === "allowed_next") return benchmarkNoiseControl;
   if (retainableScanOpenProbe?.status === "allowed_next") return retainableScanOpenProbe;
+  if (focusedSlowestTeddy?.status === "allowed_next") return focusedSlowestTeddy;
   if (scanFileResidual?.status === "allowed_next") return scanFileResidual;
   if (scanOpenPressure?.status === "allowed_next") return scanOpenPressure;
   if (mixedTeddyGainNeedsLeakRepair(summary, leakSummary)) return wholeEngineLeak;
@@ -920,6 +1140,7 @@ function currentSpeedStatus({ summary, historical, installedStatus, installedEvi
       runId: installedStatus.runId,
       promotionQualified: installedStatus.promotionQualified,
       retainableStrictEvidence: installedStatus.retainableStrictEvidence,
+      identityNoiseSummary: installedStatus.identityNoiseSummary ?? null,
     },
     recentPredecessors: {
       status: historicalDiagnosticStatus.status,
@@ -992,11 +1213,20 @@ function requiredKernelProof(engineeringMove) {
   };
 }
 
-function nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers) {
+function nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers, selectedHistorical) {
   if (
     latestDiagnosticAttribution?.freshForCurrentBinary !== true ||
     latestDiagnosticAttribution?.diagnosticAttributionMode !== true ||
     latestDiagnosticAttribution?.usableForRuntimeMove !== false
+  ) {
+    return null;
+  }
+  const diagnosticTimestamp = Date.parse(latestDiagnosticAttribution.timestamp ?? "");
+  const selectedTimestamp = Date.parse(selectedHistorical?.timestamp ?? "");
+  if (
+    Number.isFinite(diagnosticTimestamp) &&
+    Number.isFinite(selectedTimestamp) &&
+    diagnosticTimestamp < selectedTimestamp
   ) {
     return null;
   }
@@ -1028,8 +1258,19 @@ function nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers) {
       proofCommand: INSTALLED_SPEED_STRICT_COMMAND,
     };
   }
+  if (installed?.status === "same_binary") {
+    return null;
+  }
 
-  const target = latestDiagnosticAttribution.nextRepairTarget ?? null;
+  const split = latestDiagnosticAttribution.leakSummary?.leakAttribution?.currentOnlyScanSplit ?? null;
+  const target = (() => {
+    const topLevelTarget = latestDiagnosticAttribution.nextRepairTarget ?? null;
+    if (topLevelTarget === "scanWork") {
+      if (split?.regressingCandidateSubphase === "scanFile") return "scanFile";
+      if (split?.regressingCandidateSubphase === "scanOpen") return "scanOpen";
+    }
+    return topLevelTarget;
+  })();
   if (target === "scanOpen") {
     return {
       id: "retainable_scan_open_runtime_probe",
@@ -1050,14 +1291,7 @@ function nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers) {
       proofCommand: SPEED_PROMOTION_COMMAND,
     };
   }
-  return {
-    id: "retainable_runtime_probe",
-    status: "allowed_next_evidence",
-    owner: "tools/scripts/compare-historical-speed.mjs retainable predecessor gate",
-    reason: "Fresh diagnostic attribution exists, but it cannot authorize runtime promotion. Run the normal strict installed, predecessor, and older-snapshot gates before selecting a runtime repair.",
-    sourceDiagnosticRunId: latestDiagnosticAttribution.evaluatedHistoricalRunId ?? null,
-    proofCommand: SPEED_PROMOTION_COMMAND,
-  };
+  return null;
 }
 
 if (!existsSync(reportPath)) {
@@ -1067,21 +1301,20 @@ if (!existsSync(reportPath)) {
 const historical = readJson(reportPath, {});
 const rounds = Array.isArray(historical.roundLedger) ? historical.roundLedger : [];
 const comparisonCurrentHashes = historicalComparisonHashes(historical);
+const comparisonCurrentExecutableHashes = historicalComparisonExecutableHashes(historical);
 const evidenceFresh =
-  currentIxSha256 != null &&
-  comparisonCurrentHashes.length > 0 &&
-  comparisonCurrentHashes.every((hash) => hash === currentIxSha256);
+  reportMatchesCurrentBinary(historical, currentIxSha256);
 const summary = roundSummary(rounds);
 const leakSummary = phaseLeakSummaryFromRounds(rounds);
 const quality = evidenceQuality(historical);
 const basis = researchBasis();
-const moves = candidateMoves(summary, leakSummary, quality);
+const focusedSlowestEvidence = focusedSlowestStatus(LATEST_FOCUSED_SLOWEST_PATH, currentIxSha256);
+const moves = candidateMoves(summary, leakSummary, quality, focusedSlowestEvidence);
 const rejectedIds = moves.filter((move) => move.status === "rejected").map((move) => move.id);
 const engineeringMove = nextEngineeringMove(moves, summary, leakSummary);
-const policy = preservationPolicy(summary, leakSummary, quality, engineeringMove);
 const diagnosticReportPath = selectFreshDiagnosticHistoricalReport(currentIxSha256);
 const latestDiagnosticAttribution = diagnosticAttributionReport(diagnosticReportPath, currentIxSha256);
-const latestNativeInstalledReportPath = selectRetainableFreshNativeInstalledReport(currentIxSha256) ?? LATEST_INSTALLED_PATH;
+const latestNativeInstalledReportPath = selectStrictFreshNativeInstalledReport(currentIxSha256) ?? LATEST_INSTALLED_PATH;
 const speedProofPointers = {
   latestDiagnostic: historicalPointerStatus(LATEST_HISTORICAL_PATH, currentIxSha256),
   latestRetainable: historicalPointerStatus(LATEST_RETAINABLE_HISTORICAL_PATH, currentIxSha256),
@@ -1092,11 +1325,12 @@ const speedProofPointers = {
 };
 const selectedInstalledPointer = selectedInstalledPointerStatus(speedProofPointers);
 const selectedInstalledPath = selectedInstalledPointer?.path ? path.resolve(ROOT, selectedInstalledPointer.path) : LATEST_INSTALLED_PATH;
-const evidenceMove = nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers);
+const evidenceMove = nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers, historical);
 const effectiveEngineeringMove =
-  evidenceMove?.status?.startsWith("blocked_by_") === true
+  evidenceMove != null
     ? evidenceMove
     : engineeringMove;
+const policy = preservationPolicy(summary, leakSummary, quality, effectiveEngineeringMove);
 const benchmarkStatus = currentSpeedStatus({
   summary,
   historical,
@@ -1121,6 +1355,9 @@ const promotionAllowed =
 
 function installedPromotionBlocker(pointer) {
   const status = pointer?.status ?? "missing";
+  if (status === "same_binary") {
+    return `installed and repo normalize to the same executable code (${pointer?.runId ?? "unknown run"}); this is identity-noise evidence, not installed-vs-repo promotion proof. Produce a distinct runtime candidate, then rerun the installed speed gate before finalizing code changes`;
+  }
   if (status === "promotion_failed") {
     const failures = Array.isArray(pointer?.promotionFailures) && pointer.promotionFailures.length > 0
       ? `: ${pointer.promotionFailures.join("; ")}`
@@ -1155,13 +1392,13 @@ const finalizationGate = {
       ),
 };
 const noRuntimePromotionReason = (() => {
-  if (!evidenceFresh) return "historical report candidate hash does not match the current repo binary";
   if (promotionAllowed) return null;
   if (selectedInstalledPointer?.status !== "promotable_current") {
     return selectedInstalledPointer?.status === "promotion_failed"
       ? "current installed-vs-repo promotion proof exists and failed; finalization requires a changed runtime candidate or benchmark owner followed by a passing installed speed gate"
-      : "no current installed-vs-repo promotion proof exists for the repo binary; finalization must run and pass the installed speed gate";
+      : `no current installed-vs-repo promotion proof (${selectedInstalledPointer?.status ?? "missing"}); finalization must run and pass the installed speed gate`;
   }
+  if (!evidenceFresh) return "historical report candidate hash does not match the current repo binary";
   if (speedProofPointers.latestRetainable.status !== "retainable_current") {
     return "no current retainable strict speed proof exists for the repo binary; finalization must run and pass the strict predecessor speed gate";
   }
@@ -1182,10 +1419,13 @@ const report = {
   evaluatedHistoricalRunId: historical.runId ?? null,
   currentIx: path.relative(ROOT, currentIx),
   currentIxSha256,
+  currentIxExecutableSha256,
   comparisonCurrentHashes,
+  comparisonCurrentExecutableHashes,
   evidenceFresh,
   promotionAllowed,
   speedProofPointers,
+  focusedSlowestEvidence,
   finalizationGate,
   proofCommands: {
     installedStrictSpeed: INSTALLED_SPEED_STRICT_COMMAND,
@@ -1206,9 +1446,9 @@ const report = {
   recentHistoricalReports: latestHistoricalReports(),
   candidateMoves: moves,
   rejectedIds,
-  requiredKernelProof: requiredKernelProof(engineeringMove),
+  requiredKernelProof: requiredKernelProof(effectiveEngineeringMove),
   nextEvidenceMove: evidenceMove,
-  nextAllowedMove: moves.find((move) => move.status === "allowed_next") ?? null,
+  nextAllowedMove: effectiveEngineeringMove,
   nextRuntimeMove: engineeringMove,
   nextEngineeringMove: effectiveEngineeringMove,
 };

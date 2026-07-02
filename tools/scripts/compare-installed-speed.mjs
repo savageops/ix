@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { baseBenchEnv, defaultInstalledIxPath, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT_RIPGREP_LINUX_CORPUS } from "./lib/benchmark-config.mjs";
+import { baseBenchEnv, defaultInstalledIxPath, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT_RIPGREP_LINUX_CORPUS, experimentalBenchEnvOverrides } from "./lib/benchmark-config.mjs";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
@@ -35,6 +35,7 @@ Options:
   --expression <expr>             Search expression.
   --installed-ix <path>           Native installed IX path.
   --repo-ix <path>                Repo IX binary path.
+  --out <path>                    Exact report output path. Default: run-id report in manual-speed-compare.
   --latest-path <path>            Latest-report pointer path. Default:
                                   tools/reports/manual-speed-compare/latest-installed-speed.json.
                                   Clean strict runs also update
@@ -58,6 +59,7 @@ const corpus = argValue(args, "--corpus", DEFAULT_CORPUS);
 const expression = argValue(args, "--expression", DEFAULT_EXPR);
 const installedIx = argValue(args, "--installed-ix", DEFAULT_INSTALLED_IX);
 const repoIx = argValue(args, "--repo-ix", DEFAULT_REPO_IX);
+const explicitOutPath = argValue(args, "--out", "");
 const latestPath = path.resolve(argValue(args, "--latest-path", path.join(REPORT_DIR, "latest-installed-speed.json")));
 const samples = Number(argValue(args, "--samples", "12"));
 const threads = Number(argValue(args, "--threads", "32"));
@@ -74,7 +76,9 @@ const minInstalledImprovementPct = Number(argValue(args, "--min-installed-improv
 const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "0"));
 const scanOpenTiming = args.includes("--scan-open-timing");
 const linuxDominantAttribution = args.includes("--linux-dominant-attribution");
-const diagnosticAttributionMode = scanOpenTiming || linuxDominantAttribution;
+const experimentalEnvOverrides = experimentalBenchEnvOverrides();
+const experimentalEnvMode = Object.keys(experimentalEnvOverrides).length > 0;
+const diagnosticAttributionMode = scanOpenTiming || linuxDominantAttribution || experimentalEnvMode;
 const BENCH_ENV = {
   ...BASE_BENCH_ENV,
   IX_SCAN_OPEN_TIMING: scanOpenTiming ? "1" : "0",
@@ -140,7 +144,10 @@ function promotionFailures(host, processScan, installedHash, repoHash, installed
   if (installedRepoComparison.routeParityAcceptable !== true) {
     failures.push(`route_parity_failed:${installedRepoComparison.routeParityStatus ?? "unknown"}`);
   }
-  if (installedHash === repoHash) return failures;
+  if (installedHash === repoHash) {
+    failures.push("installed_repo_same_binary:no_promotion_evidence");
+    return failures;
+  }
   const requiredImprovementPct = Number(installedRepoComparison.score?.requiredImprovementPct ?? installedRepoComparison.effectiveInstalledImprovementPct ?? minInstalledImprovementPct);
   if (installedRepoComparison.score?.repoEngineAcceptable !== true && installedRepoComparison.repoEngineMedianMs >= installedRepoComparison.installedEngineMedianMs) {
     failures.push(`repo_not_faster:${installedRepoComparison.repoEngineMedianMs}>=${installedRepoComparison.installedEngineMedianMs}`);
@@ -188,7 +195,7 @@ if (buildFirst) {
 if (!existsSync(repoIx)) throw new Error(`repo IX not found: ${repoIx}`);
 
 const hostBefore = hostSnapshot();
-const processBefore = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV });
+const processBefore = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV, cleanupOwned: true });
 const ripgrep = measureRipgrep({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
 const ripgrepMmapComparison = measureRipgrepMmapComparison({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
 const identityControl = measureSameBinaryIdentityControl({
@@ -206,7 +213,7 @@ const effectiveInstalledImprovementPct = effectiveImprovementTargetPct({
   noiseMultiplier: identityNoiseMultiplier,
 });
 const paired = measurePairedIx();
-const processAfter = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV });
+const processAfter = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV, cleanupOwned: true });
 const hostAfter = hostSnapshot();
 const host = { before: hostBefore, after: hostAfter };
 const processScan = { before: processBefore, after: processAfter };
@@ -324,6 +331,25 @@ const scorecard = buildInstalledScorecard({
   score: installedRepoComparison.score,
   binaryRelation: installedRepoBinaryRelation,
 });
+const sameExecutableBinary = installedRepoBinaryRelation === "same_binary";
+const identityNoiseSummary = {
+  binaryRelation: installedRepoBinaryRelation,
+  evidenceAuthority: installedRepoComparison.evidenceAuthority,
+  candidatePromotionEvidence: !sameExecutableBinary,
+  installedAndRepoExecutableSha256Match: sameExecutableBinary,
+  installedExecutableSha256: installedExecutableHash,
+  repoExecutableSha256: repoExecutableHash,
+  identityControlMedianDeltaPct: identityControl?.medianDeltaPct ?? null,
+  observedEngineDeltaPct: installedRepoEngineDeltaPct,
+  observedPairedEngineMedianPct:
+    installedRepoComparison.score?.pairedRepoImprovementMedianPct ?? null,
+  observedPairedWinRate: installedRepoComparison.score?.pairedRepoWinRate ?? null,
+  observedTeddyRangeMedianPct:
+    installedRepoComparison.score?.pairedCandidateTeddyRangeImprovementMedianPct ?? null,
+  interpretation: sameExecutableBinary
+    ? "installed and repo normalize to the same executable code; this run measures benchmark drift/noise and cannot prove a runtime candidate"
+    : "installed and repo are different executable code; this run can prove or reject promotion",
+};
 const roundLedger = buildInstalledRoundLedger({
   comparison: installedRepoComparison,
   score: installedRepoComparison.score,
@@ -364,6 +390,8 @@ const report = {
   threads,
   scanOpenTiming,
   linuxDominantAttribution,
+  experimentalEnvMode,
+  experimentalEnvOverrides,
   diagnosticAttributionMode,
   benchEnv: BENCH_ENV,
   effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
@@ -374,6 +402,7 @@ const report = {
   strictEvidenceFailures: strictFailures,
   evidenceQuality,
   binaries,
+  hashesMatch: sameExecutableBinary,
   lanes: {
     ripgrep,
     ripgrepMmapComparison,
@@ -384,6 +413,7 @@ const report = {
   identityControl,
   installedRepoComparison,
   scorecard,
+  identityNoiseSummary,
   roundLedger,
   ledgerSummary,
   promotionMode,
@@ -407,10 +437,16 @@ report.deltasPct = {
 };
 
 mkdirSync(REPORT_DIR, { recursive: true });
-const outPath = path.join(REPORT_DIR, `${report.runId}.json`);
+const outPath = explicitOutPath.length > 0 ? path.resolve(explicitOutPath) : path.join(REPORT_DIR, `${report.runId}.json`);
+mkdirSync(path.dirname(outPath), { recursive: true });
 writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
 mkdirSync(path.dirname(latestPath), { recursive: true });
-writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+const diagnosticLatestPath = path.join(REPORT_DIR, "latest-diagnostic-installed-speed.json");
+if (diagnosticAttributionMode) {
+  writeFileSync(diagnosticLatestPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+} else {
+  writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+}
 const retainableInstalledThreadConfig = threads === RETAINABLE_INSTALLED_THREADS;
 if (requireStrict && report.retainableStrictEvidence && report.promotionQualified && !diagnosticAttributionMode && nativeInstalledBaselinePath(installedIx) && retainableInstalledThreadConfig) {
   writeFileSync(LATEST_RETAINABLE_INSTALLED_PATH, `${JSON.stringify(report, null, 2)}\n`, "utf8");
@@ -433,10 +469,10 @@ if (!quiet) {
     pairedWinRate: report.lanes.identityControl.pairedEngine.candidateWinRate,
     matchParity: report.lanes.identityControl.matchParity,
     routeParity: report.lanes.identityControl.routeParity,
-  } : null, evidenceQuality: report.evidenceQuality, installedRepoComparison: report.installedRepoComparison, scorecard: report.scorecard, roundLedger: report.roundLedger, ledgerSummary: report.ledgerSummary, strictEvidenceFailures: report.strictEvidenceFailures, promotionFailures: report.promotionFailures, requiredGateFailures: report.requiredGateFailures, staleProcessesBefore: report.processScan.before.matched.length, staleProcessesAfter: report.processScan.after.matched.length, deltasPct: report.deltasPct }, null, 2));
+  } : null, evidenceQuality: report.evidenceQuality, identityNoiseSummary: report.identityNoiseSummary, installedRepoComparison: report.installedRepoComparison, scorecard: report.scorecard, roundLedger: report.roundLedger, ledgerSummary: report.ledgerSummary, strictEvidenceFailures: report.strictEvidenceFailures, promotionFailures: report.promotionFailures, requiredGateFailures: report.requiredGateFailures, staleProcessesBefore: report.processScan.before.matched.length, staleProcessesAfter: report.processScan.after.matched.length, deltasPct: report.deltasPct }, null, 2));
 }
 
 if (report.requiredGateFailures.length > 0) {
-  console.error(JSON.stringify({ status: "failed", failures: report.requiredGateFailures, outPath }, null, 2));
+  console.error(JSON.stringify({ status: "failed", failures: report.requiredGateFailures, outPath, identityNoiseSummary: report.identityNoiseSummary }, null, 2));
   process.exit(report.requiredGateFailures.some((failure) => failure.gate === "promotion") ? 3 : 2);
 }
