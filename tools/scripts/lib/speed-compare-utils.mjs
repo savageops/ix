@@ -328,6 +328,11 @@ function optionalNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function nsSummaryMedianToMs(summaryValue) {
+  const ns = optionalNumber(summaryValue?.median);
+  return ns == null ? null : ns / 1_000_000;
+}
+
 function msPerFile(totalMs, filesScanned) {
   const total = Number(totalMs);
   const files = Number(filesScanned);
@@ -553,6 +558,8 @@ function stageTimingMedianFields(baseline, candidate) {
     candidateScanFileMmapMedianMs: candidate?.scanFileMmapSummary?.median ?? null,
     baselineScanFileFastCountMedianMs: baseline?.scanFileFastCountSummary?.median ?? null,
     candidateScanFileFastCountMedianMs: candidate?.scanFileFastCountSummary?.median ?? null,
+    baselineScanFileFastCountWallMedianMs: nsSummaryMedianToMs(baseline?.byteShardRangeElapsedNsMaxSummary),
+    candidateScanFileFastCountWallMedianMs: nsSummaryMedianToMs(candidate?.byteShardRangeElapsedNsMaxSummary),
     baselineScanFileLineScanMedianMs: baseline?.scanFileLineScanSummary?.median ?? null,
     candidateScanFileLineScanMedianMs: candidate?.scanFileLineScanSummary?.median ?? null,
     baselineScanOpenMsPerFileMedian: baseline?.scanOpenMsPerFileSummary?.median ?? null,

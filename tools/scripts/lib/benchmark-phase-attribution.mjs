@@ -393,6 +393,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
         baselineScanFileMedianMs: optionalNumber(sourceRound.baselineScanFileMedianMs),
         baselineScanFileMmapMedianMs: optionalNumber(sourceRound.baselineScanFileMmapMedianMs),
         baselineScanFileFastCountMedianMs: optionalNumber(sourceRound.baselineScanFileFastCountMedianMs),
+        baselineScanFileFastCountWallMedianMs: optionalNumber(sourceRound.baselineScanFileFastCountWallMedianMs),
         baselineScanFileLineScanMedianMs: optionalNumber(sourceRound.baselineScanFileLineScanMedianMs),
         baselineScanOpenMsPerFileMedian: optionalNumber(sourceRound.baselineScanOpenMsPerFileMedian),
         baselineScanFileMsPerFileMedian: optionalNumber(sourceRound.baselineScanFileMsPerFileMedian),
@@ -407,6 +408,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
         candidateScanFileMedianMs: optionalNumber(sourceRound.candidateScanFileMedianMs),
         candidateScanFileMmapMedianMs: optionalNumber(sourceRound.candidateScanFileMmapMedianMs),
         candidateScanFileFastCountMedianMs: optionalNumber(sourceRound.candidateScanFileFastCountMedianMs),
+        candidateScanFileFastCountWallMedianMs: optionalNumber(sourceRound.candidateScanFileFastCountWallMedianMs),
         candidateScanFileLineScanMedianMs: optionalNumber(sourceRound.candidateScanFileLineScanMedianMs),
         candidateScanOpenMsPerFileMedian: optionalNumber(sourceRound.candidateScanOpenMsPerFileMedian),
         candidateScanOpenPathMsPerFileMedian: optionalNumber(sourceRound.candidateScanOpenPathMsPerFileMedian),
@@ -419,6 +421,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
         scanFileDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileMedianMs, sourceRound.baselineScanFileMedianMs) : null,
         scanFileMmapDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileMmapMedianMs, sourceRound.baselineScanFileMmapMedianMs) : null,
         scanFileFastCountDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileFastCountMedianMs, sourceRound.baselineScanFileFastCountMedianMs) : null,
+        scanFileFastCountWallDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileFastCountWallMedianMs, sourceRound.baselineScanFileFastCountWallMedianMs) : null,
         scanFileLineScanDeltaMs: baselineScanSplitPresent ? delta(sourceRound.candidateScanFileLineScanMedianMs, sourceRound.baselineScanFileLineScanMedianMs) : null,
         scanOpenMsPerFileDelta: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenMsPerFileMedian, sourceRound.baselineScanOpenMsPerFileMedian) : null,
         scanOpenPathMsPerFileDelta: baselineScanSplitPresent ? delta(sourceRound.candidateScanOpenPathMsPerFileMedian, sourceRound.baselineScanOpenPathMsPerFileMedian) : null,
@@ -461,10 +464,13 @@ export function phaseLeakSummaryFromRounds(rounds) {
           const teddyMs = nsToMs(sourceRound.candidateAlternateTeddyRangeElapsedNsMedian);
           const fullScanMs = nsToMs(sourceRound.candidateAlternateFullScanElapsedNsMedian);
           const fastCountMs = optionalNumber(round.candidateScanFileFastCountMedianMs);
+          const fastCountWallMs = optionalNumber(round.candidateScanFileFastCountWallMedianMs);
           const routeMs = fastCountMs ?? (
             fullScanMs == null ? teddyMs : delta((teddyMs ?? 0) + fullScanMs, 0)
           );
+          const wallRouteMs = fastCountWallMs ?? routeMs;
           const residualMs = routeMs == null ? round.candidateScanFileMedianMs : delta(round.candidateScanFileMedianMs, routeMs);
+          const wallResidualMs = wallRouteMs == null ? round.candidateScanFileMedianMs : delta(round.candidateScanFileMedianMs, wallRouteMs);
           return {
             roundIndex: round.roundIndex,
             baselineLabel: round.baselineLabel,
@@ -472,19 +478,26 @@ export function phaseLeakSummaryFromRounds(rounds) {
             candidateTeddyRangeMedianMs: teddyMs,
             candidateAlternateFullScanMedianMs: fullScanMs,
             candidateScanFileFastCountMedianMs: fastCountMs,
+            candidateScanFileFastCountWallMedianMs: fastCountWallMs,
             candidateScanFileResidualMedianMs: residualMs,
+            candidateScanFileWallResidualMedianMs: wallResidualMs,
             candidateTeddyShareOfScanFilePct: ratioPct(teddyMs, round.candidateScanFileMedianMs),
             candidateAlternateFullScanShareOfScanFilePct: ratioPct(fullScanMs, round.candidateScanFileMedianMs),
             candidateScanFileFastCountShareOfScanFilePct: ratioPct(fastCountMs, round.candidateScanFileMedianMs),
+            candidateScanFileFastCountWallShareOfScanFilePct: ratioPct(fastCountWallMs, round.candidateScanFileMedianMs),
             candidateScanFileResidualSharePct: ratioPct(residualMs, round.candidateScanFileMedianMs),
+            candidateScanFileWallResidualSharePct: ratioPct(wallResidualMs, round.candidateScanFileMedianMs),
           };
         });
         const scanFileResidualMedianMs = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileResidualMedianMs));
+        const scanFileWallResidualMedianMs = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileWallResidualMedianMs));
         const teddyShareOfScanFilePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateTeddyShareOfScanFilePct));
         const alternateFullScanShareOfScanFilePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateAlternateFullScanShareOfScanFilePct));
         const fastCountShareOfScanFilePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileFastCountShareOfScanFilePct));
+        const fastCountWallShareOfScanFilePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileFastCountWallShareOfScanFilePct));
         const alternateFullScanMedianMs = optionalSummary(scanFileResidualRounds.map((round) => round.candidateAlternateFullScanMedianMs));
         const scanFileResidualSharePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileResidualSharePct));
+        const scanFileWallResidualSharePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileWallResidualSharePct));
         const candidateSlowestPathHotspots = topWeightedEntries(candidateSplitRounds.flatMap((round) => {
           const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
           return Array.isArray(sourceRound.candidateSlowestPathTop) ? sourceRound.candidateSlowestPathTop : [];
@@ -532,12 +545,14 @@ export function phaseLeakSummaryFromRounds(rounds) {
             targetPhaseDeltas: PAIRED_TIMING_BASIS,
             candidateSubphaseMedians: AGGREGATE_TIMING_BASIS,
             scanFileResidual: "candidate_current_only_aggregate_medians_minus_route_elapsed_medians",
+            scanFileWallResidual: "candidate_current_only_aggregate_medians_minus_max_parallel_range_elapsed_medians",
           },
           scanFileResidualEvidence: {
             basis: "aggregate_worker_time_minus_nested_route_elapsed_medians",
+            wallBasis: "aggregate_worker_time_minus_max_parallel_range_elapsed_medians",
             directlyMeasured: false,
             usableForRuntimePatch: false,
-            requiredNextProof: "isolate_mmap_open_bookkeeping_line_walk_before_runtime_patch",
+            requiredNextProof: "isolate_mmap_open_bookkeeping_line_walk_without_hot_struct_layout_change_before_runtime_patch",
           },
           dominantCandidateSubphase,
           regressingCandidateSubphase: regressingCandidateSubphase?.name ?? null,
@@ -562,9 +577,12 @@ export function phaseLeakSummaryFromRounds(rounds) {
           candidateTeddyShareOfScanFilePct: teddyShareOfScanFilePct,
           candidateAlternateFullScanShareOfScanFilePct: alternateFullScanShareOfScanFilePct,
           candidateScanFileFastCountShareOfScanFilePct: fastCountShareOfScanFilePct,
+          candidateScanFileFastCountWallShareOfScanFilePct: fastCountWallShareOfScanFilePct,
           candidateAlternateFullScanMedianMs: alternateFullScanMedianMs,
           candidateScanFileResidualSharePct: scanFileResidualSharePct,
           candidateScanFileResidualMedianMs: scanFileResidualMedianMs,
+          candidateScanFileWallResidualSharePct: scanFileWallResidualSharePct,
+          candidateScanFileWallResidualMedianMs: scanFileWallResidualMedianMs,
           scanFileResidualRounds,
           candidateSlowestPathHotspots,
           candidateSlowestPathClasses,

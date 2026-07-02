@@ -68,9 +68,10 @@ function scanFileResidualEvidenceValid(split) {
   const evidence = split?.scanFileResidualEvidence;
   return isPlainObject(evidence) &&
     evidence.basis === "aggregate_worker_time_minus_nested_route_elapsed_medians" &&
+    evidence.wallBasis === "aggregate_worker_time_minus_max_parallel_range_elapsed_medians" &&
     evidence.directlyMeasured === false &&
     evidence.usableForRuntimePatch === false &&
-    evidence.requiredNextProof === "isolate_mmap_open_bookkeeping_line_walk_before_runtime_patch";
+    evidence.requiredNextProof === "isolate_mmap_open_bookkeeping_line_walk_without_hot_struct_layout_change_before_runtime_patch";
 }
 
 function executableSha256File(filePath) {
