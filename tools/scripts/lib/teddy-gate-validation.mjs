@@ -196,6 +196,18 @@ function validateTeddyDecision(decision, evidence) {
     failures.push("teddy kernel next move requires historical speed proof command");
   }
   if (
+    String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-historical-speed.mjs") &&
+    !String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-historical-speed.mjs --build")
+  ) {
+    failures.push("teddy kernel next move historical proof must build the repo binary first");
+  }
+  if (
+    String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-installed-speed.mjs") &&
+    !String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-installed-speed.mjs --build")
+  ) {
+    failures.push("teddy kernel next move installed proof must build the repo binary first");
+  }
+  if (
     String(decision.nextAllowedMove?.proofCommand ?? "").includes("--samples 12") &&
     !String(decision.nextAllowedMove?.proofCommand ?? "").includes("--identity-control-samples 12")
   ) {

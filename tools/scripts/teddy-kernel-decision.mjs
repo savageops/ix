@@ -28,17 +28,17 @@ const INSECT_LITERAL_ALTERNATES_REFRESH = path.join(ROOT, ".docs", "research", "
 const INSECT_TEDDY_ATTRIBUTION_REFRESH = path.join(ROOT, ".docs", "research", "insect-teddy-attribution-refresh-20260613.json");
 const INSECT_PACKED_TEDDY_SHUFTI_REFRESH = path.join(ROOT, ".docs", "research", "insect-packed-teddy-shufti-refresh-20260613.json");
 const HISTORICAL_SPEED_DIAGNOSTIC_COMMAND =
-  "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --no-require-strict";
+  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --no-require-strict";
 const HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND =
-  "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --no-require-strict --scan-open-timing";
+  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --no-require-strict --scan-open-timing";
 const HISTORICAL_SPEED_STRICT_COMMAND =
-  "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --require-strict";
+  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --require-strict";
 const HISTORICAL_SPEED_SCAN_OPEN_STRICT_COMMAND =
-  "node tools/scripts/compare-historical-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --require-strict --scan-open-timing";
+  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --require-strict --scan-open-timing";
 const OLDER_SNAPSHOT_PROOF_COMMAND =
   "node tools/scripts/compare-older-snapshots.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --min-retainable-samples 12 --max-snapshots 2 --target-retainable-snapshots 2 --min-engine-improvement-pct 5 --min-paired-improvement-pct 5 --require-strict --quiet";
 const INSTALLED_SPEED_STRICT_COMMAND =
-  "node tools/scripts/compare-installed-speed.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --min-retainable-samples 12 --require-strict --require-promotion --quiet";
+  "node tools/scripts/compare-installed-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --min-retainable-samples 12 --require-strict --require-promotion --quiet";
 const SPEED_DIAGNOSTIC_COMMAND = `${HISTORICAL_SPEED_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 const SPEED_LEAK_ATTRIBUTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
 const SPEED_SCAN_OPEN_PROMOTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
