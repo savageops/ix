@@ -113,9 +113,9 @@ const PAIRED_ATTRIBUTION_METRICS = [
   { key: "scanWork", sampleField: "scanWorkMsTotal" },
   { key: "scanOpen", sampleField: "scanOpenMsTotal" },
   { key: "scanFile", sampleField: "scanFileMsTotal" },
-  { key: "teddyRangeNs", sampleField: "alternateTeddyRangeElapsedNsTotal" },
-  { key: "pcreRangeNs", sampleField: "alternatePcreRangeElapsedNsTotal" },
-  { key: "compiledRangeNs", sampleField: "alternateCompiledRangeElapsedNsTotal" },
+  { key: "teddyRangeNs", sampleField: "alternateTeddyRangeElapsedNsMax" },
+  { key: "pcreRangeNs", sampleField: "alternatePcreRangeElapsedNsMax" },
+  { key: "compiledRangeNs", sampleField: "alternateCompiledRangeElapsedNsMax" },
 ];
 
 function pairedMetricStats(baselineSamples, candidateSamples, count, metric) {

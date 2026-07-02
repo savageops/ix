@@ -515,12 +515,12 @@ function routeTimingMedianFields(baseline, candidate) {
     candidateAlternateFullScanMatchesMedian: candidate?.alternateFullScanMatchesSummary?.median ?? null,
     baselineAlternateFullScanElapsedNsMedian: baseline?.alternateFullScanElapsedNsTotalSummary?.median ?? null,
     candidateAlternateFullScanElapsedNsMedian: candidate?.alternateFullScanElapsedNsTotalSummary?.median ?? null,
-    baselineAlternatePcreRangeElapsedNsMedian: baseline?.alternatePcreRangeElapsedNsTotalSummary?.median ?? null,
-    candidateAlternatePcreRangeElapsedNsMedian: candidate?.alternatePcreRangeElapsedNsTotalSummary?.median ?? null,
-    baselineAlternateTeddyRangeElapsedNsMedian: baseline?.alternateTeddyRangeElapsedNsTotalSummary?.median ?? null,
-    candidateAlternateTeddyRangeElapsedNsMedian: candidate?.alternateTeddyRangeElapsedNsTotalSummary?.median ?? null,
-    baselineAlternateCompiledRangeElapsedNsMedian: baseline?.alternateCompiledRangeElapsedNsTotalSummary?.median ?? null,
-    candidateAlternateCompiledRangeElapsedNsMedian: candidate?.alternateCompiledRangeElapsedNsTotalSummary?.median ?? null,
+    baselineAlternatePcreRangeElapsedNsMedian: baseline?.alternatePcreRangeElapsedNsMaxSummary?.median ?? null,
+    candidateAlternatePcreRangeElapsedNsMedian: candidate?.alternatePcreRangeElapsedNsMaxSummary?.median ?? null,
+    baselineAlternateTeddyRangeElapsedNsMedian: baseline?.alternateTeddyRangeElapsedNsMaxSummary?.median ?? null,
+    candidateAlternateTeddyRangeElapsedNsMedian: candidate?.alternateTeddyRangeElapsedNsMaxSummary?.median ?? null,
+    baselineAlternateCompiledRangeElapsedNsMedian: baseline?.alternateCompiledRangeElapsedNsMaxSummary?.median ?? null,
+    candidateAlternateCompiledRangeElapsedNsMedian: candidate?.alternateCompiledRangeElapsedNsMaxSummary?.median ?? null,
   };
 }
 

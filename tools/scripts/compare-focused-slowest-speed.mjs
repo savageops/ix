@@ -87,7 +87,9 @@ for (let round = 1; round <= rounds; round += 1) {
 }
 
 const rows = roundReports.map(({ path: reportPath, report }, index) => {
-  const score = report.scorecard?.losingRounds?.[0] ??
+  const score = report.roundLedger?.[0] ??
+    report.roundLedger?.[0]?.score ??
+    report.scorecard?.losingRounds?.[0] ??
     report.scorecard?.netPositiveRounds?.[0] ??
     report.scorecard?.strictCandidateRounds?.[0] ??
     {};
@@ -103,14 +105,14 @@ const rows = roundReports.map(({ path: reportPath, report }, index) => {
     installedHash,
     repoExecutableHash,
     installedExecutableHash,
-    repoEngineImprovementPct: numberOrNull(score.repoEngineImprovementPct),
-    pairedRepoImprovementMedianPct: numberOrNull(score.pairedRepoImprovementMedianPct),
-    pairedRepoWinRate: numberOrNull(score.pairedRepoWinRate),
+    repoEngineImprovementPct: numberOrNull(score.repoEngineImprovementPct ?? score.engineImprovementPct),
+    pairedRepoImprovementMedianPct: numberOrNull(score.pairedRepoImprovementMedianPct ?? score.pairedCandidateImprovementMedianPct),
+    pairedRepoWinRate: numberOrNull(score.pairedRepoWinRate ?? score.pairedCandidateWinRate),
     pairedCandidateTeddyRangeImprovementMedianPct: numberOrNull(score.pairedCandidateTeddyRangeImprovementMedianPct),
-    installedScanFileMedianMs: numberOrNull(score.installedScanFileMedianMs),
-    repoScanFileMedianMs: numberOrNull(score.repoScanFileMedianMs),
-    installedAlternateTeddyRangeElapsedNsMedian: numberOrNull(score.installedAlternateTeddyRangeElapsedNsMedian),
-    repoAlternateTeddyRangeElapsedNsMedian: numberOrNull(score.repoAlternateTeddyRangeElapsedNsMedian),
+    installedScanFileMedianMs: numberOrNull(score.installedScanFileMedianMs ?? score.baselineScanFileMedianMs),
+    repoScanFileMedianMs: numberOrNull(score.repoScanFileMedianMs ?? score.candidateScanFileMedianMs),
+    installedAlternateTeddyRangeElapsedNsMedian: numberOrNull(score.installedAlternateTeddyRangeElapsedNsMedian ?? score.baselineAlternateTeddyRangeElapsedNsMedian),
+    repoAlternateTeddyRangeElapsedNsMedian: numberOrNull(score.repoAlternateTeddyRangeElapsedNsMedian ?? score.candidateAlternateTeddyRangeElapsedNsMedian),
     failures: report.promotionFailures ?? [],
   };
 });
