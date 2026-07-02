@@ -237,6 +237,8 @@ function focusedSlowestStatus(filePath, currentHash) {
     timestamp: pointer.timestamp ?? null,
     corpus: pointer.corpus ?? null,
     expression: pointer.expression ?? null,
+    baselineKind: pointer.baselineKind ?? null,
+    buildFirst: pointer.buildFirst === true,
     retainableFocusedEvidence,
     experimentalFocusedEvidence,
     freshForCurrentBinary,
@@ -800,10 +802,10 @@ function candidateMoves(summary, leakSummary, quality, focusedSlowest) {
         : (focusedSlowestTeddyNegative ? "allowed_next" : "waiting_for_focused_teddy_regression"),
       owner: "src/core/literal_alternates.zig::nextTeddyCandidate and focused slowest ASIC header lane",
       reason: focusedSlowestTeddyNegative
-        ? `Fresh focused slowest-file evidence (${focusedSlowest.runId ?? "unknown run"}) is current-binary retainable and Teddy-negative on ${focusedSlowest.corpus ?? "unknown corpus"}: paired Teddy median=${focusedSlowest.averages?.pairedCandidateTeddyRangeImprovementMedianPct}%, paired engine median=${focusedSlowest.averages?.pairedRepoImprovementMedianPct}%, engine raw=${focusedSlowest.averages?.repoEngineImprovementPct}%. Broad scan-file residual attribution is insufficient until this slowest-file Teddy lane is repaired or disproven.`
+        ? `Fresh focused slowest-file evidence (${focusedSlowest.runId ?? "unknown run"}) is retainable and Teddy-negative against baseline=${focusedSlowest.baselineKind ?? "unknown"} on ${focusedSlowest.corpus ?? "unknown corpus"}: paired Teddy median=${focusedSlowest.averages?.pairedCandidateTeddyRangeImprovementMedianPct}%, paired engine median=${focusedSlowest.averages?.pairedRepoImprovementMedianPct}%, engine raw=${focusedSlowest.averages?.repoEngineImprovementPct}%. Broad scan-file residual attribution is insufficient until this slowest-file Teddy lane is repaired or disproven.`
         : "Use only when a current-binary focused slowest-file run proves the dominant slow file is Teddy-negative.",
       expectedGainScore: focusedSlowestTeddyNegative ? 7 + focusedSlowestTeddyPressure : 0,
-      proofCommand: `node tools/scripts/compare-focused-slowest-speed.mjs --rounds 3 --samples 12 --threads 32 --quiet && ${SPEED_PROMOTION_COMMAND}`,
+      proofCommand: `node tools/scripts/compare-focused-slowest-speed.mjs --build --rounds 3 --samples 12 --threads 32 --quiet && ${SPEED_PROMOTION_COMMAND}`,
     },
     {
       id: "scan_file_residual_hotspot_attribution",

@@ -208,6 +208,12 @@ function validateTeddyDecision(decision, evidence) {
     failures.push("teddy kernel next move installed proof must build the repo binary first");
   }
   if (
+    String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-focused-slowest-speed.mjs") &&
+    !String(decision.nextAllowedMove?.proofCommand ?? "").includes("compare-focused-slowest-speed.mjs --build")
+  ) {
+    failures.push("teddy kernel next move focused-slowest proof must build the repo binary first");
+  }
+  if (
     String(decision.nextAllowedMove?.proofCommand ?? "").includes("--samples 12") &&
     !String(decision.nextAllowedMove?.proofCommand ?? "").includes("--identity-control-samples 12")
   ) {

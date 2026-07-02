@@ -224,15 +224,15 @@ const requiredProofCommands = [
   "zig build test --summary all",
   "zig build -Doptimize=ReleaseFast --summary all",
   "alternates-decision-table.mjs --branch-counts 4 --samples 12",
-  "compare-historical-speed.mjs --samples 12",
+  "compare-historical-speed.mjs --build --samples 12",
   "teddy-kernel-decision.mjs --quiet",
   "teddy-kernel-contract-check.mjs",
   "ix-architecture-regression-gate.mjs --quick",
 ];
 
 const requiredDecisionProofCommands = [
-  "compare-installed-speed.mjs --samples 12",
-  "compare-historical-speed.mjs --samples 12",
+  "compare-installed-speed.mjs --build --samples 12",
+  "compare-historical-speed.mjs --build --samples 12",
   "compare-older-snapshots.mjs --samples 12",
   "--identity-control-attempts 3",
   "--min-retainable-samples 12",

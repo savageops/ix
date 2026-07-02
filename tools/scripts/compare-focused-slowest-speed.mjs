@@ -26,6 +26,7 @@ Options:
   --expression <expr>             Search expression. Default: alternates benchmark expression.
   --installed-ix <path>           Baseline IX binary. Default: June 30 native backup.
   --repo-ix <path>                Repo IX binary. Default: zig-out/bin/ix-zig.exe.
+  --build                         Build repo IX ReleaseFast before each focused round.
   --quiet                         Do not print JSON.
   --help, -h                      Print this help.
 `);
@@ -39,6 +40,7 @@ const expression = argValue(args, "--expression", DEFAULT_ALTERNATES_EXPRESSION)
 const installedIx = argValue(args, "--installed-ix", DEFAULT_BACKUP);
 const repoIx = argValue(args, "--repo-ix", defaultRepoIxPath(ROOT));
 const corpus = argValue(args, "--corpus", selectSlowestCorpus());
+const buildFirst = args.includes("--build");
 const quiet = args.includes("--quiet");
 
 if (!corpus || !existsSync(corpus)) throw new Error(`focused corpus not found: ${corpus}`);
@@ -69,6 +71,7 @@ for (let round = 1; round <= rounds; round += 1) {
     "--latest-path", latestPath,
     "--no-require-strict",
     "--quiet",
+    ...(buildFirst ? ["--build"] : []),
   ], {
     cwd: ROOT,
     env: process.env,
@@ -127,7 +130,9 @@ const summary = {
   corpus,
   expression,
   installedIx,
+  baselineKind: installedIx === DEFAULT_BACKUP ? "native_backup_2026_06_30" : "custom_installed_ix",
   repoIx,
+  buildFirst,
   rounds,
   samples,
   evidenceQuality: retainableFocusedEvidence
