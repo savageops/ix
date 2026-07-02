@@ -55,6 +55,7 @@ function expectedScanWorkRepairMove(decision) {
   if (target === "scanOpen") return "scan_open_path_pressure_attribution";
   if (split?.regressingCandidateSubphase === "scanFile") return "scan_file_residual_hotspot_attribution";
   if (split?.regressingCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
+  if (split?.dominantCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
   return "whole_engine_leak_attribution";
 }
 
@@ -65,6 +66,9 @@ function expectedScanWorkNextMove(decision) {
     return "retainable_scan_open_runtime_probe";
   }
   if (diagnosticAttributionOnly(decision) && split?.regressingCandidateSubphase === "scanOpen") {
+    return "retainable_scan_open_runtime_probe";
+  }
+  if (diagnosticAttributionOnly(decision) && split?.dominantCandidateSubphase === "scanOpen") {
     return "retainable_scan_open_runtime_probe";
   }
   return expectedScanWorkRepairMove(decision);

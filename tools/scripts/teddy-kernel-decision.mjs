@@ -264,7 +264,7 @@ function selectFreshHistoricalReport(currentHash) {
         diagnostic: report.diagnosticAttributionMode === true,
       };
     })
-    .filter((entry) => entry.fresh && !entry.diagnostic)
+    .filter((entry) => entry.fresh)
     .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
   return candidates[0]?.path ?? null;
 }
@@ -716,6 +716,7 @@ function candidateMoves(summary, leakSummary, quality, focusedSlowest) {
     leakSummary?.nextRepairTarget === "scanOpen" ||
     leakSummary?.leakAttribution?.targetPhase === "scanOpen" ||
     leakSummary?.leakAttribution?.currentOnlyScanSplit?.regressingCandidateSubphase === "scanOpen";
+  const scanOpenPressureIdentified = scanOpenRegresses || scanOpenDominatesLeak;
   const scanFileResidualRegresses =
     teddyGainNeedsLeakRepair &&
     leakSummary?.leakAttribution?.currentOnlyScanSplit?.regressingCandidateSubphase === "scanFile";
@@ -754,7 +755,7 @@ function candidateMoves(summary, leakSummary, quality, focusedSlowest) {
       id: "whole_engine_leak_attribution",
       status: benchmarkNoiseBlocked
         ? "blocked_by_benchmark_noise"
-        : (scanOpenRegresses ? "satisfied_by_scan_open_split" : (scanFileResidualRegresses ? "satisfied_by_scan_file_split" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win"))),
+        : (scanOpenPressureIdentified ? "satisfied_by_scan_open_split" : (scanFileResidualRegresses ? "satisfied_by_scan_file_split" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win"))),
       owner: "tools/scripts/compare-historical-speed.mjs plus src/core/search.zig phase telemetry",
       reason: teddyGainNeedsLeakRepair
         ? `Latest historical evidence shows Teddy attribution is positive while whole-engine evidence still has a losing round; preserve the Teddy gain and isolate ${leakSummary?.nextRepairTarget ?? "discovery, scheduling, scan bookkeeping, or reporting"} overhead before changing the Teddy kernel again. Current averaged phase medians: discover=${summary.averagePairedDiscoverMedianPct}%, scan=${summary.averagePairedScanMedianPct}%, scanWork=${summary.averagePairedScanWorkMedianPct}%, teddy=${summary.averagePairedTeddyMedianPct}%. Worst round=${leakSummary?.worstRound?.baselineLabel ?? "unknown"}.`
@@ -766,30 +767,30 @@ function candidateMoves(summary, leakSummary, quality, focusedSlowest) {
       id: "scan_open_path_pressure_attribution",
       status: benchmarkNoiseBlocked
         ? "blocked_by_benchmark_noise"
-        : (diagnosticOnly && scanOpenRegresses
+        : (diagnosticOnly && scanOpenPressureIdentified
             ? "diagnostic_only"
-            : (scanOpenRegresses ? "allowed_next" : (scanFileResidualRegresses ? "blocked_by_scan_file_regression" : "waiting_for_scan_open_split"))),
+            : (scanOpenPressureIdentified ? "allowed_next" : (scanFileResidualRegresses ? "blocked_by_scan_file_regression" : "waiting_for_scan_open_split"))),
       owner: "src/core/search.zig::scanFileIntoShardTimed and scanFileIntoShardMonoTimed",
-      reason: scanOpenRegresses
+      reason: scanOpenPressureIdentified
         ? `Scan-open timing identifies the file-open wrapper as the current repair target under file-count parity=${filesScannedParityStatus}: scanOpen median=${leakSummary.leakAttribution?.currentOnlyScanSplit?.candidateScanOpenMedianMs?.median ?? leakSummary.leakAttribution?.targetRounds?.[0]?.candidateScanOpenMedianMs}ms, scanOpen per file=${leakSummary.leakAttribution?.currentOnlyScanSplit?.candidateScanOpenMsPerFileMedian?.median ?? leakSummary.leakAttribution?.targetRounds?.[0]?.candidateScanOpenMsPerFileMedian}ms, scanFile median=${leakSummary.leakAttribution?.currentOnlyScanSplit?.candidateScanFileMedianMs?.median ?? leakSummary.leakAttribution?.targetRounds?.[0]?.candidateScanFileMedianMs}ms. ${diagnosticOnly ? "This report is diagnostic-only, so it may guide the next proof run but must not directly authorize a runtime patch." : "The next runtime candidate must reduce open-path pressure per file, not chase scanned-file count, before touching the Teddy kernel."}`
         : (scanFileResidualRegresses
             ? `Scan-open owns the largest current scan-work share, but scanFile is the measured regressing subphase: scanFile paired=${leakSummary.leakAttribution.currentOnlyScanSplit.regressingCandidateSubphaseMedianPct}%, scanFile delta=${leakSummary.leakAttribution.currentOnlyScanSplit.regressingCandidateSubphaseDeltaMs}ms. Do not chase open-path pressure until scan-file residual/hotspots are repaired or disproven.`
             : (scanOpenDominatesLeak
                 ? "Scan-open owns the largest current scan-work share, but it is not the measured regressing subphase. Keep attribution open instead of routing a runtime patch to open-path pressure."
                 : "Run historical proof with --scan-open-timing before choosing an open-path, scan-file, or Teddy-kernel repair.")),
-      expectedGainScore: scanOpenRegresses ? 4 + Math.max(0, -enginePressure) : 0,
+      expectedGainScore: scanOpenPressureIdentified ? 4 + Math.max(0, -enginePressure) : 0,
       proofCommand: SPEED_SCAN_OPEN_PROMOTION_COMMAND,
     },
     {
       id: "retainable_scan_open_runtime_probe",
       status: benchmarkNoiseBlocked
         ? "blocked_by_benchmark_noise"
-        : (diagnosticOnly && scanOpenRegresses ? "allowed_next" : "waiting_for_diagnostic_scan_open_split"),
+        : (diagnosticOnly && scanOpenPressureIdentified ? "allowed_next" : "waiting_for_diagnostic_scan_open_split"),
       owner: "tools/scripts/compare-historical-speed.mjs retainable predecessor gate",
-      reason: diagnosticOnly && scanOpenRegresses
+      reason: diagnosticOnly && scanOpenPressureIdentified
         ? "A scan-open-timing run found open-path pressure, but diagnostic attribution is deliberately non-retainable evidence. Before touching scanFileIntoShardTimed, prove the current binary under the normal strict predecessor gate so runtime work is selected from production-shaped timing, not instrumentation-shaped timing."
         : "Use only after a diagnostic scan-open split identifies open-path pressure from a report that cannot itself authorize runtime changes.",
-      expectedGainScore: diagnosticOnly && scanOpenRegresses ? 5 + Math.max(0, -enginePressure) : 0,
+      expectedGainScore: diagnosticOnly && scanOpenPressureIdentified ? 5 + Math.max(0, -enginePressure) : 0,
       proofCommand: SPEED_PROMOTION_COMMAND,
     },
     {

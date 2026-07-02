@@ -329,7 +329,15 @@ export function phaseLeakSummaryFromRounds(rounds) {
     Array.isArray(round.negativePhases) &&
     round.negativePhases.length > 0
   );
-  const worstRoundRepairTarget = worstRound?.negativePhases?.[0]?.name ?? null;
+  const worstRoundRepairTarget = (() => {
+    const negativePhases = Array.isArray(worstRound?.negativePhases) ? worstRound.negativePhases : [];
+    if (negativePhases.length === 0) return null;
+    const names = new Set(negativePhases.map((phase) => phase.name));
+    if (names.has("scanWork")) return "scanWork";
+    if (names.has("scanFile")) return "scanFile";
+    if (names.has("scanOpen")) return "scanOpen";
+    return negativePhases[0]?.name ?? null;
+  })();
   const shouldRepairLeak = teddyWinningEngineLeaking || roundLevelTeddyWinningEngineLeaking;
   const repairTargets = negativeAverages.map((entry) => ({
     ...entry,

@@ -422,6 +422,7 @@ function focusedSlowestTeddyNegative(decision) {
 function expectedScanWorkRepairMove(split) {
   if (split?.regressingCandidateSubphase === "scanFile") return "scan_file_residual_hotspot_attribution";
   if (split?.regressingCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
+  if (split?.dominantCandidateSubphase === "scanOpen") return "scan_open_path_pressure_attribution";
   return "whole_engine_leak_attribution";
 }
 function diagnosticAttributionOnly(quality) {
@@ -456,6 +457,9 @@ function expectedScanWorkNextMove(split, quality, target = null) {
   if (target === "scanOpen") return "scan_open_path_pressure_attribution";
   if (target === "scanFile") return "scan_file_residual_hotspot_attribution";
   if (diagnosticAttributionOnly(quality) && split?.regressingCandidateSubphase === "scanOpen") {
+    return "retainable_scan_open_runtime_probe";
+  }
+  if (diagnosticAttributionOnly(quality) && split?.dominantCandidateSubphase === "scanOpen") {
     return "retainable_scan_open_runtime_probe";
   }
   return expectedScanWorkRepairMove(split);
