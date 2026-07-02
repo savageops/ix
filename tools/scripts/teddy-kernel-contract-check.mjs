@@ -508,10 +508,11 @@ if (teddyGainNeedsLeakRepair) {
   const expectedRepairMove = focusedTeddyNegative
     ? "focused_slowest_teddy_regression_attribution"
     : expectedActiveRepairMove(activeExpectedAttribution);
-  if (decision.preservationPolicy?.nextEngineeringMoveId !== expectedRepairMove) {
+  const expectedPolicyMove = evidenceBlockedByNoise ? "benchmark_host_noise_control" : expectedRepairMove;
+  if (decision.preservationPolicy?.nextEngineeringMoveId !== expectedPolicyMove) {
     failures.push("decision preservation policy must route engineering repair to the proved repair owner");
   }
-  if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
+  if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution" && !evidenceBlockedByNoise) {
     const expectedRuntimeMove = focusedTeddyNegative
       ? "focused_slowest_teddy_regression_attribution"
       : expectedActiveRepairMove(activeExpectedAttribution);

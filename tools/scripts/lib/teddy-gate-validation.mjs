@@ -201,10 +201,13 @@ function validateTeddyDecision(decision, evidence) {
     if (decision.preservationPolicy?.preserveTeddyGain !== true) {
       failures.push("teddy kernel decision must explicitly preserve the positive Teddy gain");
     }
-    if (decision.preservationPolicy?.nextEngineeringMoveId !== expectedTeddyRepairMove(decision)) {
+    const expectedPolicyMove = evidenceBlockedByBenchmarkNoise(decision)
+      ? "benchmark_host_noise_control"
+      : expectedTeddyRepairMove(decision);
+    if (decision.preservationPolicy?.nextEngineeringMoveId !== expectedPolicyMove) {
       failures.push("teddy kernel decision must route mixed Teddy/engine evidence to the proved repair owner");
     }
-    if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution") {
+    if (decision.nextEngineeringMove?.id !== "whole_engine_leak_attribution" && !evidenceBlockedByBenchmarkNoise(decision)) {
       const expectedRuntimeMove = expectedScanWorkNextMove(decision);
       const evidenceBlocked =
         typeof decision.nextEngineeringMove?.status === "string" &&
@@ -412,7 +415,11 @@ export function createTeddyGateValidation({ root, run, lane }) {
     if (
       isPlainObject(parsed.decision) &&
       mixedTeddyGainNeedsLeakRepair(parsed.decision) &&
-      parsed.decision.preservationPolicy?.nextEngineeringMoveId !== expectedTeddyRepairMove(parsed.decision)
+      parsed.decision.preservationPolicy?.nextEngineeringMoveId !== (
+        evidenceBlockedByBenchmarkNoise(parsed.decision)
+          ? "benchmark_host_noise_control"
+          : expectedTeddyRepairMove(parsed.decision)
+      )
     ) {
       failures.push("teddy kernel contract must preserve Teddy gain and route engineering repair to the proved repair owner");
     }

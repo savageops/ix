@@ -346,6 +346,20 @@ function elevationSnapshot() {
 function classifyHostForBenchmark(snapshot) {
   const issues = [];
   const activeCpuMinSec = 0.05;
+  const activeCpuHeavySec = 0.25;
+  const largeProcessWorkingSetBytes = 4 * 1024 * 1024 * 1024;
+  const benchmarkProcessNames = new Set([
+    "ix",
+    "iex",
+    "ix-zig",
+    "node",
+    "powershell",
+    "pwsh",
+    "conhost",
+    "windowsterminal",
+  ]);
+  const processName = (entry) => String(entry?.ProcessName ?? "").toLowerCase();
+  const isBenchmarkProcess = (entry) => benchmarkProcessNames.has(processName(entry));
   const powerName = snapshot.powerScheme?.name?.toLowerCase?.() ?? "";
   if (process.platform === "win32" && powerName && !powerName.includes("performance")) {
     issues.push({
@@ -382,6 +396,35 @@ function classifyHostForBenchmark(snapshot) {
       id: "interactive_workloads_present",
       severity: "info",
       detail: "Codex or Chrome processes appeared among top working-set processes",
+    });
+  }
+  const largeResident = (snapshot.topProcessesByWorkingSet ?? []).find((entry) =>
+    !isBenchmarkProcess(entry) &&
+    Number(entry.WorkingSet64 ?? 0) >= largeProcessWorkingSetBytes
+  );
+  if (largeResident) {
+    issues.push({
+      id: "large_resident_workload",
+      severity: "warning",
+      detail: `${largeResident.ProcessName ?? "unknown"} working set ${Math.round(Number(largeResident.WorkingSet64 ?? 0) / 1024 / 1024)} MiB`,
+      processName: largeResident.ProcessName ?? null,
+      pid: largeResident.Id ?? null,
+      workingSetBytes: Number(largeResident.WorkingSet64 ?? 0),
+    });
+  }
+  const activeNonBenchmark = activeCpu.find((entry) =>
+    !isBenchmarkProcess(entry) &&
+    Number(entry.CpuDeltaSec ?? 0) >= activeCpuHeavySec
+  );
+  if (activeNonBenchmark) {
+    issues.push({
+      id: "active_cpu_workload",
+      severity: "warning",
+      detail: `${activeNonBenchmark.ProcessName ?? "unknown"} used ${activeNonBenchmark.CpuDeltaSec}s CPU during host preflight sample`,
+      processName: activeNonBenchmark.ProcessName ?? null,
+      pid: activeNonBenchmark.Id ?? null,
+      sampleMs: snapshot.activeCpuSampleMs,
+      cpuDeltaSec: activeNonBenchmark.CpuDeltaSec,
     });
   }
   const freeMemRatio = snapshot.totalMemBytes > 0 ? snapshot.freeMemBytes / snapshot.totalMemBytes : 1;

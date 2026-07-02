@@ -131,6 +131,30 @@ export function createBenchmarkAdmission({
           null,
           "Low free memory increases paging and cache churn, invalidating small speed deltas.",
         );
+      } else if (issue.id === "large_resident_workload") {
+        add(
+          issue.id,
+          `Close or suspend ${issue.processName ?? "the memory-heavy workload"} before retained speed collection.`,
+          null,
+          `${issue.detail ?? "A large resident workload"} can perturb filesystem cache residency, paging pressure, and memory bandwidth.`,
+        );
+        addVerification(
+          issue.id,
+          "Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 8 Id,ProcessName,CPU,WorkingSet64",
+          "Confirms no large resident foreground workload is competing with the benchmark.",
+        );
+      } else if (issue.id === "active_cpu_workload") {
+        add(
+          issue.id,
+          `Stop or idle ${issue.processName ?? "the active CPU workload"} before retained speed collection.`,
+          null,
+          `${issue.detail ?? "An active CPU workload"} can distort paired medians and identity controls.`,
+        );
+        addVerification(
+          issue.id,
+          "Get-Process | Sort-Object CPU -Descending | Select-Object -First 8 Id,ProcessName,CPU,WorkingSet64",
+          "Confirms no active foreground workload is consuming CPU during benchmark preflight.",
+        );
       } else {
         add(
           issue.id ?? "unknown_warning",
