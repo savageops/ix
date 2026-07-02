@@ -74,6 +74,22 @@ function scanFileResidualEvidenceValid(split) {
     evidence.requiredNextProof === "isolate_mmap_open_bookkeeping_line_walk_without_hot_struct_layout_change_before_runtime_patch";
 }
 
+function validateDiscoverAttribution(discoverAttribution, scopeLabel, failures) {
+  if (discoverAttribution == null) {
+    failures.push(`${scopeLabel} discover attribution must include discovery/admission counter attribution`);
+    return;
+  }
+  if (discoverAttribution.filesDiscoveredParity !== true) {
+    failures.push(`${scopeLabel} discover attribution must prove discovered-file-count parity`);
+  }
+  if (discoverAttribution.filesSkippedParity !== true) {
+    failures.push(`${scopeLabel} discover attribution must prove skipped-file-count parity`);
+  }
+  if (discoverAttribution.deltas?.discoveryAccessErrors?.median !== 0) {
+    failures.push(`${scopeLabel} discover attribution must prove discovery access-error parity`);
+  }
+}
+
 function executableSha256File(filePath) {
   if (!existsSync(filePath)) return null;
   return executableHash(readFileSync(filePath));
@@ -369,7 +385,21 @@ if (diagnosticPointer?.freshForCurrentBinary === true && diagnosticPointer.diagn
         }
       }
     }
+    if (diagnosticAttribution.nextRepairTarget === "discover") {
+      validateDiscoverAttribution(
+        diagnosticAttribution.leakSummary?.leakAttribution?.discoverAttribution ?? null,
+        "decision diagnostic",
+        failures,
+      );
+    }
   }
+}
+if (decision.leakSummary?.nextRepairTarget === "discover") {
+  validateDiscoverAttribution(
+    decision.leakSummary?.leakAttribution?.discoverAttribution ?? null,
+    "decision top-level",
+    failures,
+  );
 }
 if (decision.finalizationGate?.requiredProofCommand == null ||
     !normalized(String(decision.finalizationGate.requiredProofCommand)).includes("compare-installed-speed.mjs") ||

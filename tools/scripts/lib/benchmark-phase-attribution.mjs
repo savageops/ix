@@ -267,6 +267,68 @@ const PHASE_LEAK_FIELDS = [
   ["teddyRange", "pairedCandidateTeddyRangeImprovementMedianPct", "pairedCandidateTeddyRangeDeltaMedianMs"],
 ];
 
+function medianPair(round, name) {
+  const baseline = optionalNumber(round?.[`baseline${name}Median`]);
+  const candidate = optionalNumber(round?.[`candidate${name}Median`]);
+  return {
+    baseline,
+    candidate,
+    delta: baseline == null || candidate == null ? null : delta(candidate, baseline),
+    parity: baseline == null || candidate == null ? null : baseline === candidate,
+  };
+}
+
+function discoverAttributionFromRounds(targetRounds) {
+  const usable = Array.isArray(targetRounds) ? targetRounds : [];
+  if (usable.length === 0) return null;
+  const filesDiscoveredParityValues = usable.map((round) => round.filesDiscoveredParity);
+  const filesSkippedParityValues = usable.map((round) => round.filesSkippedParity);
+  const allKnownTrue = (values) => values.length > 0 && values.every((value) => value === true);
+  return {
+    targetRoundCount: usable.length,
+    filesDiscoveredParity: filesDiscoveredParityValues.some((value) => value == null) ? null : allKnownTrue(filesDiscoveredParityValues),
+    filesSkippedParity: filesSkippedParityValues.some((value) => value == null) ? null : allKnownTrue(filesSkippedParityValues),
+    inputRoots: optionalSummary(usable.map((round) => round.inputRoots?.candidate)),
+    effectiveRoots: optionalSummary(usable.map((round) => round.effectiveRoots?.candidate)),
+    prunedRoots: optionalSummary(usable.map((round) => round.prunedRoots?.candidate)),
+    overlapPrunedRoots: optionalSummary(usable.map((round) => round.overlapPrunedRoots?.candidate)),
+    discoveredDuplicatePaths: optionalSummary(usable.map((round) => round.discoveredDuplicatePaths?.candidate)),
+    filesDiscovered: optionalSummary(usable.map((round) => round.filesDiscovered?.candidate)),
+    filesSkipped: optionalSummary(usable.map((round) => round.filesSkipped?.candidate)),
+    ignoreFilesLoaded: optionalSummary(usable.map((round) => round.ignoreFilesLoaded?.candidate)),
+    hiddenEntriesSkipped: optionalSummary(usable.map((round) => round.hiddenEntriesSkipped?.candidate)),
+    ignoredEntriesSkipped: optionalSummary(usable.map((round) => round.ignoredEntriesSkipped?.candidate)),
+    accessErrorsTotal: optionalSummary(usable.map((round) => round.accessErrorsTotal?.candidate)),
+    discoveryAccessErrors: optionalSummary(usable.map((round) => round.discoveryAccessErrors?.candidate)),
+    deltas: {
+      effectiveRoots: optionalSummary(usable.map((round) => round.effectiveRoots?.delta)),
+      prunedRoots: optionalSummary(usable.map((round) => round.prunedRoots?.delta)),
+      filesDiscovered: optionalSummary(usable.map((round) => round.filesDiscovered?.delta)),
+      filesSkipped: optionalSummary(usable.map((round) => round.filesSkipped?.delta)),
+      ignoreFilesLoaded: optionalSummary(usable.map((round) => round.ignoreFilesLoaded?.delta)),
+      hiddenEntriesSkipped: optionalSummary(usable.map((round) => round.hiddenEntriesSkipped?.delta)),
+      ignoredEntriesSkipped: optionalSummary(usable.map((round) => round.ignoredEntriesSkipped?.delta)),
+      discoveryAccessErrors: optionalSummary(usable.map((round) => round.discoveryAccessErrors?.delta)),
+    },
+    targetRounds: usable.map((round) => ({
+      roundIndex: round.roundIndex,
+      baselineLabel: round.baselineLabel,
+      filesDiscoveredParity: round.filesDiscoveredParity,
+      filesSkippedParity: round.filesSkippedParity,
+      inputRoots: round.inputRoots,
+      effectiveRoots: round.effectiveRoots,
+      prunedRoots: round.prunedRoots,
+      filesDiscovered: round.filesDiscovered,
+      filesSkipped: round.filesSkipped,
+      ignoreFilesLoaded: round.ignoreFilesLoaded,
+      hiddenEntriesSkipped: round.hiddenEntriesSkipped,
+      ignoredEntriesSkipped: round.ignoredEntriesSkipped,
+      discoveryAccessErrors: round.discoveryAccessErrors,
+    })),
+    interpretation: "discover repair target now carries file-set, root-pruning, ignore, hidden-entry, and access-error counters from existing IX JSON telemetry",
+  };
+}
+
 export function phaseLeakSummaryFromRounds(rounds) {
   const usableRounds = Array.isArray(rounds) ? rounds : [];
   const averages = Object.fromEntries(
@@ -400,6 +462,24 @@ export function phaseLeakSummaryFromRounds(rounds) {
         baselineFilesScanned: Array.isArray(sourceRound.baselineFilesScanned) ? sourceRound.baselineFilesScanned : null,
         candidateFilesScanned: Array.isArray(sourceRound.candidateFilesScanned) ? sourceRound.candidateFilesScanned : null,
         filesScannedParity: optionalBoolean(sourceRound.filesScannedParity),
+        baselineFilesDiscovered: Array.isArray(sourceRound.baselineFilesDiscovered) ? sourceRound.baselineFilesDiscovered : null,
+        candidateFilesDiscovered: Array.isArray(sourceRound.candidateFilesDiscovered) ? sourceRound.candidateFilesDiscovered : null,
+        filesDiscoveredParity: optionalBoolean(sourceRound.filesDiscoveredParity),
+        baselineFilesSkipped: Array.isArray(sourceRound.baselineFilesSkipped) ? sourceRound.baselineFilesSkipped : null,
+        candidateFilesSkipped: Array.isArray(sourceRound.candidateFilesSkipped) ? sourceRound.candidateFilesSkipped : null,
+        filesSkippedParity: optionalBoolean(sourceRound.filesSkippedParity),
+        inputRoots: medianPair(sourceRound, "InputRoots"),
+        effectiveRoots: medianPair(sourceRound, "EffectiveRoots"),
+        prunedRoots: medianPair(sourceRound, "PrunedRoots"),
+        overlapPrunedRoots: medianPair(sourceRound, "OverlapPrunedRoots"),
+        discoveredDuplicatePaths: medianPair(sourceRound, "DiscoveredDuplicatePaths"),
+        filesDiscovered: medianPair(sourceRound, "FilesDiscovered"),
+        filesSkipped: medianPair(sourceRound, "FilesSkipped"),
+        ignoreFilesLoaded: medianPair(sourceRound, "IgnoreFilesLoaded"),
+        hiddenEntriesSkipped: medianPair(sourceRound, "HiddenEntriesSkipped"),
+        ignoredEntriesSkipped: medianPair(sourceRound, "IgnoredEntriesSkipped"),
+        accessErrorsTotal: medianPair(sourceRound, "AccessErrorsTotal"),
+        discoveryAccessErrors: medianPair(sourceRound, "DiscoveryAccessErrors"),
         baselineScanSplitPresent,
         candidateScanWorkMedianMs: optionalNumber(sourceRound.candidateScanWorkMedianMs),
         candidateScanOpenMedianMs: optionalNumber(sourceRound.candidateScanOpenMedianMs),
@@ -594,6 +674,9 @@ export function phaseLeakSummaryFromRounds(rounds) {
         };
       })()
     : null;
+  const discoverAttribution = nextRepairTarget === "discover"
+    ? discoverAttributionFromRounds(targetRounds)
+    : null;
   const protectedWinningRounds = roundsWithLeaks
     .filter((round) =>
       Number(round.teddyRangeMedianPct) > 0 &&
@@ -639,6 +722,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
       targetPhase: nextRepairTarget,
       targetRounds,
       currentOnlyScanSplit,
+      discoverAttribution,
       protectedWinningRounds,
       nextProbe,
     },

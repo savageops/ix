@@ -763,6 +763,10 @@ function candidateMoves(summary, leakSummary, quality, focusedSlowest) {
   const repairTargetBasis = leakSummary?.worstRound?.negativePhases?.some?.((phase) => phase?.name === leakSummary?.nextRepairTarget)
     ? `worst protected Teddy-positive losing round ${leakSummary?.worstRound?.baselineLabel ?? "unknown"}`
     : "averaged phase ranking";
+  const discoverAttribution = leakSummary?.leakAttribution?.discoverAttribution ?? null;
+  const discoverAttributionReason = leakSummary?.nextRepairTarget === "discover" && discoverAttribution != null
+    ? ` Discover attribution: filesDiscoveredParity=${discoverAttribution.filesDiscoveredParity}, filesSkippedParity=${discoverAttribution.filesSkippedParity}, effectiveRootsDelta=${discoverAttribution.deltas?.effectiveRoots?.median ?? null}, filesDiscoveredDelta=${discoverAttribution.deltas?.filesDiscovered?.median ?? null}, ignoreFilesLoadedDelta=${discoverAttribution.deltas?.ignoreFilesLoaded?.median ?? null}, discoveryAccessErrorsDelta=${discoverAttribution.deltas?.discoveryAccessErrors?.median ?? null}.`
+    : "";
   const moves = [
     {
       id: "benchmark_host_noise_control",
@@ -783,7 +787,7 @@ function candidateMoves(summary, leakSummary, quality, focusedSlowest) {
         : (scanOpenPressureIdentified ? "satisfied_by_scan_open_split" : (scanFileResidualRegresses ? "satisfied_by_scan_file_split" : (teddyGainNeedsLeakRepair ? "allowed_next" : "waiting_for_teddy_route_win"))),
       owner: "tools/scripts/compare-historical-speed.mjs plus src/core/search.zig phase telemetry",
       reason: teddyGainNeedsLeakRepair
-        ? `Latest historical evidence shows Teddy attribution is positive while whole-engine evidence still has a losing round; preserve the Teddy gain and isolate ${leakSummary?.nextRepairTarget ?? "discovery, scheduling, scan bookkeeping, or reporting"} overhead before changing the Teddy kernel again. Repair target basis=${repairTargetBasis}. Current averaged phase medians: discover=${summary.averagePairedDiscoverMedianPct}%, scan=${summary.averagePairedScanMedianPct}%, scanWork=${summary.averagePairedScanWorkMedianPct}%, teddy=${summary.averagePairedTeddyMedianPct}%. Worst round=${leakSummary?.worstRound?.baselineLabel ?? "unknown"}.`
+        ? `Latest historical evidence shows Teddy attribution is positive while whole-engine evidence still has a losing round; preserve the Teddy gain and isolate ${leakSummary?.nextRepairTarget ?? "discovery, scheduling, scan bookkeeping, or reporting"} overhead before changing the Teddy kernel again. Repair target basis=${repairTargetBasis}. Current averaged phase medians: discover=${summary.averagePairedDiscoverMedianPct}%, scan=${summary.averagePairedScanMedianPct}%, scanWork=${summary.averagePairedScanWorkMedianPct}%, teddy=${summary.averagePairedTeddyMedianPct}%. Worst round=${leakSummary?.worstRound?.baselineLabel ?? "unknown"}.${discoverAttributionReason}`
         : "Use this only after Teddy route attribution is already net-positive and whole-engine evidence still regresses.",
       expectedGainScore: teddyGainNeedsLeakRepair ? 3 + Math.max(0, -enginePressure) + Math.max(0, teddyPressure / 4) : 0,
       proofCommand: SPEED_LEAK_ATTRIBUTION_COMMAND,

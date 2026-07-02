@@ -535,6 +535,16 @@ function stageTimingMedianFields(baseline, candidate) {
   const filesScannedParity = baselineFilesScanned != null && candidateFilesScanned != null
     ? JSON.stringify(baselineFilesScanned) === JSON.stringify(candidateFilesScanned)
     : null;
+  const baselineFilesDiscovered = Array.isArray(baseline?.filesDiscovered) ? baseline.filesDiscovered : null;
+  const candidateFilesDiscovered = Array.isArray(candidate?.filesDiscovered) ? candidate.filesDiscovered : null;
+  const filesDiscoveredParity = baselineFilesDiscovered != null && candidateFilesDiscovered != null
+    ? JSON.stringify(baselineFilesDiscovered) === JSON.stringify(candidateFilesDiscovered)
+    : null;
+  const baselineFilesSkipped = Array.isArray(baseline?.filesSkipped) ? baseline.filesSkipped : null;
+  const candidateFilesSkipped = Array.isArray(candidate?.filesSkipped) ? candidate.filesSkipped : null;
+  const filesSkippedParity = baselineFilesSkipped != null && candidateFilesSkipped != null
+    ? JSON.stringify(baselineFilesSkipped) === JSON.stringify(candidateFilesSkipped)
+    : null;
   return {
     baselineDiscoverMedianMs: baseline?.discoverSummary?.median ?? null,
     candidateDiscoverMedianMs: candidate?.discoverSummary?.median ?? null,
@@ -573,6 +583,36 @@ function stageTimingMedianFields(baseline, candidate) {
     baselineFilesScanned,
     candidateFilesScanned,
     filesScannedParity,
+    baselineFilesDiscovered,
+    candidateFilesDiscovered,
+    filesDiscoveredParity,
+    baselineFilesDiscoveredMedian: baseline?.filesDiscoveredSummary?.median ?? null,
+    candidateFilesDiscoveredMedian: candidate?.filesDiscoveredSummary?.median ?? null,
+    baselineFilesSkipped,
+    candidateFilesSkipped,
+    filesSkippedParity,
+    baselineFilesSkippedMedian: baseline?.filesSkippedSummary?.median ?? null,
+    candidateFilesSkippedMedian: candidate?.filesSkippedSummary?.median ?? null,
+    baselineInputRootsMedian: baseline?.inputRootsSummary?.median ?? null,
+    candidateInputRootsMedian: candidate?.inputRootsSummary?.median ?? null,
+    baselineEffectiveRootsMedian: baseline?.effectiveRootsSummary?.median ?? null,
+    candidateEffectiveRootsMedian: candidate?.effectiveRootsSummary?.median ?? null,
+    baselinePrunedRootsMedian: baseline?.prunedRootsSummary?.median ?? null,
+    candidatePrunedRootsMedian: candidate?.prunedRootsSummary?.median ?? null,
+    baselineOverlapPrunedRootsMedian: baseline?.overlapPrunedRootsSummary?.median ?? null,
+    candidateOverlapPrunedRootsMedian: candidate?.overlapPrunedRootsSummary?.median ?? null,
+    baselineDiscoveredDuplicatePathsMedian: baseline?.discoveredDuplicatePathsSummary?.median ?? null,
+    candidateDiscoveredDuplicatePathsMedian: candidate?.discoveredDuplicatePathsSummary?.median ?? null,
+    baselineIgnoreFilesLoadedMedian: baseline?.ignoreFilesLoadedSummary?.median ?? null,
+    candidateIgnoreFilesLoadedMedian: candidate?.ignoreFilesLoadedSummary?.median ?? null,
+    baselineHiddenEntriesSkippedMedian: baseline?.hiddenEntriesSkippedSummary?.median ?? null,
+    candidateHiddenEntriesSkippedMedian: candidate?.hiddenEntriesSkippedSummary?.median ?? null,
+    baselineIgnoredEntriesSkippedMedian: baseline?.ignoredEntriesSkippedSummary?.median ?? null,
+    candidateIgnoredEntriesSkippedMedian: candidate?.ignoredEntriesSkippedSummary?.median ?? null,
+    baselineAccessErrorsTotalMedian: baseline?.accessErrorsTotalSummary?.median ?? null,
+    candidateAccessErrorsTotalMedian: candidate?.accessErrorsTotalSummary?.median ?? null,
+    baselineDiscoveryAccessErrorsMedian: baseline?.discoveryAccessErrorsSummary?.median ?? null,
+    candidateDiscoveryAccessErrorsMedian: candidate?.discoveryAccessErrorsSummary?.median ?? null,
     baselineSlowestFileMedianMs: baseline?.slowestMsSummary?.median ?? null,
     candidateSlowestFileMedianMs: candidate?.slowestMsSummary?.median ?? null,
     baselineSlowestFileMedianBytes: baseline?.slowestBytesSummary?.median ?? null,
@@ -1985,6 +2025,8 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
   const report = parseIxReport(result.stdout);
   const density = report.stats?.fast_count_density ?? {};
   const timings = report.stats?.timings ?? {};
+  const admission = report.stats?.admission ?? {};
+  const accessErrors = report.stats?.access_errors ?? {};
   const byteShard = report.stats?.byte_shard_kernel ?? {};
   const linuxDominant = report.stats?.linux_dominant_file ?? {};
   const slowest = report.stats?.slowest ?? report.stats?.slowest_file ?? {};
@@ -2027,7 +2069,19 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
     aggregateMergeMs: Number(timings.aggregate_merge_ms ?? 0),
     aggregateFinalizeMs: Number(timings.aggregate_finalize_ms ?? 0),
     matches: Number(report.stats?.matches_found ?? 0),
+    inputRoots: Number(report.stats?.input_roots ?? 0),
+    effectiveRoots: Number(report.stats?.effective_roots ?? 0),
+    prunedRoots: Number(report.stats?.pruned_roots ?? 0),
+    overlapPrunedRoots: Number(report.stats?.overlap_pruned_roots ?? 0),
+    discoveredDuplicatePaths: Number(report.stats?.discovered_duplicate_paths ?? 0),
+    filesDiscovered: Number(report.stats?.files_discovered ?? 0),
     filesScanned: Number(report.stats?.files_scanned ?? 0),
+    filesSkipped: Number(report.stats?.files_skipped ?? 0),
+    ignoreFilesLoaded: Number(admission.ignore_files_loaded ?? 0),
+    hiddenEntriesSkipped: Number(admission.hidden_entries_skipped ?? 0),
+    ignoredEntriesSkipped: Number(admission.ignored_entries_skipped ?? 0),
+    accessErrorsTotal: Number(accessErrors.total ?? 0),
+    discoveryAccessErrors: Number(accessErrors.discovery ?? 0),
     scanOpenMsPerFile: msPerFile(timings.scan_open_ms_total, report.stats?.files_scanned),
     scanOpenPathMsPerFile: msPerFile(timings.scan_open_path_ms_total, report.stats?.files_scanned),
     scanOpenSyscallMsPerFile: msPerFile(timings.scan_open_syscall_ms_total, report.stats?.files_scanned),
@@ -2116,7 +2170,31 @@ export function summarizeIxRuns(binaryPath, label, runs) {
     aggregateMergeSummary: summary(runs.map((entry) => entry.aggregateMergeMs)),
     aggregateFinalizeSummary: summary(runs.map((entry) => entry.aggregateFinalizeMs)),
     matchCounts: [...new Set(runs.map((entry) => entry.matches))],
+    inputRoots: [...new Set(runs.map((entry) => entry.inputRoots))],
+    inputRootsSummary: summary(runs.map((entry) => entry.inputRoots)),
+    effectiveRoots: [...new Set(runs.map((entry) => entry.effectiveRoots))],
+    effectiveRootsSummary: summary(runs.map((entry) => entry.effectiveRoots)),
+    prunedRoots: [...new Set(runs.map((entry) => entry.prunedRoots))],
+    prunedRootsSummary: summary(runs.map((entry) => entry.prunedRoots)),
+    overlapPrunedRoots: [...new Set(runs.map((entry) => entry.overlapPrunedRoots))],
+    overlapPrunedRootsSummary: summary(runs.map((entry) => entry.overlapPrunedRoots)),
+    discoveredDuplicatePaths: [...new Set(runs.map((entry) => entry.discoveredDuplicatePaths))],
+    discoveredDuplicatePathsSummary: summary(runs.map((entry) => entry.discoveredDuplicatePaths)),
+    filesDiscovered: [...new Set(runs.map((entry) => entry.filesDiscovered))],
+    filesDiscoveredSummary: summary(runs.map((entry) => entry.filesDiscovered)),
     filesScanned: [...new Set(runs.map((entry) => entry.filesScanned))],
+    filesSkipped: [...new Set(runs.map((entry) => entry.filesSkipped))],
+    filesSkippedSummary: summary(runs.map((entry) => entry.filesSkipped)),
+    ignoreFilesLoaded: [...new Set(runs.map((entry) => entry.ignoreFilesLoaded))],
+    ignoreFilesLoadedSummary: summary(runs.map((entry) => entry.ignoreFilesLoaded)),
+    hiddenEntriesSkipped: [...new Set(runs.map((entry) => entry.hiddenEntriesSkipped))],
+    hiddenEntriesSkippedSummary: summary(runs.map((entry) => entry.hiddenEntriesSkipped)),
+    ignoredEntriesSkipped: [...new Set(runs.map((entry) => entry.ignoredEntriesSkipped))],
+    ignoredEntriesSkippedSummary: summary(runs.map((entry) => entry.ignoredEntriesSkipped)),
+    accessErrorsTotal: [...new Set(runs.map((entry) => entry.accessErrorsTotal))],
+    accessErrorsTotalSummary: summary(runs.map((entry) => entry.accessErrorsTotal)),
+    discoveryAccessErrors: [...new Set(runs.map((entry) => entry.discoveryAccessErrors))],
+    discoveryAccessErrorsSummary: summary(runs.map((entry) => entry.discoveryAccessErrors)),
     byteShardStrategy: [...new Set(runs.map((entry) => entry.byteShardStrategy))],
     byteShardFilesProfiled: [...new Set(runs.map((entry) => entry.byteShardFilesProfiled))],
     byteShardFilesProfiledSummary: summary(runs.map((entry) => entry.byteShardFilesProfiled)),
