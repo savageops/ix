@@ -971,6 +971,14 @@ function candidateMoves(summary, leakSummary, quality, focusedSlowest) {
       proofCommand: ".docs/research/2026-06-13-packed-teddy-kernel-proof-contract.md",
     },
     {
+      id: "line_local_whole_range_teddy_count",
+      status: "rejected",
+      owner: "src/core/literal_alternates.zig::countLogicalLinesRange",
+      reason: "Counting line-local literal alternates across the whole byte-shard range skipped newline iteration but failed normal strict predecessor proof: 1/4 net-positive rounds, 3 regression rounds, June 13 engine -6.063%, paired -8.193%, scanWork -9.402%. The likely cost is extra cross-line fingerprint candidates and changed range timing; the next candidate must stay line-aware or add a packed verifier that removes more confirmation work than it creates.",
+      expectedGainScore: 0,
+      proofCommand: "historical-speed-2026-07-02T17-31-09-729Z.json",
+    },
+    {
       id: "inline_zig_vpshufb_nibble_tables",
       status: "rejected",
       owner: "src/core/literal_alternates.zig::nextTeddyCandidate",
