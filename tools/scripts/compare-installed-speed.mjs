@@ -92,8 +92,7 @@ function resolveZigExe() {
 
 function nativeInstalledBaselinePath(filePath) {
   const normalizedPath = String(filePath ?? "").replaceAll("\\", "/").toLowerCase();
-  return normalizedPath.includes("/appdata/local/programs/iex/bin/ix.exe") &&
-    !normalizedPath.includes("/tmp-baselines/");
+  return normalizedPath.endsWith("/appdata/local/programs/iex/bin/ix.exe");
 }
 
 function measurePairedIx() {

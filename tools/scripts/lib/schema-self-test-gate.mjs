@@ -681,6 +681,7 @@ export function runSchemaSelfTest({
         },
         processScan: { beforeOk: true, afterOk: true, beforeMatched: 0, afterMatched: 0 },
         medians: { ripgrepCliMs: 100, repoCliMs: 50 },
+        evidenceQuality: { usableForRuntimeMove: true },
         identityControl: { medianDeltaPct: 0, matchParity: true, routeParity: true },
         installedRepoComparison: {
           evidenceAuthority: "installed_vs_repo",

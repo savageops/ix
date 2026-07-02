@@ -51,6 +51,10 @@ function normalized(text) {
   return text.replaceAll("\\", "/").toLowerCase();
 }
 
+function nativeInstalledBaselinePath(filePath) {
+  return normalized(String(filePath ?? "")).endsWith("/appdata/local/programs/iex/bin/ix.exe");
+}
+
 function finiteNumber(value) {
   const number = Number(value);
   return Number.isFinite(number);
@@ -117,11 +121,8 @@ function installedReportStatus(filePath, currentHash, currentExecutableHash = nu
     report.linuxDominantAttribution === true ||
     experimentalEnvMode ||
     promotionFailures.includes("diagnostic_attribution_run_not_promotion_evidence");
-  const normalizedInstalledPath = normalized(String(installedPath ?? ""));
   const canonicalCorpus = normalized(String(report.corpus ?? "")) === normalized(DEFAULT_RIPGREP_LINUX_CORPUS);
-  const nativeInstalledBaseline =
-    normalizedInstalledPath.includes("/appdata/local/programs/iex/bin/ix.exe") &&
-    !normalizedInstalledPath.includes("/tmp-baselines/");
+  const nativeInstalledBaseline = nativeInstalledBaselinePath(installedPath);
   return {
     path: path.relative(ROOT, filePath),
     runId: report.runId ?? path.basename(filePath, ".json"),

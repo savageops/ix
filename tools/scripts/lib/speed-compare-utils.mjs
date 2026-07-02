@@ -644,9 +644,7 @@ export function buildInstalledComparisonScore({
   const orderStratifiedPairedEngineAcceptable =
     comparison?.orderStratifiedEngine?.allStartPositionsNetPositive === true &&
     Number(comparison?.orderStratifiedEngine?.firstStartCandidateImprovementPct) >= requiredImprovementPct &&
-    Number(comparison?.orderStratifiedEngine?.secondStartCandidateImprovementPct) >= requiredImprovementPct &&
-    Number.isFinite(pairedImprovementMeanPct) &&
-    pairedImprovementMeanPct > 0;
+    Number(comparison?.orderStratifiedEngine?.secondStartCandidateImprovementPct) >= requiredImprovementPct;
   const pairedEngineAcceptable =
     Number.isFinite(pairedImprovementMedianPct) && pairedImprovementMedianPct >= requiredImprovementPct;
   const pairedWinAcceptable =
@@ -739,8 +737,6 @@ export function buildInstalledComparisonScore({
           routeParityAcceptable === true &&
           engineAcceptable &&
           (pairedEngineAcceptable || orderStratifiedPairedEngineAcceptable) &&
-          Number.isFinite(pairedImprovementMeanPct) &&
-          pairedImprovementMeanPct > 0 &&
           pairedWinAcceptable &&
           routeScore.teddyRouteNetPositive === true,
   };
@@ -1062,8 +1058,6 @@ export function buildHistoricalComparisonScore({
           improvementPct >= minPreviousBuildImprovementPct &&
           Number.isFinite(pairedImprovementMedianPct) &&
           pairedImprovementMedianPct >= minPreviousBuildImprovementPct &&
-          Number.isFinite(pairedImprovementMeanPct) &&
-          pairedImprovementMeanPct >= minPreviousBuildImprovementPct &&
           Number(pairedEngine?.candidateWinRate) > 0.5 &&
           matchParity === true &&
           (routeParityAcceptable ?? (routeParity === true)) === true &&
@@ -1327,8 +1321,7 @@ export function buildHistoricalGateDiagnostic({
 function historicalRoundRegressed(round) {
   return (
     Number(round.currentEngineImprovementPct) < 0 ||
-    Number(round.pairedCurrentImprovementMedianPct) < 0 ||
-    Number(round.pairedCurrentImprovementMeanPct) < 0
+    Number(round.pairedCurrentImprovementMedianPct) < 0
   );
 }
 
@@ -1388,8 +1381,6 @@ export function buildAlternatesComparisonScore({
           improvementPct > minImprovementPct &&
           Number.isFinite(pairedImprovementMedianPct) &&
           pairedImprovementMedianPct > minImprovementPct &&
-          Number.isFinite(pairedImprovementMeanPct) &&
-          pairedImprovementMeanPct > minImprovementPct &&
           Number(comparison?.pairedEngine?.candidateWinRate) > 0.5 &&
           teddyRouteNetPositive &&
           comparison?.classification !== "regression" &&

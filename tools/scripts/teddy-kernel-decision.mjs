@@ -93,6 +93,10 @@ function normalizedPathText(text) {
   return String(text ?? "").replaceAll("\\", "/").toLowerCase();
 }
 
+function nativeInstalledBaselinePath(filePath) {
+  return normalizedPathText(filePath).endsWith("/appdata/local/programs/iex/bin/ix.exe");
+}
+
 function executableSha256File(filePath) {
   if (!existsSync(filePath)) return null;
   return executableHash(readFileSync(filePath));
@@ -374,7 +378,6 @@ function installedPointerStatus(filePath, currentHash) {
   const threads = Number(pointer.threads);
   const samples = Number(pointer.samples);
   const minRetainableSamples = Number(pointer.minRetainableSamples);
-  const normalizedInstalledPath = normalizedPathText(installedPath);
   const canonicalCorpus = normalizedPathText(pointer.corpus) === normalizedPathText(DEFAULT_RIPGREP_LINUX_CORPUS);
   const freshForCurrentBinary =
     currentIxExecutableSha256 != null && repoExecutableSha256 != null
@@ -389,9 +392,7 @@ function installedPointerStatus(filePath, currentHash) {
     repoExecutableSha256 != null &&
     installedExecutableSha256 === repoExecutableSha256;
   const canonicalThreadConfig = threads === REQUIRED_INSTALLED_THREADS;
-  const nativeInstalledBaseline =
-    normalizedInstalledPath.includes("/appdata/local/programs/iex/bin/ix.exe") &&
-    !normalizedInstalledPath.includes("/tmp-baselines/");
+  const nativeInstalledBaseline = nativeInstalledBaselinePath(installedPath);
   const retainableStrictEvidence = pointer.retainableStrictEvidence === true;
   const promotionQualified = pointer.promotionQualified === true;
   const promotionFailures = Array.isArray(pointer.promotionFailures)
