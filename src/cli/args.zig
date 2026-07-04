@@ -520,6 +520,19 @@ fn materializeCompatExpression(allocator: std.mem.Allocator, expressions: []cons
 
 fn lowerCompatPattern(allocator: std.mem.Allocator, expression: []const u8, fixed_strings: bool, case_insensitive: bool) ![]const u8 {
     if (!fixed_strings and !case_insensitive and isExplicitExpression(expression)) return expression;
+    // For explicit IX-native expressions (lit:, prefix:, suffix:) with case_insensitive,
+    // convert to re:(?i) with the value extracted (not the prefix re-wrapped as a regex body).
+    if (!fixed_strings and case_insensitive) {
+        if (std.mem.startsWith(u8, expression, "lit:")) {
+            return try std.fmt.allocPrint(allocator, "re:(?i){s}", .{expression[4..]});
+        }
+        if (std.mem.startsWith(u8, expression, "prefix:")) {
+            return try std.fmt.allocPrint(allocator, "re:(?i)^{s}", .{expression[7..]});
+        }
+        if (std.mem.startsWith(u8, expression, "suffix:")) {
+            return try std.fmt.allocPrint(allocator, "re:(?i){s}$", .{expression[7..]});
+        }
+    }
     var list = std.ArrayList(u8).empty;
     errdefer list.deinit(allocator);
     if (fixed_strings) {
