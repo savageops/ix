@@ -33,6 +33,7 @@ pub const PredicateEvidence = struct {
 pub const Admission = struct {
     eligible: bool = false,
     mode: AdmissionMode = .all,
+    case_insensitive: bool = false,
     groups: [MAX_GROUPS]PredicateEvidence = undefined,
     group_count: usize = 0,
     ignored_predicates: usize = 0,
@@ -84,12 +85,13 @@ fn literalAlternatesAdmission(plan: expr.ExpressionPlan) ?Admission {
     const predicate = plan.predicates[0];
     if (predicate.kind != .regex) return null;
     if (predicate.strategy != .regex_literal_alternates) return null;
-    if (std.mem.startsWith(u8, predicate.value, "(?i)")) return null;
+    const case_insensitive = std.mem.startsWith(u8, predicate.value, "(?i)");
 
     const body = expr.literalAlternatesBody(predicate.value);
     var admission = Admission{
         .eligible = true,
         .mode = .any,
+        .case_insensitive = case_insensitive,
     };
 
     var branch_start: usize = 0;
@@ -104,7 +106,7 @@ fn literalAlternatesAdmission(plan: expr.ExpressionPlan) ?Admission {
         }
 
         if (admission.group_count == admission.groups.len) return null;
-        const evidence = evidenceForLiteralAlternateBranch(body[branch_start..index], admission.group_count);
+        const evidence = evidenceForLiteralAlternateBranch(body[branch_start..index], admission.group_count, case_insensitive);
         if (evidence.trigram_count == 0) return null;
         admission.groups[admission.group_count] = evidence;
         admission.group_count += 1;
@@ -125,9 +127,9 @@ fn evidenceForPredicate(predicate: expr.Predicate, source_index: usize) Predicat
     return evidence;
 }
 
-fn evidenceForLiteralAlternateBranch(branch: []const u8, source_index: usize) PredicateEvidence {
+fn evidenceForLiteralAlternateBranch(branch: []const u8, source_index: usize, case_insensitive: bool) PredicateEvidence {
     var evidence = PredicateEvidence{ .source_index = source_index };
-    appendTrigramsFromLiteralAlternateBranch(&evidence, branch);
+    appendTrigramsFromLiteralAlternateBranch(&evidence, branch, case_insensitive);
     return evidence;
 }
 
@@ -152,7 +154,7 @@ fn appendTrigramsFromRegex(evidence: *PredicateEvidence, pattern: []const u8) vo
     appendMandatoryRegexPrefix(evidence, body);
 }
 
-fn appendTrigramsFromLiteralAlternateBranch(evidence: *PredicateEvidence, branch: []const u8) void {
+fn appendTrigramsFromLiteralAlternateBranch(evidence: *PredicateEvidence, branch: []const u8, case_insensitive: bool) void {
     var decoded_len: usize = 0;
     var last: [2]u8 = undefined;
     var index: usize = 0;
@@ -170,6 +172,11 @@ fn appendTrigramsFromLiteralAlternateBranch(evidence: *PredicateEvidence, branch
         } else if (isRegexMeta(byte)) {
             return;
         }
+
+        // For case-insensitive admission, lowercase the byte before
+        // building trigram keys. The probe will also lowercase file bytes
+        // so lowercased keys match case-insensitively.
+        if (case_insensitive) byte = std.ascii.toLower(byte);
 
         if (decoded_len >= 2) {
             appendUnique(evidence, key(&.{ last[0], last[1], byte }));
@@ -361,8 +368,9 @@ test "literal alternates admission rejects short or regexy branches" {
     try std.testing.expect(!admit(try expr.parse("re:(abc|de\\w)")).eligible);
 }
 
-test "literal alternates admission fails closed for case-insensitive alternates" {
+test "literal alternates admission supports case-insensitive alternates" {
     const admission = admit(try expr.parse("re:(?i)(alpha|beta)"));
-    try std.testing.expect(!admission.eligible);
-    try std.testing.expectEqual(IneligibleReason.no_mandatory_trigram, admission.reason);
+    try std.testing.expect(admission.eligible);
+    try std.testing.expect(admission.case_insensitive);
+    try std.testing.expectEqual(AdmissionMode.any, admission.mode);
 }

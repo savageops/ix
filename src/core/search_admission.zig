@@ -84,6 +84,7 @@ pub const FileAdmissionGroup = struct {
 pub const TrigramAdmissionProgram = struct {
     eligible: bool = false,
     mode: trigram.AdmissionMode = .all,
+    trigram_case_insensitive: bool = false,
     group_count: usize = 0,
     group_complete_mask: u64 = 0,
     required_counts: [trigram.MAX_GROUPS]u8 = @splat(0),
@@ -102,6 +103,7 @@ pub const TrigramAdmissionProgram = struct {
         var program = TrigramAdmissionProgram{
             .eligible = admission.eligible,
             .mode = admission.mode,
+            .trigram_case_insensitive = admission.case_insensitive,
             .group_count = admission.group_count,
         };
         program.compileFileAdmission(plan, case_insensitive);
@@ -187,15 +189,20 @@ pub const TrigramAdmissionProgram = struct {
         if (!self.eligible) return true;
         if (bytes.len < 3) return false;
 
+        const ci = self.trigram_case_insensitive;
         var seen_slots: [TRIGRAM_ADMISSION_CAPACITY]bool = @splat(false);
         var group_seen_counts: [trigram.MAX_GROUPS]u8 = @splat(0);
         var satisfied_groups: u64 = 0;
-        var rolling: trigram.Trigram = trigram.key(bytes[0..3]);
+        const b0: u8 = if (ci) std.ascii.toLower(bytes[0]) else bytes[0];
+        const b1: u8 = if (ci) std.ascii.toLower(bytes[1]) else bytes[1];
+        const b2: u8 = if (ci) std.ascii.toLower(bytes[2]) else bytes[2];
+        var rolling: trigram.Trigram = trigram.key(&.{ b0, b1, b2 });
         if (self.recordTrigram(rolling, &seen_slots, &group_seen_counts, &satisfied_groups)) return true;
 
         var index: usize = 3;
         while (index < bytes.len) : (index += 1) {
-            rolling = ((rolling & 0xffff) << 8) | bytes[index];
+            const next_byte: u8 = if (ci) std.ascii.toLower(bytes[index]) else bytes[index];
+            rolling = ((rolling & 0xffff) << 8) | next_byte;
             if (self.recordTrigram(rolling, &seen_slots, &group_seen_counts, &satisfied_groups)) return true;
         }
         return false;

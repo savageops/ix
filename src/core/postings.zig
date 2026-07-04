@@ -370,13 +370,17 @@ pub fn lowerExpressionToLookupPlan(plan: expr.ExpressionPlan) LookupPlan {
     if (literalAlternatesLookupPlan(plan)) |lookup| return lookup;
 
     const admission = trigram.admit(plan);
+    // Warm index stores case-sensitive trigrams at build time. Case-insensitive
+    // admission produces lowercased keys that won't match stored postings.
+    // Fail closed: full scan until the warm index supports case-insensitive.
+    const ci_blocked = admission.eligible and admission.case_insensitive;
     var lookup = LookupPlan{
-        .eligible = admission.eligible,
+        .eligible = admission.eligible and !admission.case_insensitive,
         .mode = if (admission.mode == .any) .any else .all,
         .ignored_predicates = admission.ignored_predicates,
-        .fallback = lookupFallback(admission.reason),
+        .fallback = if (ci_blocked) .no_mandatory_evidence else lookupFallback(admission.reason),
     };
-    if (!admission.eligible) return lookup;
+    if (!admission.eligible or ci_blocked) return lookup;
 
     var group_index: usize = 0;
     while (group_index < admission.group_count) : (group_index += 1) {
