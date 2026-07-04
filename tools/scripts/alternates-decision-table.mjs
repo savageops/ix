@@ -25,7 +25,7 @@ Options:
   --samples <n>                       Samples per branch. Default: 5.
   --threads <n>                       IX thread count. Default: 32.
   --identity-control-samples <n>      Same-binary control pairs per branch. Default: min(12, samples).
-  --identity-control-attempts <n>     Same-binary control attempts per branch; first stable attempt is selected. Default: 1.
+  --identity-control-attempts <n>     Same-binary control attempts per branch; first stable attempt is selected. Default: 3.
   --no-identity-control               Disable same-binary noise control.
   --max-branches <n>                  Highest branch count when --branch-counts is omitted. Default: 8.
   --branch-counts <csv>               Explicit branch counts, e.g. 2,4,8.
@@ -53,7 +53,7 @@ const installedPromotionDeficitReport = argValue(args, "--installed-promotion-de
 const samples = Number(argValue(args, "--samples", "5"));
 const threads = Number(argValue(args, "--threads", "32"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
-const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "1"));
+const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "3"));
 const identityControlEnabled = !args.includes("--no-identity-control");
 const maxBranches = Number(argValue(args, "--max-branches", "8"));
 const branchCountsArg = argValue(args, "--branch-counts", "");

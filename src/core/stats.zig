@@ -8,6 +8,8 @@ pub const PhaseTimings = struct {
     scan_work_ms_total: f64 = 0,
     scan_open_ms_total: f64 = 0,
     scan_file_ms_total: f64 = 0,
+    scan_file_mmap_ms_total: f64 = 0,
+    scan_file_buffered_ms_total: f64 = 0,
     aggregate_merge_ms: f64 = 0,
     aggregate_finalize_ms: f64 = 0,
 };
@@ -23,6 +25,8 @@ pub const ConcurrencyStats = struct {
     available_threads: usize = 1,
     outer_scan_threads: usize = 1,
     execution_mode: []const u8 = "materialized",
+    resource_profile: []const u8 = "low",
+    scan_input_policy: []const u8 = "auto",
     sharding_enabled: bool = false,
     sharded_files: usize = 0,
     max_shard_threads: usize = 0,
@@ -455,6 +459,7 @@ test "search stats owns rust-compatible top-level schema defaults" {
     snapshot.recordSlowFile("fast.txt", 0.5, 21, false);
     try std.testing.expectEqual(@as(usize, 1), snapshot.concurrency.available_threads);
     try std.testing.expectEqualStrings("materialized", snapshot.concurrency.execution_mode);
+    try std.testing.expectEqualStrings("low", snapshot.concurrency.resource_profile);
     try std.testing.expectEqualStrings("linux_amd_asic_reg_giant_header", snapshot.linux_dominant_file.target_class);
     try std.testing.expect(!snapshot.catalog_index.enabled);
     try std.testing.expectEqualStrings("not_wired", snapshot.catalog_index.fallback_reason);

@@ -3,9 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { baseBenchEnv, defaultInstalledIxPath, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT_RIPGREP_LINUX_CORPUS, experimentalBenchEnvOverrides } from "./lib/benchmark-config.mjs";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
-import { benchmarkEvidenceFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
+import { benchmarkDecisionGrade, benchmarkEvidenceFailures, benchmarkHostWarningFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, binarySnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, measureIxOnce, measureRipgrep, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, benchmarkEnvSnapshot, binarySnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
@@ -29,7 +29,7 @@ Options:
   --samples <n>                   Samples per lane. Default: 12.
   --threads <n>                   IX/ripgrep thread count. Default: 32.
   --identity-control-samples <n>  Same-binary control pairs. Default: min(12, samples).
-  --identity-control-attempts <n> Same-binary control attempts; first stable attempt is selected. Default: 1.
+  --identity-control-attempts <n> Same-binary control attempts; first stable attempt is selected. Default: 3.
   --no-identity-control           Disable same-binary noise control.
   --corpus <path>                 Corpus path.
   --expression <expr>             Search expression.
@@ -64,7 +64,7 @@ const latestPath = path.resolve(argValue(args, "--latest-path", path.join(REPORT
 const samples = Number(argValue(args, "--samples", "12"));
 const threads = Number(argValue(args, "--threads", "32"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
-const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "1"));
+const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "3"));
 const identityControlEnabled = !args.includes("--no-identity-control");
 const buildFirst = args.includes("--build");
 const quiet = args.includes("--quiet");
@@ -162,6 +162,15 @@ function promotionFailures(host, processScan, installedHash, repoHash, installed
   if (installedRepoComparison.score?.pairedRepoEngineAcceptable !== true) {
     failures.push(`installed_paired_improvement_below_target:${Number.isFinite(pairedImprovementMedianPct) ? pairedImprovementMedianPct : "missing"}<${requiredImprovementPct}`);
   }
+  const pairedLower95Pct = Number(
+    installedRepoComparison.score?.pairedImprovementLower95Pct ??
+    installedRepoComparison.pairedEngine?.candidateImprovementPctBootstrap95?.lower,
+  );
+  if (!Number.isFinite(pairedLower95Pct) || pairedLower95Pct < requiredImprovementPct) {
+    failures.push(
+      `installed_paired_ci_below_target:${Number.isFinite(pairedLower95Pct) ? pairedLower95Pct : "missing"}<${requiredImprovementPct}`,
+    );
+  }
   const candidateWinRate = Number(installedRepoComparison.pairedEngine?.candidateWinRate);
   if (installedRepoComparison.score?.pairedRepoWinAcceptable !== true) {
     failures.push(`repo_paired_win_majority_required:${Number.isFinite(candidateWinRate) ? candidateWinRate : "missing"}`);
@@ -176,6 +185,122 @@ function promotionFailures(host, processScan, installedHash, repoHash, installed
     failures.push("installed_scorecard_not_net_positive");
   }
   return failures;
+}
+
+function writePreflightFailureReport({
+  hostBefore,
+  processBefore = null,
+  identityControl = null,
+  strictFailures,
+  reason,
+}) {
+  const host = { before: hostBefore, after: null };
+  const evidenceQuality = evidenceQualityFromFailures(strictFailures);
+  const processScan = processBefore == null ? null : { before: processBefore, after: null };
+  const report = {
+    runId: `installed-speed-${timestampSlug()}`,
+    timestamp: new Date().toISOString(),
+    corpus,
+    expression,
+    samples,
+    minRetainableSamples,
+    minInstalledImprovementPct,
+    effectiveInstalledImprovementPct: minInstalledImprovementPct,
+    identityNoiseMultiplier,
+    identityControlSamples: identityControlEnabled ? identityControlSamples : 0,
+    identityControlAttempts: identityControlEnabled ? identityControlAttempts : 0,
+    threads,
+    scanOpenTiming,
+    linuxDominantAttribution,
+    experimentalEnvMode,
+    experimentalEnvOverrides,
+    diagnosticAttributionMode,
+    benchEnv: BENCH_ENV,
+    effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
+    dependencyTrees: dependencyTreeSnapshot(ROOT),
+    host,
+    processScan,
+    decisionGrade: benchmarkDecisionGrade({
+      preflightAborted: true,
+      retainableStrictEvidence: false,
+      diagnosticAttributionMode,
+      requiredGateFailures: [
+        {
+          gate: "strict",
+          reason,
+          failures: strictFailures,
+        },
+        ...(requirePromotion
+          ? [{
+              gate: "promotion",
+              reason,
+              failures: strictFailures,
+            }]
+          : []),
+      ],
+    }),
+    retainableStrictEvidence: false,
+    strictEvidenceFailures: strictFailures,
+    evidenceQuality,
+    binaries: null,
+    hashesMatch: null,
+    lanes: null,
+    identityControl,
+    installedRepoComparison: null,
+    scorecard: null,
+    identityNoiseSummary: null,
+    roundLedger: [],
+    ledgerSummary: null,
+    promotionMode: null,
+    promotionQualified: false,
+    promotionFailures: strictFailures,
+    requiredGateFailures: [
+      {
+        gate: "strict",
+        reason,
+        failures: strictFailures,
+      },
+      ...(requirePromotion
+        ? [{
+            gate: "promotion",
+            reason,
+            failures: strictFailures,
+          }]
+        : []),
+    ],
+    deltasPct: null,
+    preflightAborted: true,
+    preflightReason: reason,
+  };
+
+  mkdirSync(REPORT_DIR, { recursive: true });
+  const outPath = explicitOutPath.length > 0 ? path.resolve(explicitOutPath) : path.join(REPORT_DIR, `${report.runId}.json`);
+  mkdirSync(path.dirname(outPath), { recursive: true });
+  writeFileSync(outPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+  mkdirSync(path.dirname(latestPath), { recursive: true });
+  writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`, "utf8");
+
+  if (!quiet) {
+    console.log(JSON.stringify({
+      outPath,
+      preflightAborted: true,
+      decisionGrade: report.decisionGrade,
+      strictEvidenceFailures: report.strictEvidenceFailures,
+      requiredGateFailures: report.requiredGateFailures,
+      evidenceQuality: report.evidenceQuality,
+      hostStatus: hostBefore?.benchmarkEnvironment?.status ?? null,
+      identityControl: identityControl == null ? null : {
+        selectedAttempt: identityControl.selectedAttempt ?? null,
+        attemptSelection: identityControl.attemptSelection ?? null,
+        medianDeltaPct: identityControl.medianDeltaPct ?? null,
+        pairedWinRate: identityControl.pairedEngine?.candidateWinRate ?? null,
+        diagnostics: identityControl.diagnostics ?? null,
+      },
+    }, null, 2));
+  }
+
+  console.error(JSON.stringify({ status: "failed", failures: report.requiredGateFailures, outPath }, null, 2));
+  process.exit(2);
 }
 
 if (samples < 1 || !Number.isFinite(samples)) throw new Error("--samples must be a positive number");
@@ -194,24 +319,79 @@ if (buildFirst) {
 if (!existsSync(repoIx)) throw new Error(`repo IX not found: ${repoIx}`);
 
 const hostBefore = hostSnapshot();
+const hostPreflightFailures = requireStrict ? benchmarkHostWarningFailures({ before: hostBefore }) : [];
 const processBefore = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV, cleanupOwned: true });
-const ripgrep = measureRipgrep({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
-const ripgrepMmapComparison = measureRipgrepMmapComparison({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
-const identityControl = measureSameBinaryIdentityControl({
-  binaryPath: repoIx,
-  ixArgs: ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)],
-  samples: identityControlSamples,
-  attempts: identityControlAttempts,
+const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)];
+let strictIdentityPreflight = null;
+if (requireStrict && identityControlEnabled && identityControlSamples > 0) {
+  strictIdentityPreflight = measureSameBinaryIdentityControl({
+    binaryPath: repoIx,
+    ixArgs,
+    samples: identityControlSamples,
+    attempts: identityControlAttempts,
+    env: BENCH_ENV,
+    enabled: identityControlEnabled,
+    label: "repo-control-preflight",
+  });
+  const preflightFailures = [
+    ...hostPreflightFailures,
+    ...(processBefore?.ok === false ? ["process_scan_before_failed"] : []),
+    ...((processBefore?.failures ?? []).map((failure) => `process_scan_before:${failure}`)),
+    ...(((processBefore?.matched?.length ?? 0) > 0) ? [`stale_processes_before:${processBefore.matched.length}`] : []),
+    ...identityControlFailures({
+      identityControl: strictIdentityPreflight,
+      enabled: identityControlEnabled,
+      requiredSamples: Math.min(12, samples),
+    }),
+  ];
+  const blockingPreflightFailures = preflightFailures.filter((failure) => !String(failure).startsWith("host:"));
+  if (blockingPreflightFailures.length > 0) {
+    writePreflightFailureReport({
+      hostBefore,
+      processBefore,
+      identityControl: strictIdentityPreflight,
+      strictFailures: preflightFailures,
+      reason: "benchmark identity preflight failed before retained run",
+    });
+  }
+}
+const ripgrep = measureRipgrepBracketed({
+  expression,
+  defaultExpression: DEFAULT_EXPR,
+  corpus,
+  threads,
+  samples,
   env: BENCH_ENV,
-  enabled: identityControlEnabled,
-  label: "repo-control",
+  between: () => {
+    const identityControl = strictIdentityPreflight ?? measureSameBinaryIdentityControl({
+      binaryPath: repoIx,
+      ixArgs,
+      samples: identityControlSamples,
+      attempts: identityControlAttempts,
+      env: BENCH_ENV,
+      enabled: identityControlEnabled,
+      label: "repo-control",
+    });
+    const effectiveInstalledImprovementPct = effectiveImprovementTargetPct({
+      configuredPct: minInstalledImprovementPct,
+      identityControl,
+      noiseMultiplier: identityNoiseMultiplier,
+    });
+    const paired = measurePairedIx();
+    return {
+      identityControl,
+      effectiveInstalledImprovementPct,
+      paired,
+    };
+  },
 });
-const effectiveInstalledImprovementPct = effectiveImprovementTargetPct({
-  configuredPct: minInstalledImprovementPct,
-  identityControl,
-  noiseMultiplier: identityNoiseMultiplier,
-});
-const paired = measurePairedIx();
+const ripgrepMmapComparison = measureRipgrepMmapComparison({ expression, defaultExpression: DEFAULT_EXPR, corpus, threads, samples, env: BENCH_ENV });
+const identityControl = ripgrep.betweenResult?.identityControl ?? null;
+const effectiveInstalledImprovementPct = ripgrep.betweenResult?.effectiveInstalledImprovementPct ?? minInstalledImprovementPct;
+const paired = ripgrep.betweenResult?.paired;
+if (paired == null) {
+  throw new Error("measureRipgrepBracketed did not produce the installed-vs-repo paired comparison");
+}
 const processAfter = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV, cleanupOwned: true });
 const hostAfter = hostSnapshot();
 const host = { before: hostBefore, after: hostAfter };
@@ -397,6 +577,12 @@ const report = {
   dependencyTrees: dependencyTreeSnapshot(ROOT),
   host,
   processScan,
+  decisionGrade: benchmarkDecisionGrade({
+    preflightAborted: false,
+    retainableStrictEvidence: strictFailures.length === 0,
+    diagnosticAttributionMode,
+    requiredGateFailures,
+  }),
   retainableStrictEvidence: strictFailures.length === 0,
   strictEvidenceFailures: strictFailures,
   evidenceQuality,
@@ -433,6 +619,8 @@ report.deltasPct = {
     100,
   ripgrepNoMmapVsForcedMmap:
     report.lanes.ripgrepMmapComparison?.noMmapImprovementPct ?? null,
+  ripgrepBracketDriftPct:
+    report.lanes.ripgrep?.bracketDriftPct ?? null,
 };
 
 mkdirSync(REPORT_DIR, { recursive: true });
@@ -452,8 +640,9 @@ if (requireStrict && report.retainableStrictEvidence && report.promotionQualifie
 }
 
 if (!quiet) {
-  console.log(JSON.stringify({ outPath, retainableStrictEvidence: report.retainableStrictEvidence, promotionQualified: report.promotionQualified, binaries: report.binaries, medians: {
+  console.log(JSON.stringify({ outPath, decisionGrade: report.decisionGrade, retainableStrictEvidence: report.retainableStrictEvidence, promotionQualified: report.promotionQualified, binaries: report.binaries, medians: {
     ripgrepCliMs: report.lanes.ripgrep.summary.median,
+    ripgrepBracketDriftPct: report.lanes.ripgrep.bracketDriftPct ?? null,
     ripgrepNoMmapCliMs: report.lanes.ripgrepMmapComparison?.never?.summary?.median ?? null,
     ripgrepFastestMmapMode: report.lanes.ripgrepMmapComparison?.fastest ?? null,
     installedCliMs: report.lanes.installed.cliSummary.median,

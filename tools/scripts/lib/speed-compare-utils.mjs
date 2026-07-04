@@ -3,6 +3,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { benchmarkIsolationPlan, defaultBenchmarkIsolationResult, mergedEnv, runWithWindowsBenchmarkIsolation } from "./benchmark-isolation.mjs";
 import { pairedAttributionLedgerFields, pairedEngineStats, phaseTimingResidualMs } from "./benchmark-phase-attribution.mjs";
 import { identityNoiseDiagnostics } from "./benchmark-noise-diagnostics.mjs";
 export { pairedAttributionLedgerFields, pairedEngineStats, phaseLeakSummaryFromRounds, phaseTimingResidualMs } from "./benchmark-phase-attribution.mjs";
@@ -11,11 +12,14 @@ export { identityNoiseDiagnostics } from "./benchmark-noise-diagnostics.mjs";
 export const DEFAULT_ALTERNATES_EXPR = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)";
 const DEFAULT_BENCHMARK_LOCK_DIR = path.join(os.tmpdir(), "ix-zig-benchmark.lock");
 const DEFAULT_STALE_BENCHMARK_LOCK_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_PENDING_BENCHMARK_LOCK_OWNER_GRACE_MS = 5 * 1000;
 const BENCHMARK_ENV_SNAPSHOT_KEYS = [
   "IX_INDEX",
   "IX_NEXUS",
+  "IX_RESOURCE_PROFILE",
   "IX_STATE_DIR",
   "IX_SCAN_OPEN_TIMING",
+  "IX_SCAN_INPUT_POLICY",
   "IX_LINUX_DOMINANT_ATTRIBUTION",
   "IX_TEDDY_FINGERPRINT_OFFSET",
   "IX_TEDDY_RANGE_FINGERPRINT_OFFSET",
@@ -28,6 +32,10 @@ const BENCHMARK_ENV_SNAPSHOT_KEYS = [
   "IX_MIN_OLDER_SNAPSHOT_ENGINE_PCT",
   "IX_MIN_OLDER_SNAPSHOT_PAIRED_PCT",
   "IX_IDENTITY_NOISE_MULTIPLIER",
+  "IX_BENCH_ISOLATION_MODE",
+  "IX_BENCH_PRIORITY_CLASS",
+  "IX_BENCH_AFFINITY_MODE",
+  "IX_BENCH_AFFINITY_LOGICAL_CPU_COUNT",
 ];
 
 export function benchmarkEnvSnapshot(env = {}) {
@@ -158,7 +166,25 @@ function dependencyTreeHash(root) {
 
 export function run(command, commandArgs, options = {}) {
   const started = process.hrtime.bigint();
-  const env = options.env ? { ...process.env, ...options.env } : process.env;
+  const env = mergedEnv(options.env ?? {});
+  const isolationPlan = benchmarkIsolationPlan(env);
+  if (process.platform === "win32" && isolationPlan.mode === "enforce" && isolationPlan.supported) {
+    const isolated = runWithWindowsBenchmarkIsolation(command, commandArgs, {
+      cwd: options.cwd ?? process.cwd(),
+      env: options.env ?? {},
+      captureStdout: true,
+      captureStderr: true,
+      maxBuffer: options.maxBuffer ?? 128 * 1024 * 1024,
+    }, isolationPlan, { allowedCodes: [0] });
+    return {
+      command: [command, ...commandArgs].join(" "),
+      exitCode: isolated.status,
+      stdout: isolated.stdout,
+      stderr: isolated.stderr,
+      durationMs: isolated.durationMs,
+      benchmarkIsolation: isolated.benchmarkIsolation ?? defaultBenchmarkIsolationResult(isolationPlan),
+    };
+  }
   const result = spawnSync(command, commandArgs, {
     cwd: options.cwd ?? process.cwd(),
     encoding: "utf8",
@@ -172,6 +198,7 @@ export function run(command, commandArgs, options = {}) {
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
     durationMs: Number(process.hrtime.bigint() - started) / 1_000_000,
+    benchmarkIsolation: defaultBenchmarkIsolationResult(isolationPlan),
   };
 }
 
@@ -208,7 +235,12 @@ function benchmarkLockAgeMs(lockDir) {
   }
 }
 
-function reclaimStaleBenchmarkLock(lockDir, { staleLockMs }) {
+function sleepMs(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return;
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, durationMs);
+}
+
+function reclaimStaleBenchmarkLock(lockDir, { staleLockMs, pendingOwnerGraceMs }) {
   const owner = readBenchmarkLockOwner(lockDir);
   const ownerPid = Number(owner?.pid);
   if (Number.isInteger(ownerPid) && ownerPid > 0) {
@@ -218,6 +250,10 @@ function reclaimStaleBenchmarkLock(lockDir, { staleLockMs }) {
   }
 
   const ageMs = benchmarkLockAgeMs(lockDir);
+  if (Number.isFinite(ageMs) && ageMs > pendingOwnerGraceMs) {
+    rmSync(lockDir, { recursive: true, force: true });
+    return { reclaimed: true, owner, reason: "owner_missing_or_invalid_after_grace" };
+  }
   if (Number.isFinite(ageMs) && ageMs > staleLockMs) {
     rmSync(lockDir, { recursive: true, force: true });
     return { reclaimed: true, owner, reason: "owner_missing_or_invalid_and_stale" };
@@ -229,14 +265,27 @@ export function acquireBenchmarkLock({
   lockDir = process.env.IX_BENCHMARK_LOCK_DIR ?? DEFAULT_BENCHMARK_LOCK_DIR,
   script = path.basename(process.argv[1] ?? "unknown"),
   staleLockMs = Number(process.env.IX_BENCHMARK_LOCK_STALE_MS ?? DEFAULT_STALE_BENCHMARK_LOCK_MS),
+  pendingOwnerGraceMs = Number(process.env.IX_BENCHMARK_LOCK_PENDING_OWNER_GRACE_MS ?? DEFAULT_PENDING_BENCHMARK_LOCK_OWNER_GRACE_MS),
 } = {}) {
   try {
     mkdirSync(lockDir);
   } catch (err) {
     if (err?.code === "EEXIST") {
-      const reclaim = reclaimStaleBenchmarkLock(lockDir, {
-        staleLockMs: Number.isFinite(staleLockMs) && staleLockMs >= 0 ? staleLockMs : DEFAULT_STALE_BENCHMARK_LOCK_MS,
+      const validStaleLockMs = Number.isFinite(staleLockMs) && staleLockMs >= 0 ? staleLockMs : DEFAULT_STALE_BENCHMARK_LOCK_MS;
+      const validPendingOwnerGraceMs = Number.isFinite(pendingOwnerGraceMs) && pendingOwnerGraceMs >= 0
+        ? pendingOwnerGraceMs
+        : DEFAULT_PENDING_BENCHMARK_LOCK_OWNER_GRACE_MS;
+      let reclaim = reclaimStaleBenchmarkLock(lockDir, {
+        staleLockMs: validStaleLockMs,
+        pendingOwnerGraceMs: validPendingOwnerGraceMs,
       });
+      if (!reclaim.reclaimed && reclaim.reason === "owner_missing_or_invalid" && validPendingOwnerGraceMs > 0) {
+        sleepMs(Math.min(validPendingOwnerGraceMs, 250));
+        reclaim = reclaimStaleBenchmarkLock(lockDir, {
+          staleLockMs: validStaleLockMs,
+          pendingOwnerGraceMs: validPendingOwnerGraceMs,
+        });
+      }
       if (!reclaim.reclaimed) {
         const ownerText = reclaim.owner ? ` owner=${JSON.stringify(reclaim.owner)}` : "";
         throw new Error(`benchmark lock already held at ${lockDir}; reason=${reclaim.reason}; another IX benchmark may be running${ownerText}`);
@@ -675,6 +724,25 @@ function installedRepairDirective({ improvementPct, pairedImprovementMedianPct, 
   };
 }
 
+function pairedImprovementConfidenceFields(pairedEngine, requiredImprovementPct) {
+  const ci = pairedEngine?.candidateImprovementPctBootstrap95 ?? null;
+  const lower95Pct = Number(ci?.lower);
+  const upper95Pct = Number(ci?.upper);
+  return {
+    pairedImprovementBootstrap95: ci,
+    pairedImprovementLower95Pct: Number.isFinite(lower95Pct) ? lower95Pct : null,
+    pairedImprovementUpper95Pct: Number.isFinite(upper95Pct) ? upper95Pct : null,
+    pairedImprovementConclusiveAboveTarget:
+      Number.isFinite(requiredImprovementPct) && Number.isFinite(lower95Pct)
+        ? lower95Pct >= requiredImprovementPct
+        : null,
+    pairedImprovementConclusiveBelowZero:
+      Number.isFinite(upper95Pct)
+        ? upper95Pct < 0
+        : null,
+  };
+}
+
 export function buildInstalledComparisonScore({
   comparison,
   binaryRelation,
@@ -687,13 +755,16 @@ export function buildInstalledComparisonScore({
   const requiredImprovementPct = binaryRelation === "same_binary" ? null : Number(minInstalledImprovementPct);
   const pairedAttribution = pairedAttributionLedgerFields(pairedEngine ?? null);
   const routeScore = teddyRouteScoreFields(pairedAttribution);
+  const pairedConfidence = pairedImprovementConfidenceFields(pairedEngine, requiredImprovementPct);
   const routeParityAcceptable = comparison?.routeParityAcceptable ?? (comparison?.routeParity === true);
   const orderStratifiedPairedEngineAcceptable =
     comparison?.orderStratifiedEngine?.allStartPositionsNetPositive === true &&
     Number(comparison?.orderStratifiedEngine?.firstStartCandidateImprovementPct) >= requiredImprovementPct &&
     Number(comparison?.orderStratifiedEngine?.secondStartCandidateImprovementPct) >= requiredImprovementPct;
   const pairedEngineAcceptable =
-    Number.isFinite(pairedImprovementMedianPct) && pairedImprovementMedianPct >= requiredImprovementPct;
+    Number.isFinite(pairedImprovementMedianPct) &&
+    pairedImprovementMedianPct >= requiredImprovementPct &&
+    pairedConfidence.pairedImprovementConclusiveAboveTarget === true;
   const pairedWinAcceptable =
     Number(pairedEngine?.candidateWinRate) > 0.5 || orderStratifiedPairedEngineAcceptable;
   const rawEngineAcceptable = Number.isFinite(improvementPct) && improvementPct >= requiredImprovementPct;
@@ -757,6 +828,7 @@ export function buildInstalledComparisonScore({
     pairedRepoWinRate: pairedEngine?.candidateWinRate,
     pairedRepoImprovementMedianPct: Number.isFinite(pairedImprovementMedianPct) ? pairedImprovementMedianPct : null,
     pairedRepoImprovementMeanPct: Number.isFinite(pairedImprovementMeanPct) ? pairedImprovementMeanPct : null,
+    ...pairedConfidence,
     pairedRepoOrderStratifiedAcceptable: orderStratifiedPairedEngineAcceptable,
     pairedRepoEngineAcceptable: pairedEngineAcceptable || orderStratifiedPairedEngineAcceptable,
     pairedRepoWinAcceptable: pairedWinAcceptable,
@@ -783,7 +855,7 @@ export function buildInstalledComparisonScore({
         : comparison?.matchParity === true &&
           routeParityAcceptable === true &&
           engineAcceptable &&
-          (pairedEngineAcceptable || orderStratifiedPairedEngineAcceptable) &&
+          pairedEngineAcceptable &&
           pairedWinAcceptable &&
           routeScore.teddyRouteNetPositive === true,
   };
@@ -1063,6 +1135,10 @@ export function buildHistoricalComparisonScore({
   const pairedImprovementMeanPct = Number(pairedEngine?.candidateImprovementPctSummary?.mean);
   const pairedAttribution = pairedAttributionLedgerFields(pairedEngine ?? null);
   const routeScore = teddyRouteScoreFields(pairedAttribution);
+  const pairedConfidence = pairedImprovementConfidenceFields(
+    pairedEngine,
+    sameBinary ? null : minPreviousBuildImprovementPct,
+  );
   const repairDirective = installedRepairDirective({
     improvementPct,
     pairedImprovementMedianPct,
@@ -1084,6 +1160,7 @@ export function buildHistoricalComparisonScore({
     pairedCurrentWinRate: pairedEngine?.candidateWinRate,
     pairedCurrentImprovementMedianPct: Number.isFinite(pairedImprovementMedianPct) ? pairedImprovementMedianPct : null,
     pairedCurrentImprovementMeanPct: Number.isFinite(pairedImprovementMeanPct) ? pairedImprovementMeanPct : null,
+    ...pairedConfidence,
     orderStratifiedFirstStartSampleCount: orderStratifiedEngine?.firstStartSampleCount ?? null,
     orderStratifiedSecondStartSampleCount: orderStratifiedEngine?.secondStartSampleCount ?? null,
     orderStratifiedFirstStartCurrentImprovementPct: orderStratifiedEngine?.firstStartCandidateImprovementPct ?? null,
@@ -1105,6 +1182,7 @@ export function buildHistoricalComparisonScore({
           improvementPct >= minPreviousBuildImprovementPct &&
           Number.isFinite(pairedImprovementMedianPct) &&
           pairedImprovementMedianPct >= minPreviousBuildImprovementPct &&
+          pairedConfidence.pairedImprovementConclusiveAboveTarget === true &&
           Number(pairedEngine?.candidateWinRate) > 0.5 &&
           matchParity === true &&
           (routeParityAcceptable ?? (routeParity === true)) === true &&
@@ -1141,6 +1219,14 @@ export function buildHistoricalRoundLedger(comparisons) {
     pairedCandidateImprovementMeanPct:
       comparison.score?.pairedCurrentImprovementMeanPct ??
       comparison.pairedEngine?.candidateImprovementPctSummary?.mean ??
+      null,
+    pairedCandidateImprovementLower95Pct:
+      comparison.score?.pairedImprovementLower95Pct ??
+      comparison.pairedEngine?.candidateImprovementPctBootstrap95?.lower ??
+      null,
+    pairedCandidateImprovementUpper95Pct:
+      comparison.score?.pairedImprovementUpper95Pct ??
+      comparison.pairedEngine?.candidateImprovementPctBootstrap95?.upper ??
       null,
     orderStratifiedFirstStartSampleCount: comparison.score?.orderStratifiedFirstStartSampleCount,
     orderStratifiedSecondStartSampleCount: comparison.score?.orderStratifiedSecondStartSampleCount,
@@ -1184,6 +1270,7 @@ export function buildHistoricalRoundLedger(comparisons) {
     mixedKernelEngineSignal: comparison.score?.mixedKernelEngineSignal,
     repairDirective: comparison.score?.repairDirective,
     repairTargetPhase: comparison.score?.repairTargetPhase,
+    scanSplitTelemetryEnabled: comparison.scanSplitTelemetryEnabled === true,
     pairCount: comparison.pairedEngine?.count ?? null,
     ...pairOrderScoreFields(comparison.pairOrderSummary ?? comparison.pairedEngine?.pairOrderSummary),
     matchParity: comparison.score?.matchParity ?? comparison.matchParity,
@@ -1251,6 +1338,7 @@ export function buildHistoricalScorecard(comparisons) {
       mixedKernelEngineSignal: comparison.score?.mixedKernelEngineSignal,
       repairDirective: comparison.score?.repairDirective,
       repairTargetPhase: comparison.score?.repairTargetPhase,
+      scanSplitTelemetryEnabled: comparison.scanSplitTelemetryEnabled === true,
       requiredImprovementPct: comparison.score?.requiredImprovementPct ?? comparison.minPreviousBuildImprovementPct,
       matchParity: comparison.score?.matchParity ?? comparison.matchParity,
       routeParity: comparison.score?.routeParity ?? comparison.routeParity,
@@ -2000,6 +2088,76 @@ export function measureRipgrep({ expression, defaultExpression = DEFAULT_ALTERNA
   return { command: "rg", label, mmapMode, args, samples: runs, summary: summary(runs.map((entry) => entry.durationMs)) };
 }
 
+export function measureRipgrepBracketed({
+  expression,
+  defaultExpression = DEFAULT_ALTERNATES_EXPR,
+  corpus,
+  threads,
+  samples,
+  env,
+  mmapMode = "force",
+  label = "ripgrep",
+  between,
+} = {}) {
+  const totalSamples = Math.max(1, Number(samples ?? 1));
+  const beforeSamples = Math.max(1, Math.ceil(totalSamples / 2));
+  const afterSamples = Math.max(0, totalSamples - beforeSamples);
+  const before = measureRipgrep({
+    expression,
+    defaultExpression,
+    corpus,
+    threads,
+    samples: beforeSamples,
+    env,
+    mmapMode,
+    label: `${label}-before`,
+  });
+  const betweenResult = typeof between === "function" ? between() : null;
+  const after = afterSamples > 0
+    ? measureRipgrep({
+        expression,
+        defaultExpression,
+        corpus,
+        threads,
+        samples: afterSamples,
+        env,
+        mmapMode,
+        label: `${label}-after`,
+      })
+    : {
+        command: "rg",
+        label: `${label}-after`,
+        mmapMode,
+        args: before.args,
+        samples: [],
+        summary: summary([]),
+      };
+  const combinedSamples = [
+    ...before.samples.map((entry) => ({ ...entry, phase: "before" })),
+    ...after.samples.map((entry) => ({ ...entry, phase: "after" })),
+  ];
+  const beforeMedian = Number(before.summary?.median);
+  const afterMedian = Number(after.summary?.median);
+  const bracketDriftPct =
+    Number.isFinite(beforeMedian) && beforeMedian !== 0 && Number.isFinite(afterMedian)
+      ? ((afterMedian - beforeMedian) / beforeMedian) * 100
+      : null;
+  return {
+    command: "rg",
+    label,
+    mmapMode,
+    args: before.args,
+    bracketed: true,
+    bracketOrder: ["before", "after"],
+    betweenResult,
+    before,
+    after,
+    samples: combinedSamples,
+    summary: summary(combinedSamples.map((entry) => entry.durationMs)),
+    bracketDriftPct,
+  };
+}
+
 export function measureRipgrepMmapComparison({ expression, defaultExpression = DEFAULT_ALTERNATES_EXPR, corpus, threads, samples, env }) {
   if (expression !== defaultExpression) return null;
   const force = measureRipgrep({ expression, defaultExpression, corpus, threads, samples, env, mmapMode: "force", label: "ripgrep-mmap" });
@@ -2052,6 +2210,7 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
   const engineMs = Number(report.stats?.timings?.total_ms ?? result.durationMs);
   return {
     sample,
+    benchmarkIsolation: result.benchmarkIsolation ?? null,
     cliMs: result.durationMs,
     engineMs,
     discoverMs: Number(timings.discover_ms ?? 0),
@@ -2064,8 +2223,10 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
     scanOpenSyscallMsTotal: optionalNumber(timings.scan_open_syscall_ms_total),
     scanFileMsTotal: optionalNumber(timings.scan_file_ms_total),
     scanFileMmapMsTotal: optionalNumber(timings.scan_file_mmap_ms_total),
+    scanFileBufferedMsTotal: optionalNumber(timings.scan_file_buffered_ms_total),
     scanFileFastCountMsTotal,
     scanFileLineScanMsTotal: optionalNumber(timings.scan_file_line_scan_ms_total),
+    scanInputPolicy: report.stats?.concurrency?.scan_input_policy ?? "auto",
     aggregateMergeMs: Number(timings.aggregate_merge_ms ?? 0),
     aggregateFinalizeMs: Number(timings.aggregate_finalize_ms ?? 0),
     matches: Number(report.stats?.matches_found ?? 0),
@@ -2132,6 +2293,27 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
   };
 }
 
+function summarizeBenchmarkIsolation(runs) {
+  const isolations = runs
+    .map((entry) => entry?.benchmarkIsolation)
+    .filter((entry) => entry != null && typeof entry === "object");
+  return {
+    modes: [...new Set(isolations.map((entry) => entry.mode ?? null))],
+    requestedPriorityClasses: [...new Set(isolations.map((entry) => entry.requestedPriorityClass ?? null))],
+    appliedPriorityClasses: [...new Set(isolations.map((entry) => entry.appliedPriorityClass ?? null))],
+    requestedAffinityMasks: [...new Set(isolations.map((entry) => entry.requestedAffinityMaskHex ?? null))],
+    appliedAffinityMasks: [...new Set(isolations.map((entry) => entry.appliedAffinityMaskHex ?? null))],
+    selectionStrategies: [...new Set(isolations.map((entry) => entry.selectionStrategy ?? null))],
+    topologyCheckedValues: [...new Set(isolations.map((entry) => entry.topology?.checked ?? null))],
+    topologyFallbackValues: [...new Set(isolations.map((entry) => entry.topologyFallbackUsed ?? null))],
+    priorityErrors: [...new Set(isolations.map((entry) => entry.priorityError ?? null).filter((entry) => entry != null))],
+    affinityErrors: [...new Set(isolations.map((entry) => entry.affinityError ?? null).filter((entry) => entry != null))],
+    supportedValues: [...new Set(isolations.map((entry) => entry.supported ?? null))],
+    reasons: [...new Set(isolations.map((entry) => entry.reason ?? null).filter((entry) => entry != null))],
+    sampleCount: isolations.length,
+  };
+}
+
 export function summarizeIxRuns(binaryPath, label, runs) {
   const binary = binarySnapshot(binaryPath);
   return {
@@ -2141,6 +2323,7 @@ export function summarizeIxRuns(binaryPath, label, runs) {
     executableSha256: binary.executableSha256,
     binary,
     samples: runs,
+    benchmarkIsolationSummary: summarizeBenchmarkIsolation(runs),
     cliSummary: summary(runs.map((entry) => entry.cliMs)),
     engineSummary: summary(runs.map((entry) => entry.engineMs)),
     discoverSummary: summary(runs.map((entry) => entry.discoverMs)),
@@ -2153,6 +2336,7 @@ export function summarizeIxRuns(binaryPath, label, runs) {
     scanOpenSyscallSummary: optionalSummary(runs.map((entry) => entry.scanOpenSyscallMsTotal)),
     scanFileSummary: summary(runs.map((entry) => entry.scanFileMsTotal)),
     scanFileMmapSummary: optionalSummary(runs.map((entry) => entry.scanFileMmapMsTotal)),
+    scanFileBufferedSummary: optionalSummary(runs.map((entry) => entry.scanFileBufferedMsTotal)),
     scanFileFastCountSummary: optionalSummary(runs.map((entry) => entry.scanFileFastCountMsTotal)),
     scanFileLineScanSummary: optionalSummary(runs.map((entry) => entry.scanFileLineScanMsTotal)),
     scanOpenMsPerFileSummary: summary(runs.map((entry) => entry.scanOpenMsPerFile)),

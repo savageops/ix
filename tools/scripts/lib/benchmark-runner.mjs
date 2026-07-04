@@ -6,6 +6,7 @@ import path from "node:path";
 import { classifyHotspot, computeRatio, computeSpeedupPct, summarizeSeries } from "./metrics.mjs";
 import { pairOrderSummary } from "./speed-compare-utils.mjs";
 import { benchmarkHostNoiseConfig } from "./benchmark-config.mjs";
+import { benchmarkIsolationPlan, defaultBenchmarkIsolationResult, mergedEnv, runWithWindowsBenchmarkIsolation } from "./benchmark-isolation.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports");
@@ -102,11 +103,17 @@ export function runTimedCommand(command, args, allowedCodes = [0], options = {})
   const stdio = captureStdout
     ? (captureStderr ? "pipe" : ["ignore", "pipe", "ignore"])
     : (captureStderr ? ["ignore", "ignore", "pipe"] : "ignore");
+  const effectiveEnv = mergedEnv(options.env ?? {});
+  const isolationPlan = benchmarkIsolationPlan(effectiveEnv);
+
+  if (process.platform === "win32" && isolationPlan.mode === "enforce" && isolationPlan.supported) {
+    return runWithWindowsBenchmarkIsolation(command, args, options, isolationPlan, { allowedCodes });
+  }
 
   const started = process.hrtime.bigint();
   const result = spawnSync(command, args, {
     cwd: ROOT,
-    env: { ...process.env, ...(options.env ?? {}) },
+    env: effectiveEnv,
     encoding: "utf8",
     stdio,
     maxBuffer: 128 * 1024 * 1024,
@@ -126,6 +133,7 @@ export function runTimedCommand(command, args, allowedCodes = [0], options = {})
     stdout: captureStdout ? (result.stdout?.toString() ?? "") : "",
     stderr: captureStderr ? (result.stderr?.toString() ?? "") : "",
     status,
+    benchmarkIsolation: defaultBenchmarkIsolationResult(isolationPlan),
   };
 }
 
@@ -328,6 +336,43 @@ function activeCpuProcessSnapshot(sampleMs = 750) {
   }
 }
 
+function schedulerPressureSnapshot() {
+  if (process.platform !== "win32") {
+    return { checked: false, reason: "non-windows" };
+  }
+  const json = safeCommand("powershell", [
+    "-NoProfile",
+    "-Command",
+    [
+      "$samples = Get-Counter -Counter '\\System\\Processor Queue Length','\\System\\Context Switches/sec','\\Processor(_Total)\\% Processor Time' -SampleInterval 1 -MaxSamples 1 | Select-Object -ExpandProperty CounterSamples",
+      "$samples | Select-Object Path,CookedValue | ConvertTo-Json -Compress",
+    ].join("; "),
+  ]);
+  if (!json) {
+    return { checked: false, reason: "counter_probe_failed" };
+  }
+  try {
+    const parsed = JSON.parse(json);
+    const rows = Array.isArray(parsed) ? parsed : [parsed];
+    const byPath = new Map(rows.map((entry) => [String(entry?.Path ?? ""), Number(entry?.CookedValue ?? NaN)]));
+    return {
+      checked: true,
+      reason: null,
+      processorQueueLength: Number.isFinite(byPath.get("\\\\system\\\\processor queue length")) ? byPath.get("\\\\system\\\\processor queue length") : (
+        rows.find((entry) => String(entry?.Path ?? "").toLowerCase().includes("\\system\\processor queue length"))?.CookedValue ?? null
+      ),
+      contextSwitchesPerSec: Number.isFinite(byPath.get("\\\\system\\\\context switches/sec")) ? byPath.get("\\\\system\\\\context switches/sec") : (
+        rows.find((entry) => String(entry?.Path ?? "").toLowerCase().includes("\\system\\context switches/sec"))?.CookedValue ?? null
+      ),
+      totalProcessorTimePct: Number.isFinite(byPath.get("\\\\processor(_total)\\\\% processor time")) ? byPath.get("\\\\processor(_total)\\\\% processor time") : (
+        rows.find((entry) => String(entry?.Path ?? "").toLowerCase().includes("\\processor(_total)\\% processor time"))?.CookedValue ?? null
+      ),
+    };
+  } catch {
+    return { checked: false, reason: "counter_probe_invalid_json" };
+  }
+}
+
 function elevationSnapshot() {
   if (process.platform !== "win32") return { checked: false, isAdmin: null, reason: "non-windows" };
   const output = safeCommand("powershell", [
@@ -349,10 +394,91 @@ export function classifyHostForBenchmark(snapshot, config = benchmarkHostNoiseCo
   const activeCpuMinSec = config.activeCpuMinSec;
   const activeCpuHeavySec = config.activeCpuHeavySec;
   const largeProcessWorkingSetBytes = config.largeProcessWorkingSetBytes;
+  const largeProcessWarningFreeMemRatio = config.largeProcessWarningFreeMemRatio;
+  const largeProcessWarningShareOfTotalMem = config.largeProcessWarningShareOfTotalMem;
+  const defenderResidentSeverity = config.defenderResidentSeverity ?? "warning";
+  const interactiveWorkloadSeverity = config.interactiveWorkloadSeverity ?? "info";
+  const interactiveWorkloadWarningCount = Number(config.interactiveWorkloadWarningCount ?? 2);
+  const schedulerCpuHighPct = Number(config.schedulerCpuHighPct ?? 85);
+  const processorQueueLengthWarning = Number(config.processorQueueLengthWarning ?? 2);
+  const contextSwitchesPerCpuWarning = Number(config.contextSwitchesPerCpuWarning ?? 15000);
   const benchmarkProcessNames = new Set(config.benchmarkProcessNames);
+  const interactiveWorkloadNames = new Set((config.interactiveWorkloadProcessNames ?? ["chrome", "codex"]).map((entry) => String(entry).toLowerCase()));
   const processName = (entry) => String(entry?.ProcessName ?? "").toLowerCase();
   const isBenchmarkProcess = (entry) => benchmarkProcessNames.has(processName(entry));
   const powerName = snapshot.powerScheme?.name?.toLowerCase?.() ?? "";
+  const freeMemRatio = snapshot.totalMemBytes > 0 ? snapshot.freeMemBytes / snapshot.totalMemBytes : 1;
+  const isolation = snapshot.benchmarkIsolation ?? null;
+  const schedulerPressure = snapshot.schedulerPressure ?? null;
+  const logicalCpuCount = Math.max(1, Number(snapshot?.cpu?.logicalCount ?? snapshot?.availableParallelism ?? 1));
+  const processorQueueLength = Number(schedulerPressure?.processorQueueLength);
+  const totalProcessorTimePct = Number(schedulerPressure?.totalProcessorTimePct);
+  const contextSwitchesPerSec = Number(schedulerPressure?.contextSwitchesPerSec);
+  const contextSwitchesPerCpu = Number.isFinite(contextSwitchesPerSec) ? contextSwitchesPerSec / logicalCpuCount : null;
+  if (snapshot.platform === "win32" && isolation?.mode !== "enforce") {
+    issues.push({
+      id: "benchmark_isolation_not_enforced",
+      severity: "warning",
+      detail: `benchmark isolation mode ${isolation?.mode ?? "unknown"} is not enforce`,
+    });
+  } else if (snapshot.platform === "win32" && isolation?.mode === "enforce" && isolation?.supported !== true) {
+    issues.push({
+      id: "benchmark_isolation_unavailable",
+      severity: "warning",
+      detail: isolation?.reason ?? "benchmark isolation could not compute an affinity plan",
+    });
+  } else if (
+    snapshot.platform === "win32" &&
+    isolation?.mode === "enforce" &&
+    isolation?.affinityMode === "approx_physical_cores" &&
+    (isolation?.topology?.checked !== true || isolation?.topologyFallbackUsed === true)
+  ) {
+    issues.push({
+      id: "benchmark_isolation_topology_unavailable",
+      severity: "warning",
+      detail: isolation?.topology?.reason ?? "benchmark isolation fell back to a non-topology affinity selection",
+    });
+  }
+  if (snapshot.platform === "win32" && schedulerPressure?.checked !== true) {
+    issues.push({
+      id: "scheduler_pressure_unavailable",
+      severity: "warning",
+      detail: schedulerPressure?.reason ?? "scheduler pressure counters were unavailable",
+    });
+  } else {
+    if (Number.isFinite(processorQueueLength) && processorQueueLength >= processorQueueLengthWarning) {
+      issues.push({
+        id: "processor_queue_length_high",
+        severity: "warning",
+        detail: `Processor Queue Length ${processorQueueLength} indicates runnable threads waiting for CPU`,
+        processorQueueLength,
+        totalProcessorTimePct: Number.isFinite(totalProcessorTimePct) ? totalProcessorTimePct : null,
+      });
+    }
+    if (Number.isFinite(contextSwitchesPerCpu) && contextSwitchesPerCpu >= contextSwitchesPerCpuWarning) {
+      issues.push({
+        id: "context_switch_rate_high",
+        severity: "warning",
+        detail: `Context switches/sec per logical CPU ${Math.round(contextSwitchesPerCpu)} exceeded ${contextSwitchesPerCpuWarning}`,
+        contextSwitchesPerSec,
+        contextSwitchesPerCpu,
+        logicalCpuCount,
+      });
+    }
+    if (
+      Number.isFinite(totalProcessorTimePct) &&
+      totalProcessorTimePct >= schedulerCpuHighPct &&
+      (Number.isFinite(processorQueueLength) ? processorQueueLength >= processorQueueLengthWarning : true)
+    ) {
+      issues.push({
+        id: "system_cpu_pressure",
+        severity: "warning",
+        detail: `Total processor time ${Math.round(totalProcessorTimePct)}% with runnable queue pressure`,
+        totalProcessorTimePct,
+        processorQueueLength: Number.isFinite(processorQueueLength) ? processorQueueLength : null,
+      });
+    }
+  }
   if (process.platform === "win32" && powerName && !powerName.includes("performance")) {
     issues.push({
       id: "non_performance_power_plan",
@@ -364,7 +490,7 @@ export function classifyHostForBenchmark(snapshot, config = benchmarkHostNoiseCo
   if (topNames.has("msmpeng")) {
     issues.push({
       id: "defender_resident_in_top_working_set",
-      severity: "info",
+      severity: defenderResidentSeverity,
       detail: "MsMpEng appeared among top working-set processes",
     });
   }
@@ -382,11 +508,11 @@ export function classifyHostForBenchmark(snapshot, config = benchmarkHostNoiseCo
       cpuDeltaSec: activeDefender.CpuDeltaSec,
     });
   }
-  const browserOrAgentCount = [...topNames].filter((name) => name === "chrome" || name === "codex").length;
-  if (browserOrAgentCount >= 2) {
+  const browserOrAgentCount = [...topNames].filter((name) => interactiveWorkloadNames.has(name)).length;
+  if (browserOrAgentCount >= interactiveWorkloadWarningCount) {
     issues.push({
       id: "interactive_workloads_present",
-      severity: "info",
+      severity: interactiveWorkloadSeverity,
       detail: "Codex or Chrome processes appeared among top working-set processes",
     });
   }
@@ -395,13 +521,27 @@ export function classifyHostForBenchmark(snapshot, config = benchmarkHostNoiseCo
     Number(entry.WorkingSet64 ?? 0) >= largeProcessWorkingSetBytes
   );
   if (largeResident) {
+    const workingSetBytes = Number(largeResident.WorkingSet64 ?? 0);
+    const workingSetShareOfTotalMem = snapshot.totalMemBytes > 0 ? workingSetBytes / snapshot.totalMemBytes : 0;
+    const activeResident = activeCpu.find((entry) =>
+      Number(entry?.Id ?? -1) === Number(largeResident.Id ?? -2) &&
+      Number(entry?.CpuDeltaSec ?? 0) >= activeCpuMinSec
+    );
+    const severity = (
+      freeMemRatio < largeProcessWarningFreeMemRatio ||
+      workingSetShareOfTotalMem >= largeProcessWarningShareOfTotalMem ||
+      activeResident != null
+    ) ? "warning" : "info";
     issues.push({
       id: "large_resident_workload",
-      severity: "warning",
+      severity,
       detail: `${largeResident.ProcessName ?? "unknown"} working set ${Math.round(Number(largeResident.WorkingSet64 ?? 0) / 1024 / 1024)} MiB`,
       processName: largeResident.ProcessName ?? null,
       pid: largeResident.Id ?? null,
-      workingSetBytes: Number(largeResident.WorkingSet64 ?? 0),
+      workingSetBytes,
+      workingSetShareOfTotalMem,
+      freeMemRatio,
+      activeCpuDeltaSec: activeResident?.CpuDeltaSec ?? null,
     });
   }
   const activeNonBenchmark = activeCpu.find((entry) =>
@@ -419,7 +559,6 @@ export function classifyHostForBenchmark(snapshot, config = benchmarkHostNoiseCo
       cpuDeltaSec: activeNonBenchmark.CpuDeltaSec,
     });
   }
-  const freeMemRatio = snapshot.totalMemBytes > 0 ? snapshot.freeMemBytes / snapshot.totalMemBytes : 1;
   if (freeMemRatio < 0.2) {
     issues.push({
       id: "low_available_memory",
@@ -438,6 +577,7 @@ export function hostSnapshot() {
   const cpus = os.cpus();
   const cpuSpeeds = cpus.map((cpu) => cpu.speed).filter((speed) => Number.isFinite(speed));
   const powerScheme = process.platform === "win32" ? parsePowerScheme(safeCommand("powercfg", ["/getactivescheme"])) : null;
+  const benchmarkIsolation = benchmarkIsolationPlan();
   const snapshot = {
     timestamp: new Date().toISOString(),
     platform: process.platform,
@@ -456,6 +596,8 @@ export function hostSnapshot() {
       speedMeanMhz: cpuSpeeds.length ? Math.round(cpuSpeeds.reduce((sum, speed) => sum + speed, 0) / cpuSpeeds.length) : null,
     },
     powerScheme,
+    benchmarkIsolation,
+    schedulerPressure: schedulerPressureSnapshot(),
     elevation: elevationSnapshot(),
     topProcessesByWorkingSet: topProcessSnapshot(),
     topProcessesByCpu: topCpuProcessSnapshot(),
@@ -537,6 +679,7 @@ function extractPhaseMs(report) {
     scanOpenSyscall: optionalNumber(timings.scan_open_syscall_ms_total),
     scanFile: Number(timings.scan_file_ms_total ?? 0),
     scanFileMmap: optionalNumber(timings.scan_file_mmap_ms_total),
+    scanFileBuffered: optionalNumber(timings.scan_file_buffered_ms_total),
     scanFileFastCount: scanFileFastCountMsTotal,
     scanFileLineScan: optionalNumber(timings.scan_file_line_scan_ms_total),
     total: Number(timings.total_ms ?? 0),
@@ -552,10 +695,30 @@ function measuredIxEntry(binaryPath, args, result, sampleIndex) {
   return {
     result,
     report,
+    benchmarkIsolation: result.benchmarkIsolation ?? null,
     engineMs,
     cliMs: result.durationMs,
     phaseMs: extractPhaseMs(report),
     sampleIndex,
+  };
+}
+
+function summarizeBenchmarkIsolationEntries(runs) {
+  const isolations = runs
+    .map((run) => run?.benchmarkIsolation)
+    .filter((entry) => entry != null && typeof entry === "object");
+  return {
+    modes: [...new Set(isolations.map((entry) => entry.mode ?? null))],
+    requestedPriorityClasses: [...new Set(isolations.map((entry) => entry.requestedPriorityClass ?? null))],
+    appliedPriorityClasses: [...new Set(isolations.map((entry) => entry.appliedPriorityClass ?? null))],
+    requestedAffinityMasks: [...new Set(isolations.map((entry) => entry.requestedAffinityMaskHex ?? null))],
+    appliedAffinityMasks: [...new Set(isolations.map((entry) => entry.appliedAffinityMaskHex ?? null))],
+    selectionStrategies: [...new Set(isolations.map((entry) => entry.selectionStrategy ?? null))],
+    topologyCheckedValues: [...new Set(isolations.map((entry) => entry.topology?.checked ?? null))],
+    topologyFallbackValues: [...new Set(isolations.map((entry) => entry.topologyFallbackUsed ?? null))],
+    priorityErrors: [...new Set(isolations.map((entry) => entry.priorityError ?? null).filter((entry) => entry != null))],
+    affinityErrors: [...new Set(isolations.map((entry) => entry.affinityError ?? null).filter((entry) => entry != null))],
+    sampleCount: isolations.length,
   };
 }
 
@@ -604,6 +767,7 @@ function summarizeIxEntries(binaryPath, args, measuredRuns) {
     processOverheadMs: Math.max(0, selected.cliMs - selected.engineMs),
     sampleDurationsMs: cliSamples,
     engineSampleDurationsMs: engineSamples,
+    benchmarkIsolationSummary: summarizeBenchmarkIsolationEntries(measuredRuns),
     phaseSampleDurationsMs: summarizePhaseSamples(byEngine),
     processOverheadSampleDurationsMs: summarizeProcessOverheadSamples(byEngine),
     sampleSummary: sampleSummary(cliSamples),

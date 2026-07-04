@@ -20,6 +20,26 @@ Every optimization decision must be reasoned at three levels:
 
 If an optimization only satisfies level 1, it is incomplete. The roadmap items below exist because they satisfy all three.
 
+## Frontier Research And Source Reuse
+
+Before writing code, acquire the strongest external source material first. That means current papers, arXiv, high-end systems articles, old but still dominant computer-science work, and frontier open-source implementations that already solve the same class of problem at a high level.
+
+- Default to copying or tightly adapting proven algorithms, layouts, state machines, benchmark methods, and tests from the highest-quality reference repos and papers.
+- Do not reinvent mechanisms locally when a stronger external implementation or paper already exists. Local invention is for glue, adaptation, integration, or a gap that remains after source search fails.
+- Research depth is part of the implementation contract: look for current frontier work and older overlooked work before deciding the mechanism.
+- Prefer primary sources and maintainer-grade repos over summaries or second-hand explanations.
+- When license, architecture, and ownership fit, import the real pattern instead of re-deriving it from scratch.
+
+## Benchmark Falsification Before Runtime Blame
+
+Any speed miss must first be treated as a benchmark hypothesis, not an engine verdict. Before reverting or rejecting a runtime candidate, prove that the measurement lane is comparable, clean, and correctly instrumented.
+
+- Verify match parity, route parity, binary provenance, same-binary identity drift, host noise, scheduler isolation, Defender or filesystem-filter interference, and phase-timing exclusivity before attributing loss to a search kernel.
+- If the miss is smaller than observed identity drift or the host preflight is noisy, the result is exploratory. Preserve promising candidates, gather stronger rounds, and fix the benchmark owner before making an architectural decision.
+- If a phase appears slower, first prove that phase is measured exclusively and consistently across binaries. Nested or double-counted timing cannot drive repair targets.
+- Compare only against the single hardest valid predecessor lane for retained historical proof. Invalid rows with match or route mismatch cannot select the predecessor and cannot drive phase attribution.
+- A route-local win plus a small whole-engine loss is a salvage problem, not a revert command. Preserve the gain, isolate the losing owner, and widen sample depth under a cleaner envelope.
+
 ## Architecture
 
 ```

@@ -14,6 +14,22 @@ export const BENCHMARK_HOST_NOISE_DEFAULTS = {
   activeCpuMinSec: 0.05,
   activeCpuHeavySec: 0.25,
   largeProcessWorkingSetBytes: 4 * 1024 * 1024 * 1024,
+  largeProcessWarningFreeMemRatio: 0.5,
+  largeProcessWarningShareOfTotalMem: 0.125,
+  defenderResidentSeverity: "info",
+  interactiveWorkloadSeverity: "info",
+  interactiveWorkloadWarningCount: 2,
+  interactiveWorkloadProcessNames: ["chrome", "codex"],
+  schedulerCpuHighPct: 85,
+  processorQueueLengthWarning: 2,
+  contextSwitchesPerCpuWarning: 15000,
+};
+export const BENCHMARK_ISOLATION_DEFAULTS = {
+  modeWindows: "enforce",
+  modeOther: "telemetry",
+  priorityClass: "High",
+  affinityMode: "approx_physical_cores",
+  minLogicalCpuCount: 2,
 };
 export const BENCHMARK_PROCESS_NAMES = [
   "ix",
@@ -42,7 +58,11 @@ export function baseBenchEnv(kind) {
   return {
     IX_INDEX: "0",
     IX_NEXUS: "0",
+    IX_RESOURCE_PROFILE: "high",
     IX_STATE_DIR: benchmarkStateDir(kind),
+    IX_BENCH_ISOLATION_MODE: process.platform === "win32" ? "enforce" : "telemetry",
+    IX_BENCH_PRIORITY_CLASS: BENCHMARK_ISOLATION_DEFAULTS.priorityClass,
+    IX_BENCH_AFFINITY_MODE: BENCHMARK_ISOLATION_DEFAULTS.affinityMode,
   };
 }
 
@@ -68,6 +88,23 @@ function finitePositiveNumber(value, fallback) {
   return Number.isFinite(number) && number > 0 ? number : fallback;
 }
 
+function severityValue(value, fallback) {
+  return value === "info" || value === "warning" ? value : fallback;
+}
+
+function csvList(value, fallback) {
+  if (typeof value !== "string" || value.trim().length === 0) return fallback;
+  const list = value
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry.length > 0);
+  return list.length > 0 ? list : fallback;
+}
+
+function enumValue(value, allowed, fallback) {
+  return allowed.includes(value) ? value : fallback;
+}
+
 export function benchmarkHostNoiseConfig(env = process.env) {
   return {
     activeCpuMinSec: finitePositiveNumber(env.IX_BENCH_HOST_ACTIVE_CPU_MIN_SEC, BENCHMARK_HOST_NOISE_DEFAULTS.activeCpuMinSec),
@@ -76,6 +113,74 @@ export function benchmarkHostNoiseConfig(env = process.env) {
       env.IX_BENCH_HOST_LARGE_WORKING_SET_BYTES,
       BENCHMARK_HOST_NOISE_DEFAULTS.largeProcessWorkingSetBytes,
     ),
+    largeProcessWarningFreeMemRatio: finitePositiveNumber(
+      env.IX_BENCH_HOST_LARGE_WORKING_SET_WARNING_FREE_MEM_RATIO,
+      BENCHMARK_HOST_NOISE_DEFAULTS.largeProcessWarningFreeMemRatio,
+    ),
+    largeProcessWarningShareOfTotalMem: finitePositiveNumber(
+      env.IX_BENCH_HOST_LARGE_WORKING_SET_WARNING_SHARE_OF_TOTAL_MEM,
+      BENCHMARK_HOST_NOISE_DEFAULTS.largeProcessWarningShareOfTotalMem,
+    ),
+    defenderResidentSeverity: severityValue(
+      env.IX_BENCH_HOST_DEFENDER_RESIDENT_SEVERITY,
+      BENCHMARK_HOST_NOISE_DEFAULTS.defenderResidentSeverity,
+    ),
+    interactiveWorkloadSeverity: severityValue(
+      env.IX_BENCH_HOST_INTERACTIVE_WORKLOAD_SEVERITY,
+      BENCHMARK_HOST_NOISE_DEFAULTS.interactiveWorkloadSeverity,
+    ),
+    interactiveWorkloadWarningCount: finitePositiveNumber(
+      env.IX_BENCH_HOST_INTERACTIVE_WORKLOAD_WARNING_COUNT,
+      BENCHMARK_HOST_NOISE_DEFAULTS.interactiveWorkloadWarningCount,
+    ),
+    interactiveWorkloadProcessNames: csvList(
+      env.IX_BENCH_HOST_INTERACTIVE_WORKLOAD_NAMES,
+      BENCHMARK_HOST_NOISE_DEFAULTS.interactiveWorkloadProcessNames,
+    ),
+    schedulerCpuHighPct: finitePositiveNumber(
+      env.IX_BENCH_HOST_SCHEDULER_CPU_HIGH_PCT,
+      BENCHMARK_HOST_NOISE_DEFAULTS.schedulerCpuHighPct,
+    ),
+    processorQueueLengthWarning: finitePositiveNumber(
+      env.IX_BENCH_HOST_PROCESSOR_QUEUE_LENGTH_WARNING,
+      BENCHMARK_HOST_NOISE_DEFAULTS.processorQueueLengthWarning,
+    ),
+    contextSwitchesPerCpuWarning: finitePositiveNumber(
+      env.IX_BENCH_HOST_CONTEXT_SWITCHES_PER_CPU_WARNING,
+      BENCHMARK_HOST_NOISE_DEFAULTS.contextSwitchesPerCpuWarning,
+    ),
     benchmarkProcessNames: BENCHMARK_PROCESS_NAMES,
+  };
+}
+
+export function benchmarkIsolationConfig(env = process.env, platform = process.platform, availableParallelism = os.availableParallelism()) {
+  const defaultMode = platform === "win32"
+    ? BENCHMARK_ISOLATION_DEFAULTS.modeWindows
+    : BENCHMARK_ISOLATION_DEFAULTS.modeOther;
+  return {
+    mode: enumValue(env.IX_BENCH_ISOLATION_MODE, ["off", "telemetry", "enforce"], defaultMode),
+    priorityClass: enumValue(
+      env.IX_BENCH_PRIORITY_CLASS,
+      ["Idle", "BelowNormal", "Normal", "AboveNormal", "High", "RealTime"],
+      BENCHMARK_ISOLATION_DEFAULTS.priorityClass,
+    ),
+    affinityMode: enumValue(
+      env.IX_BENCH_AFFINITY_MODE,
+      ["off", "approx_physical_cores", "all_logical"],
+      BENCHMARK_ISOLATION_DEFAULTS.affinityMode,
+    ),
+    requestedLogicalCpuCount: finitePositiveNumber(
+      env.IX_BENCH_AFFINITY_LOGICAL_CPU_COUNT,
+      Math.max(
+        BENCHMARK_ISOLATION_DEFAULTS.minLogicalCpuCount,
+        Math.min(
+          availableParallelism,
+          Math.ceil(availableParallelism / 2),
+        ),
+      ),
+    ),
+    minLogicalCpuCount: BENCHMARK_ISOLATION_DEFAULTS.minLogicalCpuCount,
+    platform,
+    availableParallelism,
   };
 }

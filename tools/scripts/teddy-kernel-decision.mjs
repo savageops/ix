@@ -3,12 +3,13 @@ import { createHash } from "node:crypto";
 import path from "node:path";
 import { evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { DEFAULT_RIPGREP_LINUX_CORPUS, hasExperimentalBenchEnv } from "./lib/benchmark-config.mjs";
-import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
+import { argValue, preferHistoricalSelectionSeed, timestampSlug } from "./lib/script-helpers.mjs";
 import { phaseLeakSummaryFromRounds } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const HISTORICAL_REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
 const LATEST_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-historical-speed.json");
+const LATEST_NONDIAGNOSTIC_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-nondiagnostic-historical-speed.json");
 const LATEST_RETAINABLE_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-retainable-historical-speed.json");
 const LATEST_FAILED_HISTORICAL_PATH = path.join(HISTORICAL_REPORT_DIR, "latest-failed-historical-speed.json");
 const INSTALLED_REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
@@ -28,21 +29,19 @@ const INSECT_LITERAL_ALTERNATES_REFRESH = path.join(ROOT, ".docs", "research", "
 const INSECT_TEDDY_ATTRIBUTION_REFRESH = path.join(ROOT, ".docs", "research", "insect-teddy-attribution-refresh-20260613.json");
 const INSECT_PACKED_TEDDY_SHUFTI_REFRESH = path.join(ROOT, ".docs", "research", "insect-packed-teddy-shufti-refresh-20260613.json");
 const HISTORICAL_SPEED_DIAGNOSTIC_COMMAND =
-  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --no-require-strict";
+  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --quiet --no-require-strict";
 const HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND =
-  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --no-require-strict --scan-open-timing";
+  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --quiet --no-require-strict --scan-open-timing";
 const HISTORICAL_SPEED_STRICT_COMMAND =
-  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --require-strict";
+  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --quiet --require-strict";
 const HISTORICAL_SPEED_SCAN_OPEN_STRICT_COMMAND =
-  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --max-backups 4 --quiet --require-strict --scan-open-timing";
-const OLDER_SNAPSHOT_PROOF_COMMAND =
-  "node tools/scripts/compare-older-snapshots.mjs --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --min-retainable-samples 12 --max-snapshots 2 --target-retainable-snapshots 2 --min-engine-improvement-pct 5 --min-paired-improvement-pct 5 --require-strict --quiet";
+  "node tools/scripts/compare-historical-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --quiet --require-strict --scan-open-timing";
 const INSTALLED_SPEED_STRICT_COMMAND =
   "node tools/scripts/compare-installed-speed.mjs --build --samples 12 --identity-control-samples 12 --identity-control-attempts 3 --min-retainable-samples 12 --require-strict --require-promotion --quiet";
-const SPEED_DIAGNOSTIC_COMMAND = `${HISTORICAL_SPEED_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
-const SPEED_LEAK_ATTRIBUTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
-const SPEED_SCAN_OPEN_PROMOTION_COMMAND = `${HISTORICAL_SPEED_SCAN_OPEN_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
-const SPEED_PROMOTION_COMMAND = `${INSTALLED_SPEED_STRICT_COMMAND} && ${HISTORICAL_SPEED_STRICT_COMMAND} && ${OLDER_SNAPSHOT_PROOF_COMMAND}`;
+const SPEED_DIAGNOSTIC_COMMAND = HISTORICAL_SPEED_DIAGNOSTIC_COMMAND;
+const SPEED_LEAK_ATTRIBUTION_COMMAND = HISTORICAL_SPEED_SCAN_OPEN_DIAGNOSTIC_COMMAND;
+const SPEED_SCAN_OPEN_PROMOTION_COMMAND = HISTORICAL_SPEED_SCAN_OPEN_STRICT_COMMAND;
+const SPEED_PROMOTION_COMMAND = `${INSTALLED_SPEED_STRICT_COMMAND} && ${HISTORICAL_SPEED_STRICT_COMMAND}`;
 const REQUIRED_INSTALLED_SAMPLES = 12;
 const REQUIRED_INSTALLED_RETAINABLE_SAMPLES = 12;
 
@@ -68,10 +67,15 @@ const currentIx = argValue(args, "--current-ix", DEFAULT_CURRENT_IX);
 const currentIxSha256 = sha256File(currentIx);
 const currentIxExecutableSha256 = executableSha256File(currentIx);
 const explicitReportPath = argValue(args, "--report", "");
-const reportSelection = explicitReportPath.length > 0 ? "explicit" : "newest_fresh_current_binary";
+const reportSelection = explicitReportPath.length > 0 ? "explicit" : "newest_fresh_current_binary_nondiagnostic";
 const reportPath = explicitReportPath.length > 0
   ? explicitReportPath
-  : (selectFreshHistoricalReport(currentIxSha256) ?? path.join(HISTORICAL_REPORT_DIR, "latest-historical-speed.json"));
+  : (
+      selectFreshHistoricalReport(currentIxSha256) ??
+      (existsSync(LATEST_NONDIAGNOSTIC_HISTORICAL_PATH)
+        ? LATEST_NONDIAGNOSTIC_HISTORICAL_PATH
+        : path.join(HISTORICAL_REPORT_DIR, "latest-historical-speed.json"))
+    );
 const outPath = argValue(args, "--out", path.join(REPORT_DIR, `teddy-kernel-decision-${timestampSlug()}.json`));
 const quiet = args.includes("--quiet");
 
@@ -280,13 +284,12 @@ function selectFreshHistoricalReport(currentHash) {
         path: fullPath,
         timestamp: report.timestamp ?? null,
         runId: report.runId ?? name.replace(/\.json$/, ""),
-        fresh: reportMatchesCurrentBinary(report, currentHash),
-        diagnostic: report.diagnosticAttributionMode === true,
+        report,
+        selectionClass: "historical_report",
+        allowSelection: reportMatchesCurrentBinary(report, currentHash),
       };
-    })
-    .filter((entry) => entry.fresh)
-    .sort((left, right) => String(right.timestamp ?? right.runId).localeCompare(String(left.timestamp ?? left.runId)));
-  return candidates[0]?.path ?? null;
+    });
+  return preferHistoricalSelectionSeed(candidates)?.path ?? null;
 }
 
 function selectFreshDiagnosticHistoricalReport(currentHash) {
@@ -1213,8 +1216,7 @@ function currentSpeedStatus({ summary, historical, installedStatus, installedEvi
     },
     finalizationAllowed:
       installedStatus.status === "promotable_current" &&
-      historicalRetainableStatus.status === "retainable_current" &&
-      olderStatus.status === "retainable_current",
+      historicalRetainableStatus.status === "retainable_current",
   };
 }
 
@@ -1229,8 +1231,7 @@ function requiredKernelProof(engineeringMove) {
       "confirmation checks only branches in the surviving bucket or proves an equivalent lower-cost verifier",
       "route, match, full-scan calls, full-scan bytes, and full-scan matches remain unchanged",
       "installed-vs-current promotion passes with paired median and win-rate non-negative",
-      "recent predecessor ladder passes one build at a time",
-      "older snapshot ladder remains retainable",
+      "single hardest valid predecessor gate passes one build at a time",
     ],
     rejectedShortcuts: [
       "single_load_shifted_equality_mask",
@@ -1317,7 +1318,7 @@ function nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers, selec
       id: "retainable_scan_open_runtime_probe",
       status: "allowed_next_evidence",
       owner: "tools/scripts/compare-historical-speed.mjs retainable predecessor gate",
-      reason: "Fresh diagnostic attribution found scanOpen pressure, but diagnostic attribution is non-promotional. Run the normal strict installed, predecessor, and older-snapshot gates before selecting any scanOpen runtime repair.",
+      reason: "Fresh diagnostic attribution found scanOpen pressure, but diagnostic attribution is non-promotional. Run the normal strict installed gate and the single-hardest-predecessor gate before selecting any scanOpen runtime repair.",
       sourceDiagnosticRunId: latestDiagnosticAttribution.evaluatedHistoricalRunId ?? null,
       proofCommand: SPEED_PROMOTION_COMMAND,
     };
@@ -1327,7 +1328,7 @@ function nextEvidenceMove(latestDiagnosticAttribution, speedProofPointers, selec
       id: "retainable_scan_file_runtime_probe",
       status: "allowed_next_evidence",
       owner: "tools/scripts/compare-historical-speed.mjs retainable predecessor gate",
-      reason: "Fresh diagnostic attribution found scanFile pressure, but diagnostic attribution is non-promotional. Run the normal strict installed, predecessor, and older-snapshot gates before selecting any scanFile runtime repair.",
+      reason: "Fresh diagnostic attribution found scanFile pressure, but diagnostic attribution is non-promotional. Run the normal strict installed gate and the single-hardest-predecessor gate before selecting any scanFile runtime repair.",
       sourceDiagnosticRunId: latestDiagnosticAttribution.evaluatedHistoricalRunId ?? null,
       proofCommand: SPEED_PROMOTION_COMMAND,
     };
@@ -1391,8 +1392,7 @@ const promotionAllowed =
   summary.netPositiveRounds === summary.count &&
   quality.usableForRuntimeMove === true &&
   speedProofPointers.latestRetainable.status === "retainable_current" &&
-  selectedInstalledPointer?.status === "promotable_current" &&
-  speedProofPointers.latestOlderSnapshots.status === "retainable_current";
+  selectedInstalledPointer?.status === "promotable_current";
 
 function installedPromotionBlocker(pointer) {
   const status = pointer?.status ?? "missing";
@@ -1425,8 +1425,6 @@ const finalizationGate = {
     : (
         selectedInstalledPointer?.status !== "promotable_current"
           ? installedPromotionBlocker(selectedInstalledPointer)
-          : speedProofPointers.latestOlderSnapshots.status !== "retainable_current"
-          ? `no current older-snapshot proof (${speedProofPointers.latestOlderSnapshots.status}); run the older-snapshot speed gate before finalizing code changes`
           : speedProofPointers.latestRetainable.status === "retainable_current"
           ? "current retainable strict proof exists, but the selected report is not net-positive enough for runtime promotion"
           : `no current retainable strict speed proof (${speedProofPointers.latestRetainable.status}); run the strict speed gate before finalizing code changes`
@@ -1472,7 +1470,6 @@ const report = {
     installedStrictSpeed: INSTALLED_SPEED_STRICT_COMMAND,
     historicalSpeed: HISTORICAL_SPEED_DIAGNOSTIC_COMMAND,
     historicalStrictSpeed: HISTORICAL_SPEED_STRICT_COMMAND,
-    olderSnapshots: OLDER_SNAPSHOT_PROOF_COMMAND,
     speedGate: SPEED_PROMOTION_COMMAND,
   },
   noRuntimePromotionReason,

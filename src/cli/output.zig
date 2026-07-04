@@ -323,8 +323,8 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
     try writer.writeAll(",");
     try writeAdmissionJson(writer, report.stats.admission);
     try writer.writeAll(",");
-    try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"scan_open_ms_total\":{d},\"scan_file_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ report.stats.timings.discover_ms, report.stats.timings.scan_ms, report.stats.timings.aggregate_ms, report.stats.timings.total_ms, report.stats.timings.scan_work_ms_total, report.stats.timings.scan_open_ms_total, report.stats.timings.scan_file_ms_total, report.stats.timings.aggregate_merge_ms, report.stats.timings.aggregate_finalize_ms });
-    try writer.print("\"concurrency\":{{\"available_threads\":{},\"outer_scan_threads\":{},\"execution_mode\":\"{s}\",\"sharding_enabled\":{s},\"sharded_files\":{},\"max_shard_threads\":{},\"max_shard_ranges\":{},\"max_shard_chunk_bytes\":{}}},", .{ report.stats.concurrency.available_threads, report.stats.concurrency.outer_scan_threads, report.stats.concurrency.execution_mode, boolText(report.stats.concurrency.sharding_enabled), report.stats.concurrency.sharded_files, report.stats.concurrency.max_shard_threads, report.stats.concurrency.max_shard_ranges, report.stats.concurrency.max_shard_chunk_bytes });
+    try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"scan_open_ms_total\":{d},\"scan_file_ms_total\":{d},\"scan_file_mmap_ms_total\":{d},\"scan_file_buffered_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ report.stats.timings.discover_ms, report.stats.timings.scan_ms, report.stats.timings.aggregate_ms, report.stats.timings.total_ms, report.stats.timings.scan_work_ms_total, report.stats.timings.scan_open_ms_total, report.stats.timings.scan_file_ms_total, report.stats.timings.scan_file_mmap_ms_total, report.stats.timings.scan_file_buffered_ms_total, report.stats.timings.aggregate_merge_ms, report.stats.timings.aggregate_finalize_ms });
+    try writer.print("\"concurrency\":{{\"available_threads\":{},\"outer_scan_threads\":{},\"execution_mode\":\"{s}\",\"resource_profile\":\"{s}\",\"scan_input_policy\":\"{s}\",\"sharding_enabled\":{s},\"sharded_files\":{},\"max_shard_threads\":{},\"max_shard_ranges\":{},\"max_shard_chunk_bytes\":{}}},", .{ report.stats.concurrency.available_threads, report.stats.concurrency.outer_scan_threads, report.stats.concurrency.execution_mode, report.stats.concurrency.resource_profile, report.stats.concurrency.scan_input_policy, boolText(report.stats.concurrency.sharding_enabled), report.stats.concurrency.sharded_files, report.stats.concurrency.max_shard_threads, report.stats.concurrency.max_shard_ranges, report.stats.concurrency.max_shard_chunk_bytes });
     try writer.writeAll("\"slowest_files\":[");
     for (report.stats.slowest_files[0..report.stats.slowest_file_count], 0..) |slowest, index| {
         if (index != 0) try writer.writeAll(",");
@@ -938,6 +938,10 @@ test "search json emits bounded slowest file attribution list" {
     const out = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_open_ms_total\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_file_ms_total\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_file_mmap_ms_total\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_file_buffered_ms_total\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_input_policy\":\"auto\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"resource_profile\":\"low\"") != null);
     const slow_index = std.mem.indexOf(u8, out, "\"path\":\"slow.h\"") orelse return error.MissingSlowFile;
     const fast_index = std.mem.indexOf(u8, out, "\"path\":\"fast.h\"") orelse return error.MissingFastFile;
 

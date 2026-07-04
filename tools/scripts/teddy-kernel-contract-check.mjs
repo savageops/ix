@@ -263,13 +263,8 @@ const requiredProofCommands = [
 const requiredDecisionProofCommands = [
   "compare-installed-speed.mjs --build --samples 12",
   "compare-historical-speed.mjs --build --samples 12",
-  "compare-older-snapshots.mjs --samples 12",
   "--identity-control-attempts 3",
   "--min-retainable-samples 12",
-  "--max-snapshots 2",
-  "--target-retainable-snapshots 2",
-  "--min-engine-improvement-pct 5",
-  "--min-paired-improvement-pct 5",
   "--require-strict",
   "--require-promotion",
 ];
@@ -703,7 +698,6 @@ if (evidenceBlockedMove && !String(decision.nextAllowedMove?.proofCommand ?? "")
 const decisionProofText = normalized([
   decision.proofCommands?.installedStrictSpeed,
   decision.proofCommands?.historicalSpeed,
-  decision.proofCommands?.olderSnapshots,
   decision.proofCommands?.speedGate,
   decision.nextAllowedMove?.proofCommand,
   decision.nextEngineeringMove?.proofCommand,
@@ -711,6 +705,9 @@ const decisionProofText = normalized([
 ].filter(Boolean).join("\n"));
 for (const command of includesAll(decisionProofText, requiredDecisionProofCommands.map((entry) => entry.toLowerCase()))) {
   failures.push(`decision missing required proof command: ${command}`);
+}
+if (decisionProofText.includes("compare-older-snapshots.mjs")) {
+  failures.push("decision proof commands must not require older-snapshot gates; use only the single hardest predecessor gate");
 }
 for (const rejected of [
   "scalar_start_byte_or_line_admission",

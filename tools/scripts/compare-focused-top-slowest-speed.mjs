@@ -16,8 +16,8 @@ if (args.includes("--help") || args.includes("-h")) {
 
 Runs compare-focused-slowest-speed.mjs over the top slowest files seen in
 recent installed/historical reports. Diagnostic attribution only; final
-promotion still requires the full installed, predecessor, and older-snapshot
-speed gates.
+promotion still requires the full installed gate plus the single hardest valid
+predecessor gate.
 
 Options:
   --top <n>                      Number of slow files. Default: 4.

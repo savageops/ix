@@ -181,6 +181,75 @@ export function summarizeSeries(values) {
   };
 }
 
+function xorshift32(seed) {
+  let state = (Number(seed) >>> 0) || 0x9e3779b9;
+  return () => {
+    state ^= state << 13;
+    state >>>= 0;
+    state ^= state >>> 17;
+    state >>>= 0;
+    state ^= state << 5;
+    state >>>= 0;
+    return state / 0x1_0000_0000;
+  };
+}
+
+function bootstrapResample(values, rand) {
+  const sample = new Array(values.length);
+  for (let i = 0; i < values.length; i += 1) {
+    sample[i] = values[Math.floor(rand() * values.length)];
+  }
+  return sample;
+}
+
+export function bootstrapPercentileConfidenceInterval(
+  values,
+  estimator = median,
+  {
+    alpha = 0.05,
+    iterations = 2000,
+    seed = 0x1a2b3c4d,
+  } = {},
+) {
+  const finite = values.filter((value) => Number.isFinite(value));
+  if (finite.length === 0) {
+    return null;
+  }
+  if (finite.length === 1) {
+    return {
+      estimator: estimator(finite),
+      lower: finite[0],
+      upper: finite[0],
+      alpha,
+      iterations: 0,
+      method: "bootstrap_percentile",
+      sampleCount: 1,
+      seed,
+    };
+  }
+  const rand = xorshift32(seed);
+  const estimates = [];
+  for (let i = 0; i < iterations; i += 1) {
+    estimates.push(estimator(bootstrapResample(finite, rand)));
+  }
+  estimates.sort((left, right) => left - right);
+  const lowerIndex = Math.max(0, Math.floor((alpha / 2) * estimates.length));
+  const upperIndex = Math.min(
+    estimates.length - 1,
+    Math.ceil((1 - alpha / 2) * estimates.length) - 1,
+  );
+  return {
+    estimator: estimator(finite),
+    lower: estimates[lowerIndex],
+    upper: estimates[upperIndex],
+    alpha,
+    iterations,
+    method: "bootstrap_percentile",
+    sampleCount: finite.length,
+    seed,
+  };
+}
+
 export function computeSpeedupPct(iexMs, rgMs) {
   if (rgMs <= 0) {
     return 0;

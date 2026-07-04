@@ -12,6 +12,14 @@ const std = @import("std");
 
 const VEC_SIZE = 32;
 const Vec = @Vector(VEC_SIZE, u8);
+const SHORT_NEEDLE_MAX = 16;
+const BITPARALLEL_NEEDLE_MAX = 64;
+
+const NeedleAnomalies = struct {
+    first: usize,
+    mid: usize,
+    last: usize,
+};
 
 /// SIMD-accelerated single-byte search (memchr equivalent).
 ///
@@ -64,9 +72,18 @@ pub inline fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return null;
     if (needle.len == 1) return indexOfByte(haystack, needle[0]);
+    if (needle.len <= SHORT_NEEDLE_MAX) {
+        if (indexOfShortOrdered(haystack, needle)) |index| return index;
+        if (shortNeedleAnchorIndex(needle) != null) return null;
+    }
+    if (needle.len <= BITPARALLEL_NEEDLE_MAX) {
+        return indexOfBitParallel(haystack, needle);
+    }
 
-    const first_byte: Vec = @splat(needle[0]);
-    const last_byte: Vec = @splat(needle[needle.len - 1]);
+    const anomalies = locateNeedleAnomalies(needle);
+    const first_byte: Vec = @splat(needle[anomalies.first]);
+    const mid_byte: Vec = @splat(needle[anomalies.mid]);
+    const last_byte: Vec = @splat(needle[anomalies.last]);
     const n_len = needle.len;
     const scan_end = haystack.len - n_len + 1;
 
@@ -75,20 +92,22 @@ pub inline fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
     // Main SIMD loop — check 32 candidate start positions per iteration.
     while (offset + VEC_SIZE <= scan_end) : (offset += VEC_SIZE) {
         // Load first-byte positions and corresponding last-byte positions.
-        const first_chunk: Vec = haystack[offset..][0..VEC_SIZE].*;
-        const last_chunk: Vec = haystack[offset + n_len - 1 ..][0..VEC_SIZE].*;
+        const first_chunk: Vec = haystack[offset + anomalies.first ..][0..VEC_SIZE].*;
+        const mid_chunk: Vec = haystack[offset + anomalies.mid ..][0..VEC_SIZE].*;
+        const last_chunk: Vec = haystack[offset + anomalies.last ..][0..VEC_SIZE].*;
 
         const first_mask: u32 = @bitCast(first_chunk == first_byte);
+        const mid_mask: u32 = @bitCast(mid_chunk == mid_byte);
         const last_mask: u32 = @bitCast(last_chunk == last_byte);
         // AND: both first and last byte must match.
-        var mask: u32 = first_mask & last_mask;
+        var mask: u32 = first_mask & mid_mask & last_mask;
 
         // Verify each surviving candidate.
         while (mask != 0) {
             const bit: u5 = @truncate(@ctz(mask));
             const pos = offset + bit;
             // Full verify — skip first and last bytes (already matched).
-            if (n_len <= 2 or std.mem.eql(u8, haystack[pos + 1 .. pos + n_len - 1], needle[1 .. n_len - 1])) {
+            if (std.mem.eql(u8, haystack[pos .. pos + n_len], needle)) {
                 return pos;
             }
             mask &= mask - 1; // Clear lowest set bit.
@@ -97,15 +116,234 @@ pub inline fn indexOf(haystack: []const u8, needle: []const u8) ?usize {
 
     // Scalar tail — at most VEC_SIZE-1 remaining start positions.
     while (offset < scan_end) : (offset += 1) {
-        if (haystack[offset] == needle[0] and
-            haystack[offset + n_len - 1] == needle[n_len - 1] and
-            (n_len <= 2 or std.mem.eql(u8, haystack[offset + 1 .. offset + n_len - 1], needle[1 .. n_len - 1])))
+        if (haystack[offset + anomalies.first] == needle[anomalies.first] and
+            haystack[offset + anomalies.mid] == needle[anomalies.mid] and
+            haystack[offset + anomalies.last] == needle[anomalies.last] and
+            std.mem.eql(u8, haystack[offset .. offset + n_len], needle))
         {
             return offset;
         }
     }
 
     return null;
+}
+
+fn locateNeedleAnomalies(needle: []const u8) NeedleAnomalies {
+    var anomalies = NeedleAnomalies{
+        .first = 0,
+        .mid = needle.len / 2,
+        .last = needle.len - 1,
+    };
+
+    const has_duplicates =
+        needle[anomalies.first] == needle[anomalies.mid] or
+        needle[anomalies.first] == needle[anomalies.last] or
+        needle[anomalies.mid] == needle[anomalies.last];
+
+    if (needle.len > 3 and has_duplicates) {
+        while (needle[anomalies.mid] == needle[anomalies.first] and anomalies.mid + 1 < anomalies.last) {
+            anomalies.mid += 1;
+        }
+        while ((needle[anomalies.last] == needle[anomalies.mid] or needle[anomalies.last] == needle[anomalies.first]) and
+            anomalies.last > anomalies.mid + 1)
+        {
+            anomalies.last -= 1;
+        }
+    }
+
+    if (needle.len > 8) {
+        var vibrant_first = anomalies.first;
+        var vibrant_mid = anomalies.mid;
+        const vibrant_last = anomalies.last;
+
+        while ((needle[vibrant_mid] > 191 or needle[vibrant_mid] == needle[vibrant_last]) and
+            vibrant_mid + 1 < vibrant_last)
+        {
+            vibrant_mid += 1;
+        }
+        if (needle[vibrant_mid] < 191) {
+            anomalies.mid = vibrant_mid;
+        } else {
+            vibrant_mid = anomalies.mid;
+        }
+
+        while ((needle[vibrant_first] > 191 or needle[vibrant_first] == needle[vibrant_mid] or
+            needle[vibrant_first] == needle[vibrant_last]) and
+            vibrant_first + 1 < vibrant_mid)
+        {
+            vibrant_first += 1;
+        }
+        if (needle[vibrant_first] < 191) {
+            anomalies.first = vibrant_first;
+        }
+    }
+
+    return anomalies;
+}
+
+pub inline fn countNonOverlapping(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0 or needle.len > haystack.len) return 0;
+    if (needle.len <= BITPARALLEL_NEEDLE_MAX) {
+        return countNonOverlappingBitParallel(haystack, needle);
+    }
+
+    var total: usize = 0;
+    var start: usize = 0;
+    while (start + needle.len <= haystack.len) {
+        const index = indexOf(haystack[start..], needle) orelse break;
+        total += 1;
+        start += index + needle.len;
+    }
+    return total;
+}
+
+inline fn indexOfBitParallel(haystack: []const u8, needle: []const u8) ?usize {
+    var masks = [_]u64{0} ** 256;
+    for (needle, 0..) |byte, index| {
+        const bit: u6 = @intCast(index);
+        masks[byte] |= @as(u64, 1) << bit;
+    }
+
+    const match_bit: u64 = @as(u64, 1) << @as(u6, @intCast(needle.len - 1));
+    var state: u64 = 0;
+
+    for (haystack, 0..) |byte, index| {
+        state = ((state << 1) | 1) & masks[byte];
+        if ((state & match_bit) != 0) {
+            return index + 1 - needle.len;
+        }
+    }
+
+    return null;
+}
+
+inline fn countNonOverlappingBitParallel(haystack: []const u8, needle: []const u8) usize {
+    var masks = [_]u64{0} ** 256;
+    for (needle, 0..) |byte, index| {
+        const bit: u6 = @intCast(index);
+        masks[byte] |= @as(u64, 1) << bit;
+    }
+
+    const match_bit: u64 = @as(u64, 1) << @as(u6, @intCast(needle.len - 1));
+    var state: u64 = 0;
+    var total: usize = 0;
+
+    for (haystack) |byte| {
+        state = ((state << 1) | 1) & masks[byte];
+        if ((state & match_bit) != 0) {
+            total += 1;
+            state = 0;
+        }
+    }
+
+    return total;
+}
+
+inline fn indexOfShortOrdered(haystack: []const u8, needle: []const u8) ?usize {
+    const anchor_index = shortNeedleAnchorIndex(needle) orelse return null;
+    const scan_end = haystack.len - needle.len + 1;
+    const anchor_limit = scan_end + anchor_index;
+    var verify_order: [SHORT_NEEDLE_MAX]u8 = undefined;
+    const verify_len = shortNeedleVerifyOrder(needle, anchor_index, &verify_order);
+    var anchor_cursor: usize = anchor_index;
+
+    while (anchor_cursor < anchor_limit) {
+        const rel = indexOfByte(haystack[anchor_cursor..anchor_limit], needle[anchor_index]) orelse break;
+        const anchor_pos = anchor_cursor + rel;
+        const start = anchor_pos - anchor_index;
+        if (shortNeedleEqualsOrdered(haystack[start .. start + needle.len], needle, &verify_order, verify_len)) {
+            return start;
+        }
+        anchor_cursor = anchor_pos + 1;
+    }
+
+    return null;
+}
+
+inline fn shortNeedleAnchorIndex(needle: []const u8) ?usize {
+    if (needle.len < 3 or needle.len > SHORT_NEEDLE_MAX) return null;
+
+    var best_index: usize = 0;
+    var best_commonness = byteCommonnessScore(needle[0]);
+    for (1..needle.len) |index| {
+        const commonness = byteCommonnessScore(needle[index]);
+        if (commonness < best_commonness or (commonness == best_commonness and index > best_index)) {
+            best_index = index;
+            best_commonness = commonness;
+        }
+    }
+
+    if (best_index == 0 or best_index + 1 == needle.len) return null;
+    return best_index;
+}
+
+inline fn shortNeedleVerifyOrder(needle: []const u8, anchor_index: usize, order: *[SHORT_NEEDLE_MAX]u8) usize {
+    var count: usize = 0;
+    for (0..needle.len) |index| {
+        if (index == anchor_index) continue;
+        const current_commonness = byteCommonnessScore(needle[index]);
+        var insert_at = count;
+        while (insert_at > 0) {
+            const previous_index = order[insert_at - 1];
+            const previous_commonness = byteCommonnessScore(needle[previous_index]);
+            if (current_commonness > previous_commonness) break;
+            if (current_commonness == previous_commonness and index < previous_index) break;
+            order[insert_at] = order[insert_at - 1];
+            insert_at -= 1;
+        }
+        order[insert_at] = @intCast(index);
+        count += 1;
+    }
+    return count;
+}
+
+inline fn shortNeedleEqualsOrdered(candidate: []const u8, needle: []const u8, order: *const [SHORT_NEEDLE_MAX]u8, order_len: usize) bool {
+    for (order[0..order_len]) |index8| {
+        const index: usize = index8;
+        if (candidate[index] != needle[index]) return false;
+    }
+    return true;
+}
+
+inline fn byteCommonnessScore(byte: u8) u8 {
+    return switch (byte) {
+        ' ', '\t', '\r', '\n' => 255,
+        '_', '-', '.', '/', '\\', ':', ';', ',', '0'...'9' => 220,
+        'A'...'Z', 'a'...'z' => alphaCommonnessScore(std.ascii.toLower(byte)),
+        else => 32,
+    };
+}
+
+inline fn alphaCommonnessScore(byte: u8) u8 {
+    return switch (byte) {
+        'e' => 210,
+        't' => 205,
+        'a' => 200,
+        'o' => 195,
+        'i' => 190,
+        'n' => 185,
+        's' => 180,
+        'r' => 175,
+        'l' => 170,
+        'd' => 165,
+        'h' => 160,
+        'u' => 155,
+        'c' => 150,
+        'm' => 145,
+        'f' => 140,
+        'y' => 135,
+        'w' => 130,
+        'g' => 125,
+        'p' => 120,
+        'b' => 115,
+        'v' => 110,
+        'k' => 105,
+        'x' => 80,
+        'q' => 75,
+        'j' => 70,
+        'z' => 65,
+        else => 100,
+    };
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -172,4 +410,63 @@ test "indexOf — first+last match but interior mismatch" {
     // 'f' and 'x' match at position 0 but interior differs.
     const data = "f__x fox";
     try std.testing.expectEqual(@as(?usize, 5), indexOf(data, "fox"));
+}
+
+test "locateNeedleAnomalies pivots duplicate fingerprint bytes" {
+    const anomalies = locateNeedleAnomalies("aXaYa");
+    try std.testing.expectEqual(@as(usize, 0), anomalies.first);
+    try std.testing.expectEqual(@as(usize, 3), anomalies.mid);
+    try std.testing.expectEqual(@as(usize, 4), anomalies.last);
+}
+
+test "locateNeedleAnomalies shifts away from UTF-8 prefix bytes when possible" {
+    const needle = [_]u8{ 0xD0, 0xD1, 0xD2, 'A', 'B', 'C', 0xD3, 0xD4, 0xD5, 'Z' };
+    const anomalies = locateNeedleAnomalies(&needle);
+    try std.testing.expectEqual(@as(usize, 3), anomalies.first);
+    try std.testing.expectEqual(@as(usize, 5), anomalies.mid);
+    try std.testing.expectEqual(@as(usize, 9), anomalies.last);
+}
+
+test "indexOf long literal route uses anomaly fingerprint and verifies survivors" {
+    const needle =
+        "aaaaa-source-code-long-literal-fingerprint-pivot-needle-0123456789-END";
+    try std.testing.expect(needle.len > BITPARALLEL_NEEDLE_MAX);
+    const data =
+        "aaaaa-source-code-long-literal-fingerprint-pivot-needle-0123456789-ENX " ++
+        "prefix " ++ needle ++ " suffix";
+    try std.testing.expectEqual(@as(?usize, 78), indexOf(data, needle));
+}
+
+test "short needle route prefers interior rare anchor when available" {
+    try std.testing.expectEqual(@as(?usize, 2), shortNeedleAnchorIndex("aa!a"));
+    try std.testing.expectEqual(@as(?usize, null), shortNeedleAnchorIndex("aaaa"));
+    try std.testing.expectEqual(@as(?usize, null), shortNeedleAnchorIndex("!aaa"));
+    try std.testing.expectEqual(@as(?usize, null), shortNeedleAnchorIndex("aaa!"));
+}
+
+test "indexOf â€” short ordered anchor skips common-prefix false starts" {
+    const data = "aaaaaaaabaaaa aa!a tail";
+    try std.testing.expectEqual(@as(?usize, 14), indexOf(data, "aa!a"));
+}
+
+test "indexOf â€” medium literal bit-parallel route finds first match" {
+    const needle = "ABCDEFGHIJKLMNOPQRST";
+    const data = "zzzzzzzzzz" ++ needle ++ "__tail";
+    try std.testing.expectEqual(@as(?usize, 10), indexOf(data, needle));
+}
+
+test "indexOf â€” medium literal bit-parallel route skips dense false starts" {
+    const needle = "prefix-needle-window";
+    const data = "prefix-needle-windov prefix-needle-window";
+    try std.testing.expectEqual(@as(?usize, 21), indexOf(data, needle));
+}
+
+test "countNonOverlapping â€” bit-parallel medium literal counts separated hits" {
+    const needle = "ABCDEFGHIJKLMNOPQRST";
+    const data = needle ++ "__" ++ needle ++ "__" ++ needle;
+    try std.testing.expectEqual(@as(usize, 3), countNonOverlapping(data, needle));
+}
+
+test "countNonOverlapping â€” bit-parallel repeated-byte needle stays non-overlapping" {
+    try std.testing.expectEqual(@as(usize, 2), countNonOverlapping("aaaaaaaa", "aaaa"));
 }

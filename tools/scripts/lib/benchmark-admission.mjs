@@ -25,7 +25,6 @@ export function remediationEntries(remediation) {
 
 function hasDefenderRemediation(remediation) {
   return remediationEntries(remediation).some((entry) =>
-    entry?.issueId === "defender_active_in_top_working_set" ||
     entry?.issueId === "defender_active_cpu_sample"
   );
 }
@@ -69,6 +68,17 @@ export function createBenchmarkAdmission({
     return !normalized.some((entry) => /^architecture-gate-\d{4}-\d{2}-\d{2}T/.test(path.basename(entry)));
   }
 
+  function hasDefenderAnalyzerAvailabilityVerification(remediation) {
+    return Array.isArray(remediation?.verificationCommands) &&
+      remediation.verificationCommands.some((command) =>
+        command?.issueId === "defender_performance_analyzer_available" &&
+        command.mutates === false &&
+        command.requiresAdmin === false &&
+        typeof command.command === "string" &&
+        command.command.includes("Get-Command New-MpPerformanceRecording, Get-MpPerformanceReport")
+      );
+  }
+
   function benchmarkHostRemediation(issues, context = {}) {
     const corpus = context.corpus ?? benchmarkCorpus;
     const stableStateRoot = path.dirname(context.stateDir ?? stateDir);
@@ -79,6 +89,8 @@ export function createBenchmarkAdmission({
       nativeInstallDir,
       stableStateRoot,
     ])];
+    const defenderRecordingDir = path.join(root, "tools", "reports", "defender-performance");
+    const defenderRecordingPath = path.join(defenderRecordingDir, "ix-benchmark-defender.etl");
     const actions = [];
     const verificationCommands = [];
     const seen = new Set();
@@ -109,20 +121,97 @@ export function createBenchmarkAdmission({
           true,
           true,
         );
-      } else if (issue.id === "defender_active_in_top_working_set" || issue.id === "defender_active_cpu_sample") {
+      } else if (issue.id === "defender_active_cpu_sample") {
+        addVerification(
+          "defender_performance_analyzer_available",
+          "Get-Command New-MpPerformanceRecording, Get-MpPerformanceReport | Select-Object Name,Source,Version | ConvertTo-Json -Depth 3",
+          "Confirms Microsoft Defender Performance Analyzer cmdlets are available before prescribing an elevated ETL capture.",
+        );
         addVerification(
           issue.id,
           "Get-MpPreference | Select-Object -ExpandProperty ExclusionPath",
           "Lists Defender exclusion paths without changing machine policy.",
           true,
         );
+        addVerification(
+          "defender_performance_analyzer_report",
+          `Get-MpPerformanceReport -Path ${psSingleQuote(defenderRecordingPath)} -TopProcesses 10 -TopScans 50 | ConvertTo-Json -Depth 4`,
+          "Converts a Defender performance recording into process and scan attribution after reproducing the benchmark window.",
+          true,
+        );
         add(
           issue.id,
-          "Pause or exclude benchmark corpus, build, report, and temporary state paths from Defender while collecting retained speed evidence.",
-          `Add-MpPreference -ExclusionPath ${paths.map(psSingleQuote).join(", ")}`,
-          "Active Defender CPU during host preflight means filesystem and process sampling can be perturbed by scanning.",
+          "Attribute active Defender CPU with Performance Analyzer before treating the benchmark miss as an IX runtime regression.",
+          null,
+          "Active Defender CPU during host preflight means filesystem and process sampling can be perturbed by scanning; diagnose the scan owner before changing IX code or machine policy.",
+        );
+        add(
+          "defender_performance_analyzer_capture",
+          "Capture Microsoft Defender Antivirus performance events while reproducing the benchmark miss.",
+          `New-Item -ItemType Directory -Force -Path ${psSingleQuote(defenderRecordingDir)} | Out-Null; New-MpPerformanceRecording -RecordTo ${psSingleQuote(defenderRecordingPath)}`,
+          "Microsoft documents this analyzer for identifying files, paths, extensions, and processes that cause Defender scan performance issues.",
           true,
           true,
+        );
+      } else if (issue.id === "interactive_workloads_present") {
+        add(
+          issue.id,
+          "Record resident interactive workloads and rely on fixed low-resource benchmark isolation; do not require closing Codex, Chrome, or other real desktop tools before retained speed evidence.",
+          null,
+          `${issue.detail ?? "Interactive foreground workloads"} is workload context; retained attribution should be driven by enforced isolation, scheduler pressure, active CPU, memory pressure, and paired identity controls.`,
+        );
+        addVerification(
+          issue.id,
+          "Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 8 Id,ProcessName,CPU,WorkingSet64",
+          "Records the live desktop workload envelope before retained benchmarking without prescribing app shutdown.",
+        );
+      } else if (issue.id === "benchmark_isolation_not_enforced" || issue.id === "benchmark_isolation_unavailable") {
+        add(
+          issue.id,
+          "Enable enforced benchmark isolation so retained speed runs use a fixed priority and affinity policy instead of the default desktop scheduler.",
+          null,
+          issue.detail ?? "Benchmark isolation was not enforced during host preflight.",
+        );
+        addVerification(
+          issue.id,
+          "node -e \"import('./tools/scripts/lib/benchmark-runner.mjs').then((m)=>console.log(JSON.stringify(m.hostSnapshot().benchmarkIsolation,null,2)))\"",
+          "Confirms the current benchmark isolation plan before rerunning retained speed gates.",
+        );
+      } else if (issue.id === "benchmark_isolation_topology_unavailable") {
+        add(
+          issue.id,
+          "Fix Windows CPU-topology discovery so retained benchmarks pin one logical processor per physical core instead of falling back to a blind low-bits mask.",
+          null,
+          issue.detail ?? "Benchmark isolation topology metadata was unavailable during host preflight.",
+        );
+        addVerification(
+          issue.id,
+          "node -e \"import('./tools/scripts/lib/benchmark-runner.mjs').then((m)=>console.log(JSON.stringify(m.hostSnapshot().benchmarkIsolation,null,2)))\"",
+          "Confirms Windows CPU-set topology and the resulting affinity selection before rerunning retained speed gates.",
+        );
+      } else if (issue.id === "scheduler_pressure_unavailable") {
+        add(
+          issue.id,
+          "Verify Windows scheduler pressure counters are readable before treating benchmark noise classification as complete.",
+          null,
+          issue.detail ?? "Scheduler pressure counters were unavailable during host preflight.",
+        );
+        addVerification(
+          issue.id,
+          "node -e \"import('./tools/scripts/lib/benchmark-runner.mjs').then((m)=>console.log(JSON.stringify(m.hostSnapshot().schedulerPressure,null,2)))\"",
+          "Confirms scheduler pressure telemetry is available before rerunning retained speed gates.",
+        );
+      } else if (issue.id === "processor_queue_length_high" || issue.id === "context_switch_rate_high" || issue.id === "system_cpu_pressure") {
+        add(
+          issue.id,
+          "Move retained benchmarks to a quieter host state or reduce competing workload concurrency before collecting promotion-grade speed evidence.",
+          null,
+          issue.detail ?? "Scheduler pressure indicates runnable contention during benchmark preflight.",
+        );
+        addVerification(
+          issue.id,
+          "node -e \"import('./tools/scripts/lib/benchmark-runner.mjs').then((m)=>console.log(JSON.stringify(m.hostSnapshot().schedulerPressure,null,2)))\"",
+          "Confirms processor queue length, context switches, and total CPU pressure before rerunning retained speed gates.",
         );
       } else if (issue.id === "low_available_memory") {
         add(
@@ -174,7 +263,6 @@ export function createBenchmarkAdmission({
         "ripgrep_12_sample",
         "installed_speed_compare",
         "historical_speed_compare",
-        "older_snapshot_ladder",
         "alternates_decision",
       ],
     };
@@ -193,27 +281,14 @@ export function createBenchmarkAdmission({
           "--speed-only",
           "--strict-installed-speed",
           "--strict-historical-speed",
-          "--strict-older-snapshots",
           "--installed-speed-samples",
           smokeSampleArg,
           "--historical-speed-samples",
           smokeSampleArg,
-          "--older-snapshot-samples",
-          smokeSampleArg,
-          "--older-snapshot-max",
-          "1",
-          "--older-snapshot-retainable-target",
-          "1",
-          "--older-snapshot-identity-attempts",
-          "3",
-          "--min-older-snapshot-engine-pct",
-          "5",
-          "--min-older-snapshot-paired-pct",
-          "5",
           "--min-retainable-speed-samples",
           smokeSampleArg,
         ].join(" "),
-        reason: "Confirms the host preflight is clean before spending full benchmark time.",
+        reason: "Confirms the host preflight is clean before spending full benchmark time on installed plus the single hardest valid predecessor.",
       },
       {
         id: "retained_installed_historical",
@@ -223,25 +298,14 @@ export function createBenchmarkAdmission({
           "--speed-only",
           "--strict-installed-speed",
           "--strict-historical-speed",
-          "--strict-older-snapshots",
           "--installed-speed-samples",
           sampleArg,
           "--historical-speed-samples",
           sampleArg,
-          "--older-snapshot-samples",
-          sampleArg,
-          "--older-snapshot-retainable-target",
-          "2",
-          "--older-snapshot-identity-attempts",
-          "3",
-          "--min-older-snapshot-engine-pct",
-          "5",
-          "--min-older-snapshot-paired-pct",
-          "5",
           "--min-retainable-speed-samples",
           sampleArg,
         ].join(" "),
-        reason: "Proves current repo IX against installed IX and older snapshots with retained sample depth.",
+        reason: "Proves current repo IX against installed IX and the single hardest valid predecessor with retained sample depth.",
       },
       {
         id: "retained_alternates_route",
@@ -595,6 +659,9 @@ export function createBenchmarkAdmission({
     if (hasDefenderRemediation(entry.remediation) && !hasStableDefenderRemediationPaths(entry.remediation)) {
       failures.push(`${laneId}: host-preflight skip Defender remediation must include stable benchmark exclusion paths`);
     }
+    if (hasDefenderRemediation(entry.remediation) && !hasDefenderAnalyzerAvailabilityVerification(entry.remediation)) {
+      failures.push(`${laneId}: host-preflight skip Defender remediation must include analyzer availability verification`);
+    }
   }
 
   function validateBenchmarkHostPreflightLane(entry, failures) {
@@ -609,6 +676,24 @@ export function createBenchmarkAdmission({
         typeof hostAfter.elevation.checked !== "boolean")
     ) {
       failures.push("benchmark_host_preflight: host snapshots require elevation metadata");
+    }
+    if (
+      entry.status !== "skipped" &&
+      (!isPlainObject(hostBefore?.benchmarkIsolation) ||
+        !isPlainObject(hostAfter?.benchmarkIsolation) ||
+        typeof hostBefore.benchmarkIsolation.mode !== "string" ||
+        typeof hostAfter.benchmarkIsolation.mode !== "string")
+    ) {
+      failures.push("benchmark_host_preflight: host snapshots require benchmark isolation metadata");
+    }
+    if (
+      entry.status !== "skipped" &&
+      (!isPlainObject(hostBefore?.schedulerPressure) ||
+        !isPlainObject(hostAfter?.schedulerPressure) ||
+        typeof hostBefore.schedulerPressure.checked !== "boolean" ||
+        typeof hostAfter.schedulerPressure.checked !== "boolean")
+    ) {
+      failures.push("benchmark_host_preflight: host snapshots require scheduler pressure metadata");
     }
     if (entry.status !== "failed") return;
     const remediation = entry.metrics?.remediation;
@@ -647,19 +732,22 @@ export function createBenchmarkAdmission({
     if (
       isPlainObject(remediation) &&
       Array.isArray(remediation.actions) &&
-      remediation.actions.some((action) => action?.issueId === "defender_active_in_top_working_set" && action.requiresAdmin !== true)
+      remediation.actions.some((action) => action?.issueId === "defender_resident_in_top_working_set" && action.requiresAdmin !== true)
     ) {
       failures.push("benchmark_host_preflight: Defender remediation must be marked admin-required");
     }
     if (
       isPlainObject(remediation) &&
       Array.isArray(remediation.verificationCommands) &&
-      remediation.verificationCommands.some((command) => command?.issueId === "defender_active_in_top_working_set" && command.requiresAdmin !== true)
+      remediation.verificationCommands.some((command) => command?.issueId === "defender_resident_in_top_working_set" && command.requiresAdmin !== true)
     ) {
       failures.push("benchmark_host_preflight: Defender verification must be marked admin-required");
     }
     if (hasDefenderRemediation(remediation) && !hasStableDefenderRemediationPaths(remediation)) {
       failures.push("benchmark_host_preflight: Defender remediation must include stable benchmark exclusion paths");
+    }
+    if (hasDefenderRemediation(remediation) && !hasDefenderAnalyzerAvailabilityVerification(remediation)) {
+      failures.push("benchmark_host_preflight: Defender remediation must include analyzer availability verification");
     }
   }
 
@@ -738,7 +826,7 @@ export function createBenchmarkAdmission({
       entry.status === "failed" &&
       isPlainObject(entry.metrics.remediation) &&
       Array.isArray(entry.metrics.remediation.actions) &&
-      entry.metrics.remediation.actions.some((action) => action?.issueId === "defender_active_in_top_working_set" && action.requiresAdmin !== true)
+      entry.metrics.remediation.actions.some((action) => action?.issueId === "defender_resident_in_top_working_set" && action.requiresAdmin !== true)
     ) {
       failures.push("benchmark_readiness: Defender remediation must be marked admin-required");
     }
@@ -747,7 +835,7 @@ export function createBenchmarkAdmission({
       isPlainObject(entry.metrics.remediation) &&
       Array.isArray(entry.metrics.remediation.verificationCommands) &&
       entry.metrics.remediation.verificationCommands.some((command) =>
-        command?.issueId === "defender_active_in_top_working_set" && command.requiresAdmin !== true
+        command?.issueId === "defender_resident_in_top_working_set" && command.requiresAdmin !== true
       )
     ) {
       failures.push("benchmark_readiness: Defender verification must be marked admin-required");
@@ -758,6 +846,13 @@ export function createBenchmarkAdmission({
       !hasStableDefenderRemediationPaths(entry.metrics.remediation)
     ) {
       failures.push("benchmark_readiness: Defender remediation must include stable benchmark exclusion paths");
+    }
+    if (
+      entry.status === "failed" &&
+      hasDefenderRemediation(entry.metrics.remediation) &&
+      !hasDefenderAnalyzerAvailabilityVerification(entry.metrics.remediation)
+    ) {
+      failures.push("benchmark_readiness: Defender remediation must include analyzer availability verification");
     }
     if (entry.status === "failed" && !isPlainObject(entry.metrics.privilege)) {
       failures.push("benchmark_readiness: failed status requires privilege readiness summary");
@@ -822,35 +917,28 @@ export function createBenchmarkAdmission({
         !hostSmoke.includes("--speed-only") ||
         !hostSmoke.includes("--strict-installed-speed") ||
         !hostSmoke.includes("--strict-historical-speed") ||
-        !hostSmoke.includes("--strict-older-snapshots") ||
         !hostSmoke.includes("--installed-speed-samples 2") ||
         !hostSmoke.includes("--historical-speed-samples 2") ||
-        !hostSmoke.includes("--older-snapshot-samples 2") ||
-        !hostSmoke.includes("--older-snapshot-max 1") ||
-        !hostSmoke.includes("--older-snapshot-retainable-target 1") ||
-        !hostSmoke.includes("--older-snapshot-identity-attempts 3") ||
-        !hostSmoke.includes("--min-older-snapshot-engine-pct 5") ||
-        !hostSmoke.includes("--min-older-snapshot-paired-pct 5") ||
         !hostSmoke.includes("--min-retainable-speed-samples 2")
       ) {
         failures.push("benchmark_readiness: host preflight smoke command must run strict paired-smoke speed gates");
+      }
+      if (hostSmoke.includes("--strict-older-snapshots") || hostSmoke.includes("--older-snapshot-")) {
+        failures.push("benchmark_readiness: host preflight smoke command must not require older-snapshot gates");
       }
       const retained = String(commandById.get("retained_installed_historical") ?? "");
       if (
         !retained.includes("--speed-only") ||
         !retained.includes("--strict-installed-speed") ||
         !retained.includes("--strict-historical-speed") ||
-        !retained.includes("--strict-older-snapshots") ||
         !retained.includes("--installed-speed-samples 12") ||
         !retained.includes("--historical-speed-samples 12") ||
-        !retained.includes("--older-snapshot-samples 12") ||
-        !retained.includes("--older-snapshot-retainable-target 2") ||
-        !retained.includes("--older-snapshot-identity-attempts 3") ||
-        !retained.includes("--min-older-snapshot-engine-pct 5") ||
-        !retained.includes("--min-older-snapshot-paired-pct 5") ||
         !retained.includes("--min-retainable-speed-samples 12")
       ) {
         failures.push("benchmark_readiness: retained installed/historical command must run strict retained sample gates");
+      }
+      if (retained.includes("--strict-older-snapshots") || retained.includes("--older-snapshot-")) {
+        failures.push("benchmark_readiness: retained installed/historical command must not require older-snapshot gates");
       }
       const alternates = String(commandById.get("retained_alternates_route") ?? "");
       if (

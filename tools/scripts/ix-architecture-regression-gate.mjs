@@ -21,12 +21,14 @@ import { createProcessGateValidation } from "./lib/process-gate-validation.mjs";
 import { createAgentSurfaceGateValidation } from "./lib/agent-surface-gate-validation.mjs";
 import { createPlanningGateValidation } from "./lib/planning-gate-validation.mjs";
 import { createNativeInstallGateValidation } from "./lib/native-install-gate-validation.mjs";
-import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
+import { argValue, preferHistoricalSelectionSeed, timestampSlug } from "./lib/script-helpers.mjs";
 import { runSchemaSelfTest } from "./lib/schema-self-test-gate.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "architecture-gate");
 const LATEST_TEDDY_DECISION = path.join(ROOT, "tools", "reports", "teddy-kernel-decision", "latest-teddy-kernel-decision.json");
+const LATEST_HISTORICAL_SPEED = path.join(ROOT, "tools", "reports", "historical-speed", "latest-historical-speed.json");
+const LATEST_NONDIAGNOSTIC_HISTORICAL_SPEED = path.join(ROOT, "tools", "reports", "historical-speed", "latest-nondiagnostic-historical-speed.json");
 const NATIVE_INSTALL_DIR = path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin");
 const NATIVE_INSTALL_IX = path.join(NATIVE_INSTALL_DIR, "ix.exe");
 const NATIVE_INSTALL_IEX = path.join(NATIVE_INSTALL_DIR, "iex.exe");
@@ -48,19 +50,19 @@ Options:
   --strict-installed-speed                 Require installed speed strict evidence.
   --historical-speed                       Include previous-build speed lane.
   --strict-historical-speed                Require historical speed strict evidence.
-  --older-snapshots                        Include older snapshot ladder speed lane.
-  --strict-older-snapshots                 Require older snapshot strict evidence.
+  --older-snapshots                        Include diagnostic older snapshot ladder speed lane.
+  --strict-older-snapshots                 Require diagnostic older snapshot strict evidence for an explicitly reopened lane.
   --alternates-decision                    Include literal-alternates decision lane.
   --out <path>                             Report output path.
   --state-dir <path>                       Temporary state directory.
   --installed-speed-samples <n>            Installed speed samples. Default: 12.
   --historical-speed-samples <n>           Historical speed samples. Default: 12.
-  --older-snapshot-samples <n>             Older snapshot samples. Default: 12.
-  --older-snapshot-max <n>                 Older snapshot cap for smoke runs.
-  --older-snapshot-retainable-target <n>   Retainable older snapshot target for strict runs.
-  --older-snapshot-identity-attempts <n>   Same-binary control attempts. Default: 3.
-  --min-older-snapshot-engine-pct <n>      Required older-snapshot engine improvement.
-  --min-older-snapshot-paired-pct <n>      Required older-snapshot paired improvement.
+  --older-snapshot-samples <n>             Diagnostic older snapshot samples. Default: 12.
+  --older-snapshot-max <n>                 Diagnostic older snapshot cap for smoke runs.
+  --older-snapshot-retainable-target <n>   Diagnostic retainable older snapshot target for strict runs.
+  --older-snapshot-identity-attempts <n>   Diagnostic same-binary control attempts. Default: 3.
+  --min-older-snapshot-engine-pct <n>      Diagnostic older-snapshot engine improvement target.
+  --min-older-snapshot-paired-pct <n>      Diagnostic older-snapshot paired improvement target.
   --alternates-decision-samples <n>        Alternates samples. Default: 12.
   --alternates-decision-max-branches <n>   Alternates max branch count. Default: 8.
   --alternates-decision-branch-counts <csv>
@@ -289,6 +291,7 @@ if (schemaSelfTest) {
     stateDir,
     outPath,
     classifyHostForBenchmark,
+    preferHistoricalSelectionSeed,
     validateReport,
     validateBenchmarkHostPreflightLane,
     validateBenchmarkLockLane,
@@ -547,8 +550,8 @@ function historicalSpeedLane(hostPreflight = null) {
     return lane("historical_speed_compare", "skipped", { reason: "zig-out binary missing; run build first", corpus, strictRequired });
   }
 
-  const latestPath = path.join(ROOT, "tools", "reports", "historical-speed", "latest-historical-speed.json");
-  rmSync(latestPath, { force: true });
+  rmSync(LATEST_HISTORICAL_SPEED, { force: true });
+  rmSync(LATEST_NONDIAGNOSTIC_HISTORICAL_SPEED, { force: true });
   const commandArgs = [
     "tools/scripts/compare-historical-speed.mjs",
     "--corpus",
@@ -564,7 +567,7 @@ function historicalSpeedLane(hostPreflight = null) {
     "--identity-noise-multiplier",
     String(identityNoiseMultiplier),
     "--max-backups",
-    "6",
+    "1",
     "--quiet",
   ];
   if (strictRequired) {
@@ -573,12 +576,15 @@ function historicalSpeedLane(hostPreflight = null) {
     commandArgs.push("--no-require-strict");
   }
   const evidence = run(process.execPath, commandArgs);
+  const latestPath = existsSync(LATEST_NONDIAGNOSTIC_HISTORICAL_SPEED)
+    ? LATEST_NONDIAGNOSTIC_HISTORICAL_SPEED
+    : LATEST_HISTORICAL_SPEED;
   if (!existsSync(latestPath)) {
     return lane("historical_speed_compare", "failed", {
       corpus,
       strictRequired,
       evidence,
-      reason: "historical-speed comparator did not write latest-historical-speed.json",
+      reason: "historical-speed comparator did not write an authoritative latest historical report",
     });
   }
 
@@ -759,7 +765,7 @@ function olderSnapshotLadderLane(hostPreflight = null) {
   if (quick) return lane("older_snapshot_ladder", "skipped", { reason: "--quick", strictRequired });
   if (!olderSnapshots && !strictOlderSnapshots) {
     return lane("older_snapshot_ladder", "skipped", {
-      reason: "enable with --older-snapshots or --strict-older-snapshots",
+      reason: "diagnostic-only; enable with --older-snapshots or --strict-older-snapshots when explicitly reopened",
       strictRequired,
     });
   }

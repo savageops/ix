@@ -4,6 +4,7 @@ const windows = std.os.windows;
 const catalog = @import("catalog.zig");
 const generation = @import("generation.zig");
 const postings = @import("postings.zig");
+const resource_profile = @import("resource_profile.zig");
 const state_dir = @import("state_dir.zig");
 const usn = @import("usn.zig");
 
@@ -37,7 +38,6 @@ pub const MEMORY_LIMIT_ENV = "IX_INDEXD_MEMORY_LIMIT_MB";
 const INDEX_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_FILE_READ_LIMIT: usize = 64 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_TOTAL_READ_LIMIT: usize = 384 * 1024 * 1024;
-const INDEXD_DEFAULT_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024;
 const MUTATION_SETTLE_WINDOW_NS: u64 = 75 * std.time.ns_per_ms;
 const MUTATION_SETTLE_MAX_WINDOWS: u32 = 2;
 
@@ -349,8 +349,9 @@ fn fileTimeToUnixNs(file_time: windows.FILETIME) i128 {
 }
 
 fn configuredMemoryLimitBytes() usize {
-    const value_ptr = std.c.getenv(MEMORY_LIMIT_ENV ++ "\x00") orelse return INDEXD_DEFAULT_MEMORY_LIMIT_BYTES;
-    return parseMemoryLimitMb(std.mem.span(value_ptr)) orelse INDEXD_DEFAULT_MEMORY_LIMIT_BYTES;
+    const profile_default = resource_profile.current().indexdDefaultMemoryLimitBytes();
+    const value_ptr = std.c.getenv(MEMORY_LIMIT_ENV ++ "\x00") orelse return profile_default;
+    return parseMemoryLimitMb(std.mem.span(value_ptr)) orelse profile_default;
 }
 
 fn parseMemoryLimitMb(value: []const u8) ?usize {

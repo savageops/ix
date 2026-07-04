@@ -11,6 +11,31 @@ const builtin = @import("builtin");
 var nt_cwd_prefix: [1024]u8 = undefined;
 var nt_cwd_prefix_len: usize = 0;
 
+fn ntPathPrefix(display_path: []const u8) []const u8 {
+    const nt_hdr = "\\??\\";
+    const is_abs = display_path.len >= 2 and display_path[1] == ':' and
+        ((display_path[0] >= 'A' and display_path[0] <= 'Z') or
+            (display_path[0] >= 'a' and display_path[0] <= 'z'));
+    return if (is_abs) nt_hdr else nt_cwd_prefix[0..nt_cwd_prefix_len];
+}
+
+fn writeNtPath(prefix: []const u8, display_path: []const u8, out: []u8) ?[]const u8 {
+    const total_len = prefix.len + display_path.len;
+    if (total_len > out.len) return null;
+
+    @memcpy(out[0..prefix.len], prefix);
+    var write_pos: usize = prefix.len;
+    var previous_was_separator = write_pos > 0 and out[write_pos - 1] == '\\';
+    for (display_path) |byte| {
+        const normalized: u8 = if (byte == '/') '\\' else byte;
+        if (normalized == '\\' and previous_was_separator) continue;
+        out[write_pos] = normalized;
+        write_pos += 1;
+        previous_was_separator = normalized == '\\';
+    }
+    return out[0..write_pos];
+}
+
 /// Resolves CWD into an NT object path prefix.
 pub fn initCwdPrefix(io: std.Io) void {
     if (comptime builtin.os.tag != .windows) return;
@@ -36,25 +61,22 @@ pub inline fn openFile(io: std.Io, display_path: []const u8) !std.Io.File {
     if (nt_cwd_prefix_len == 0)
         return std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false });
 
-    const nt_hdr: []const u8 = "\\??\\";
-    const is_abs = display_path.len >= 2 and display_path[1] == ':' and
-        ((display_path[0] >= 'A' and display_path[0] <= 'Z') or
-            (display_path[0] >= 'a' and display_path[0] <= 'z'));
-    const prefix = if (is_abs) nt_hdr else nt_cwd_prefix[0..nt_cwd_prefix_len];
-    const total_len = prefix.len + display_path.len;
-
     var nt_buf: [1280]u8 = undefined;
-    if (total_len > nt_buf.len)
+    const prefix = ntPathPrefix(display_path);
+    const nt_path = writeNtPath(prefix, display_path, &nt_buf) orelse
         return std.Io.Dir.cwd().openFile(io, display_path, .{ .allow_directory = false });
+    return std.Io.Dir.cwd().openFile(io, nt_path, .{ .allow_directory = false });
+}
 
-    @memcpy(nt_buf[0..prefix.len], prefix);
-    @memcpy(nt_buf[prefix.len..][0..display_path.len], display_path);
-    var write_pos: usize = 0;
-    for (nt_buf[0..total_len]) |b| {
-        const c = if (b == '/') @as(u8, '\\') else b;
-        if (write_pos > 0 and c == '\\' and nt_buf[write_pos - 1] == '\\') continue;
-        nt_buf[write_pos] = c;
-        write_pos += 1;
-    }
-    return std.Io.Dir.cwd().openFile(io, nt_buf[0..write_pos], .{ .allow_directory = false });
+test "writeNtPath normalizes only the display path payload" {
+    var out: [128]u8 = undefined;
+    const prefix = "\\??\\C:\\repo\\";
+    const encoded = writeNtPath(prefix, "src/core//search.zig", &out) orelse return error.TestExpectedPath;
+    try std.testing.expectEqualStrings("\\??\\C:\\repo\\src\\core\\search.zig", encoded);
+}
+
+test "writeNtPath keeps absolute drive paths rooted at nt header" {
+    var out: [128]u8 = undefined;
+    const encoded = writeNtPath("\\??\\", "E:/Workspaces//ix-zig/src/core/search.zig", &out) orelse return error.TestExpectedPath;
+    try std.testing.expectEqualStrings("\\??\\E:\\Workspaces\\ix-zig\\src\\core\\search.zig", encoded);
 }

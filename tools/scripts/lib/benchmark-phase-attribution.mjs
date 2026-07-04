@@ -1,3 +1,5 @@
+import { bootstrapPercentileConfidenceInterval, median } from "./metrics.mjs";
+
 function finiteNumbers(values) {
   return values
     .filter((value) => value != null)
@@ -53,6 +55,12 @@ function delta(left, right) {
   return leftNumber - rightNumber;
 }
 
+function nonNegativeDelta(left, right) {
+  const computed = delta(left, right);
+  if (!Number.isFinite(computed)) return null;
+  return computed < 0 ? 0 : computed;
+}
+
 function nsToMs(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number / 1_000_000 : null;
@@ -61,7 +69,7 @@ function nsToMs(value) {
 function subphaseTimingPresent(openMs, fileMs) {
   const open = Number(openMs);
   const file = Number(fileMs);
-  return Number.isFinite(open) && open > 0 && Number.isFinite(file) && file > 0;
+  return Number.isFinite(open) && open >= 0 && Number.isFinite(file) && file >= 0;
 }
 
 const PAIRED_TIMING_BASIS = "paired_samples";
@@ -143,14 +151,27 @@ function pairedMetricStats(baselineSamples, candidateSamples, count, metric) {
   const finiteImprovementPct = pairs
     .map((pair) => pair.candidateImprovementPct)
     .filter(Number.isFinite);
+  const deltas = pairs.map((pair) => pair.delta).filter(Number.isFinite);
   return {
     count: pairs.length,
     candidateWins,
     baselineWins,
     ties,
     candidateWinRate: pairs.length === 0 ? null : candidateWins / pairs.length,
-    deltaSummary: pairs.length === 0 ? null : summary(pairs.map((pair) => pair.delta)),
+    deltaSummary: pairs.length === 0 ? null : summary(deltas),
+    deltaBootstrap95:
+      deltas.length === 0
+        ? null
+        : bootstrapPercentileConfidenceInterval(deltas, median, {
+            seed: 0x2000 + metric.key.split("").reduce((sum, ch) => sum + ch.charCodeAt(0), 0),
+          }),
     candidateImprovementPctSummary: finiteImprovementPct.length === 0 ? null : summary(finiteImprovementPct),
+    candidateImprovementPctBootstrap95:
+      finiteImprovementPct.length === 0
+        ? null
+        : bootstrapPercentileConfidenceInterval(finiteImprovementPct, median, {
+            seed: 0x4000 + metric.key.split("").reduce((sum, ch) => sum + ch.charCodeAt(0), 0),
+          }),
     pairs,
   };
 }
@@ -181,6 +202,7 @@ export function pairedEngineStats(baselineSamples, candidateSamples, { baselineL
   const finiteImprovementPct = pairs
     .map((pair) => pair[`${candidateLabel}ImprovementPct`])
     .filter(Number.isFinite);
+  const deltas = pairs.map((pair) => pair.deltaMs).filter(Number.isFinite);
   const attribution = Object.fromEntries(
     PAIRED_ATTRIBUTION_METRICS.map((metric) => [
       metric.key,
@@ -195,8 +217,16 @@ export function pairedEngineStats(baselineSamples, candidateSamples, { baselineL
     baselineWins,
     ties,
     candidateWinRate: count === 0 ? null : candidateWins / count,
-    deltaSummary: count === 0 ? null : summary(pairs.map((pair) => pair.deltaMs)),
+    deltaSummary: count === 0 ? null : summary(deltas),
+    deltaBootstrap95:
+      deltas.length === 0
+        ? null
+        : bootstrapPercentileConfidenceInterval(deltas, median, { seed: 0x5eed1e55 }),
     candidateImprovementPctSummary: finiteImprovementPct.length === 0 ? null : summary(finiteImprovementPct),
+    candidateImprovementPctBootstrap95:
+      finiteImprovementPct.length === 0
+        ? null
+        : bootstrapPercentileConfidenceInterval(finiteImprovementPct, median, { seed: 0x5eedc1 }),
     attribution,
     pairs,
   };
@@ -331,11 +361,29 @@ function discoverAttributionFromRounds(targetRounds) {
 
 export function phaseLeakSummaryFromRounds(rounds) {
   const usableRounds = Array.isArray(rounds) ? rounds : [];
+  const comparableRounds = usableRounds.filter((round) =>
+    round?.matchParity === true && round?.routeParityAcceptable === true
+  );
+  const excludedRounds = usableRounds
+    .filter((round) => !(round?.matchParity === true && round?.routeParityAcceptable === true))
+    .map((round) => ({
+      roundIndex: round?.roundIndex ?? null,
+      baselineLabel: round?.baselineLabel ?? null,
+      matchParity: round?.matchParity ?? null,
+      routeParityAcceptable: round?.routeParityAcceptable ?? null,
+      pairedEngineMedianPct: round?.pairedCandidateImprovementMedianPct ?? null,
+      reason:
+        round?.matchParity !== true
+          ? "match_parity_failed"
+          : "route_parity_not_acceptable",
+    }));
+  const timingComparable = comparableRounds.length > 0;
+  const attributionRounds = timingComparable ? comparableRounds : [];
   const averages = Object.fromEntries(
-    PHASE_LEAK_FIELDS.map(([name, key]) => [name, average(usableRounds.map((round) => round?.[key]))]),
+    PHASE_LEAK_FIELDS.map(([name, key]) => [name, average(attributionRounds.map((round) => round?.[key]))]),
   );
   const deltaMsAverages = Object.fromEntries(
-    PHASE_LEAK_FIELDS.map(([name, , deltaKey]) => [name, average(usableRounds.map((round) => round?.[deltaKey]))]),
+    PHASE_LEAK_FIELDS.map(([name, , deltaKey]) => [name, average(attributionRounds.map((round) => round?.[deltaKey]))]),
   );
   const leakingPhaseCounts = Object.fromEntries(PHASE_LEAK_FIELDS.map(([name]) => [name, 0]));
   const negativeAverages = Object.entries(averages)
@@ -347,7 +395,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
       pairedDeltaMedianMs: Number.isFinite(Number(deltaMsAverages[name])) ? Number(deltaMsAverages[name]) : null,
       pairedDeltaMagnitudeMs: Number.isFinite(Number(deltaMsAverages[name])) ? Math.abs(Number(deltaMsAverages[name])) : null,
     }));
-  const roundsWithLeaks = usableRounds.map((round) => {
+  const roundsWithLeaks = attributionRounds.map((round) => {
     const phases = Object.fromEntries(PHASE_LEAK_FIELDS.map(([name, key, deltaKey]) => [
       name,
       {
@@ -381,7 +429,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
   const worstRound = roundsWithLeaks
     .filter((round) => Number.isFinite(Number(round.pairedEngineMedianPct)))
     .sort((left, right) => Number(left.pairedEngineMedianPct) - Number(right.pairedEngineMedianPct))[0] ?? null;
-  const averageEnginePairedMedianPct = average(usableRounds.map((round) => round?.pairedCandidateImprovementMedianPct));
+  const averageEnginePairedMedianPct = average(attributionRounds.map((round) => round?.pairedCandidateImprovementMedianPct));
   const teddyWinningEngineLeaking =
     Number(averages.teddyRange) > 0 &&
     Number(averageEnginePairedMedianPct) < 0;
@@ -428,10 +476,9 @@ export function phaseLeakSummaryFromRounds(rounds) {
     .map((round) => {
       const phase = round.negativePhases.find((entry) => entry.name === nextRepairTarget) ?? {};
       const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
-      const baselineScanSplitPresent = subphaseTimingPresent(
-        sourceRound.baselineScanOpenMedianMs,
-        sourceRound.baselineScanFileMedianMs,
-      );
+      const baselineScanSplitPresent =
+        sourceRound.scanSplitTelemetryEnabled === true &&
+        subphaseTimingPresent(sourceRound.baselineScanOpenMedianMs, sourceRound.baselineScanFileMedianMs);
       const baselineScanOpenSharePct = baselineScanSplitPresent
         ? ratioPct(sourceRound.baselineScanOpenMedianMs, sourceRound.baselineScanWorkMedianMs)
         : null;
@@ -480,6 +527,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
         ignoredEntriesSkipped: medianPair(sourceRound, "IgnoredEntriesSkipped"),
         accessErrorsTotal: medianPair(sourceRound, "AccessErrorsTotal"),
         discoveryAccessErrors: medianPair(sourceRound, "DiscoveryAccessErrors"),
+        scanSplitTelemetryEnabled: sourceRound.scanSplitTelemetryEnabled === true,
         baselineScanSplitPresent,
         candidateScanWorkMedianMs: optionalNumber(sourceRound.candidateScanWorkMedianMs),
         candidateScanOpenMedianMs: optionalNumber(sourceRound.candidateScanOpenMedianMs),
@@ -518,9 +566,12 @@ export function phaseLeakSummaryFromRounds(rounds) {
   const currentOnlyScanSplit = ["scanWork", "scanFile"].includes(nextRepairTarget)
     ? (() => {
         const candidateSplitRounds = targetRounds.filter((round) =>
+          round.scanSplitTelemetryEnabled === true &&
           subphaseTimingPresent(round.candidateScanOpenMedianMs, round.candidateScanFileMedianMs)
         );
-        const predecessorSplitRounds = targetRounds.filter((round) => round.baselineScanSplitPresent);
+        const predecessorSplitRounds = targetRounds.filter((round) =>
+          round.scanSplitTelemetryEnabled === true && round.baselineScanSplitPresent
+        );
         const candidateScanOpenShare = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenSharePct));
         const candidateScanFileShare = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileSharePct));
         const candidateScanOpenMedianMs = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenMedianMs));
@@ -535,12 +586,18 @@ export function phaseLeakSummaryFromRounds(rounds) {
         const candidateScanOpenPathMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenPathMsPerFileMedian));
         const candidateScanOpenSyscallMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanOpenSyscallMsPerFileMedian));
         const candidateScanFileMsPerFileMedian = optionalSummary(candidateSplitRounds.map((round) => round.candidateScanFileMsPerFileMedian));
+        const candidateScanFileExclusiveMedianMs = optionalSummary(candidateSplitRounds.map((round) =>
+          nonNegativeDelta(round.candidateScanFileMedianMs, round.candidateScanOpenMedianMs)
+        ));
+        const candidateScanFileExclusiveSharePct = optionalSummary(candidateSplitRounds.map((round) =>
+          ratioPct(nonNegativeDelta(round.candidateScanFileMedianMs, round.candidateScanOpenMedianMs), round.candidateScanWorkMedianMs)
+        ));
         const fileParityValues = candidateSplitRounds.map((round) => round.filesScannedParity);
         const filesScannedParity = fileParityValues.length === 0 || fileParityValues.some((value) => value == null)
           ? null
           : fileParityValues.every((value) => value === true);
         const scanFileResidualRounds = candidateSplitRounds.map((round) => {
-          const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
+          const sourceRound = attributionRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
           const teddyMs = nsToMs(sourceRound.candidateAlternateTeddyRangeElapsedNsMedian);
           const fullScanMs = nsToMs(sourceRound.candidateAlternateFullScanElapsedNsMedian);
           const fastCountMs = optionalNumber(round.candidateScanFileFastCountMedianMs);
@@ -579,7 +636,7 @@ export function phaseLeakSummaryFromRounds(rounds) {
         const scanFileResidualSharePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileResidualSharePct));
         const scanFileWallResidualSharePct = optionalSummary(scanFileResidualRounds.map((round) => round.candidateScanFileWallResidualSharePct));
         const candidateSlowestPathHotspots = topWeightedEntries(candidateSplitRounds.flatMap((round) => {
-          const sourceRound = usableRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
+          const sourceRound = attributionRounds.find((entry) => entry?.roundIndex === round.roundIndex) ?? {};
           return Array.isArray(sourceRound.candidateSlowestPathTop) ? sourceRound.candidateSlowestPathTop : [];
         }));
         const candidateSlowestPathClasses = topWeightedEntries(candidateSlowestPathHotspots.map((entry) => ({
@@ -587,9 +644,9 @@ export function phaseLeakSummaryFromRounds(rounds) {
           count: entry.count,
         })));
         const dominantCandidateSubphase =
-          Number(candidateScanOpenShare?.median ?? 0) > Number(candidateScanFileShare?.median ?? 0)
+          Number(candidateScanOpenShare?.median ?? 0) > Number(candidateScanFileExclusiveSharePct?.median ?? 0)
             ? "scanOpen"
-            : (candidateScanFileShare == null ? null : "scanFile");
+            : (candidateScanFileExclusiveSharePct == null ? null : "scanFileExclusive");
         const regressingCandidateSubphase = [
           {
             name: "scanOpen",
@@ -653,6 +710,8 @@ export function phaseLeakSummaryFromRounds(rounds) {
           candidateScanOpenPathMsPerFileMedian,
           candidateScanOpenSyscallMsPerFileMedian,
           candidateScanFileMsPerFileMedian,
+          candidateScanFileExclusiveMedianMs,
+          candidateScanFileExclusiveSharePct,
           filesScannedParity,
           candidateTeddyShareOfScanFilePct: teddyShareOfScanFilePct,
           candidateAlternateFullScanShareOfScanFilePct: alternateFullScanShareOfScanFilePct,
@@ -669,8 +728,8 @@ export function phaseLeakSummaryFromRounds(rounds) {
           interpretation: candidateSplitRounds.length === 0
             ? `${nextRepairTarget} is leaking, but current split telemetry is unavailable; rerun with --scan-open-timing`
             : (predecessorSplitRounds.length < targetRounds.length
-                ? `${nextRepairTarget} is leaking; predecessor split telemetry is incomplete, so use current-only scanOpen/scanFile shares to choose the next owner`
-                : `${nextRepairTarget} is leaking; predecessor and candidate scanOpen/scanFile split telemetry are comparable`),
+                ? `${nextRepairTarget} is leaking; predecessor split telemetry is incomplete, so use current-only nested open plus file-exclusive timing to choose the next owner`
+                : `${nextRepairTarget} is leaking; predecessor and candidate nested open plus file-exclusive timing are comparable`),
         };
       })()
     : null;
@@ -688,12 +747,20 @@ export function phaseLeakSummaryFromRounds(rounds) {
       pairedEngineMedianPct: round.pairedEngineMedianPct,
       teddyRangeMedianPct: round.teddyRangeMedianPct,
     }));
-  const nextProbe = nextRepairTarget === "scanWork"
-    ? {
-        id: "split_scan_work_open_vs_file",
-        reason: "scanWork is leaking; use current-only scanOpen/scanFile medians when predecessor builds lack those counters",
-        commandSuffix: "--scan-open-timing",
-      }
+  const nextProbe = timingComparable !== true
+    ? null
+    : nextRepairTarget === "scanWork"
+    ? (currentOnlyScanSplit == null || currentOnlyScanSplit.candidateSplitRoundCount === 0
+      ? {
+          id: "split_scan_work_open_vs_file",
+          reason: "scanWork is leaking; collect nested scan-open and file timing before choosing the next owner",
+          commandSuffix: "--scan-open-timing",
+        }
+      : {
+          id: "isolate_scan_file_residual_owner",
+          reason: "scanWork is leaking and split timing is available; next proof should isolate file-exclusive residual work such as line-walk, mmap fallback, and bookkeeping rather than rerunning split capture",
+          commandSuffix: null,
+        })
     : (nextRepairTarget === "scanFile" && currentOnlyScanSplit == null
       ? {
           id: "split_scan_file_components",
@@ -706,13 +773,19 @@ export function phaseLeakSummaryFromRounds(rounds) {
           commandSuffix: null,
         }));
   return {
+    usableRoundCount: usableRounds.length,
+    comparableRoundCount: comparableRounds.length,
+    blockedByCorrectnessOrRouteParity: timingComparable !== true,
+    excludedRounds,
     averages,
     deltaMsAverages,
     timingBasis: {
       phaseLeakAverages: PAIRED_TIMING_BASIS,
       targetPhaseDeltas: PAIRED_TIMING_BASIS,
       scanOpenScanFileMedians: AGGREGATE_TIMING_BASIS,
-      note: "paired sample deltas decide regressions; aggregate timing medians are diagnostic owner hints and may disagree with paired deltas under scheduler or filesystem variance",
+      note: timingComparable
+        ? "paired sample deltas decide regressions; aggregate timing medians are diagnostic owner hints and may disagree with paired deltas under scheduler or filesystem variance"
+        : "timing attribution is blocked until at least one round preserves match parity and acceptable route parity",
     },
     negativeAverages,
     repairTargets,
@@ -726,10 +799,12 @@ export function phaseLeakSummaryFromRounds(rounds) {
       protectedWinningRounds,
       nextProbe,
     },
-    preservePositivePhase: shouldRepairLeak ? "teddyRange" : null,
-    nextRepairTarget,
-    diagnosis: shouldRepairLeak
-      ? "preserve_positive_teddy_gain_and_repair_whole_engine_leak"
-      : "no_positive_teddy_negative_engine_split_detected",
+    preservePositivePhase: timingComparable && shouldRepairLeak ? "teddyRange" : null,
+    nextRepairTarget: timingComparable ? nextRepairTarget : null,
+    diagnosis: timingComparable
+      ? (shouldRepairLeak
+          ? "preserve_positive_teddy_gain_and_repair_whole_engine_leak"
+          : "no_positive_teddy_negative_engine_split_detected")
+      : "timing_attribution_blocked_by_match_or_route_parity",
   };
 }

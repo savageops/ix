@@ -46,15 +46,23 @@ pub const Counter = struct {
     }
 
     pub inline fn countMatches(self: *const Counter, line: []const u8, case_insensitive: bool) usize {
+        return self.countMatchesInternal(line, case_insensitive, false);
+    }
+
+    pub inline fn countMatchesCasefoldedHaystack(self: *const Counter, line: []const u8) usize {
+        return self.countMatchesInternal(line, true, true);
+    }
+
+    inline fn countMatchesInternal(self: *const Counter, line: []const u8, case_insensitive: bool, haystack_casefolded: bool) usize {
         if (self.short_line_teddy_plan) |*plan| {
             if (line.len < TEDDY_RANGE_SHIFT_MIN_LINE_BYTES) {
-                return countTeddyPrefix3(line, &self.alternates, plan, case_insensitive);
+                return countTeddyPrefix3Internal(line, &self.alternates, plan, case_insensitive, haystack_casefolded);
             }
         }
         if (self.teddy_plan) |*plan| {
-            return countTeddyPrefix3(line, &self.alternates, plan, case_insensitive);
+            return countTeddyPrefix3Internal(line, &self.alternates, plan, case_insensitive, haystack_casefolded);
         }
-        return self.alternates.countMatchesScalar(line, case_insensitive);
+        return self.alternates.countMatchesScalarInternal(line, case_insensitive, haystack_casefolded);
     }
 
     pub inline fn usesTeddy(self: *const Counter) bool {
@@ -183,14 +191,22 @@ pub const LiteralAlternates = struct {
     }
 
     pub inline fn countMatchesScalar(self: *const LiteralAlternates, line: []const u8, case_insensitive: bool) usize {
+        return self.countMatchesScalarInternal(line, case_insensitive, false);
+    }
+
+    pub inline fn countMatchesScalarCasefoldedHaystack(self: *const LiteralAlternates, line: []const u8) usize {
+        return self.countMatchesScalarInternal(line, true, true);
+    }
+
+    inline fn countMatchesScalarInternal(self: *const LiteralAlternates, line: []const u8, case_insensitive: bool, haystack_casefolded: bool) usize {
         var total: usize = 0;
         var cursor: usize = 0;
         while (cursor < line.len) {
             const remaining = line[cursor..];
-            const start_offset = self.nextStartByteOffset(remaining, case_insensitive) orelse break;
+            const start_offset = self.nextStartByteOffsetInternal(remaining, case_insensitive, haystack_casefolded) orelse break;
             cursor += start_offset;
             const candidate = line[cursor..];
-            const best_len = self.firstMatchingBranchLen(candidate, case_insensitive) orelse {
+            const best_len = self.firstMatchingBranchLenInternal(candidate, case_insensitive, haystack_casefolded) orelse {
                 cursor += 1;
                 continue;
             };
@@ -201,25 +217,43 @@ pub const LiteralAlternates = struct {
     }
 
     pub inline fn nextStartByteOffset(self: *const LiteralAlternates, line: []const u8, case_insensitive: bool) ?usize {
+        return self.nextStartByteOffsetInternal(line, case_insensitive, false);
+    }
+
+    inline fn nextStartByteOffsetInternal(self: *const LiteralAlternates, line: []const u8, case_insensitive: bool, haystack_casefolded: bool) ?usize {
         if (line.len == 0) return null;
         if (!case_insensitive) return sz.indexOfByteSet(line, &self.first_byte_set);
+        if (haystack_casefolded) return sz.indexOfByteSet(line, &self.first_byte_folded_set);
         return sz.indexOfByteSet(line, &self.first_byte_case_set);
     }
 
     pub inline fn firstMatchingBranchLen(self: *const LiteralAlternates, candidate: []const u8, case_insensitive: bool) ?usize {
+        return self.firstMatchingBranchLenInternal(candidate, case_insensitive, false);
+    }
+
+    pub inline fn firstMatchingBranchLenCasefoldedHaystack(self: *const LiteralAlternates, candidate: []const u8) ?usize {
+        return self.firstMatchingBranchLenInternal(candidate, true, true);
+    }
+
+    inline fn firstMatchingBranchLenInternal(self: *const LiteralAlternates, candidate: []const u8, case_insensitive: bool, haystack_casefolded: bool) ?usize {
         if (candidate.len == 0) return null;
-        var branch_mask = self.branchMaskForByte(candidate[0], case_insensitive);
+        var branch_mask = self.branchMaskForByteInternal(candidate[0], case_insensitive, haystack_casefolded);
         while (branch_mask != 0) {
             const branch_index: u5 = @intCast(@ctz(branch_mask));
             branch_mask &= branch_mask - 1;
             const branch = self.branches[branch_index];
-            if (startsWithLiteral(candidate, branch, case_insensitive)) return branch.len;
+            if (startsWithLiteralInternal(candidate, branch, case_insensitive, haystack_casefolded)) return branch.len;
         }
         return null;
     }
 
     pub inline fn branchMaskForByte(self: *const LiteralAlternates, byte: u8, case_insensitive: bool) u32 {
+        return self.branchMaskForByteInternal(byte, case_insensitive, false);
+    }
+
+    inline fn branchMaskForByteInternal(self: *const LiteralAlternates, byte: u8, case_insensitive: bool, haystack_casefolded: bool) u32 {
         if (!case_insensitive) return self.first_byte_branch_masks[byte];
+        if (haystack_casefolded) return self.first_byte_folded_branch_masks[byte];
         return self.first_byte_folded_branch_masks[std.ascii.toLower(byte)];
     }
 };
@@ -336,6 +370,22 @@ pub inline fn count(line: []const u8, pattern: []const u8, case_insensitive: boo
     return total;
 }
 
+pub inline fn countCasefoldedHaystack(line: []const u8, pattern: []const u8) usize {
+    if (counterCacheEnabled()) {
+        if (counter_cache.ensureCompiled(pattern, true)) |counter| {
+            return counter.countMatchesCasefoldedHaystack(line);
+        }
+    }
+
+    const alternates = parse(pattern) orelse return 0;
+    const counter = Counter{
+        .alternates = alternates,
+        .teddy_plan = teddyPlanWithOffset(alternates, true, null),
+        .short_line_teddy_plan = null,
+    };
+    return counter.countMatchesCasefoldedHaystack(line);
+}
+
 pub inline fn parse(pattern: []const u8) ?LiteralAlternates {
     var alternates: LiteralAlternates = .{};
     var start: usize = 0;
@@ -443,6 +493,10 @@ fn literalPrefixCollision(left: []const u8, right: []const u8, case_insensitive:
 }
 
 inline fn countTeddyPrefix3(line: []const u8, alternates: *const LiteralAlternates, plan: *const TeddyPlan, case_insensitive: bool) usize {
+    return countTeddyPrefix3Internal(line, alternates, plan, case_insensitive, false);
+}
+
+inline fn countTeddyPrefix3Internal(line: []const u8, alternates: *const LiteralAlternates, plan: *const TeddyPlan, case_insensitive: bool, haystack_casefolded: bool) usize {
     if (line.len < TEDDY_FINGERPRINT_BYTES) return 0;
     if (plan.fingerprint_offset > 0) {
         if (plan.fingerprint_offset >= line.len) return 0;
@@ -456,8 +510,8 @@ inline fn countTeddyPrefix3(line: []const u8, alternates: *const LiteralAlternat
     const scan_limit = line.len - TEDDY_FINGERPRINT_BYTES + 1;
 
     while (cursor < scan_limit) {
-        if (nextTeddyCandidate(line, cursor, plan, case_insensitive)) |candidate| {
-            const branch_len = alternates.firstMatchingBranchLen(line[candidate..], case_insensitive) orelse {
+        if (nextTeddyCandidateInternal(line, cursor, plan, case_insensitive, haystack_casefolded)) |candidate| {
+            const branch_len = alternates.firstMatchingBranchLenInternal(line[candidate..], case_insensitive, haystack_casefolded) orelse {
                 cursor = candidate + 1;
                 continue;
             };
@@ -472,6 +526,10 @@ inline fn countTeddyPrefix3(line: []const u8, alternates: *const LiteralAlternat
 }
 
 inline fn nextTeddyCandidate(line: []const u8, start: usize, plan: *const TeddyPlan, case_insensitive: bool) ?usize {
+    return nextTeddyCandidateInternal(line, start, plan, case_insensitive, false);
+}
+
+inline fn nextTeddyCandidateInternal(line: []const u8, start: usize, plan: *const TeddyPlan, case_insensitive: bool, haystack_casefolded: bool) ?usize {
     const Vec = @Vector(32, u8);
     const VEC_SIZE = 32;
     if (line.len < TEDDY_FINGERPRINT_BYTES) return null;
@@ -483,7 +541,7 @@ inline fn nextTeddyCandidate(line: []const u8, start: usize, plan: *const TeddyP
         var c0: Vec = line[offset..][0..VEC_SIZE].*;
         var c1: Vec = line[offset + 1 ..][0..VEC_SIZE].*;
         var c2: Vec = line[offset + 2 ..][0..VEC_SIZE].*;
-        if (case_insensitive) {
+        if (case_insensitive and !haystack_casefolded) {
             c0 = asciiLowerVec32(c0);
             c1 = asciiLowerVec32(c1);
             c2 = asciiLowerVec32(c2);
@@ -500,9 +558,9 @@ inline fn nextTeddyCandidate(line: []const u8, start: usize, plan: *const TeddyP
     }
 
     while (offset < scan_limit) : (offset += 1) {
-        const b0 = if (case_insensitive) std.ascii.toLower(line[offset]) else line[offset];
-        const b1 = if (case_insensitive) std.ascii.toLower(line[offset + 1]) else line[offset + 1];
-        const b2 = if (case_insensitive) std.ascii.toLower(line[offset + 2]) else line[offset + 2];
+        const b0 = if (case_insensitive and !haystack_casefolded) std.ascii.toLower(line[offset]) else line[offset];
+        const b1 = if (case_insensitive and !haystack_casefolded) std.ascii.toLower(line[offset + 1]) else line[offset + 1];
+        const b2 = if (case_insensitive and !haystack_casefolded) std.ascii.toLower(line[offset + 2]) else line[offset + 2];
         for (0..plan.branch_count) |branch_index| {
             if (b0 == plan.fingerprints[branch_index][0] and
                 b1 == plan.fingerprints[branch_index][1] and
@@ -531,7 +589,7 @@ fn setByteMask(mask: *[4]u64, byte: u8) void {
 }
 
 inline fn indexOfLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) ?usize {
-    if (!case_insensitive) return sz.indexOf(line, needle);
+    if (!case_insensitive) return simd.indexOf(line, needle);
     if (needle.len == 0) return 0;
     if (needle.len > line.len) return null;
     var index: usize = 0;
@@ -542,19 +600,32 @@ inline fn indexOfLiteral(line: []const u8, needle: []const u8, case_insensitive:
 }
 
 inline fn startsWithLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) bool {
-    return line.len >= needle.len and literalEquals(line[0..needle.len], needle, case_insensitive);
+    return startsWithLiteralInternal(line, needle, case_insensitive, false);
+}
+
+inline fn startsWithLiteralInternal(line: []const u8, needle: []const u8, case_insensitive: bool, haystack_casefolded: bool) bool {
+    return line.len >= needle.len and literalEqualsInternal(line[0..needle.len], needle, case_insensitive, haystack_casefolded);
 }
 
 inline fn literalEquals(left: []const u8, right: []const u8, case_insensitive: bool) bool {
+    return literalEqualsInternal(left, right, case_insensitive, false);
+}
+
+inline fn literalEqualsInternal(left: []const u8, right: []const u8, case_insensitive: bool, haystack_casefolded: bool) bool {
     if (left.len != right.len) return false;
     for (left, right) |a, b| {
-        if (!byteEquals(a, b, case_insensitive)) return false;
+        if (!byteEqualsInternal(a, b, case_insensitive, haystack_casefolded)) return false;
     }
     return true;
 }
 
 inline fn byteEquals(left: u8, right: u8, case_insensitive: bool) bool {
+    return byteEqualsInternal(left, right, case_insensitive, false);
+}
+
+inline fn byteEqualsInternal(left: u8, right: u8, case_insensitive: bool, haystack_casefolded: bool) bool {
     if (!case_insensitive) return left == right;
+    if (haystack_casefolded) return left == std.ascii.toLower(right);
     return std.ascii.toLower(left) == std.ascii.toLower(right);
 }
 
@@ -598,6 +669,25 @@ test "literal alternates compiled folded start mask admits case insensitive line
     try std.testing.expectEqual(@as(?usize, 0), alternates.nextStartByteOffset("SHERLOCK HOLMES", true));
     try std.testing.expectEqual(@as(?usize, 1), alternates.column("sherlock holmes", true));
     try std.testing.expectEqual(@as(usize, 2), alternates.countMatches("sherlock holmes and irene adler", true));
+}
+
+test "literal alternates casefolded haystack matches case insensitive count" {
+    const pattern = "ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT";
+    const folded = "err_sys link_req_rst cfg_bme_evt";
+    try std.testing.expectEqual(count(folded, pattern, true), countCasefoldedHaystack(folded, pattern));
+}
+
+test "literal alternates uppercase branches match lowercase haystack under casefold" {
+    const pattern = "ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT";
+    try std.testing.expectEqual(@as(usize, 2), count("goto err_sysfs;\nerr_sysfs:\n", pattern, true));
+}
+
+
+test "literal alternates casefolded haystack uses folded start-byte and branch-mask path" {
+    const alternates = parse("ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT").?;
+    try std.testing.expectEqual(@as(?usize, 4), alternates.nextStartByteOffsetInternal("zzz err_sys", true, true));
+    try std.testing.expectEqual(@as(u32, 1), alternates.branchMaskForByteInternal('e', true, true));
+    try std.testing.expectEqual(@as(?usize, 7), alternates.firstMatchingBranchLenCasefoldedHaystack("err_sys trailing"));
 }
 
 test "literal alternates skip false start bytes and continue to later full match" {

@@ -1,7 +1,11 @@
+import { phaseLeakSummaryFromRounds } from "./benchmark-phase-attribution.mjs";
+import { hardestComparableHistoricalLabel } from "./script-helpers.mjs";
+
 export function runSchemaSelfTest({
   stateDir,
   outPath,
   classifyHostForBenchmark,
+  preferHistoricalSelectionSeed,
   validateReport,
   validateBenchmarkHostPreflightLane,
   validateBenchmarkLockLane,
@@ -34,7 +38,7 @@ export function runSchemaSelfTest({
     paths: ["C:\\bench\\architecture-gate-2026-06-13T00-00-00-000Z"],
     actions: [
       {
-        issueId: "defender_active_in_top_working_set",
+        issueId: "defender_resident_in_top_working_set",
         action: "fix defender",
         command: "Add-MpPreference -ExclusionPath C:\\bench\\architecture-gate-2026-06-13T00-00-00-000Z",
         reason: "test",
@@ -44,7 +48,7 @@ export function runSchemaSelfTest({
     ],
     verificationCommands: [
       {
-        issueId: "defender_active_in_top_working_set",
+        issueId: "defender_resident_in_top_working_set",
         command: "Get-MpPreference | Select-Object -ExpandProperty ExclusionPath",
         reason: "test",
         mutates: false,
@@ -283,15 +287,15 @@ export function runSchemaSelfTest({
       metrics: {
         hostClean: false,
         host: {
-          before: { elevation: { checked: true, isAdmin: false } },
-          after: { elevation: { checked: true, isAdmin: false } },
+          before: { elevation: { checked: true, isAdmin: false }, benchmarkIsolation: { mode: "enforce", supported: true }, schedulerPressure: { checked: true } },
+          after: { elevation: { checked: true, isAdmin: false }, benchmarkIsolation: { mode: "enforce", supported: true }, schedulerPressure: { checked: true } },
         },
         remediation: {
           blocked: true,
           paths: ["C:\\bench\\architecture-gate-2026-06-13T00-00-00-000Z"],
           actions: [
             {
-              issueId: "defender_active_in_top_working_set",
+              issueId: "defender_resident_in_top_working_set",
               action: "fix defender",
               command: "Add-MpPreference -ExclusionPath C:\\bench\\architecture-gate-2026-06-13T00-00-00-000Z",
               reason: "test",
@@ -301,7 +305,7 @@ export function runSchemaSelfTest({
           ],
           verificationCommands: [
             {
-              issueId: "defender_active_in_top_working_set",
+              issueId: "defender_resident_in_top_working_set",
               command: "Get-MpPreference | Select-Object -ExpandProperty ExclusionPath",
               reason: "test",
               mutates: false,
@@ -321,16 +325,27 @@ export function runSchemaSelfTest({
       activeCpuMinSec: 0.05,
       activeCpuHeavySec: 0.25,
       largeProcessWorkingSetBytes: 1024,
+      largeProcessWarningFreeMemRatio: 0.5,
+      largeProcessWarningShareOfTotalMem: 0.125,
       benchmarkProcessNames: ["node"],
     };
     const largeResident = classifyHostForBenchmark({
       topProcessesByWorkingSet: [{ Id: 7, ProcessName: "LM Studio", WorkingSet64: 2048 }],
       activeCpuProcesses: [],
       totalMemBytes: 16 * 1024 * 1024,
-      freeMemBytes: 16 * 1024 * 1024,
+      freeMemBytes: 4 * 1024 * 1024,
     }, hostNoiseConfig);
     if (!largeResident.issues.some((issue) => issue.id === "large_resident_workload" && issue.severity === "warning")) {
       assertionFailures.push("benchmark host classifier must warn on large resident non-benchmark workloads");
+    }
+    const abundantResident = classifyHostForBenchmark({
+      topProcessesByWorkingSet: [{ Id: 9, ProcessName: "LM Studio", WorkingSet64: 2048 }],
+      activeCpuProcesses: [],
+      totalMemBytes: 64 * 1024 * 1024,
+      freeMemBytes: 56 * 1024 * 1024,
+    }, hostNoiseConfig);
+    if (!abundantResident.issues.some((issue) => issue.id === "large_resident_workload" && issue.severity === "info")) {
+      assertionFailures.push("benchmark host classifier must downgrade large idle resident workloads when free memory is abundant");
     }
     const activeCpu = classifyHostForBenchmark({
       topProcessesByWorkingSet: [],
@@ -342,6 +357,252 @@ export function runSchemaSelfTest({
     if (!activeCpu.issues.some((issue) => issue.id === "active_cpu_workload" && issue.severity === "warning")) {
       assertionFailures.push("benchmark host classifier must warn on active CPU non-benchmark workloads");
     }
+    const defenderResident = classifyHostForBenchmark({
+      topProcessesByWorkingSet: [{ Id: 3, ProcessName: "MsMpEng", WorkingSet64: 4096 }],
+      activeCpuProcesses: [],
+      totalMemBytes: 64 * 1024 * 1024,
+      freeMemBytes: 48 * 1024 * 1024,
+    }, hostNoiseConfig);
+    if (!defenderResident.issues.some((issue) => issue.id === "defender_resident_in_top_working_set" && issue.severity === "info")) {
+      assertionFailures.push("benchmark host classifier must record resident Defender as context without blocking isolated retained evidence");
+    }
+    const interactiveResident = classifyHostForBenchmark({
+      platform: "win32",
+      topProcessesByWorkingSet: [
+        { Id: 10, ProcessName: "Codex", WorkingSet64: 4096 },
+        { Id: 11, ProcessName: "chrome", WorkingSet64: 4096 },
+      ],
+      benchmarkIsolation: { mode: "enforce", supported: true },
+      activeCpuProcesses: [],
+      totalMemBytes: 64 * 1024 * 1024,
+      freeMemBytes: 48 * 1024 * 1024,
+    }, hostNoiseConfig);
+    if (!interactiveResident.issues.some((issue) => issue.id === "interactive_workloads_present" && issue.severity === "info")) {
+      assertionFailures.push("benchmark host classifier must record resident Codex/Chrome workloads as context without blocking isolated retained evidence");
+    }
+    const schedulerPressure = classifyHostForBenchmark({
+      platform: "win32",
+      cpu: { logicalCount: 8 },
+      benchmarkIsolation: { mode: "enforce", supported: true },
+      schedulerPressure: { checked: true, processorQueueLength: 3, contextSwitchesPerSec: 160000, totalProcessorTimePct: 92 },
+      topProcessesByWorkingSet: [],
+      activeCpuProcesses: [],
+      totalMemBytes: 64 * 1024 * 1024,
+      freeMemBytes: 64 * 1024 * 1024,
+    }, hostNoiseConfig);
+    if (!schedulerPressure.issues.some((issue) => issue.id === "processor_queue_length_high" && issue.severity === "warning")) {
+      assertionFailures.push("benchmark host classifier must warn when processor queue length indicates runnable contention");
+    }
+    if (!schedulerPressure.issues.some((issue) => issue.id === "context_switch_rate_high" && issue.severity === "warning")) {
+      assertionFailures.push("benchmark host classifier must warn when context switches per CPU exceed the contention threshold");
+    }
+    if (!schedulerPressure.issues.some((issue) => issue.id === "system_cpu_pressure" && issue.severity === "warning")) {
+      assertionFailures.push("benchmark host classifier must warn when total CPU time and queue pressure indicate CPU contention");
+    }
+    const isolationDisabled = classifyHostForBenchmark({
+      platform: "win32",
+      benchmarkIsolation: { mode: "telemetry", supported: true },
+      topProcessesByWorkingSet: [],
+      activeCpuProcesses: [],
+      totalMemBytes: 64 * 1024 * 1024,
+      freeMemBytes: 64 * 1024 * 1024,
+    }, hostNoiseConfig);
+    if (!isolationDisabled.issues.some((issue) => issue.id === "benchmark_isolation_not_enforced" && issue.severity === "warning")) {
+      assertionFailures.push("benchmark host classifier must warn when benchmark isolation is not enforced");
+    }
+    const missingSchedulerPressure = classifyHostForBenchmark({
+      platform: "win32",
+      benchmarkIsolation: { mode: "enforce", supported: true },
+      topProcessesByWorkingSet: [],
+      activeCpuProcesses: [],
+      totalMemBytes: 64 * 1024 * 1024,
+      freeMemBytes: 64 * 1024 * 1024,
+    }, hostNoiseConfig);
+    if (!missingSchedulerPressure.issues.some((issue) => issue.id === "scheduler_pressure_unavailable" && issue.severity === "warning")) {
+      assertionFailures.push("benchmark host classifier must warn when scheduler pressure counters are unavailable");
+    }
+  }
+  if (typeof preferHistoricalSelectionSeed !== "function") {
+    assertionFailures.push("historical selection seed self-test requires preferHistoricalSelectionSeed");
+  } else {
+    const retainedSeedWins = preferHistoricalSelectionSeed([
+      {
+        filePath: "latest-historical-speed.json",
+        selectionClass: "latest_historical",
+        report: { timestamp: "2026-07-04T10:26:34.608Z", diagnosticAttributionMode: true },
+      },
+      {
+        filePath: "latest-failed-historical-speed.json",
+        selectionClass: "latest_failed",
+        report: { timestamp: "2026-07-04T10:25:30.801Z", retainableStrictEvidence: false, diagnosticAttributionMode: false },
+      },
+      {
+        filePath: "latest-retainable-historical-speed.json",
+        selectionClass: "latest_retainable",
+        report: { timestamp: "2026-07-04T10:17:54.484Z", retainableStrictEvidence: true, diagnosticAttributionMode: false },
+      },
+    ]);
+    if (retainedSeedWins?.filePath !== "latest-retainable-historical-speed.json") {
+      assertionFailures.push("historical selection seed must prefer retainable historical proof over newer weak reports");
+    }
+    const cleanFailedSeedWins = preferHistoricalSelectionSeed([
+      {
+        filePath: "latest-nondiagnostic-historical-speed.json",
+        selectionClass: "latest_nondiagnostic",
+        report: {
+          timestamp: "2026-07-04T10:26:34.608Z",
+          diagnosticAttributionMode: false,
+          retainableStrictEvidence: false,
+          preflightAborted: false,
+          samples: 2,
+          minRetainableSamples: 12,
+          evidenceQuality: {
+            hostFailures: ["host:noisy"],
+            identityFailures: [],
+            processFailures: [],
+            sampleFailures: ["underpowered_samples:2<12"],
+          },
+        },
+      },
+      {
+        filePath: "latest-failed-historical-speed.json",
+        selectionClass: "latest_failed",
+        report: {
+          timestamp: "2026-07-04T10:25:30.801Z",
+          diagnosticAttributionMode: false,
+          retainableStrictEvidence: false,
+          preflightAborted: false,
+          samples: 12,
+          minRetainableSamples: 12,
+          evidenceQuality: {
+            hostFailures: [],
+            identityFailures: [],
+            processFailures: [],
+            sampleFailures: [],
+          },
+        },
+      },
+    ]);
+    if (cleanFailedSeedWins?.filePath !== "latest-failed-historical-speed.json") {
+      assertionFailures.push("historical selection seed must prefer a clean retained-sample failed report over a newer exploratory miss");
+    }
+    const diagnosticLatestIgnored = preferHistoricalSelectionSeed([
+      {
+        filePath: "latest-historical-speed.json",
+        selectionClass: "latest_historical",
+        report: { timestamp: "2026-07-04T10:26:34.608Z", diagnosticAttributionMode: true },
+      },
+      {
+        filePath: "latest-failed-historical-speed.json",
+        selectionClass: "latest_failed",
+        report: { timestamp: "2026-07-04T10:25:30.801Z", retainableStrictEvidence: false, diagnosticAttributionMode: false },
+      },
+    ]);
+    if (diagnosticLatestIgnored?.filePath !== "latest-failed-historical-speed.json") {
+      assertionFailures.push("historical selection seed must ignore newer diagnostic historical reports when choosing the next predecessor seed");
+    }
+    const onlyGenericLatest = preferHistoricalSelectionSeed([
+      {
+        filePath: "latest-historical-speed.json",
+        selectionClass: "latest_historical",
+        report: { timestamp: "2026-07-04T10:25:30.801Z", diagnosticAttributionMode: false },
+      },
+      {
+        filePath: "latest-failed-historical-speed.json",
+        selectionClass: "latest_failed",
+        report: null,
+      },
+    ]);
+    if (onlyGenericLatest?.filePath !== "latest-historical-speed.json") {
+      assertionFailures.push("historical selection seed must still use the generic latest report when it is non-diagnostic and no retained seed exists");
+    }
+  }
+  const comparableHistoricalLabel = hardestComparableHistoricalLabel({
+    comparisons: [
+      {
+        label: "backup-invalid-match",
+        evidenceAuthority: "previous_build",
+        matchParity: false,
+        routeParityAcceptable: true,
+        currentEngineImprovementPct: -4,
+        pairedEngine: { candidateWinRate: 0.1 },
+      },
+      {
+        label: "backup-invalid-route",
+        evidenceAuthority: "previous_build",
+        matchParity: true,
+        routeParityAcceptable: false,
+        currentEngineImprovementPct: -6,
+        pairedEngine: { candidateWinRate: 0.1 },
+      },
+      {
+        label: "backup-comparable",
+        evidenceAuthority: "previous_build",
+        matchParity: true,
+        routeParityAcceptable: true,
+        currentEngineImprovementPct: 0.5,
+        pairedEngine: { candidateWinRate: 0.6 },
+      },
+    ],
+  });
+  if (comparableHistoricalLabel !== "backup-comparable") {
+    assertionFailures.push("hardest historical predecessor label must ignore match-parity or route-parity failures");
+  }
+  const noComparableHistoricalLabel = hardestComparableHistoricalLabel({
+    comparisons: [
+      {
+        label: "backup-invalid-match",
+        evidenceAuthority: "previous_build",
+        matchParity: false,
+        routeParityAcceptable: true,
+      },
+      {
+        label: "backup-invalid-route",
+        evidenceAuthority: "previous_build",
+        matchParity: true,
+        routeParityAcceptable: false,
+      },
+    ],
+  });
+  if (noComparableHistoricalLabel !== null) {
+    assertionFailures.push("hardest historical predecessor label must return null when no comparable previous-build rows remain");
+  }
+  const blockedPhaseLeakSummary = phaseLeakSummaryFromRounds([
+    {
+      roundIndex: 1,
+      baselineLabel: "backup-invalid-match",
+      matchParity: false,
+      routeParityAcceptable: true,
+      pairedCandidateImprovementMedianPct: -2.4,
+      pairedCandidateDiscoverImprovementMedianPct: 0.5,
+      pairedCandidateDiscoverDeltaMedianMs: -1,
+      pairedCandidateScanImprovementMedianPct: -1.2,
+      pairedCandidateScanDeltaMedianMs: 8,
+      pairedCandidateAggregateImprovementMedianPct: 100,
+      pairedCandidateAggregateDeltaMedianMs: 0,
+      pairedCandidateEngineResidualImprovementMedianPct: -0.4,
+      pairedCandidateEngineResidualDeltaMedianMs: 1,
+      pairedCandidateScanWorkImprovementMedianPct: -1.1,
+      pairedCandidateScanWorkDeltaMedianMs: 20,
+      pairedCandidateScanOpenImprovementMedianPct: null,
+      pairedCandidateScanOpenDeltaMedianMs: 0,
+      pairedCandidateScanFileImprovementMedianPct: -1.1,
+      pairedCandidateScanFileDeltaMedianMs: 20,
+      pairedCandidateTeddyRangeImprovementMedianPct: 12,
+      pairedCandidateTeddyRangeDeltaMedianMs: -3,
+    },
+  ]);
+  if (blockedPhaseLeakSummary?.blockedByCorrectnessOrRouteParity !== true) {
+    assertionFailures.push("phase leak attribution must block when match parity fails");
+  }
+  if (blockedPhaseLeakSummary?.nextRepairTarget !== null) {
+    assertionFailures.push("phase leak attribution must not nominate a repair target when correctness or route parity blocks timing comparison");
+  }
+  if (blockedPhaseLeakSummary?.diagnosis !== "timing_attribution_blocked_by_match_or_route_parity") {
+    assertionFailures.push("phase leak attribution must emit the blocked-by-parity diagnosis when no comparable rounds remain");
+  }
+  if (blockedPhaseLeakSummary?.excludedRounds?.[0]?.reason !== "match_parity_failed") {
+    assertionFailures.push("phase leak attribution must record excluded mismatch rounds explicitly");
   }
   validateBenchmarkLockLane(
     {
@@ -384,7 +645,7 @@ export function runSchemaSelfTest({
         remediation: {
           actions: [
             {
-              issueId: "defender_active_in_top_working_set",
+              issueId: "defender_resident_in_top_working_set",
               action: "fix defender",
               command: "Add-MpPreference -ExclusionPath C:\\bench",
               reason: "test",
@@ -394,7 +655,7 @@ export function runSchemaSelfTest({
           ],
           verificationCommands: [
             {
-              issueId: "defender_active_in_top_working_set",
+              issueId: "defender_resident_in_top_working_set",
               command: "Get-MpPreference | Select-Object -ExpandProperty ExclusionPath",
               reason: "test",
               mutates: false,
@@ -417,7 +678,7 @@ export function runSchemaSelfTest({
         remediation: {
           actions: [
             {
-              issueId: "defender_active_in_top_working_set",
+              issueId: "defender_resident_in_top_working_set",
               action: "fix defender",
               command: "Add-MpPreference -ExclusionPath C:\\bench",
               reason: "test",
@@ -427,7 +688,7 @@ export function runSchemaSelfTest({
           ],
           verificationCommands: [
             {
-              issueId: "defender_active_in_top_working_set",
+              issueId: "defender_resident_in_top_working_set",
               command: "Get-MpPreference | Select-Object -ExpandProperty ExclusionPath",
               reason: "test",
               mutates: false,
@@ -457,7 +718,7 @@ export function runSchemaSelfTest({
         remediation: {
           actions: [
             {
-              issueId: "defender_active_in_top_working_set",
+              issueId: "defender_resident_in_top_working_set",
               action: "fix defender",
               command: "Add-MpPreference -ExclusionPath C:\\bench",
               reason: "test",
@@ -467,7 +728,7 @@ export function runSchemaSelfTest({
           ],
           verificationCommands: [
             {
-              issueId: "defender_active_in_top_working_set",
+              issueId: "defender_resident_in_top_working_set",
               command: "Get-MpPreference | Select-Object -ExpandProperty ExclusionPath",
               reason: "test",
               mutates: false,
@@ -1799,10 +2060,13 @@ export function runSchemaSelfTest({
     "ripgrep_12_sample: ok status requires proof classification",
     "benchmark_host_preflight: expected lane missing",
     "benchmark_host_preflight: host snapshots require elevation metadata",
+    "benchmark_host_preflight: host snapshots require benchmark isolation metadata",
+    "benchmark_host_preflight: host snapshots require scheduler pressure metadata",
     "benchmark_host_preflight: failed status requires remediation actions",
     "benchmark_host_preflight: remediation actions must declare mutation and privilege behavior",
     "benchmark_host_preflight: failed status requires non-mutating verification commands with privilege metadata",
     "benchmark_host_preflight: Defender remediation must include stable benchmark exclusion paths",
+    "benchmark_host_preflight: Defender remediation must include analyzer availability verification",
     "benchmark_lock: expected lane missing",
     "benchmark_lock: ok status requires stale reclaim and live-lock refusal proof",
     "benchmark_readiness: expected lane missing",
@@ -1812,6 +2076,7 @@ export function runSchemaSelfTest({
     "benchmark_readiness: Defender remediation must be marked admin-required",
     "benchmark_readiness: Defender verification must be marked admin-required",
     "benchmark_readiness: Defender remediation must include stable benchmark exclusion paths",
+    "benchmark_readiness: Defender remediation must include analyzer availability verification",
     "benchmark_readiness: failed status requires privilege readiness summary",
     "benchmark_readiness: privilege summary must declare admin requirement and availability",
     "benchmark_readiness: admin remediation requires adminRequired privilege summary",
@@ -1831,6 +2096,7 @@ export function runSchemaSelfTest({
     "installed_speed_compare: host-preflight skip requires required gate failure envelope",
     "installed_speed_compare: host-preflight skip requires remediation actions",
     "installed_speed_compare: host-preflight skip Defender remediation must include stable benchmark exclusion paths",
+    "installed_speed_compare: host-preflight skip Defender remediation must include analyzer availability verification",
     "installed_speed_compare: ok status requires parsed sample count to match requested samples",
     "installed_speed_compare: strict ok status requires the retained sample floor",
     "installed_speed_compare: strict ok status requires repo promotion over installed",
@@ -1863,6 +2129,7 @@ export function runSchemaSelfTest({
     "historical_speed_compare: host-preflight skip requires required gate failure envelope",
     "historical_speed_compare: host-preflight skip requires remediation actions",
     "historical_speed_compare: host-preflight skip Defender remediation must include stable benchmark exclusion paths",
+    "historical_speed_compare: host-preflight skip Defender remediation must include analyzer availability verification",
     "historical_speed_compare: strict ok status requires retainable strict evidence",
     "historical_speed_compare: ok status requires clean after-run IX process scan",
     "historical_speed_compare: ok status requires clean comparator process state reports",
@@ -1909,6 +2176,7 @@ export function runSchemaSelfTest({
     "alternates_decision: host-preflight skip requires required gate failure envelope",
     "alternates_decision: host-preflight skip requires remediation actions",
     "alternates_decision: host-preflight skip Defender remediation must include stable benchmark exclusion paths",
+    "alternates_decision: host-preflight skip Defender remediation must include analyzer availability verification",
     "alternates_decision: ok status requires comparison summary",
     "alternates_decision: comparison summary must match comparison rows",
     "alternates_decision: ok status requires branch scorecard",

@@ -498,6 +498,10 @@ test "regex literal alternates may be wrapped in one full pattern group" {
     const casefold = try parse("re:(?i)alpha|beta");
     try std.testing.expectEqual(MatcherStrategy.regex_literal_alternates, casefold.predicates[0].strategy);
     try std.testing.expectEqualStrings("alpha|beta", literalAlternatesBody(casefold.predicates[0].value));
+
+    const grouped_casefold = try parse("re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)");
+    try std.testing.expectEqual(MatcherStrategy.regex_literal_alternates, grouped_casefold.predicates[0].strategy);
+    try std.testing.expectEqualStrings("ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT", literalAlternatesBody(grouped_casefold.predicates[0].value));
 }
 
 test "parser trims source and splits rust-style boolean tokens" {

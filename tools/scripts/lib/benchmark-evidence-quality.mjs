@@ -1,5 +1,13 @@
 import { identityControlFailures } from "./speed-compare-utils.mjs";
 
+export function benchmarkHostWarningFailures(host) {
+  const hostIssues = [
+    ...(host?.before?.benchmarkEnvironment?.issues ?? []),
+    ...(host?.after?.benchmarkEnvironment?.issues ?? []),
+  ].filter((issue) => issue?.severity === "warning");
+  return hostIssues.map((issue) => `host:${issue.id}:${issue.detail}`);
+}
+
 export function benchmarkEvidenceFailures({
   samples,
   minRetainableSamples,
@@ -13,13 +21,7 @@ export function benchmarkEvidenceFailures({
   if (Number.isFinite(samples) && Number.isFinite(minRetainableSamples) && samples < minRetainableSamples) {
     failures.push(`underpowered_samples:${samples}<${minRetainableSamples}`);
   }
-  const hostIssues = [
-    ...(host?.before?.benchmarkEnvironment?.issues ?? []),
-    ...(host?.after?.benchmarkEnvironment?.issues ?? []),
-  ].filter((issue) => issue?.severity === "warning");
-  for (const issue of hostIssues) {
-    failures.push(`host:${issue.id}:${issue.detail}`);
-  }
+  failures.push(...benchmarkHostWarningFailures(host));
   if (processScan?.before?.ok === false) failures.push("process_scan_before_failed");
   if (processScan?.after?.ok === false) failures.push("process_scan_after_failed");
   for (const failure of processScan?.before?.failures ?? []) failures.push(`process_scan_before:${failure}`);
@@ -63,4 +65,21 @@ export function evidenceQualityFromFailures(failures = []) {
     comparisonFailures,
     failures: all,
   };
+}
+
+export function benchmarkDecisionGrade({
+  preflightAborted = false,
+  retainableStrictEvidence = false,
+  diagnosticAttributionMode = false,
+  requiredGateFailures = [],
+} = {}) {
+  if (preflightAborted === true) return "preflight_rejected";
+  if (
+    retainableStrictEvidence === true &&
+    diagnosticAttributionMode !== true &&
+    (!Array.isArray(requiredGateFailures) || requiredGateFailures.length === 0)
+  ) {
+    return "retainable";
+  }
+  return "exploratory";
 }

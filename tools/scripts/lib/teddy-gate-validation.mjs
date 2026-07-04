@@ -393,10 +393,14 @@ function decisionReport(decision, rejectedIds) {
 export function createTeddyGateValidation({ root, run, lane }) {
   function teddyKernelDecisionLane() {
     const latestHistorical = path.join(root, "tools", "reports", "historical-speed", "latest-historical-speed.json");
-    if (!existsSync(latestHistorical)) {
+    const latestNonDiagnosticHistorical = path.join(root, "tools", "reports", "historical-speed", "latest-nondiagnostic-historical-speed.json");
+    const historicalInput = existsSync(latestNonDiagnosticHistorical)
+      ? latestNonDiagnosticHistorical
+      : latestHistorical;
+    if (!existsSync(historicalInput)) {
       return lane("teddy_kernel_decision", "skipped", {
-        reason: "latest historical speed report missing",
-        expected: latestHistorical,
+        reason: "latest authoritative historical speed report missing",
+        expected: historicalInput,
       });
     }
     const latestPath = path.join(root, "tools", "reports", "teddy-kernel-decision", "latest-teddy-kernel-decision.json");

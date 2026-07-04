@@ -3,6 +3,8 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
 import { benchmarkEnvSnapshot, dependencyTreeSnapshot } from "./lib/speed-compare-utils.mjs";
+import { hostSnapshot } from "./lib/benchmark-runner.mjs";
+import { benchmarkHostWarningFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "older-snapshot-ladder");
@@ -22,7 +24,7 @@ Options:
                                   Default: tools/reports/manual-speed-compare/tmp-baselines.
   --samples <n>                   Samples per snapshot. Default: 12.
   --identity-control-samples <n>  Same-binary control samples. Default: min(12, samples).
-  --identity-control-attempts <n> Same-binary control attempts. Default: 1.
+  --identity-control-attempts <n> Same-binary control attempts. Default: 3.
   --min-retainable-samples <n>    Minimum samples for child strict evidence.
                                   Default: 12.
   --max-snapshots <n>             Limit runnable snapshot comparisons after mtime sort.
@@ -54,7 +56,7 @@ Options:
 const baselineDir = path.resolve(argValue(args, "--baseline-dir", DEFAULT_BASELINE_DIR));
 const samples = Number(argValue(args, "--samples", "12"));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
-const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "1"));
+const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "3"));
 const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", process.env.IX_MIN_RETAINABLE_SPEED_SAMPLES ?? "12"));
 const maxSnapshotsRaw = argValue(args, "--max-snapshots", "");
 const maxSnapshots = maxSnapshotsRaw === "" ? Infinity : Number(maxSnapshotsRaw);
@@ -86,6 +88,81 @@ if (maxCandidates !== Infinity && (!Number.isFinite(maxCandidates) || maxCandida
 if (!Number.isFinite(minEngineImprovementPct)) throw new Error("--min-engine-improvement-pct must be a finite number");
 if (!Number.isFinite(minPairedImprovementPct)) throw new Error("--min-paired-improvement-pct must be a finite number");
 if (!Number.isFinite(childTimeoutMs) || childTimeoutMs < 1000) throw new Error("--child-timeout-ms must be at least 1000");
+
+function writeHostPreflightFailureReport(hostBefore) {
+  const host = { before: hostBefore, after: null };
+  const strictFailures = benchmarkHostWarningFailures(host);
+  const report = {
+    runId: `older-snapshot-ladder-${timestampSlug()}`,
+    generatedAt: new Date().toISOString(),
+    baselineDir,
+    samples,
+    identityControlSamples,
+    identityControlAttempts,
+    minRetainableSamples,
+    childTimeoutMs,
+    maxSnapshots: maxSnapshots === Infinity ? null : maxSnapshots,
+    targetRetainableSnapshots: targetRetainableSnapshots === Infinity ? null : targetRetainableSnapshots,
+    maxCandidates: maxCandidates === Infinity ? null : maxCandidates,
+    minEngineImprovementPct,
+    minPairedImprovementPct,
+    sort: newestFirst ? "newest_first" : "oldest_first",
+    candidateSnapshotsScanned: 0,
+    runnableSnapshots: 0,
+    retainableSnapshots: 0,
+    nonRetainableRunnableSnapshots: 0,
+    skippedSnapshots: 0,
+    strictRequired: requireStrict,
+    effectiveBenchEnv: benchmarkEnvSnapshot(),
+    dependencyTrees: dependencyTreeSnapshot(ROOT),
+    retainableEvidence: false,
+    failures: strictFailures,
+    failureSummary: {
+      categories: { host_preflight: 1 },
+      retainableLabels: [],
+      blockedLabels: [],
+      skippedLabels: [],
+      bestRetainableRound: null,
+      worstBlockingRound: {
+        label: null,
+        status: "preflight_aborted",
+        category: "host",
+        enginePct: null,
+        pairedPct: null,
+        strict: true,
+        failures: strictFailures,
+      },
+      topLevelFailures: strictFailures,
+    },
+    rounds: [],
+    host,
+    preflightAborted: true,
+  };
+
+  mkdirSync(REPORT_DIR, { recursive: true });
+  const reportPath = path.join(REPORT_DIR, `${report.runId}.json`);
+  writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  mkdirSync(path.dirname(latestPath), { recursive: true });
+  writeFileSync(latestPath, `${JSON.stringify(report, null, 2)}\n`);
+
+  if (!quiet) {
+    console.log(`Report: ${reportPath}`);
+    console.log(`Retainable evidence: ${report.retainableEvidence}`);
+  }
+  console.error(JSON.stringify({
+    status: "failed",
+    failures: [
+      {
+        gate: "strict",
+        reason: "benchmark host preflight failed before older-snapshot ladder run",
+        failures: strictFailures,
+      },
+    ],
+    reportPath,
+    evidenceQuality: evidenceQualityFromFailures(strictFailures),
+  }, null, 2));
+  process.exit(1);
+}
 
 function snapshotCandidates() {
   const candidates = readdirSync(baselineDir)
@@ -297,6 +374,11 @@ if (dryRun) {
     console.log(`${index + 1}\t${candidate.mtimeIso}\t${candidate.bytes}\t${candidate.path}`);
   }
   process.exit(0);
+}
+
+const hostBefore = hostSnapshot();
+if (requireStrict && benchmarkHostWarningFailures({ before: hostBefore }).length > 0) {
+  writeHostPreflightFailureReport(hostBefore);
 }
 
 mkdirSync(REPORT_DIR, { recursive: true });

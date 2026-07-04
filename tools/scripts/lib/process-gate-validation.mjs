@@ -42,6 +42,14 @@ function summarizeProcessStatusReport(report) {
 }
 
 export function createProcessGateValidation({ run, lane, findBuiltIx }) {
+  function processNameProbe() {
+    return run("powershell", [
+      "-NoProfile",
+      "-Command",
+      "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.Name -match '^(ix|iex|ix-zig|__ix_indexd|__ix_nexus)(\\.exe)?$' -and -not ($_.CommandLine -match '\\sprocess\\s+status\\s+--json') } | Select-Object ProcessId,Name,CommandLine,WorkingSetSize | ConvertTo-Json -Compress",
+    ]);
+  }
+
   function scanIxProcesses() {
     const ix = findBuiltIx();
     const status = ix
@@ -77,13 +85,18 @@ export function createProcessGateValidation({ run, lane, findBuiltIx }) {
       });
     }
 
-    const probe = run("powershell", [
-      "-NoProfile",
-      "-Command",
-      "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.Name -match '^(ix|iex|ix-zig|__ix_indexd|__ix_nexus)(\\.exe)?$' } | Select-Object ProcessId,Name,CommandLine,WorkingSetSize | ConvertTo-Json -Compress",
-    ]);
+    let probe = processNameProbe();
     if (probe.exitCode !== 0) return lane("process_scan", "failed", { evidence: compactCommandResult(probe), processStatus: compactCommandResult(status), processReport, failures: [...statusFailures, "process-name probe failed"] });
-    const text = probe.stdout.trim();
+    let text = probe.stdout.trim();
+    let transientRescans = 0;
+    while (text.length > 0 && transientRescans < 5) {
+      run("powershell", ["-NoProfile", "-Command", "Start-Sleep -Milliseconds 500"]);
+      const retry = processNameProbe();
+      if (retry.exitCode !== 0) break;
+      probe = retry;
+      text = probe.stdout.trim();
+      transientRescans += 1;
+    }
     const failures = [...statusFailures];
     if (text.length > 0) failures.push("live IX-named processes matched process-name probe");
     return lane("process_scan", failures.length === 0 ? "ok" : "failed", {
@@ -92,6 +105,7 @@ export function createProcessGateValidation({ run, lane, findBuiltIx }) {
       processReport,
       failures,
       matched: text || "[]",
+      transientRescans,
     });
   }
 
