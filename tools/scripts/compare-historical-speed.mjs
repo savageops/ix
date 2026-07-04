@@ -371,6 +371,11 @@ function writePreflightFailureReport({
     diagnosticAttributionMode,
     benchEnv: BENCH_ENV,
     effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
+    repoBinaryFreshness,
+    processMetricCapture: {
+      peakRss: "unavailable_spawn_sync_runner",
+      note: "IX speed samples expose nullable peakWorkingSetBytes fields; retained peak-RSS gating requires a proven async process runner.",
+    },
     dependencyTrees: dependencyTreeSnapshot(ROOT),
     host,
     processScan,
@@ -595,6 +600,10 @@ const report = {
   benchEnv: BENCH_ENV,
   effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
   repoBinaryFreshness,
+  processMetricCapture: {
+    peakRss: "unavailable_spawn_sync_runner",
+    note: "IX speed samples expose nullable peakWorkingSetBytes fields; retained peak-RSS gating requires a proven async process runner.",
+  },
   dependencyTrees: dependencyTreeSnapshot(ROOT),
   host,
   processScan,

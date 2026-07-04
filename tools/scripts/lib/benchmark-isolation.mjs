@@ -343,6 +343,13 @@ export function runWithWindowsBenchmarkIsolation(command, args, options, isolati
     stdout: captureStdout ? String(payload?.stdout ?? "") : "",
     stderr: captureStderr ? String(payload?.stderr ?? "") : "",
     status,
+    processMetrics: payload?.processMetrics && typeof payload.processMetrics === "object"
+      ? {
+          peakWorkingSetBytes: Number(payload.processMetrics.peakWorkingSetBytes ?? 0),
+          peakPagedMemoryBytes: Number(payload.processMetrics.peakPagedMemoryBytes ?? 0),
+          peakVirtualMemoryBytes: Number(payload.processMetrics.peakVirtualMemoryBytes ?? 0),
+        }
+      : null,
     benchmarkIsolation: payload?.benchmarkIsolation
       ? {
           ...payload.benchmarkIsolation,
