@@ -4248,8 +4248,8 @@ fn shouldAttemptWholeFileAdmission(whole_file_available: bool, case_insensitive:
     return whole_file_available and !case_insensitive and program.fileAdmissionEnabled();
 }
 
-fn shouldAttemptTrigramPrune(file_bytes: usize, single_chunk: bool, admission: trigram.Admission, case_insensitive: bool) bool {
-    return admission.eligible and !case_insensitive and single_chunk and file_bytes >= TRIGRAM_MIN_PRUNE_BYTES;
+fn shouldAttemptTrigramPrune(file_bytes: usize, single_chunk: bool, admission: trigram.Admission, _: bool) bool {
+    return admission.eligible and single_chunk and file_bytes >= TRIGRAM_MIN_PRUNE_BYTES;
 }
 
 fn availableThreads() usize {

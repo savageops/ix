@@ -24,6 +24,7 @@ pub const FileAdmissionGroup = struct {
     mode: FileAdmissionGroupMode = .all,
     needle_count: usize = 0,
     needles: [FILE_ADMISSION_MAX_GROUP_NEEDLES][]const u8 = @splat(""),
+    case_insensitive: bool = false,
 
     fn appendNeedle(self: *FileAdmissionGroup, needle: []const u8) bool {
         if (self.needle_count >= self.needles.len) return false;
@@ -36,19 +37,34 @@ pub const FileAdmissionGroup = struct {
         return switch (self.mode) {
             .all => {
                 for (self.needles[0..self.needle_count]) |needle| {
-                    if (sz.indexOfAdmission(bytes, needle) == null) return true;
+                    if (!containsNeedle(bytes, needle, self.case_insensitive)) return true;
                 }
                 return false;
             },
             .any => {
                 for (self.needles[0..self.needle_count]) |needle| {
-                    if (sz.indexOfAdmission(bytes, needle) != null) return false;
+                    if (containsNeedle(bytes, needle, self.case_insensitive)) return false;
                 }
                 return self.needle_count != 0;
             },
         };
     }
 };
+
+/// Case-sensitive fast path via StringZilla/BMH admission probe.
+/// Case-insensitive path uses std.ascii.eqlIgnoreCase in a rolling window
+/// — slower but false-negative-safe: every case variant of the needle
+/// is found because both sides compare case-insensitively.
+fn containsNeedle(haystack: []const u8, needle: []const u8, case_insensitive: bool) bool {
+    if (!case_insensitive) return sz.indexOfAdmission(haystack, needle) != null;
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
+    }
+    return false;
+}
 
 pub const TrigramAdmissionProgram = struct {
     eligible: bool = false,
@@ -87,23 +103,30 @@ pub const TrigramAdmissionProgram = struct {
     }
 
     fn compileFileAdmission(self: *TrigramAdmissionProgram, plan: expr.ExpressionPlan, case_insensitive: bool) void {
-        if (case_insensitive) return;
         const predicates = plan.predicates[0..plan.predicate_count];
         switch (plan.mode) {
             .any => {
                 for (predicates) |predicate| {
-                    const group = predicateAdmissionGroupRuntimeCaseSensitive(predicate) orelse {
+                    const predicate_ci = case_insensitive or (predicate.kind == .regex and std.mem.startsWith(u8, predicate.value, "(?i)"));
+                    const group = predicateAdmissionGroupRuntime(predicate) orelse {
                         self.file_admission_mode = .disabled;
                         self.file_admission_group_count = 0;
                         return;
                     };
-                    self.appendFileAdmissionGroup(group);
+                    var g = group;
+                    g.case_insensitive = predicate_ci;
+                    self.appendFileAdmissionGroup(g);
                 }
                 if (self.file_admission_group_count != 0) self.file_admission_mode = .any;
             },
             .all => {
                 for (predicates) |predicate| {
-                    if (predicateAdmissionGroupRuntimeCaseSensitive(predicate)) |group| self.appendFileAdmissionGroup(group);
+                    const predicate_ci = case_insensitive or (predicate.kind == .regex and std.mem.startsWith(u8, predicate.value, "(?i)"));
+                    if (predicateAdmissionGroupRuntime(predicate)) |group| {
+                        var g = group;
+                        g.case_insensitive = predicate_ci;
+                        self.appendFileAdmissionGroup(g);
+                    }
                 }
                 if (self.file_admission_group_count != 0) self.file_admission_mode = .all;
             },
@@ -350,12 +373,15 @@ test "compiled file admission keeps supported all-mode subset" {
     try std.testing.expect(!program.fileAdmissionMiss("PM_RESUME"));
 }
 
-test "compiled file admission disables for case insensitive search" {
+test "compiled file admission supports case insensitive search" {
     const plan = try expr.parse("lit:alpha && lit:omega");
     const admission = trigram.admit(plan);
     const program = TrigramAdmissionProgram.compile(admission, plan, true);
-    try std.testing.expectEqual(FileAdmissionMode.disabled, program.file_admission_mode);
-    try std.testing.expect(!program.fileAdmissionMiss("alpha only"));
+    try std.testing.expectEqual(FileAdmissionMode.all, program.file_admission_mode);
+    try std.testing.expect(program.fileAdmissionMiss("alpha only"));
+    try std.testing.expect(!program.fileAdmissionMiss("alpha and omega"));
+    // case-insensitive: ALPHA should match alpha
+    try std.testing.expect(!program.fileAdmissionMiss("ALPHA and OMEGA"));
 }
 
 test "compiled file admission stores long prefix probe once" {
@@ -379,14 +405,17 @@ test "compiled file admission supports regex literal alternates any group" {
     try std.testing.expect(!program.fileAdmissionMiss("wakeup via LINK_REQ_RST path"));
 }
 
-test "compiled file admission disables inline casefold alternates" {
+test "compiled file admission supports inline casefold alternates" {
     const plan = try expr.parse("re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)");
     const admission = trigram.admit(plan);
     const program = TrigramAdmissionProgram.compile(admission, plan, false);
 
-    try std.testing.expectEqual(FileAdmissionMode.disabled, program.file_admission_mode);
-    try std.testing.expect(!program.fileAdmissionEnabled());
-    try std.testing.expect(!program.fileAdmissionMiss("goto err_sysfs;"));
+    try std.testing.expectEqual(FileAdmissionMode.all, program.file_admission_mode);
+    try std.testing.expect(program.fileAdmissionEnabled());
+    // Lowercase variant should NOT be pruned (case-insensitive admission)
+    try std.testing.expect(!program.fileAdmissionMiss("wakeup via link_req_rst path"));
+    // Unrelated content SHOULD be pruned
+    try std.testing.expect(program.fileAdmissionMiss("nothing relevant here"));
 }
 
 test "compiled file admission supports literal alternates within all-mode plan" {
