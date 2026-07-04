@@ -28,7 +28,7 @@ pub const FileList = struct {
 
     pub fn append(self: *FileList, allocator: std.mem.Allocator, entry: DiscoveredFile) !void {
         if (self.len == self.capacity) {
-            const new_cap = if (self.capacity == 0) 64 else self.capacity * 2;
+            const new_cap = if (self.capacity == 0) 4096 else self.capacity * 2;
             const new_buf = try allocator.alloc(DiscoveredFile, new_cap);
             if (self.buffer) |old| {
                 @memcpy(new_buf[0..self.len], old[0..self.len]);
