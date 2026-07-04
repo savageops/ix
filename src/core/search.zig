@@ -1769,7 +1769,7 @@ fn loadEvidenceFrontierCache(
 
     var candidates: std.ArrayList([]const u8) = .empty;
     while (lines.next()) |raw_line| {
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        const line = trimCR(raw_line);
         if (line.len == 0) continue;
         candidates.append(allocator, line) catch return null;
     }
@@ -1806,7 +1806,7 @@ fn loadEvidenceFrontierCacheFast(
 
     var candidates: std.ArrayList([]const u8) = .empty;
     while (lines.next()) |raw_line| {
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        const line = trimCR(raw_line);
         if (line.len == 0) continue;
         candidates.append(allocator, line) catch return null;
     }
@@ -3354,7 +3354,7 @@ fn countRegexDecompositionLogicalLinesRange(
         const line_end = lineEndForOffset(data, candidate_start);
         result.candidate_lines_checked += 1;
         const raw_line = data[line_start..line_end];
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        const line = trimCR(raw_line);
         if (regexLineMatches(line, pattern)) {
             result.matches += 1;
             result.candidate_lines_matched += 1;
@@ -3647,7 +3647,7 @@ fn recordLineIntoShardImpl(
     shard: *ShardReport,
     chunk_casefolded: bool,
 ) void {
-    const line = std.mem.trimEnd(u8, raw_line, "\r");
+    const line = trimCR(raw_line);
     if (request.stats_only) {
         const ci = if (chunk_casefolded) false else request.case_insensitive;
         const count = if (mono) |m|
@@ -4267,6 +4267,15 @@ fn shouldAttemptTrigramPrune(file_bytes: usize, single_chunk: bool, admission: t
     return admission.eligible and single_chunk and file_bytes >= TRIGRAM_MIN_PRUNE_BYTES;
 }
 
+/// Fast CR trim: single-byte branch instead of std.mem.trimEnd's scalar
+/// scan-from-end loop. std.mem.trimEnd scans backwards past ALL trailing
+/// characters in the set — for "\r" that's at most 1 byte, but it still
+/// enters a loop. This is a 1-cycle branch on the hot per-line path.
+inline fn trimCR(raw_line: []const u8) []const u8 {
+    if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r') return raw_line[0 .. raw_line.len - 1];
+    return raw_line;
+}
+
 fn availableThreads() usize {
     return std.Thread.getCpuCount() catch 1;
 }
@@ -4472,7 +4481,7 @@ fn recordLine(
     report: *SearchReport,
     chunk_casefolded: bool,
 ) !void {
-    const line = std.mem.trimEnd(u8, raw_line, "\r");
+    const line = trimCR(raw_line);
     if (request.stats_only) {
         const ci = if (chunk_casefolded) false else request.case_insensitive;
         const count = statsOnlyMatchCount(line, plan, ci, chunk_casefolded);
@@ -4616,7 +4625,7 @@ fn regexDecompositionFastCount(
         stats.candidate_lines_checked += 1;
         const line_end = lineEndForOffset(buffer, candidate_start);
         const raw_line = buffer[line_start..line_end];
-        const line = std.mem.trimEnd(u8, raw_line, "\r");
+        const line = trimCR(raw_line);
         if (regexLineMatches(line, predicate.value)) {
             count += 1;
             stats.candidate_lines_matched += 1;
