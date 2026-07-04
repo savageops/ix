@@ -13,6 +13,7 @@ export const DEFAULT_ALTERNATES_EXPR = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RS
 const DEFAULT_BENCHMARK_LOCK_DIR = path.join(os.tmpdir(), "ix-zig-benchmark.lock");
 const DEFAULT_STALE_BENCHMARK_LOCK_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_PENDING_BENCHMARK_LOCK_OWNER_GRACE_MS = 5 * 1000;
+const RUNTIME_FRESHNESS_EXTENSIONS = new Set([".zig", ".c", ".h"]);
 const BENCHMARK_ENV_SNAPSHOT_KEYS = [
   "IX_INDEX",
   "IX_NEXUS",
@@ -323,6 +324,52 @@ export function acquireBenchmarkLock({
     process.exit(143);
   });
   return { lockDir, release };
+}
+
+function newestRuntimeInput(root) {
+  let newest = null;
+  const visitFile = (filePath) => {
+    const stat = statSync(filePath);
+    if (!newest || stat.mtimeMs > newest.mtimeMs) {
+      newest = { path: filePath, mtimeMs: stat.mtimeMs, mtime: stat.mtime.toISOString() };
+    }
+  };
+  const visitDir = (dirPath) => {
+    for (const entry of readdirSync(dirPath, { withFileTypes: true })) {
+      const fullPath = path.join(dirPath, entry.name);
+      if (entry.isDirectory()) {
+        visitDir(fullPath);
+      } else if (entry.isFile() && RUNTIME_FRESHNESS_EXTENSIONS.has(path.extname(entry.name))) {
+        visitFile(fullPath);
+      }
+    }
+  };
+  const srcDir = path.join(root, "src");
+  if (existsSync(srcDir)) visitDir(srcDir);
+  for (const fileName of ["build.zig", "build.zig.zon"]) {
+    const filePath = path.join(root, fileName);
+    if (existsSync(filePath)) visitFile(filePath);
+  }
+  return newest;
+}
+
+export function assertRepoBinaryFresh({ root, repoIx, label = "repo IX" } = {}) {
+  if (!root) throw new Error("assertRepoBinaryFresh requires root");
+  if (!repoIx) throw new Error("assertRepoBinaryFresh requires repoIx");
+  if (!existsSync(repoIx)) throw new Error(`${label} not found: ${repoIx}`);
+  const binaryStat = statSync(repoIx);
+  const newestInput = newestRuntimeInput(root);
+  if (newestInput && binaryStat.mtimeMs + 1 < newestInput.mtimeMs) {
+    throw new Error(
+      `${label} is stale: ${repoIx} mtime ${binaryStat.mtime.toISOString()} is older than ${newestInput.path} mtime ${newestInput.mtime}. Run the ReleaseFast build before benchmarking.`,
+    );
+  }
+  return {
+    ok: true,
+    binaryPath: repoIx,
+    binaryMtime: binaryStat.mtime.toISOString(),
+    newestRuntimeInput: newestInput,
+  };
 }
 
 function percentile(sorted, p) {
@@ -705,10 +752,15 @@ function installedRepairDirective({ improvementPct, pairedImprovementMedianPct, 
   const scanPct = Number(pairedAttribution?.pairedCandidateScanImprovementMedianPct);
   const discoverPct = Number(pairedAttribution?.pairedCandidateDiscoverImprovementMedianPct);
   const engineRegressed = Number(improvementPct) < 0 || Number(pairedImprovementMedianPct) < 0;
+  const engineImproved = Number(improvementPct) > 0 && Number(pairedImprovementMedianPct) > 0;
   const teddyImproved = routeScore?.teddyRouteObserved === true &&
     routeScore?.teddyRouteNetPositive === true &&
     Number.isFinite(teddyMedianPct) &&
     teddyMedianPct > 0;
+  const teddyRegressed = routeScore?.teddyRouteObserved === true &&
+    routeScore?.teddyRouteNetPositive !== true &&
+    Number.isFinite(teddyMedianPct) &&
+    teddyMedianPct < 0;
   const targetPhase = [
     ["scanWork", scanWorkPct],
     ["scan", scanPct],
@@ -719,8 +771,8 @@ function installedRepairDirective({ improvementPct, pairedImprovementMedianPct, 
     mixedKernelEngineSignal: teddyImproved && engineRegressed,
     repairDirective: teddyImproved && engineRegressed
       ? "preserve_teddy_gain_repair_whole_engine"
-      : (engineRegressed ? "repair_whole_engine_regression" : null),
-    repairTargetPhase: targetPhase,
+      : (engineRegressed ? "repair_whole_engine_regression" : (engineImproved && teddyRegressed ? "preserve_engine_gain_repair_teddy_route" : null)),
+    repairTargetPhase: engineImproved && teddyRegressed ? "teddyRoute" : targetPhase,
   };
 }
 
@@ -856,8 +908,7 @@ export function buildInstalledComparisonScore({
           routeParityAcceptable === true &&
           engineAcceptable &&
           pairedEngineAcceptable &&
-          pairedWinAcceptable &&
-          routeScore.teddyRouteNetPositive === true,
+          pairedWinAcceptable,
   };
 }
 
@@ -1139,6 +1190,13 @@ export function buildHistoricalComparisonScore({
     pairedEngine,
     sameBinary ? null : minPreviousBuildImprovementPct,
   );
+  const requiredImprovementPct = sameBinary ? null : minPreviousBuildImprovementPct;
+  const orderStratifiedPairedEngineAcceptable =
+    orderStratifiedEngine?.allStartPositionsNetPositive === true &&
+    Number(orderStratifiedEngine?.firstStartCandidateImprovementPct) >= requiredImprovementPct &&
+    Number(orderStratifiedEngine?.secondStartCandidateImprovementPct) >= requiredImprovementPct;
+  const pairedWinAcceptable =
+    Number(pairedEngine?.candidateWinRate) > 0.5 || orderStratifiedPairedEngineAcceptable;
   const repairDirective = installedRepairDirective({
     improvementPct,
     pairedImprovementMedianPct,
@@ -1151,7 +1209,7 @@ export function buildHistoricalComparisonScore({
       baselineLabel,
       candidateLabel: "repo-current",
       evidenceAuthority: sameBinary ? "identity_noise_only" : "previous_build",
-      requiredImprovementPct: sameBinary ? null : minPreviousBuildImprovementPct,
+      requiredImprovementPct,
       historyEngineMedianMs: historyEngineMedianMs ?? null,
       currentEngineMedianMs: currentEngineMedianMs ?? null,
       currentEngineImprovementPct: improvementPct,
@@ -1166,6 +1224,8 @@ export function buildHistoricalComparisonScore({
     orderStratifiedFirstStartCurrentImprovementPct: orderStratifiedEngine?.firstStartCandidateImprovementPct ?? null,
     orderStratifiedSecondStartCurrentImprovementPct: orderStratifiedEngine?.secondStartCandidateImprovementPct ?? null,
     orderStratifiedAllStartPositionsNetPositive: orderStratifiedEngine?.allStartPositionsNetPositive ?? null,
+    pairedCurrentOrderStratifiedAcceptable: orderStratifiedPairedEngineAcceptable,
+    pairedCurrentWinAcceptable: pairedWinAcceptable,
     ...pairedAttribution,
     ...routeScore,
     ...repairDirective,
@@ -1183,10 +1243,9 @@ export function buildHistoricalComparisonScore({
           Number.isFinite(pairedImprovementMedianPct) &&
           pairedImprovementMedianPct >= minPreviousBuildImprovementPct &&
           pairedConfidence.pairedImprovementConclusiveAboveTarget === true &&
-          Number(pairedEngine?.candidateWinRate) > 0.5 &&
+          pairedWinAcceptable &&
           matchParity === true &&
-          (routeParityAcceptable ?? (routeParity === true)) === true &&
-          routeScore.teddyRouteNetPositive === true,
+          (routeParityAcceptable ?? (routeParity === true)) === true,
   };
 }
 

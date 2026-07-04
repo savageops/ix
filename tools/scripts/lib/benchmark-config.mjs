@@ -4,6 +4,8 @@ import path from "node:path";
 export const DEFAULT_RIPGREP_LINUX_CORPUS = "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux";
 export const DEFAULT_ALTERNATES_EXPRESSION = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)";
 export const DEFAULT_NATIVE_INSTALL_DIR = path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin");
+export const DEFAULT_RETAINED_BENCH_THREADS = 2;
+export const DEFAULT_RETAINED_RESOURCE_PROFILE = "low";
 export const EXPERIMENTAL_BENCH_ENV_KEYS = [
   "IX_TEDDY_FINGERPRINT_OFFSET",
   "IX_TEDDY_RANGE_FINGERPRINT_OFFSET",
@@ -58,7 +60,7 @@ export function baseBenchEnv(kind) {
   return {
     IX_INDEX: "0",
     IX_NEXUS: "0",
-    IX_RESOURCE_PROFILE: "high",
+    IX_RESOURCE_PROFILE: DEFAULT_RETAINED_RESOURCE_PROFILE,
     IX_STATE_DIR: benchmarkStateDir(kind),
     IX_BENCH_ISOLATION_MODE: process.platform === "win32" ? "enforce" : "telemetry",
     IX_BENCH_PRIORITY_CLASS: BENCHMARK_ISOLATION_DEFAULTS.priorityClass,

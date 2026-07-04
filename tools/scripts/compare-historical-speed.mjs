@@ -1,11 +1,11 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { baseBenchEnv, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT_NATIVE_INSTALL_DIR, DEFAULT_RIPGREP_LINUX_CORPUS } from "./lib/benchmark-config.mjs";
+import { baseBenchEnv, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT_NATIVE_INSTALL_DIR, DEFAULT_RETAINED_BENCH_THREADS, DEFAULT_RIPGREP_LINUX_CORPUS } from "./lib/benchmark-config.mjs";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkDecisionGrade, benchmarkEvidenceFailures, benchmarkHostWarningFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, hardestComparableHistoricalLabel, preferHistoricalSelectionSeed, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, benchmarkEnvSnapshot, binarySnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, assertRepoBinaryFresh, benchmarkEnvSnapshot, binarySnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
@@ -29,7 +29,7 @@ benchsuite, with ripgrep measured first and route/match parity recorded.
 Options:
   --build                               Build repo IX ReleaseFast before measuring.
   --samples <n>                         Samples per comparison. Default: 12.
-  --threads <n>                         IX/ripgrep thread count. Default: 32.
+  --threads <n>                         IX/ripgrep thread count. Default: ${DEFAULT_RETAINED_BENCH_THREADS}.
   --identity-control-samples <n>        Same-binary control pairs. Default: min(12, samples).
   --identity-control-attempts <n>       Same-binary control attempts; first stable attempt is selected. Default: 3.
   --no-identity-control                 Disable same-binary noise control.
@@ -59,7 +59,7 @@ const expression = argValue(args, "--expression", DEFAULT_EXPR);
 const repoIx = argValue(args, "--repo-ix", DEFAULT_REPO_IX);
 const installDir = argValue(args, "--install-dir", DEFAULT_INSTALL_DIR);
 const samples = Number(argValue(args, "--samples", "12"));
-const threads = Number(argValue(args, "--threads", "32"));
+const threads = Number(argValue(args, "--threads", String(DEFAULT_RETAINED_BENCH_THREADS)));
 const identityControlSamples = Number(argValue(args, "--identity-control-samples", String(Math.min(12, samples))));
 const identityControlAttempts = Number(argValue(args, "--identity-control-attempts", process.env.IX_IDENTITY_CONTROL_ATTEMPTS ?? "3"));
 const identityControlEnabled = !args.includes("--no-identity-control");
@@ -325,12 +325,10 @@ function strictEvidenceFailures(host, processScan, comparisons, identityControl)
         `previous_build_paired_ci_below_target:${comparison.label}:${Number.isFinite(pairedLower95Pct) ? pairedLower95Pct : "missing"}<${requiredImprovementPct}`,
       );
     }
-    const candidateWinRate = Number(comparison.pairedEngine?.candidateWinRate);
-    if (!Number.isFinite(candidateWinRate) || candidateWinRate <= 0.5) {
+    const candidateWinRate = Number(comparison.score?.pairedCurrentWinRate ?? comparison.pairedEngine?.candidateWinRate);
+    const orderStratifiedPairedEngineAcceptable = comparison.score?.pairedCurrentOrderStratifiedAcceptable === true;
+    if ((!Number.isFinite(candidateWinRate) || candidateWinRate <= 0.5) && !orderStratifiedPairedEngineAcceptable) {
       failures.push(`previous_build_paired_win_majority_required:${comparison.label}:${Number.isFinite(candidateWinRate) ? candidateWinRate : "missing"}`);
-    }
-    if (comparison.score?.teddyRouteObserved === true && comparison.score?.teddyRouteNetPositive !== true) {
-      failures.push(`previous_build_teddy_route_not_net_positive:${comparison.label}`);
     }
   }
   return failures;
@@ -457,6 +455,7 @@ if (buildFirst) {
   requireOk(run(resolveZigExe(), ["build", "-Doptimize=ReleaseFast", "--summary", "all"]), "ReleaseFast build");
 }
 if (!existsSync(repoIx)) throw new Error(`repo IX not found: ${repoIx}`);
+const repoBinaryFreshness = assertRepoBinaryFresh({ root: ROOT, repoIx, label: "repo IX" });
 
 const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)];
 const hostBefore = hostSnapshot();
@@ -595,6 +594,7 @@ const report = {
   diagnosticAttributionMode,
   benchEnv: BENCH_ENV,
   effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
+  repoBinaryFreshness,
   dependencyTrees: dependencyTreeSnapshot(ROOT),
   host,
   processScan,

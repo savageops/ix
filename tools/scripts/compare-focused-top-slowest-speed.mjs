@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import path from "node:path";
-import { DEFAULT_ALTERNATES_EXPRESSION } from "./lib/benchmark-config.mjs";
+import { DEFAULT_ALTERNATES_EXPRESSION, DEFAULT_RETAINED_BENCH_THREADS } from "./lib/benchmark-config.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
 
 const ROOT = process.cwd();
@@ -23,7 +23,7 @@ Options:
   --top <n>                      Number of slow files. Default: 4.
   --rounds <n>                   Focused rounds per file. Default: 3.
   --samples <n>                  Samples per round. Default: 12.
-  --threads <n>                  IX/ripgrep thread count. Default: 32.
+  --threads <n>                  IX/ripgrep thread count. Default: ${DEFAULT_RETAINED_BENCH_THREADS}.
   --expression <expr>            Search expression. Default: alternates benchmark expression.
   --quiet                        Do not print JSON.
   --help, -h                     Print this help.
@@ -34,7 +34,7 @@ Options:
 const top = Number(argValue(args, "--top", "4"));
 const rounds = Number(argValue(args, "--rounds", "3"));
 const samples = Number(argValue(args, "--samples", "12"));
-const threads = Number(argValue(args, "--threads", "32"));
+const threads = Number(argValue(args, "--threads", String(DEFAULT_RETAINED_BENCH_THREADS)));
 const expression = argValue(args, "--expression", DEFAULT_ALTERNATES_EXPRESSION);
 const quiet = args.includes("--quiet");
 

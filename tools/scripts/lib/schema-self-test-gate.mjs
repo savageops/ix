@@ -1,5 +1,10 @@
 import { phaseLeakSummaryFromRounds } from "./benchmark-phase-attribution.mjs";
+import { baseBenchEnv, DEFAULT_RETAINED_BENCH_THREADS, DEFAULT_RETAINED_RESOURCE_PROFILE } from "./benchmark-config.mjs";
+import { mkdtempSync, mkdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { hardestComparableHistoricalLabel } from "./script-helpers.mjs";
+import { assertRepoBinaryFresh } from "./speed-compare-utils.mjs";
 
 export function runSchemaSelfTest({
   stateDir,
@@ -318,6 +323,46 @@ export function runSchemaSelfTest({
     failures,
   );
   const assertionFailures = [];
+  const installedBenchEnv = baseBenchEnv("installed");
+  const historicalBenchEnv = baseBenchEnv("historical");
+  if (DEFAULT_RETAINED_BENCH_THREADS !== 2) {
+    assertionFailures.push("retained benchmark default thread count must stay fixed at the low-resource envelope");
+  }
+  if (DEFAULT_RETAINED_RESOURCE_PROFILE !== "low") {
+    assertionFailures.push("retained benchmark default resource profile must be low");
+  }
+  if (installedBenchEnv.IX_RESOURCE_PROFILE !== "low" || historicalBenchEnv.IX_RESOURCE_PROFILE !== "low") {
+    assertionFailures.push("retained benchmark base env must use IX_RESOURCE_PROFILE=low");
+  }
+  const freshnessFixtureRoot = mkdtempSync(path.join(os.tmpdir(), "ix-zig-freshness-self-test-"));
+  try {
+    const srcDir = path.join(freshnessFixtureRoot, "src");
+    const binDir = path.join(freshnessFixtureRoot, "zig-out", "bin");
+    mkdirSync(srcDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    const sourcePath = path.join(srcDir, "main.zig");
+    const binaryPath = path.join(binDir, process.platform === "win32" ? "ix-zig.exe" : "ix-zig");
+    writeFileSync(sourcePath, "const x = 1;\n", "utf8");
+    writeFileSync(binaryPath, "binary\n", "utf8");
+    const sourceTime = new Date("2026-01-01T00:00:00.000Z");
+    const freshBinaryTime = new Date("2026-01-01T00:00:05.000Z");
+    utimesSync(sourcePath, sourceTime, sourceTime);
+    utimesSync(binaryPath, freshBinaryTime, freshBinaryTime);
+    assertRepoBinaryFresh({ root: freshnessFixtureRoot, repoIx: binaryPath });
+    const staleSourceTime = new Date("2026-01-01T00:00:10.000Z");
+    utimesSync(sourcePath, staleSourceTime, staleSourceTime);
+    let staleRejected = false;
+    try {
+      assertRepoBinaryFresh({ root: freshnessFixtureRoot, repoIx: binaryPath });
+    } catch (error) {
+      staleRejected = String(error?.message ?? "").includes("is stale");
+    }
+    if (!staleRejected) {
+      assertionFailures.push("repo binary freshness guard must reject source-newer-than-binary benchmark inputs");
+    }
+  } finally {
+    rmSync(freshnessFixtureRoot, { recursive: true, force: true });
+  }
   if (typeof classifyHostForBenchmark !== "function") {
     assertionFailures.push("benchmark host classifier self-test requires classifyHostForBenchmark");
   } else {

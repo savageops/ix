@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import os from "node:os";
 import path from "node:path";
 import { classifyHostForBenchmark, hostSnapshot } from "./lib/benchmark-runner.mjs";
+import { DEFAULT_RETAINED_BENCH_THREADS } from "./lib/benchmark-config.mjs";
 import { createBenchmarkAdmission } from "./lib/benchmark-admission.mjs";
 import {
   createAlternatesDecisionGateLane,
@@ -381,6 +382,8 @@ function installedSpeedLane(hostPreflight = null) {
     ix,
     "--samples",
     String(installedSpeedSamples),
+    "--threads",
+    String(DEFAULT_RETAINED_BENCH_THREADS),
     "--min-retainable-samples",
     String(minRetainableSpeedSamples),
     "--min-installed-improvement-pct",
@@ -560,6 +563,8 @@ function historicalSpeedLane(hostPreflight = null) {
     ix,
     "--samples",
     String(historicalSpeedSamples),
+    "--threads",
+    String(DEFAULT_RETAINED_BENCH_THREADS),
     "--min-retainable-samples",
     String(minRetainableSpeedSamples),
     "--min-previous-build-improvement-pct",
@@ -1076,7 +1081,7 @@ function benchmarkControlLane(hostPreflight = null) {
     "--corpus",
     corpus,
     "--threads",
-    "32",
+    String(DEFAULT_RETAINED_BENCH_THREADS),
     "--warmup",
     String(ripgrepWarmupSamples),
     "--samples",
