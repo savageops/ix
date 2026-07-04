@@ -25,6 +25,10 @@ pub const FileAdmissionGroup = struct {
     needle_count: usize = 0,
     needles: [FILE_ADMISSION_MAX_GROUP_NEEDLES][]const u8 = @splat(""),
     case_insensitive: bool = false,
+    /// For case-insensitive admission: lowercase copies of the needles.
+    /// Stored in a fixed buffer to avoid allocation.
+    lower_needles: [FILE_ADMISSION_MAX_GROUP_NEEDLES][16]u8 = @splat(@splat(0)),
+    lower_needle_lens: [FILE_ADMISSION_MAX_GROUP_NEEDLES]usize = @splat(0),
 
     fn appendNeedle(self: *FileAdmissionGroup, needle: []const u8) bool {
         if (self.needle_count >= self.needles.len) return false;
@@ -33,38 +37,49 @@ pub const FileAdmissionGroup = struct {
         return true;
     }
 
+    /// Prepare lowercase needle copies for case-insensitive admission.
+    /// Called once after all needles are appended.
+    pub fn prepareCaseInsensitive(self: *FileAdmissionGroup) void {
+        if (!self.case_insensitive) return;
+        for (0..self.needle_count) |i| {
+            const needle = self.needles[i];
+            const lower_len = @min(needle.len, self.lower_needles[i].len);
+            for (0..lower_len) |j| {
+                self.lower_needles[i][j] = std.ascii.toLower(needle[j]);
+            }
+            self.lower_needle_lens[i] = lower_len;
+        }
+    }
+
+    /// Admission check. For case-insensitive mode, the caller MUST pass
+    /// an already-lowercased buffer (use asciiLowerBuf before calling).
+    /// This avoids per-needle eqlIgnoreCase overhead — one SIMD casefold
+    /// pass on the haystack, then fast BMH/StringZilla on each needle.
     pub fn isMiss(self: *const FileAdmissionGroup, bytes: []const u8) bool {
         return switch (self.mode) {
             .all => {
-                for (self.needles[0..self.needle_count]) |needle| {
-                    if (!containsNeedle(bytes, needle, self.case_insensitive)) return true;
+                for (0..self.needle_count) |i| {
+                    const needle = if (self.case_insensitive)
+                        self.lower_needles[i][0..self.lower_needle_lens[i]]
+                    else
+                        self.needles[i];
+                    if (sz.indexOfAdmission(bytes, needle) == null) return true;
                 }
                 return false;
             },
             .any => {
-                for (self.needles[0..self.needle_count]) |needle| {
-                    if (containsNeedle(bytes, needle, self.case_insensitive)) return false;
+                for (0..self.needle_count) |i| {
+                    const needle = if (self.case_insensitive)
+                        self.lower_needles[i][0..self.lower_needle_lens[i]]
+                    else
+                        self.needles[i];
+                    if (sz.indexOfAdmission(bytes, needle) != null) return false;
                 }
                 return self.needle_count != 0;
             },
         };
     }
 };
-
-/// Case-sensitive fast path via StringZilla/BMH admission probe.
-/// Case-insensitive path uses std.ascii.eqlIgnoreCase in a rolling window
-/// — slower but false-negative-safe: every case variant of the needle
-/// is found because both sides compare case-insensitively.
-fn containsNeedle(haystack: []const u8, needle: []const u8, case_insensitive: bool) bool {
-    if (!case_insensitive) return sz.indexOfAdmission(haystack, needle) != null;
-    if (needle.len == 0) return true;
-    if (needle.len > haystack.len) return false;
-    var i: usize = 0;
-    while (i <= haystack.len - needle.len) : (i += 1) {
-        if (std.ascii.eqlIgnoreCase(haystack[i .. i + needle.len], needle)) return true;
-    }
-    return false;
-}
 
 pub const TrigramAdmissionProgram = struct {
     eligible: bool = false,
@@ -135,8 +150,19 @@ pub const TrigramAdmissionProgram = struct {
 
     fn appendFileAdmissionGroup(self: *TrigramAdmissionProgram, group: FileAdmissionGroup) void {
         if (self.file_admission_group_count >= self.file_admission_groups.len) return;
-        self.file_admission_groups[self.file_admission_group_count] = group;
+        var g = group;
+        g.prepareCaseInsensitive();
+        self.file_admission_groups[self.file_admission_group_count] = g;
         self.file_admission_group_count += 1;
+    }
+
+    /// Returns true if any admission group is case-insensitive, so the caller
+    /// knows to casefold the haystack buffer before calling fileAdmissionMiss.
+    pub fn needsCasefold(self: *const TrigramAdmissionProgram) bool {
+        for (0..self.file_admission_group_count) |i| {
+            if (self.file_admission_groups[i].case_insensitive) return true;
+        }
+        return false;
     }
 
     pub fn fileAdmissionMiss(self: *const TrigramAdmissionProgram, bytes: []const u8) bool {
@@ -378,10 +404,15 @@ test "compiled file admission supports case insensitive search" {
     const admission = trigram.admit(plan);
     const program = TrigramAdmissionProgram.compile(admission, plan, true);
     try std.testing.expectEqual(FileAdmissionMode.all, program.file_admission_mode);
+    // The scan owner lowercases case-insensitive haystacks before admission.
+    try std.testing.expect(program.needsCasefold());
+    // Lowercased haystack (as the scan loop provides it):
     try std.testing.expect(program.fileAdmissionMiss("alpha only"));
     try std.testing.expect(!program.fileAdmissionMiss("alpha and omega"));
-    // case-insensitive: ALPHA should match alpha
-    try std.testing.expect(!program.fileAdmissionMiss("ALPHA and OMEGA"));
+    var folded: [16]u8 = undefined;
+    const mixed = "ALPHA and OMEGA";
+    for (mixed, 0..) |byte, index| folded[index] = std.ascii.toLower(byte);
+    try std.testing.expect(!program.fileAdmissionMiss(folded[0..mixed.len]));
 }
 
 test "compiled file admission stores long prefix probe once" {

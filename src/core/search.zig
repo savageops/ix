@@ -2820,7 +2820,13 @@ fn scanFileMmap(
         shard.slowest_bytes = file_bytes;
     }
 
-    if (shouldAttemptWholeFileAdmission(true, request.case_insensitive, trigram_program) and trigram_program.fileAdmissionMiss(data)) {
+    const mmap_admission_casefold_required =
+        shouldAttemptWholeFileAdmission(true, request.case_insensitive, trigram_program) and
+        trigram_program.needsCasefold();
+    if (!mmap_admission_casefold_required and
+        shouldAttemptWholeFileAdmission(true, request.case_insensitive, trigram_program) and
+        trigram_program.fileAdmissionMiss(data))
+    {
         recordEvidencePruned(shard, file_bytes);
         const file_ms = elapsedMs(io, file_started);
         recordShardScanFileMmapMs(shard, file_ms);
@@ -3443,14 +3449,16 @@ fn scanOpenFileIntoShardImpl(
             } else |_| {}
         }
     }
-    if (shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program) and
-        trigram_program.fileAdmissionMiss(read_buffer[0..first_read]))
+    if (shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program))
     {
-        recordEvidencePruned(shard, file_bytes);
-        const file_ms = elapsedMs(io, file_started);
-        recordShardScanFileBufferedMs(shard, file_ms);
-        if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
-        return;
+        if (trigram_program.needsCasefold()) asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
+        if (trigram_program.fileAdmissionMiss(read_buffer[0..first_read])) {
+            recordEvidencePruned(shard, file_bytes);
+            const file_ms = elapsedMs(io, file_started);
+            recordShardScanFileBufferedMs(shard, file_ms);
+            if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            return;
+        }
     }
     const literal_admission_satisfied =
         shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program) and
@@ -4244,8 +4252,8 @@ fn tryTrigramPruneFile(
     return true;
 }
 
-fn shouldAttemptWholeFileAdmission(whole_file_available: bool, case_insensitive: bool, program: *const TrigramAdmissionProgram) bool {
-    return whole_file_available and !case_insensitive and program.fileAdmissionEnabled();
+fn shouldAttemptWholeFileAdmission(whole_file_available: bool, _: bool, program: *const TrigramAdmissionProgram) bool {
+    return whole_file_available and program.fileAdmissionEnabled();
 }
 
 fn shouldAttemptTrigramPrune(file_bytes: usize, single_chunk: bool, admission: trigram.Admission, _: bool) bool {
@@ -4314,13 +4322,15 @@ fn scanOpenFile(
         report.slowest_path = display_path;
         report.slowest_bytes = file_bytes;
     }
-    if (shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program) and
-        trigram_program.fileAdmissionMiss(read_buffer[0..first_read]))
+    if (shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program))
     {
-        const file_ms = elapsedMs(io, file_started);
-        recordReportScanFileBufferedMs(report, file_ms);
-        if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
-        return;
+        if (trigram_program.needsCasefold()) asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
+        if (trigram_program.fileAdmissionMiss(read_buffer[0..first_read])) {
+            const file_ms = elapsedMs(io, file_started);
+            recordReportScanFileBufferedMs(report, file_ms);
+            if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
+            return;
+        }
     }
     const literal_admission_satisfied =
         shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program) and
@@ -5541,7 +5551,7 @@ test "whole-file admission requires a complete file buffer" {
     try std.testing.expect(program.fileAdmissionEnabled());
     try std.testing.expect(shouldAttemptWholeFileAdmission(true, false, &program));
     try std.testing.expect(!shouldAttemptWholeFileAdmission(false, false, &program));
-    try std.testing.expect(!shouldAttemptWholeFileAdmission(true, true, &program));
+    try std.testing.expect(shouldAttemptWholeFileAdmission(true, true, &program));
 }
 
 test "warm index live marker validates magic pid and root" {
