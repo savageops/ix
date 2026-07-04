@@ -4,6 +4,7 @@ const windows = std.os.windows;
 const catalog = @import("catalog.zig");
 const generation = @import("generation.zig");
 const postings = @import("postings.zig");
+const process_memory = @import("process_memory.zig");
 const resource_profile = @import("resource_profile.zig");
 const state_dir = @import("state_dir.zig");
 const usn = @import("usn.zig");
@@ -27,12 +28,6 @@ extern "kernel32" fn GetProcessTimes(
     lpUserTime: *windows.FILETIME,
 ) callconv(.winapi) windows.BOOL;
 
-extern "kernel32" fn K32GetProcessMemoryInfo(
-    Process: windows.HANDLE,
-    ppsmemCounters: *PROCESS_MEMORY_COUNTERS,
-    cb: windows.DWORD,
-) callconv(.winapi) windows.BOOL;
-
 pub const LIVE_MARKER_NAME = "index.live";
 pub const MEMORY_LIMIT_ENV = "IX_INDEXD_MEMORY_LIMIT_MB";
 const INDEX_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
@@ -40,19 +35,6 @@ const INDEX_LARGE_SOURCE_FILE_READ_LIMIT: usize = 64 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_TOTAL_READ_LIMIT: usize = 384 * 1024 * 1024;
 const MUTATION_SETTLE_WINDOW_NS: u64 = 75 * std.time.ns_per_ms;
 const MUTATION_SETTLE_MAX_WINDOWS: u32 = 2;
-
-const PROCESS_MEMORY_COUNTERS = extern struct {
-    cb: windows.DWORD,
-    PageFaultCount: windows.DWORD,
-    PeakWorkingSetSize: windows.SIZE_T,
-    WorkingSetSize: windows.SIZE_T,
-    QuotaPeakPagedPoolUsage: windows.SIZE_T,
-    QuotaPagedPoolUsage: windows.SIZE_T,
-    QuotaPeakNonPagedPoolUsage: windows.SIZE_T,
-    QuotaNonPagedPoolUsage: windows.SIZE_T,
-    PagefileUsage: windows.SIZE_T,
-    PeakPagefileUsage: windows.SIZE_T,
-};
 
 pub const Request = struct {
     root: []const u8,
@@ -366,20 +348,13 @@ fn parseMemoryLimitMb(value: []const u8) ?usize {
 
 fn enforceMemoryBudget(limit_bytes: usize) !void {
     if (limit_bytes == 0) return;
-    const resident = currentResidentBytes() orelse return;
-    if (memoryBudgetExceeded(resident, limit_bytes)) return error.MemoryBudgetExceeded;
+    const resident = process_memory.currentResidentBytes() orelse return;
+    if (resident > std.math.maxInt(usize)) return error.MemoryBudgetExceeded;
+    if (memoryBudgetExceeded(@intCast(resident), limit_bytes)) return error.MemoryBudgetExceeded;
 }
 
 fn memoryBudgetExceeded(current_bytes: usize, limit_bytes: usize) bool {
     return limit_bytes != 0 and current_bytes > limit_bytes;
-}
-
-fn currentResidentBytes() ?usize {
-    if (builtin.os.tag != .windows) return null;
-    var counters: PROCESS_MEMORY_COUNTERS = undefined;
-    counters.cb = @sizeOf(PROCESS_MEMORY_COUNTERS);
-    if (K32GetProcessMemoryInfo(windows.GetCurrentProcess(), &counters, @sizeOf(PROCESS_MEMORY_COUNTERS)) == windows.BOOL.FALSE) return null;
-    return counters.WorkingSetSize;
 }
 
 pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []const u8) !generation.ReaderPin {
@@ -1372,7 +1347,7 @@ test "indexd memory budget rejects resident usage over cap" {
     try std.testing.expect(!memoryBudgetExceeded(1, 1));
     try std.testing.expect(!memoryBudgetExceeded(std.math.maxInt(usize), 0));
     if (builtin.os.tag == .windows) {
-        const resident = currentResidentBytes() orelse return error.TestExpectedResidentMemory;
+        const resident = process_memory.currentResidentBytes() orelse return error.TestExpectedResidentMemory;
         try std.testing.expect(resident > 0);
         try std.testing.expectError(error.MemoryBudgetExceeded, enforceMemoryBudget(1));
     }

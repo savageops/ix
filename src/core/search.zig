@@ -12,6 +12,7 @@ const nt_open = @import("nt_open.zig");
 const regex = @import("regex.zig");
 const pcre_regex = @import("pcre_regex.zig");
 const postings = @import("postings.zig");
+const process_memory = @import("process_memory.zig");
 const protected_paths = @import("protected_paths.zig");
 const resource_profile = @import("resource_profile.zig");
 const scan_input_policy = @import("scan_input_policy.zig");
@@ -4116,6 +4117,7 @@ fn isContainedBy(parent: PreparedRoot, candidate: PreparedRoot) bool {
 }
 
 fn refreshStats(report: *SearchReport) void {
+    const memory_snapshot = process_memory.currentProcessSnapshot();
     report.scan_file_ms_total = report.scan_file_mmap_ms_total + report.scan_file_buffered_ms_total;
     report.stats.input_roots = report.input_roots;
     report.stats.effective_roots = report.effective_roots;
@@ -4150,6 +4152,11 @@ fn refreshStats(report: *SearchReport) void {
         .scan_file_buffered_ms_total = report.scan_file_buffered_ms_total,
         .aggregate_merge_ms = report.aggregate_ms,
         .aggregate_finalize_ms = 0,
+    };
+    report.stats.process_memory = .{
+        .available = memory_snapshot.available,
+        .current_resident_bytes = memory_snapshot.current_resident_bytes,
+        .peak_resident_bytes = memory_snapshot.peak_resident_bytes,
     };
     const byte_sharded = report.stats.byte_shard_kernel.enabled;
     const byte_shard_ranges = if (report.stats.byte_shard_kernel.files_profiled > 0)

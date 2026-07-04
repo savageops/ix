@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const catalog = @import("catalog.zig");
 const generation = @import("generation.zig");
 const indexd = @import("indexd.zig");
+const process_memory = @import("process_memory.zig");
 const state_dir = @import("state_dir.zig");
 
 const windows = std.os.windows;
@@ -22,25 +23,6 @@ extern "kernel32" fn GetProcessTimes(
     lpKernelTime: *windows.FILETIME,
     lpUserTime: *windows.FILETIME,
 ) callconv(.winapi) windows.BOOL;
-
-extern "kernel32" fn K32GetProcessMemoryInfo(
-    Process: windows.HANDLE,
-    ppsmemCounters: *PROCESS_MEMORY_COUNTERS,
-    cb: windows.DWORD,
-) callconv(.winapi) windows.BOOL;
-
-const PROCESS_MEMORY_COUNTERS = extern struct {
-    cb: windows.DWORD,
-    PageFaultCount: windows.DWORD,
-    PeakWorkingSetSize: windows.SIZE_T,
-    WorkingSetSize: windows.SIZE_T,
-    QuotaPeakPagedPoolUsage: windows.SIZE_T,
-    QuotaPagedPoolUsage: windows.SIZE_T,
-    QuotaPeakNonPagedPoolUsage: windows.SIZE_T,
-    QuotaNonPagedPoolUsage: windows.SIZE_T,
-    PagefileUsage: windows.SIZE_T,
-    PeakPagefileUsage: windows.SIZE_T,
-};
 
 const PROCESS_QUERY_LIMITED_INFORMATION: windows.DWORD = 0x0000_1000;
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 4 * 1024 * 1024 * 1024;
@@ -436,10 +418,8 @@ fn processMemoryBytes(pid: u32) ?u64 {
     if (builtin.os.tag != .windows or pid == 0) return null;
     const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, windows.BOOL.FALSE, @intCast(pid)) orelse return null;
     defer _ = CloseHandle(handle);
-    var counters = std.mem.zeroes(PROCESS_MEMORY_COUNTERS);
-    counters.cb = @sizeOf(PROCESS_MEMORY_COUNTERS);
-    if (K32GetProcessMemoryInfo(handle, &counters, @sizeOf(PROCESS_MEMORY_COUNTERS)) == windows.BOOL.FALSE) return null;
-    return @intCast(counters.WorkingSetSize);
+    const snapshot = process_memory.snapshotForHandle(handle) orelse return null;
+    return snapshot.current_resident_bytes;
 }
 
 fn fileTimeToUnixNs(file_time: windows.FILETIME) i128 {

@@ -2260,6 +2260,7 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
   const accessErrors = report.stats?.access_errors ?? {};
   const byteShard = report.stats?.byte_shard_kernel ?? {};
   const linuxDominant = report.stats?.linux_dominant_file ?? {};
+  const ixProcessMemory = report.stats?.process_memory ?? {};
   const slowest = report.stats?.slowest ?? report.stats?.slowest_file ?? {};
   const slowestFiles = Array.isArray(report.stats?.slowest_files) ? report.stats.slowest_files : [];
   const byteShardStrategy = byteShard.strategy ?? "none";
@@ -2285,9 +2286,12 @@ export function measureIxOnce(binaryPath, ixArgs, sample, options = {}) {
     sample,
     benchmarkIsolation: result.benchmarkIsolation ?? null,
     processMetrics: result.processMetrics ?? null,
-    peakWorkingSetBytes: optionalNumber(result.processMetrics?.peakWorkingSetBytes),
+    peakWorkingSetBytes: optionalNumber(result.processMetrics?.peakWorkingSetBytes) ?? optionalNumber(ixProcessMemory.peak_resident_bytes),
     peakPagedMemoryBytes: optionalNumber(result.processMetrics?.peakPagedMemoryBytes),
     peakVirtualMemoryBytes: optionalNumber(result.processMetrics?.peakVirtualMemoryBytes),
+    ixProcessMemoryAvailable: ixProcessMemory.available === true,
+    ixCurrentResidentBytes: optionalNumber(ixProcessMemory.current_resident_bytes),
+    ixPeakResidentBytes: optionalNumber(ixProcessMemory.peak_resident_bytes),
     cliMs: result.durationMs,
     engineMs,
     discoverMs: Number(timings.discover_ms ?? 0),

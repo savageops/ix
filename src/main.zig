@@ -19,6 +19,7 @@ test {
     _ = @import("core/postings.zig");
     _ = @import("core/literal_alternates.zig");
     _ = @import("core/process_tool.zig");
+    _ = @import("core/process_memory.zig");
     _ = @import("core/protected_paths.zig");
     _ = @import("core/resource_profile.zig");
     _ = @import("core/indexd.zig");

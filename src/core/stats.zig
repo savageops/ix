@@ -14,6 +14,12 @@ pub const PhaseTimings = struct {
     aggregate_finalize_ms: f64 = 0,
 };
 
+pub const ProcessMemoryStats = struct {
+    available: bool = false,
+    current_resident_bytes: u64 = 0,
+    peak_resident_bytes: u64 = 0,
+};
+
 pub const SlowFileStat = struct {
     path: []const u8 = "",
     duration_ms: f64 = 0,
@@ -370,6 +376,7 @@ pub const SearchStats = struct {
     admission: AdmissionStats = .{},
     fallback_line_scan: ?FallbackLineScanStats = null,
     timings: PhaseTimings = .{},
+    process_memory: ProcessMemoryStats = .{},
     concurrency: ConcurrencyStats = .{},
     slowest_files: [5]SlowFileStat = @splat(.{}),
     slowest_file_count: usize = 0,
@@ -468,6 +475,7 @@ test "search stats owns rust-compatible top-level schema defaults" {
     try std.testing.expect(!snapshot.generation_refresh.enabled);
     try std.testing.expectEqualStrings("not_wired", snapshot.generation_refresh.refresh_status);
     try std.testing.expectEqualStrings("not_wired", snapshot.generation_refresh.fallback_reason);
+    try std.testing.expect(!snapshot.process_memory.available);
     try std.testing.expectEqual(@as(usize, 3), snapshot.slowest_file_count);
     try std.testing.expectEqualStrings("slower.txt", snapshot.slowest_files[0].path);
     try std.testing.expectEqualStrings("fixture.txt", snapshot.slowest_files[1].path);
