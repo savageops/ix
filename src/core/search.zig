@@ -484,9 +484,29 @@ fn prepareWarmIndexFrontier(
     // indexing before doing the expensive postings evaluation. This is the
     // false-negative floor — if the signature mismatches, fall back to cold.
     //
-    // For delta generations, walk the parent epoch chain to find the base
-    // generation that carries the signature.
-    {
+    // Staleness guard: on cache MISS, validate the corpus hasn't changed.
+    // But try the frontier cache FIRST — if a previous query on this
+    // expression+epoch already validated the corpus and cached the candidate
+    // list, we can skip the expensive 79k-file signature walk entirely.
+    // The frontier cache epoch-pins the generation, so it's safe as long
+    // as the generation hasn't been superseded (which the pin guarantees).
+    if (loadWarmQueryFrontier(io, allocator, root_state.index_dir, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
+        return .{
+            .active_files = cached,
+            .root = root,
+            .root_fingerprint = root_identity.fingerprint,
+            .epoch = pin.epoch,
+            .discovered = report.files_discovered,
+            .candidate_count = cached.len,
+            .known_matches = known_matches,
+        };
+    }
+
+    // Signature walk: only runs when BOTH the hits cache AND frontier cache
+    // missed AND this is NOT a delta generation. Delta generations carry their
+    // own freshness proof (the delta overlay IS the change set), so the
+    // signature check is meaningless for them.
+    if (pin.parent_epoch == null) {
         var sig_epoch = pin.epoch;
         var search_parent = pin.parent_epoch;
         while (true) {
@@ -507,18 +527,6 @@ fn prepareWarmIndexFrontier(
             if (!indexed_sig.matches(live_sig)) return warmIndexFallback(report, "stale_signature");
             break;
         }
-    }
-
-    if (loadWarmQueryFrontier(io, allocator, root_state.index_dir, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
-        return .{
-            .active_files = cached,
-            .root = root,
-            .root_fingerprint = root_identity.fingerprint,
-            .epoch = pin.epoch,
-            .discovered = report.files_discovered,
-            .candidate_count = cached.len,
-            .known_matches = known_matches,
-        };
     }
 
     if (pin.parent_epoch) |parent_epoch| {
