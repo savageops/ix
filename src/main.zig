@@ -290,6 +290,10 @@ fn shouldLaunchIndexdSidecar(enabled: bool, request: cli.SearchRequest, report: 
     if (request.case_insensitive) return false;
     if (request.hidden) return false;
     if (request.path_count != 1) return false;
+    // Don't launch sidecar if the warm index was already used — the index
+    // exists and is valid, no rebuild needed. Only launch on cold fallback
+    // (no index available) to bootstrap the first index.
+    if (report.stats.catalog_index.available) return false;
     return report.files_discovered > 0;
 }
 
