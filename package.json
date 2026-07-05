@@ -1,6 +1,7 @@
 {
-  "name": "ix-zig-bench",
-  "version": "0.1.0",
+  "name": "ix-zig",
+  "version": "0.2.0",
+  "description": "IX — 32 bytes/cycle code search engine with warm-index foreground admission",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,5 +13,10 @@
     "eval:agent": "node tools/scripts/ix-agent-real-eval.mjs",
     "install:native": "node tools/scripts/sync-native-install.mjs",
     "dashboard": "node tools/scripts/dashboard-server.mjs"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/savageops/ix-zig.git"
+  },
+  "license": "MIT"
 }
