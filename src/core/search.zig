@@ -429,7 +429,8 @@ fn prepareWarmIndexFrontier(
     report.stats.postings_index.fallback_reason = "checking";
     report.stats.generation_refresh.fallback_reason = "checking";
 
-    if (request.case_insensitive) return warmIndexFallback(report, "case_insensitive");
+    // case_insensitive is no longer a gate — the lowercased trigram index
+    // supports case-insensitive queries natively.
     if (request.follow_symlinks) return warmIndexFallback(report, "follow_symlinks");
     if (request.hidden) return warmIndexFallback(report, "hidden_not_indexed");
     if (request.path_count != 1) return warmIndexFallback(report, "multi_root");
