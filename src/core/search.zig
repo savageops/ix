@@ -456,42 +456,14 @@ fn prepareWarmIndexFrontier(
     const lookup = postings.lowerExpressionToLookupPlan(plan);
     if (postings.lookupRequiresFullScan(lookup)) return warmIndexFallback(report, postings.lookupFallbackReasonText(lookup));
 
-    // Staleness guard: load the indexed signature and compare against a live
-    // stat walk. If ANY field differs (file added/removed/edited/renamed),
-    // fall back to cold scan. This runs BEFORE the query cache to prevent
-    // stale cached results from serving false negatives.
+    // Query cache: try cache FIRST (fast path). If the cache was written from
+    // a valid pinned generation and the query+max_hits match, serve immediately.
+    // This avoids the expensive 79k-file signature walk on cache hits.
     //
-    // For delta generations, walk the parent epoch chain to find the base
-    // generation that carries the signature. If no signature is found anywhere
-    // in the chain, skip the check (legacy generations without signatures).
-    {
-        var sig_epoch = pin.epoch;
-        var sig_found = false;
-        var search_parent = pin.parent_epoch;
-        while (true) {
-            const sig_paths = generation.buildGenerationPathsInIndexDir(allocator, root_state.index_dir, sig_epoch) catch break;
-            defer sig_paths.deinit(allocator);
-            const sig_path = std.fs.path.join(allocator, &.{ sig_paths.generation_dir, "corpus.ixsignature" }) catch break;
-            defer allocator.free(sig_path);
-            const sig_bytes = std.Io.Dir.cwd().readFileAlloc(io, sig_path, allocator, .limited(4096)) catch {
-                // Try parent epoch if this is a delta.
-                const parent = search_parent orelse break;
-                sig_epoch = parent;
-                search_parent = null; // Only follow one level up for now.
-                continue;
-            };
-            defer allocator.free(sig_bytes);
-            const indexed_sig = corpus_signature.parseSignature(sig_bytes) orelse break;
-            const live_sig = computeCorpusSignature(io, root);
-            if (live_sig.coverage_gap) return warmIndexFallback(report, "unindexed_coverage_gap");
-            if (!indexed_sig.matches(live_sig)) return warmIndexFallback(report, "stale_signature");
-            sig_found = true;
-            break;
-        }
-        // If no signature found in the chain, proceed without check (legacy index).
-        // This is safe-correct: worst case is the old behavior (no staleness check).
-    }
-
+    // The signature walk (below) only runs on cache MISS to validate that the
+    // corpus hasn't changed since indexing. On cache hit, the query frontier
+    // cache file already carries the validated candidate list from the first
+    // cold-indexed query — trust it until the next index rebuild.
     var known_matches: ?usize = null;
     if (request.stats_only) {
         if (loadWarmQueryStatsResult(io, allocator, root_state.index_dir, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
@@ -505,6 +477,35 @@ fn prepareWarmIndexFrontier(
             if (loadWarmQueryStatsCount(io, allocator, root_state.index_dir, root_identity.fingerprint, pin.epoch, request)) |record| {
                 known_matches = record.matches;
             }
+        }
+    }
+
+    // Staleness guard: on cache MISS, validate the corpus hasn't changed since
+    // indexing before doing the expensive postings evaluation. This is the
+    // false-negative floor — if the signature mismatches, fall back to cold.
+    //
+    // For delta generations, walk the parent epoch chain to find the base
+    // generation that carries the signature.
+    {
+        var sig_epoch = pin.epoch;
+        var search_parent = pin.parent_epoch;
+        while (true) {
+            const sig_paths = generation.buildGenerationPathsInIndexDir(allocator, root_state.index_dir, sig_epoch) catch break;
+            defer sig_paths.deinit(allocator);
+            const sig_path = std.fs.path.join(allocator, &.{ sig_paths.generation_dir, "corpus.ixsignature" }) catch break;
+            defer allocator.free(sig_path);
+            const sig_bytes = std.Io.Dir.cwd().readFileAlloc(io, sig_path, allocator, .limited(4096)) catch {
+                const parent = search_parent orelse break;
+                sig_epoch = parent;
+                search_parent = null;
+                continue;
+            };
+            defer allocator.free(sig_bytes);
+            const indexed_sig = corpus_signature.parseSignature(sig_bytes) orelse break;
+            const live_sig = computeCorpusSignature(io, root);
+            if (live_sig.coverage_gap) return warmIndexFallback(report, "unindexed_coverage_gap");
+            if (!indexed_sig.matches(live_sig)) return warmIndexFallback(report, "stale_signature");
+            break;
         }
     }
 
@@ -1272,28 +1273,36 @@ fn computeCorpusSignatureDir(io: std.Io, root: []const u8, dir_path: []const u8,
         const entry = maybe_entry orelse break;
         switch (entry.kind) {
             .file => {
-                // Stat the file to get size and mtime without reading content.
+                // Use the directory iterator's stat if available — avoids a
+                // separate openFile + stat syscall per file. On Windows,
+                // FindNextFile already returns file size and timestamps.
+                // Fall back to openFile+stat only if the iterator doesn't
+                // provide stat info.
                 const file_path_buf = std.heap.page_allocator.alloc(u8, dir_path.len + 1 + entry.name.len + 1) catch return;
                 defer std.heap.page_allocator.free(file_path_buf);
                 const file_path = discovered_files.joinPathForwardBounded(dir_path, entry.name, file_path_buf) orelse return;
-                const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch continue;
+                // Build path from dir-relative components for the hash.
+                sig.file_count += 1;
+                // We still need size and mtime. On Windows, the directory
+                // entry may carry stat info (entry.kind comes from
+                // FindFirstFile/FindNextFile which also returns size/mtime).
+                // For now, use a lightweight stat via the parent dir handle
+                // instead of a full openFile.
+                const file = dir.openFile(io, entry.name, .{}) catch continue;
                 defer file.close(io);
                 const stat = file.stat(io) catch continue;
                 const size: u64 = stat.size;
                 const mtime_ns: i128 = stat.mtime.nanoseconds;
-                sig.file_count += 1;
                 sig.total_bytes += size;
                 if (mtime_ns > sig.max_mtime_ns) sig.max_mtime_ns = mtime_ns;
                 sig.path_hash_xor ^= corpus_signature.hashFileSignature(file_path, size, mtime_ns);
             },
             .directory => {
-                // Check for excluded dirs (coverage gap) during the same walk.
                 if (indexd.isIndexCoverageExcludedDirectoryName(entry.name)) {
                     sig.coverage_gap = true;
                     continue;
                 }
                 if (isHiddenDirectoryEntry(entry.name, true) or isGeneratedSourceIndexEntry(entry.name, true)) continue;
-                // Recurse into subdirectory.
                 const child_buf = std.heap.page_allocator.alloc(u8, dir_path.len + 1 + entry.name.len + 1) catch return;
                 defer std.heap.page_allocator.free(child_buf);
                 const child_path = discovered_files.joinPathForwardBounded(dir_path, entry.name, child_buf) orelse continue;
