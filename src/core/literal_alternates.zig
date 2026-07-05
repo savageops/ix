@@ -2,6 +2,7 @@ const std = @import("std");
 const pcre_regex = @import("pcre_regex.zig");
 const simd = @import("simd.zig");
 const sz = @import("sz.zig");
+const byte_frequencies = @import("byte_frequencies.zig");
 
 pub const MAX_BRANCHES = 32;
 const TEDDY_MAX_BRANCHES = 8;
@@ -290,8 +291,10 @@ pub inline fn teddyPlanWithOffset(alternates: LiteralAlternates, case_insensitiv
     const max_offset = min_branch_len - TEDDY_FINGERPRINT_BYTES;
     plan.fingerprint_offset = if (fingerprint_offset) |offset|
         @min(offset, max_offset)
+    else if (std.c.getenv("IX_TEDDY_FINGERPRINT_OFFSET")) |env_ptr|
+        teddyFingerprintOffsetFromEnv(env_ptr, max_offset)
     else
-        teddyFingerprintOffsetOverride(max_offset);
+        rarityPivotedFingerprintOffset(branches, max_offset);
     for (branches, 0..) |branch, index| {
         const bucket = index % TEDDY_BUCKETS;
         plan.bucket_masks[bucket] |= @as(u32, 1) << @intCast(index);
@@ -455,12 +458,50 @@ fn pcreRangeEligible(pattern: []const u8, branch_count: usize) bool {
     return std.mem.indexOfScalar(u8, pattern, '\\') == null;
 }
 
-fn teddyFingerprintOffsetOverride(max_offset: usize) usize {
-    const value_ptr = std.c.getenv("IX_TEDDY_FINGERPRINT_OFFSET") orelse return 0;
-    const value = std.mem.span(value_ptr);
+fn teddyFingerprintOffsetFromEnv(env_ptr: [*:0]const u8, max_offset: usize) usize {
+    const value = std.mem.span(env_ptr);
     if (value.len == 0) return 0;
     const parsed = std.fmt.parseUnsigned(usize, value, 10) catch return 0;
     return @min(parsed, max_offset);
+}
+
+/// Pick the fingerprint offset whose 3 bytes are collectively rarest across
+/// all branches, minimizing false-positive fingerprint hits on the SIMD
+/// prefilter. This is the BurntSushi/aho-corasick `freq_rank` principle
+/// (select the rarest byte as the prefilter anchor) extended to a shared
+/// multi-branch offset.
+///
+/// Score for offset N = Σ over branches Σ over the 3 fingerprint bytes of
+/// `rank(byte)`. Lowest score wins. Ties go to the smaller offset.
+///
+/// For ASCII letters we score the more-common case variant (max of upper/
+/// lower rank), because case-insensitive mode lowercases the haystack before
+/// compare and case-sensitive mode sees the byte as-is — the conservative max
+/// covers both paths.
+fn rarityPivotedFingerprintOffset(branches: []const []const u8, max_offset: usize) usize {
+    if (max_offset == 0) return 0;
+    var best_offset: usize = 0;
+    var best_score: u64 = std.math.maxInt(u64);
+    var offset: usize = 0;
+    while (offset <= max_offset) : (offset += 1) {
+        var score: u64 = 0;
+        for (branches) |branch| {
+            var i: usize = 0;
+            while (i < TEDDY_FINGERPRINT_BYTES) : (i += 1) {
+                const byte = branch[offset + i];
+                const ranked = if (std.ascii.isAlphabetic(byte))
+                    @max(byte_frequencies.rank(std.ascii.toLower(byte)), byte_frequencies.rank(std.ascii.toUpper(byte)))
+                else
+                    byte_frequencies.rank(byte);
+                score += ranked;
+            }
+        }
+        if (score < best_score) {
+            best_score = score;
+            best_offset = offset;
+        }
+    }
+    return best_offset;
 }
 
 fn teddyRangeFingerprintOffset(alternates: LiteralAlternates) ?usize {
@@ -744,22 +785,26 @@ test "teddy literal alternates planner admits branch four ripgrep shape" {
     try std.testing.expectEqual(@as(u32, 2), plan.bucket_masks[1]);
     try std.testing.expectEqual(@as(u32, 4), plan.bucket_masks[2]);
     try std.testing.expectEqual(@as(u32, 8), plan.bucket_masks[3]);
-    try std.testing.expectEqual(@as(usize, 0), plan.fingerprint_offset);
-    try std.testing.expectEqualSlices(u8, "err", plan.fingerprints[0][0..3]);
-    try std.testing.expectEqualSlices(u8, "pme", plan.fingerprints[1][0..3]);
-    try std.testing.expectEqualSlices(u8, "lin", plan.fingerprints[2][0..3]);
-    try std.testing.expectEqualSlices(u8, "cfg", plan.fingerprints[3][0..3]);
+    // Rarity-pivoted offset: offset 3 wins because `_sy|_tu|k_r|_bm` has the
+    // lowest Σ byte-frequency rank across all 4 branches. The `_` anchor
+    // followed by a discriminating byte (`s`, `t`, `k`, `b`) is rarer than
+    // the offset-0 set `err|pme|lin|cfg` which uses common letters.
+    try std.testing.expectEqual(@as(usize, 3), plan.fingerprint_offset);
+    try std.testing.expectEqualSlices(u8, "_sy", plan.fingerprints[0][0..3]);
+    try std.testing.expectEqualSlices(u8, "_tu", plan.fingerprints[1][0..3]);
+    try std.testing.expectEqualSlices(u8, "k_r", plan.fingerprints[2][0..3]);
+    try std.testing.expectEqualSlices(u8, "_bm", plan.fingerprints[3][0..3]);
 }
 
 test "literal alternates counter hoists teddy plan for repeated line counts" {
     const counter = Counter.init("ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT", true) orelse return error.TestExpectedEqual;
     try std.testing.expect(counter.usesTeddy());
     try std.testing.expectEqual(@as(usize, 4), counter.teddy_plan.?.branch_count);
-    try std.testing.expectEqual(@as(usize, 0), counter.teddy_plan.?.fingerprint_offset);
+    try std.testing.expectEqual(@as(usize, 3), counter.teddy_plan.?.fingerprint_offset);
 
     const range_counter = Counter.initForLogicalLineRange("ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT", true) orelse return error.TestExpectedEqual;
     try std.testing.expect(range_counter.usesTeddy());
-    try std.testing.expectEqual(@as(usize, 0), range_counter.teddy_plan.?.fingerprint_offset);
+    try std.testing.expectEqual(@as(usize, 3), range_counter.teddy_plan.?.fingerprint_offset);
 
     const line =
         "err_sys pme_turn_off link_req_rst cfg_bme_evt " ++
@@ -797,4 +842,68 @@ test "teddy literal alternates planner rejects unsupported shapes" {
 
     const too_many = parse("aa0|bb1|cc2|dd3|ee4|ff5|gg6|hh7|ii8").?;
     try std.testing.expect(teddyPlan(too_many, false) == null);
+}
+
+test "rarity-pivoted fingerprint offset picks lowest-score position" {
+    // 4 branches, all length 6, max_offset = 3. 'q' is the rarest ASCII
+    // letter (rank 112 upper / 139 lower). The 'q' sits at index 3 in each
+    // branch, so offset 1 gives fingerprints `aaq|bbq|ccq|ddq` — the lowest
+    // Σ rank across all four branches.
+    const alternates = parse("aaaqaa|bbbqbb|cccqcc|dddqdd").?;
+    const offset = rarityPivotedFingerprintOffset(alternates.slice(), 3);
+    try std.testing.expectEqual(@as(usize, 1), offset);
+}
+
+test "rarity-pivoted fingerprint offset returns 0 when max_offset is 0" {
+    // All branches exactly 3 bytes long: only offset 0 is valid.
+    const alternates = parse("abc|def|ghi|jkl").?;
+    const offset = rarityPivotedFingerprintOffset(alternates.slice(), 0);
+    try std.testing.expectEqual(@as(usize, 0), offset);
+}
+
+test "rarity-pivoted fingerprint offset ties resolve to smaller offset" {
+    // Two offsets with identical scores: the smaller one wins.
+    // All-same bytes at every offset → all scores equal → offset 0 wins.
+    const alternates = parse("aaaaaa|bbbbbb|cccccc|dddddd").?;
+    const offset = rarityPivotedFingerprintOffset(alternates.slice(), 3);
+    try std.testing.expectEqual(@as(usize, 0), offset);
+}
+
+test "rarity-pivoted fingerprint offset matches brute-force parity on bench pattern" {
+    // Brute-force parity check: the selector's choice must equal the offset
+    // with the minimum Σ rank over 3-byte fingerprints across all branches.
+    // This is the false-negative safety net — if the selector picks a wrong
+    // offset, it doesn't cause false negatives (every offset is correct for
+    // matching), but it must pick the BEST offset for the speed win.
+    const alternates = parse("ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT").?;
+    const branches = alternates.slice();
+    const min_len = blk: {
+        var m: usize = std.math.maxInt(usize);
+        for (branches) |b| m = @min(m, b.len);
+        break :blk m;
+    };
+    const max_offset = min_len - TEDDY_FINGERPRINT_BYTES;
+
+    var brute_best_offset: usize = 0;
+    var brute_best_score: u64 = std.math.maxInt(u64);
+    for (0..max_offset + 1) |off| {
+        var score: u64 = 0;
+        for (branches) |branch| {
+            for (0..TEDDY_FINGERPRINT_BYTES) |i| {
+                const byte = branch[off + i];
+                const ranked = if (std.ascii.isAlphabetic(byte))
+                    @max(byte_frequencies.rank(std.ascii.toLower(byte)), byte_frequencies.rank(std.ascii.toUpper(byte)))
+                else
+                    byte_frequencies.rank(byte);
+                score += ranked;
+            }
+        }
+        if (score < brute_best_score) {
+            brute_best_score = score;
+            brute_best_offset = off;
+        }
+    }
+
+    const selected = rarityPivotedFingerprintOffset(branches, max_offset);
+    try std.testing.expectEqual(brute_best_offset, selected);
 }
