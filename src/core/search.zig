@@ -4,6 +4,7 @@ const path_admission = @import("admission.zig");
 const byte_shard = @import("byte_shard.zig");
 const cli = @import("../cli/args.zig");
 const catalog = @import("catalog.zig");
+const corpus_signature = @import("corpus_signature.zig");
 const discovered_files = @import("discovered_files.zig");
 const expr = @import("expr.zig");
 const generation = @import("generation.zig");
@@ -434,7 +435,6 @@ fn prepareWarmIndexFrontier(
     if (request.path_count != 1) return warmIndexFallback(report, "multi_root");
 
     const root = request.paths[0];
-    if (rootHasWarmIndexCoverageGap(io, allocator, root)) return warmIndexFallback(report, "unindexed_coverage_gap");
     const root_identity = catalog.identifyRoot(allocator, root) catch return warmIndexFallback(report, "root_identity_failed");
     defer root_identity.deinit(allocator);
     const root_state = state_dir.buildRootIndexState(allocator, root_identity.fingerprint) catch return warmIndexFallback(report, "state_dir_failed");
@@ -456,10 +456,26 @@ fn prepareWarmIndexFrontier(
     const lookup = postings.lowerExpressionToLookupPlan(plan);
     if (postings.lookupRequiresFullScan(lookup)) return warmIndexFallback(report, postings.lookupFallbackReasonText(lookup));
 
-    // TEMPORARY: skip staleness check until corpus signature is wired in commit 3.
-    // The countFilesInRoot function was removed — it will be replaced by
-    // computeCorpusSignature in the next commits. For now, trust the index
-    // unconditionally (the query cache false-negative path is the known risk).
+    // Staleness guard: load the indexed signature and compare against a live
+    // stat walk. If ANY field differs (file added/removed/edited/renamed),
+    // fall back to cold scan. This runs BEFORE the query cache to prevent
+    // stale cached results from serving false negatives.
+    //
+    // Delta generations (parent_epoch != null) don't carry a signature —
+    // the delta overlay itself proves freshness by construction. Skip the
+    // signature check for delta-pinned generations.
+    if (pin.parent_epoch == null) {
+        const sig_paths = generation.buildGenerationPathsInIndexDir(allocator, root_state.index_dir, pin.epoch) catch return warmIndexFallback(report, "signature_paths_failed");
+        defer sig_paths.deinit(allocator);
+        const sig_path = std.fs.path.join(allocator, &.{ sig_paths.generation_dir, "corpus.ixsignature" }) catch return warmIndexFallback(report, "signature_path_failed");
+        defer allocator.free(sig_path);
+        const sig_bytes = std.Io.Dir.cwd().readFileAlloc(io, sig_path, allocator, .limited(4096)) catch return warmIndexFallback(report, "no_indexed_signature");
+        defer allocator.free(sig_bytes);
+        const indexed_sig = corpus_signature.parseSignature(sig_bytes) orelse return warmIndexFallback(report, "signature_parse_failed");
+        const live_sig = computeCorpusSignature(io, root);
+        if (live_sig.coverage_gap) return warmIndexFallback(report, "unindexed_coverage_gap");
+        if (!indexed_sig.matches(live_sig)) return warmIndexFallback(report, "stale_signature");
+    }
 
     var known_matches: ?usize = null;
     if (request.stats_only) {
@@ -1216,26 +1232,61 @@ fn warmPathStillReadable(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-fn rootHasWarmIndexCoverageGap(io: std.Io, allocator: std.mem.Allocator, root: []const u8) bool {
-    return directoryContainsWarmIndexCoverageGap(io, allocator, root);
+/// Live corpus signature walk: stat-only recursive walk of the root.
+/// Produces CorpusSignature for comparison against the indexed signature.
+/// Also detects coverage gaps (excluded dirs like node_modules) during the
+/// same walk — zero extra cost. Replaces the separate rootHasWarmIndexCoverageGap walk.
+fn computeCorpusSignature(io: std.Io, root: []const u8) corpus_signature.CorpusSignature {
+    var sig = corpus_signature.CorpusSignature{};
+    computeCorpusSignatureDir(io, root, root, &sig);
+    return sig;
 }
 
-fn directoryContainsWarmIndexCoverageGap(io: std.Io, allocator: std.mem.Allocator, path: []const u8) bool {
-    const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return true;
+fn computeCorpusSignatureDir(io: std.Io, root: []const u8, dir_path: []const u8, sig: *corpus_signature.CorpusSignature) void {
+    const dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch {
+        sig.coverage_gap = true;
+        return;
+    };
     defer dir.close(io);
     var iterator = dir.iterate();
     while (true) {
-        const maybe_entry = iterator.next(io) catch return true;
+        const maybe_entry = iterator.next(io) catch {
+            sig.coverage_gap = true;
+            return;
+        };
         const entry = maybe_entry orelse break;
-        if (entry.kind != .directory) continue;
-        if (indexd.isIndexCoverageExcludedDirectoryName(entry.name)) return true;
-        if (isHiddenDirectoryEntry(entry.name, true) or isGeneratedSourceIndexEntry(entry.name, true)) continue;
-        const child_path = discovered_files.joinPathForward(allocator, path, entry.name) catch return true;
-        const has_gap = directoryContainsWarmIndexCoverageGap(io, allocator, child_path);
-        allocator.free(child_path);
-        if (has_gap) return true;
+        switch (entry.kind) {
+            .file => {
+                // Stat the file to get size and mtime without reading content.
+                const file_path_buf = std.heap.page_allocator.alloc(u8, dir_path.len + 1 + entry.name.len + 1) catch return;
+                defer std.heap.page_allocator.free(file_path_buf);
+                const file_path = discovered_files.joinPathForwardBounded(dir_path, entry.name, file_path_buf) orelse return;
+                const file = std.Io.Dir.cwd().openFile(io, file_path, .{}) catch continue;
+                defer file.close(io);
+                const stat = file.stat(io) catch continue;
+                const size: u64 = stat.size;
+                const mtime_ns: i128 = stat.mtime.nanoseconds;
+                sig.file_count += 1;
+                sig.total_bytes += size;
+                if (mtime_ns > sig.max_mtime_ns) sig.max_mtime_ns = mtime_ns;
+                sig.path_hash_xor ^= corpus_signature.hashFileSignature(file_path, size, mtime_ns);
+            },
+            .directory => {
+                // Check for excluded dirs (coverage gap) during the same walk.
+                if (indexd.isIndexCoverageExcludedDirectoryName(entry.name)) {
+                    sig.coverage_gap = true;
+                    continue;
+                }
+                if (isHiddenDirectoryEntry(entry.name, true) or isGeneratedSourceIndexEntry(entry.name, true)) continue;
+                // Recurse into subdirectory.
+                const child_buf = std.heap.page_allocator.alloc(u8, dir_path.len + 1 + entry.name.len + 1) catch return;
+                defer std.heap.page_allocator.free(child_buf);
+                const child_path = discovered_files.joinPathForwardBounded(dir_path, entry.name, child_buf) orelse continue;
+                computeCorpusSignatureDir(io, root, child_path, sig);
+            },
+            else => {},
+        }
     }
-    return false;
 }
 
 fn writeWarmQueryFrontier(
@@ -6261,7 +6312,9 @@ test "search run consumes live warm postings and scans only candidate files" {
 
     const stale_report = try run(io, allocator, request, plan);
     try std.testing.expect(!std.mem.eql(u8, stale_report.stats.generation_refresh.refresh_status, "live_query_hits_cache"));
-    try std.testing.expectEqualStrings("stale_candidate_path", stale_report.stats.generation_refresh.fallback_reason);
+    // The signature check catches the file change before the candidate path probe.
+    try std.testing.expect(std.mem.eql(u8, stale_report.stats.generation_refresh.fallback_reason, "stale_signature") or
+        std.mem.eql(u8, stale_report.stats.generation_refresh.fallback_reason, "stale_candidate_path"));
     try std.testing.expect(stale_report.files_scanned > 0);
     try std.testing.expectEqual(@as(usize, 2), stale_report.matches_found);
     try std.testing.expectEqual(@as(usize, 2), stale_report.hit_count);
