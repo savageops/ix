@@ -3496,7 +3496,7 @@ fn scanOpenFileIntoShardImpl(
     if (simd.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
         shard.files_skipped += 1;
         shard.admission_stats.binary_entries_skipped += 1;
-        shard.admission_stats.binary_file_bytes += @intCast(file.length(io) catch first_read);
+        shard.admission_stats.binary_file_bytes += @intCast(first_read);
         recordEvidenceSkipped(shard);
         return;
     }
@@ -4403,7 +4403,7 @@ fn scanOpenFile(
     if (simd.indexOfByte(read_buffer[0..@min(1024, first_read)], 0) != null) {
         report.files_skipped += 1;
         report.stats.admission.binary_entries_skipped += 1;
-        report.stats.admission.binary_file_bytes += @intCast(file.length(io) catch first_read);
+        report.stats.admission.binary_file_bytes += @intCast(first_read);
         return;
     }
     const single_chunk = first_read < read_buffer.len;
