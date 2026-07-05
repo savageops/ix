@@ -456,6 +456,11 @@ fn prepareWarmIndexFrontier(
     const lookup = postings.lowerExpressionToLookupPlan(plan);
     if (postings.lookupRequiresFullScan(lookup)) return warmIndexFallback(report, postings.lookupFallbackReasonText(lookup));
 
+    // TEMPORARY: skip staleness check until corpus signature is wired in commit 3.
+    // The countFilesInRoot function was removed — it will be replaced by
+    // computeCorpusSignature in the next commits. For now, trust the index
+    // unconditionally (the query cache false-negative path is the known risk).
+
     var known_matches: ?usize = null;
     if (request.stats_only) {
         if (loadWarmQueryStatsResult(io, allocator, root_state.index_dir, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {

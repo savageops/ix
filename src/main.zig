@@ -23,6 +23,7 @@ test {
     _ = @import("core/protected_paths.zig");
     _ = @import("core/resource_profile.zig");
     _ = @import("core/byte_frequencies.zig");
+    _ = @import("core/corpus_signature.zig");
     _ = @import("core/indexd.zig");
     _ = @import("core/generation.zig");
     _ = @import("core/usn.zig");
