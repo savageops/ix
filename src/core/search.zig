@@ -449,7 +449,20 @@ fn prepareWarmIndexFrontier(
 
     const current_paths = generation.buildGenerationPathsInIndexDir(allocator, root_state.index_dir, 1) catch return warmIndexFallback(report, "paths_failed");
     defer current_paths.deinit(allocator);
-    const pin = generation.pinCurrentGenerationWithPayloads(io, allocator, root_state.index_dir, current_paths.current_manifest_path, root_identity.fingerprint) catch |err| switch (err) {
+
+    // Manifest-only pin: reads the 198-byte manifest file and validates the
+    // header (magic, version, root fingerprint, epoch). Does NOT read or
+    // checksum the segment payloads (catalog.ixcat + postings.ixpost +
+    // corpus.ixsignature). For the linux bench corpus the postings segment
+    // alone is 922 MiB — re-reading it on every warm query to verify a
+    // checksum that was already validated at publish time is the dominant
+    // warm-lane overhead.
+    //
+    // Payload validation runs below ONLY on cache miss, immediately before
+    // the postings/catalog files are actually touched. On cache hit the
+    // validated candidate list is already on disk and the payload bytes
+    // are never read, so the checksum re-verification is pure overhead.
+    const pin = generation.pinCurrentGenerationManifest(io, allocator, current_paths.current_manifest_path, root_identity.fingerprint) catch |err| switch (err) {
         error.NoCurrentGeneration => return warmIndexFallback(report, "no_current_generation"),
         else => return warmIndexFallback(report, @errorName(err)),
     };
@@ -480,6 +493,18 @@ fn prepareWarmIndexFrontier(
             }
         }
     }
+
+    // Cache miss: NOW validate the segment payloads before touching them.
+    // This is the expensive full-segment checksum read (~937 MiB for the
+    // linux bench corpus), but it only runs when the cache misses — the
+    // common warm-query path (cache hit) skips it entirely. The validation
+    // is the false-negative floor for cache misses: if the postings file
+    // was corrupted or partially written, the checksum catches it here
+    // before we trust the candidate list.
+    generation.validatePinnedPayloads(io, allocator, root_state.index_dir, pin) catch |err| switch (err) {
+        error.NoCurrentGeneration => return warmIndexFallback(report, "no_current_generation"),
+        else => return warmIndexFallback(report, @errorName(err)),
+    };
 
     // Staleness guard: on cache MISS, validate the corpus hasn't changed since
     // indexing before doing the expensive postings evaluation. This is the

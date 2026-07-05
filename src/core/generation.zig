@@ -429,6 +429,62 @@ pub fn tryPinCurrentGeneration(io: std.Io, allocator: std.mem.Allocator, manifes
     return pinManifestBytesForRoot(bytes, expected_root) catch null;
 }
 
+/// Reads and parses the current generation manifest WITHOUT validating
+/// segment payload checksums. Returns a ReaderPin whose epoch can be used
+/// for cache lookup. The caller MUST run `validatePinnedPayloads` before
+/// reading any segment payload (catalog/postings) if the cache misses.
+///
+/// This split exists because payload validation reads every segment file
+/// in full (catalog + postings + signature) to verify Wyhash checksums —
+/// for the linux bench corpus that's ~937 MB read on every warm query.
+/// On a cache hit the validated candidate list is already on disk and
+/// the payload bytes are never touched, so the checksum re-read is pure
+/// overhead. Pinning the manifest alone is a 198-byte file read.
+pub fn pinCurrentGenerationManifest(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    manifest_path: []const u8,
+    expected_root: RootFingerprint,
+) !ReaderPin {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, manifest_path, allocator, .limited(MANIFEST_READ_LIMIT)) catch |err| switch (err) {
+        error.FileNotFound => return error.NoCurrentGeneration,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    return pinManifestBytesForRoot(bytes, expected_root);
+}
+
+/// Validates segment payload checksums for a pin obtained from
+/// `pinCurrentGenerationManifest`. Runs the expensive full-segment read
+/// only when the cache misses and the caller is about to touch the
+/// catalog/postings payloads.
+pub fn validatePinnedPayloads(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    index_dir: []const u8,
+    pin: ReaderPin,
+) !void {
+    const paths = try buildGenerationPathsInIndexDir(allocator, index_dir, pin.epoch);
+    defer paths.deinit(allocator);
+
+    // Re-read the manifest to get segment records. The pin carries the
+    // segment count but not the per-segment paths/checksums (those are
+    // validated from the manifest bytes directly).
+    const manifest_bytes = std.Io.Dir.cwd().readFileAlloc(io, paths.current_manifest_path, allocator, .limited(MANIFEST_READ_LIMIT)) catch return error.NoCurrentGeneration;
+    defer allocator.free(manifest_bytes);
+
+    var cursor = Cursor{ .bytes = manifest_bytes };
+    const header = try readHeader(&cursor);
+    _ = try validateManifestHeaderForRoot(header, pin.root_fingerprint);
+
+    var index: usize = 0;
+    while (index < pin.segment_count) : (index += 1) {
+        const segment = try readSegmentRecord(&cursor, pin.epoch);
+        try validatePublishedSegmentPayload(io, allocator, paths.generation_dir, segment);
+    }
+    if (cursor.remaining() != 0) return error.TrailingGenerationManifestData;
+}
+
 pub fn tryPinCurrentGenerationWithPayloads(
     io: std.Io,
     allocator: std.mem.Allocator,
