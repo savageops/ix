@@ -2,7 +2,7 @@
 
 # IX
 
-**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Admission-bytecode lane. Warm query-frontier reuse. Thread-sharded execution. Exact-verified output.**
+**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Warm-index foreground admission. Casefold-buffer admission probe. Thread-sharded execution. Exact-verified output.**
 
 *AVX2 SIMD literal scan · Boolean predicate algebra · Generation-pinned warm index · Arena-allocated pipeline · Vendored C kernels compiled into one binary*
 
@@ -55,7 +55,7 @@ The binary is 2 MB. It vendors everything — StringZilla, PCRE2 with JIT — co
 ## Use It
 
 ```sh
-git clone https://github.com/AX-IX/ix-zig.git
+git clone https://github.com/savageops/ix-zig.git
 cd ix-zig
 zig build test --summary all
 zig build -Doptimize=ReleaseFast --summary all
@@ -105,6 +105,26 @@ Bare text is literal. `re:` is required for regex. `||` composes alternates.
 Bare `ix PATTERN [PATH]` accepts a narrow `rg`-shaped subset and lowers it into canonical IX expressions. Supports `-e` (multiple patterns → `||`), `-F` (fixed strings → escaped `lit:` or `re:`), `-i` (case insensitive → `(?i)` prefix), `-j N` (threads). Raw regex containing `&&` or `||` is ambiguous and rejected at parse time.
 
 This is a translator, not a second grammar.
+
+</details>
+
+<details>
+<summary><strong>Warm index — accelerate repeated searches</strong></summary>
+<br>
+
+IX can build a persistent trigram index for a corpus and use it to prune files before opening them. On a 79k-file Linux kernel source tree, this reduces files scanned from 79,402 to ~195 — a **76% wall-clock speedup** for warm-lane queries.
+
+```sh
+# Build the index (one-time per corpus, ~3-5 min for large trees)
+IX_INDEXD_MEMORY_LIMIT_MB=16384 ix.exe __ix_indexd "/path/to/corpus" --foreground --once
+
+# Search with the index enabled
+IX_INDEX=1 ix.exe "lit:search_term" "/path/to/corpus" --json
+```
+
+Set `IX_INDEX=1` (or `true`/`on`) to enable foreground warm-index admission. The index lives at `%LOCALAPPDATA%\iEx\ix\index\` and persists across invocations. Rebuild after large corpus changes.
+
+> The index rejects candidates. It never creates matches. The exact verifier confirms every emitted result.
 
 </details>
 
@@ -168,8 +188,8 @@ Each query is classified by shape and routed to the narrowest execution path:
 
 | Layer | Implementation |
 |:------|:---------------|
-| Byte search | StringZilla v4.6.0, AVX2: `VPCMPEQB` (32 bytes per 256-bit YMM lane) + `VPMOVMSKB` (compress mask) + `TZCNT` (position). Substring search fingerprints by first+last byte across 32 candidate positions; full byte-by-byte verify only on survivors. Most false positives eliminated without touching the needle interior. |
-| SIMD backend | Compile-time selection only — `-mavx2` → `__AVX2__` → `SZ_USE_HASWELL=1`. `SZ_DYNAMIC_DISPATCH=0` disables runtime CPU detection (and DllMain on Windows). SWAR fallback (~8 bytes/cycle) if built without `-mavx2`. Zero dispatch overhead in the final binary. |
+| Byte search | StringZilla v4.6.0, AVX2: `VPCMPEQB` (32 bytes per 256-bit YMM lane) + `VPMOVMSKB` (compress mask) + `TZCNT` (position). Substring search fingerprints by rarity-pivoted 3-byte anomaly selection (first/mid/last with collision avoidance) across 32 candidate positions; full byte-by-byte verify only on survivors. Most false positives eliminated without touching the needle interior. |
+| SIMD backend | Compile-time selection only — `-mavx2` → `__AVX2__` → `SZ_USE_HASWELL=1`. `SZ_DYNAMIC_DISPATCH=0` disables runtime CPU detection (and DllMain on Windows). AVX2-only target; no SWAR fallback tier. Zero dispatch overhead in the final binary. |
 | Zig/C boundary | `sz_shim.c` — StringZilla is header-only (`static inline`); Zig's `@cImport` can't link those, so the shim forces the C compiler to emit real linkable symbols. Include chain `immintrin.h → mm_malloc.h → stdlib.h` requires `link_libc = true` in `build.zig`. |
 | PCRE2 integration | Vendored PCRE2 10.44 source at `.refs/pcre2/` compiled via `addCSourceFiles` in `build.zig` (27 translation units). Static `config.h` enables `SUPPORT_JIT`, `SUPPORT_UNICODE`, and `PCRE2_STATIC`. The sljit backend at `.refs/pcre2/src/sljit/` compiles regex patterns to native x86 machine code. `pcre_regex.zig` wraps the C API via `@cImport` with a threadlocal single-entry compile cache — zero overhead on cache hit, one JIT compilation per unique pattern per thread. |
 | Query model | Typed `ExpressionPlan`, boolean composition, explicit literal / regex / prefix / suffix predicates with trigram evidence extraction |
@@ -199,13 +219,15 @@ Each query is classified by shape and routed to the narrowest execution path:
 
 - **Whole-buffer fast count** — single-chunk files (< 1 MiB) with single-predicate stats-only queries skip line splitting entirely. Match count is computed over the raw buffer in one pass, eliminating newline scanning and per-line dispatch.
 - **Word-boundary byte-sharded fast count** — stats-only `re:\bLITERAL\b` on large mmap-backed files bypasses materialized line splitting. The planner emits a `word_boundary_literal` byte-shard descriptor; shards claim newline-owned byte ranges, verify boundary predicates around each candidate literal hit, and count one logical-line match per owned line. Unsupported or unsafe ranges fall back to the materialized verifier.
-- **Chunk casefold** — case-insensitive queries with all-lowercase literal predicates casefold the 1 MiB read buffer in-place once per chunk instead of per-line. Reduces ~100k `toLower` calls to ~500 AVX2 vector passes on a 500-file corpus.
+- **Chunk casefold** — case-insensitive queries with all-lowercase literal predicates casefold the 1 MiB read buffer in-place once per chunk instead of per-line. Extends to case-insensitive literal alternates: the whole-buffer casefold runs once, then Teddy multi-pattern matching searches the casefolded buffer. Reduces ~100k `toLower` calls to ~500 AVX2 vector passes on a 500-file corpus.
+- **Per-line CR trim** — `trimCR` replaces `std.mem.trimEnd` with a single-byte branch on the last byte. Eliminates the scalar loop overhead on every line in the scan hot path.
+- **Case-insensitive trigram admission** — literal-alternates patterns with `(?i)` now produce case-insensitive trigram evidence (lowercased at compile time) and the admission probe lowercases file bytes before computing rolling trigrams. Files lacking the lowercased trigram evidence are pruned without casefolding the full buffer.
 - **SIMD ASCII casefold** — custom `@Vector(32, u8)` pipeline: wrapping-subtract `'A'` (maps A-Z to 0-25), compare `< 26` to mask uppercase, select-OR `0x20`. 32 bytes per iteration, scalar tail for remainder.
-- **Adaptive thread scaling** — thread count is `ceil(sqrt(file_count / 8))`, capped at CPU count. Avoids Windows `CreateThread` spawn cost (~210μs) dominating scan work on small corpora.
+- **Adaptive thread scaling** — thread count scales with corpus size (`sqrt(file_count)` clamped to `[4, cpu_count]`), with `resource_profile.zig` adjusting caps for small/large corpora across low/medium/high profiles. Avoids Windows `CreateThread` spawn cost (~210μs) dominating scan work on small corpora.
 - **Dynamic work claiming** — for corpora < 128 files with eligible plans, workers claim files via `@atomicRmw(.Add)` instead of static partitioning. Eliminates tail imbalance when file sizes vary.
 - **`__chkstk` avoidance** — casefold buffers (2 KiB line + 256 B needle) are isolated into separate functions. Keeps hot-path stack frames under 4 KiB, avoiding Windows page-probe overhead on every function entry across 100k+ lines.
-- **Single-shot positional read** — first chunk uses `readPositional` (one syscall) instead of `readPositionalAll` (retry loop). Most source files are < 1 MiB and fit in a single read. File length lookup deferred until the first chunk proves the file exceeds the buffer.
-- **4 KiB prefix probe** — cold protected-tree scans inspect the prefix before escalating to full small-file reads. The already-opened handle is reused for the rest of the stream, avoiding reopen churn while rejecting binary/irrelevant files early.
+- **Single-shot streaming read** — first chunk uses `readStreaming` (one syscall, up to 1 MiB). Most source files are < 1 MiB and fit in a single read. File length lookup deferred until the first chunk proves the file exceeds the buffer.
+- **Binary sniff** — first 1024 bytes of the read buffer checked for null byte via `simd.indexOfByte`. Binary files skipped before any line processing.
 - **1 MiB chunk sizing** — chosen to fit in L2/L3 cache so StringZilla SIMD newline scan operates on warm cache lines. Larger buffers risk cache thrashing; smaller ones increase syscall frequency.
 - **Binary sniff** — first 1024 bytes checked for null byte via `sz.indexOfByte`. Binary files skipped before any line processing.
 - **Protected-root admission** — Windows system roots skip volatile database/log stores and non-text protected extensions before open. Recoverable `FileBusy` / access failures become bounded `access_errors` samples and partial status instead of aborting the scan.
@@ -533,6 +555,7 @@ src/
     args.zig        argv parsing and compatibility lowering
     output.zig      text, JSON, sentinels, help
   core/
+    byte_frequencies.zig  256-entry empirical byte-frequency table (rare-byte heuristic)
     catalog.zig     warm FileCatalog — root fingerprint, file IDs, metadata, tombstone folding
     generation.zig  IXGEN001 generation manifests, reader pins, atomic current refresh, compaction/GC planning
     indexd.zig      hidden warm-index daemon boundary, root lock, heartbeat, live marker, repair diagnostics
@@ -540,10 +563,13 @@ src/
     pcre_regex.zig  PCRE2 JIT regex engine (compile-once, match-many)
     postings.zig    IXPOST01 trigram postings, lookup lowering, FileId candidate selection
     regex.zig       Zig-native backtracking regex (fallback)
+    resource_profile.zig  low/medium/high resource ceiling (thread caps, memory limits)
+    scan_input_policy.zig  auto/mmap/buffered I/O mode selector
     search.zig      scan pipeline — discover, admission, shard, scan, merge, aggregate
-    simd.zig        Zig @Vector byte-search kernels
+    search_admission.zig   trigram admission program, file-level admission groups
+    simd.zig        Zig @Vector byte-search kernels (3-byte anomaly fingerprint, indexOfByte, indexOf)
     inspect.zig     bounded file windows and match context
-    trigram.zig     trigram extraction and admission gates
+    trigram.zig     trigram extraction and admission gates (case-insensitive support)
     stats.zig       telemetry model
     sz.zig          StringZilla Zig wrapper
     corpus.zig      proof-program compilation for explain
