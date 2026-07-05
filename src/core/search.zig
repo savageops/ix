@@ -4479,10 +4479,10 @@ fn scanOpenFile(
                 }
             }
             if (!needs_fold) {
-                recordEvidencePruned(shard, file_bytes);
+                report.files_skipped += 1;
                 const file_ms = elapsedMs(io, file_started);
-                recordShardScanFileBufferedMs(shard, file_ms);
-                if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+                recordReportScanFileBufferedMs(report, file_ms);
+                if (file_ms >= report.slowest_ms) report.slowest_ms = file_ms;
                 return;
             }
             asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);

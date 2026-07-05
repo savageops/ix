@@ -169,14 +169,27 @@ pub fn classifyDensity(file_count: usize, total_files: usize) DensityClass {
 }
 
 pub fn extractFileTrigrams(allocator: std.mem.Allocator, bytes: []const u8) ![]TrigramKey {
+    return extractFileTrigramsLowercased(allocator, bytes);
+}
+
+/// Extract trigrams with all bytes lowercased. This makes the index
+/// case-insensitive-compatible: case-insensitive queries produce lowercased
+/// trigram keys that match the stored postings. Case-sensitive queries also
+/// work (lowercase trigrams are a superset — the verifier filters false positives).
+fn extractFileTrigramsLowercased(allocator: std.mem.Allocator, bytes: []const u8) ![]TrigramKey {
     if (bytes.len < 3) return allocator.alloc(TrigramKey, 0);
 
     var keys = std.ArrayList(TrigramKey).empty;
     errdefer keys.deinit(allocator);
 
+    // Use a stack buffer for lowercasing 3-byte windows — no allocation.
+    var lower_buf: [3]u8 = undefined;
     var index: usize = 0;
     while (index + 3 <= bytes.len) : (index += 1) {
-        const key = makeTrigramKey(bytes[index..][0..3]);
+        lower_buf[0] = std.ascii.toLower(bytes[index]);
+        lower_buf[1] = std.ascii.toLower(bytes[index + 1]);
+        lower_buf[2] = std.ascii.toLower(bytes[index + 2]);
+        const key = makeTrigramKey(&lower_buf);
         if (isValidTrigramKey(key)) try keys.append(allocator, key);
     }
     std.sort.heap(TrigramKey, keys.items, {}, lessThanTrigramKey);
@@ -373,9 +386,9 @@ pub fn lowerExpressionToLookupPlan(plan: expr.ExpressionPlan) LookupPlan {
     // Warm index stores case-sensitive trigrams at build time. Case-insensitive
     // admission produces lowercased keys that won't match stored postings.
     // Fail closed: full scan until the warm index supports case-insensitive.
-    const ci_blocked = admission.eligible and admission.case_insensitive;
+    const ci_blocked = false; // Index now stores lowercased trigrams — CI queries work.
     var lookup = LookupPlan{
-        .eligible = admission.eligible and !admission.case_insensitive,
+        .eligible = admission.eligible,
         .mode = if (admission.mode == .any) .any else .all,
         .ignored_predicates = admission.ignored_predicates,
         .fallback = if (ci_blocked) .no_mandatory_evidence else lookupFallback(admission.reason),
@@ -1414,12 +1427,10 @@ test "postings lookup lowering refuses literal alternates with short evidence br
     try std.testing.expect(lookupRequiresFullScan(lookup));
 }
 
-test "postings lookup lowering fails closed for case-insensitive literal alternates" {
+test "postings lookup lowering supports case-insensitive literal alternates" {
+    // Index now stores lowercased trigrams — case-insensitive queries match.
     const lookup = lowerExpressionToLookupPlan(try expr.parse("re:(?i)(alpha|beta)"));
-
-    try std.testing.expect(!lookup.eligible);
-    try std.testing.expectEqual(LookupFallback.no_mandatory_evidence, lookup.fallback);
-    try std.testing.expect(lookupRequiresFullScan(lookup));
+    try std.testing.expect(lookup.eligible);
 }
 
 test "postings lookup lowering fails closed for unindexed disjunction branch" {
