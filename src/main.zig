@@ -217,7 +217,11 @@ pub fn main(init: std.process.Init) !void {
                 .foreground = request.foreground,
                 .once = request.once,
                 .repair = request.repair,
-            }) catch std.process.exit(0);
+            }) catch |err| {
+                try output.writeError(stderr, "indexd_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
         },
     }
     try stdout.flush();

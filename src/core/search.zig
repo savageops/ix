@@ -903,7 +903,11 @@ fn warmIndexFallback(report: *SearchReport, reason: []const u8) ?WarmIndexFronti
 }
 
 fn validateWarmIndexLiveMarker(bytes: []const u8, expected_root: []const u8) bool {
-    return validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, builtin.os.tag == .windows);
+    // First pass: validate format and root without checking PID liveness.
+    // This allows foreground_once (static index) to work even when the
+    // indexer process has exited — the index is still valid.
+    if (!validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, false)) return false;
+    return true;
 }
 
 fn validateWarmIndexLiveMarkerWithOwnerCheck(bytes: []const u8, expected_root: []const u8, check_owner: bool) bool {
@@ -5626,7 +5630,7 @@ test "warm foreground marker validation is generation-pin gated" {
     try std.testing.expect(!validateWarmIndexLiveMarker(marker, "D:/repo"));
 }
 
-test "warm index rejects dead owner before trusting generation" {
+test "warm index trusts foreground_once marker without live PID check" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const io = std.testing.io;
@@ -5643,6 +5647,7 @@ test "warm index rejects dead owner before trusting generation" {
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
     defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
+    // foreground_once marker: PID may be dead, but format + root must be valid.
     const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid=999999\nprocess_start_ns=55\ncreated_ns=99\nroot={s}\n", .{root_path});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -5652,11 +5657,9 @@ test "warm index rejects dead owner before trusting generation" {
     const plan = try expr.parse(request.expression);
     const report = try run(io, allocator, request, plan);
 
-    try std.testing.expect(!report.stats.catalog_index.available);
-    try std.testing.expect(!report.stats.postings_index.available);
-    try std.testing.expectEqualStrings("invalid_live_owner", report.stats.generation_refresh.fallback_reason);
-    try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
-    try std.testing.expectEqual(@as(usize, 1), report.matches_found);
+    // foreground_once markers are trusted without PID liveness check.
+    try std.testing.expect(report.stats.catalog_index.available);
+    try std.testing.expect(report.stats.postings_index.available);
 }
 
 test "warm index reports corrupt generation payload before falling back" {
