@@ -1384,6 +1384,7 @@ const RUN_ONE_BENCHMARK_OPTION_KEYS = new Set([
   "corpus",
   "expression",
   "ixBinaryPath",
+  "nexus",
   "pairedPreviousInterleave",
   "previousIxBinaryPath",
   "profile",
@@ -1391,6 +1392,7 @@ const RUN_ONE_BENCHMARK_OPTION_KEYS = new Set([
   "rustIxBinaryPath",
   "samples",
   "threads",
+  "warmIndex",
   "warmup",
   "write",
 ]);
@@ -1423,12 +1425,17 @@ export function runOneBenchmark(options = {}) {
   const threads = options.threads;
   const warmup = Number(options.warmup ?? 0);
   const samples = Number(options.samples ?? 1);
+  // Warm-index and nexus env overrides. Default to "0" (cold baseline) so
+  // historical benchmark semantics are preserved unless the caller explicitly
+  // opts in via --warm-index 1 / --nexus 1.
+  const warmIndex = options.warmIndex ?? "0";
+  const nexus = options.nexus ?? "0";
   const measureOptions = {
     warmup,
     samples,
     env: {
-      IX_INDEX: "0",
-      IX_NEXUS: "0",
+      IX_INDEX: String(warmIndex),
+      IX_NEXUS: String(nexus),
     },
   };
   const hostBefore = hostSnapshot();
