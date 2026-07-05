@@ -14,6 +14,7 @@ pub const RootFingerprint = catalog.RootFingerprint;
 pub const SegmentKind = enum(u8) {
     catalog = 1,
     postings = 2,
+    signature = 3,
 };
 
 pub const ManifestFlags = packed struct(u32) {
@@ -631,6 +632,7 @@ fn segmentKindFromByte(byte: u8) !SegmentKind {
     return switch (byte) {
         @intFromEnum(SegmentKind.catalog) => .catalog,
         @intFromEnum(SegmentKind.postings) => .postings,
+        @intFromEnum(SegmentKind.signature) => .signature,
         else => error.UnknownGenerationSegment,
     };
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const windows = std.os.windows;
 const catalog = @import("catalog.zig");
+const corpus_signature = @import("corpus_signature.zig");
 const generation = @import("generation.zig");
 const postings = @import("postings.zig");
 const process_memory = @import("process_memory.zig");
@@ -451,6 +452,13 @@ fn publishRootGenerationWithParentBudget(io: std.Io, allocator: std.mem.Allocato
     defer allocator.free(postings_bytes);
     try enforceMemoryBudget(memory_limit_bytes);
 
+    // Compute corpus signature from the IndexedFile array — the exact files
+    // that were just indexed. Zero TOCTOU: no second walk, no filesystem access.
+    // This signature is compared against a live stat walk at query time.
+    const corpus_sig = computeSignatureFromIndexedFiles(files.items);
+    const signature_bytes = try corpus_signature.serializeSignature(allocator, corpus_sig);
+    defer allocator.free(signature_bytes);
+
     const state = try state_dir.buildRootIndexState(allocator, root_identity.fingerprint);
     defer state.deinit(allocator);
     const paths = try generation.buildGenerationPathsInIndexDir(allocator, state.index_dir, epoch);
@@ -458,6 +466,7 @@ fn publishRootGenerationWithParentBudget(io: std.Io, allocator: std.mem.Allocato
     const payloads = [_]generation.SegmentPayload{
         .{ .kind = .catalog, .relative_path = "catalog.ixcat", .bytes = catalog_bytes },
         .{ .kind = .postings, .relative_path = "postings.ixpost", .bytes = postings_bytes },
+        .{ .kind = .signature, .relative_path = "corpus.ixsignature", .bytes = signature_bytes },
     };
     return generation.publishGenerationPayloads(io, allocator, paths, root_identity.fingerprint, epoch, parent_epoch, &payloads);
 }
@@ -758,6 +767,21 @@ test "large source index admission includes script source family" {
 
 fn lessThanIndexedFilePath(_: void, lhs: IndexedFile, rhs: IndexedFile) bool {
     return std.mem.lessThan(u8, lhs.path, rhs.path);
+}
+
+/// Computes corpus signature from the IndexedFile array at publish time.
+/// Zero I/O, zero TOCTOU — operates on the exact files that were just indexed.
+/// Uses the shared hashFileSignature function so both indexer and search
+/// produce identical signatures for the same file set.
+fn computeSignatureFromIndexedFiles(files: []const IndexedFile) corpus_signature.CorpusSignature {
+    var sig = corpus_signature.CorpusSignature{};
+    for (files) |file| {
+        sig.file_count += 1;
+        sig.total_bytes += file.size;
+        if (file.mtime_ns > sig.max_mtime_ns) sig.max_mtime_ns = file.mtime_ns;
+        sig.path_hash_xor ^= corpus_signature.hashFileSignature(file.path, file.size, file.mtime_ns);
+    }
+    return sig;
 }
 
 fn isDefaultHiddenEntry(name: []const u8) bool {
@@ -1176,7 +1200,7 @@ test "indexd compacted root generation keeps old epoch readable until current sw
     const compacted_pin = try compactCurrentRootGenerationWithBudget(std.testing.io, std.testing.allocator, root, 0);
     try std.testing.expect(compacted_pin.epoch >= base_pin.epoch);
     try std.testing.expectEqual(@as(?generation.Epoch, base_pin.epoch), compacted_pin.parent_epoch);
-    try std.testing.expectEqual(@as(usize, 2), compacted_pin.segment_count);
+    try std.testing.expectEqual(@as(usize, 3), compacted_pin.segment_count);
 
     var small_buffer: [64]u8 = undefined;
     _ = try std.Io.Dir.cwd().readFile(std.testing.io, base_paths.manifest_path, &small_buffer);
@@ -1231,7 +1255,7 @@ test "indexd compact current generation falls back to initial publish when no cu
 
     const pin = try compactCurrentRootGenerationWithBudget(std.testing.io, std.testing.allocator, root, 0);
     try std.testing.expectEqual(@as(?generation.Epoch, null), pin.parent_epoch);
-    try std.testing.expectEqual(@as(usize, 2), pin.segment_count);
+    try std.testing.expectEqual(@as(usize, 3), pin.segment_count);
 
     const root_identity = try catalog.identifyRoot(std.testing.allocator, root);
     defer root_identity.deinit(std.testing.allocator);
