@@ -559,7 +559,19 @@ pub fn evaluateLookupPlanFromOpenFile(
     if (lookupRequiresFullScan(lookup)) return error.RequiresFullScan;
     const header = try readHeaderAt(io, file, 0);
     try validatePostingsHeader(header, expected_root, expected_generation);
-    const candidates = try evaluateLookupPlanFromOpenFileHeader(io, allocator, file, header, lookup);
+
+    // Pre-load the entire entry table into memory. The table is
+    // trigram_count * SERIALIZED_ENTRY_SIZE bytes (13.4 MiB for the linux
+    // bench corpus). Reading it once sequentially eliminates the ~480
+    // random-offset readPositionalAll syscalls the binary search was doing
+    // per query — each one Defender-intercepted at ~0.2 ms on a saturated
+    // host. The in-memory binary search is then pure pointer arithmetic.
+    const entry_table_bytes = header.trigram_count * SERIALIZED_ENTRY_SIZE;
+    const entry_table = try allocator.alloc(u8, entry_table_bytes);
+    defer allocator.free(entry_table);
+    try readExactAt(io, file, entry_table, SERIALIZED_HEADER_SIZE);
+
+    const candidates = try evaluateLookupPlanFromMemory(io, allocator, file, header, entry_table, lookup);
     return .{
         .header = header,
         .candidates = candidates,
@@ -810,6 +822,110 @@ fn evaluateLookupPlanFromOpenFileHeader(
     }
 
     return current;
+}
+
+/// Same as evaluateLookupPlanFromOpenFileHeader but binary-searches the
+/// pre-loaded entry table in memory instead of doing random-offset
+/// readPositionalAll syscalls per binary-search step. The entry_table is
+/// the raw serialized bytes of all entries (trigram_count *
+/// SERIALIZED_ENTRY_SIZE), read once sequentially.
+fn evaluateLookupPlanFromMemory(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: *std.Io.File,
+    header: PostingsSegmentHeader,
+    entry_table: []const u8,
+    lookup: LookupPlan,
+) ![]FileId {
+    var current = try evaluateLookupGroupFromMemory(io, allocator, file, header, entry_table, lookup.groups[0]);
+    errdefer allocator.free(current);
+
+    var group_index: usize = 1;
+    while (group_index < lookup.group_count) : (group_index += 1) {
+        const next_group = try evaluateLookupGroupFromMemory(io, allocator, file, header, entry_table, lookup.groups[group_index]);
+        defer allocator.free(next_group);
+        const merged = switch (lookup.mode) {
+            .all => try intersectFileIds(allocator, current, next_group),
+            .any => try unionFileIds(allocator, current, next_group),
+        };
+        allocator.free(current);
+        current = merged;
+    }
+
+    return current;
+}
+
+fn evaluateLookupGroupFromMemory(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    file: *std.Io.File,
+    header: PostingsSegmentHeader,
+    entry_table: []const u8,
+    group: LookupGroup,
+) ![]FileId {
+    if (group.key_count == 0) return allocator.alloc(FileId, 0);
+    var ordered = [_]LookupEntrySpan{undefined} ** trigram.MAX_TRIGRAMS_PER_GROUP;
+    const ordered_count = try collectLookupEntrySpansFromMemory(header, entry_table, group, &ordered);
+    if (ordered_count == 0) return allocator.alloc(FileId, 0);
+
+    var current = try readFileIdsForEntryFromOpenFile(io, allocator, file, header, ordered[0].entry);
+    errdefer allocator.free(current);
+
+    var key_index: usize = 1;
+    while (key_index < ordered_count) : (key_index += 1) {
+        const ids = try readFileIdsForEntryFromOpenFile(io, allocator, file, header, ordered[key_index].entry);
+        defer allocator.free(ids);
+        const merged = try intersectFileIds(allocator, current, ids);
+        allocator.free(current);
+        current = merged;
+        if (current.len == 0) break;
+    }
+    return current;
+}
+
+fn collectLookupEntrySpansFromMemory(
+    header: PostingsSegmentHeader,
+    entry_table: []const u8,
+    group: LookupGroup,
+    out: *[trigram.MAX_TRIGRAMS_PER_GROUP]LookupEntrySpan,
+) !usize {
+    var count: usize = 0;
+    for (group.keys[0..group.key_count]) |key| {
+        const entry = try lookupEntryFromMemory(header, entry_table, key) orelse return 0;
+        out[count] = .{ .key = key, .entry = entry };
+        count += 1;
+    }
+    std.sort.insertion(LookupEntrySpan, out[0..count], {}, lessThanLookupEntrySpan);
+    return count;
+}
+
+/// Binary search for a trigram key in the pre-loaded entry table. Pure
+/// memory access — zero syscalls. The entry table is the contiguous array
+/// of serialized PostingsEntry records starting at SERIALIZED_HEADER_SIZE.
+fn lookupEntryFromMemory(
+    header: PostingsSegmentHeader,
+    entry_table: []const u8,
+    key_value: TrigramKey,
+) !?PostingsEntry {
+    var low: u64 = 0;
+    var high = header.trigram_count;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        const offset: usize = @intCast(mid * SERIALIZED_ENTRY_SIZE);
+        if (offset + SERIALIZED_ENTRY_SIZE > entry_table.len) return error.PostingsOffsetOverflow;
+        var cursor = Cursor{ .bytes = entry_table[offset .. offset + SERIALIZED_ENTRY_SIZE] };
+        const entry = try readEntry(&cursor);
+        if (entry.key == key_value) {
+            if (!isValidEntryForHeader(entry, header)) return error.InvalidPostingsEntry;
+            return entry;
+        }
+        if (entry.key < key_value) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return null;
 }
 
 fn evaluateLookupGroupFromOpenFile(
