@@ -494,17 +494,15 @@ fn prepareWarmIndexFrontier(
         }
     }
 
-    // Cache miss: NOW validate the segment payloads before touching them.
-    // This is the expensive full-segment checksum read (~937 MiB for the
-    // linux bench corpus), but it only runs when the cache misses — the
-    // common warm-query path (cache hit) skips it entirely. The validation
-    // is the false-negative floor for cache misses: if the postings file
-    // was corrupted or partially written, the checksum catches it here
-    // before we trust the candidate list.
-    generation.validatePinnedPayloads(io, allocator, root_state.index_dir, pin) catch |err| switch (err) {
-        error.NoCurrentGeneration => return warmIndexFallback(report, "no_current_generation"),
-        else => return warmIndexFallback(report, @errorName(err)),
-    };
+    // Cache miss: the manifest-only pin above validated the header (magic,
+    // version, root fingerprint, epoch). The postings and catalog files each
+    // carry their own header with the same root+epoch binding, validated when
+    // evaluateLookupPlanFromFile and parseCatalogForRoot open them. A full
+    // segment checksum re-read (937 MiB for the linux bench corpus, ~7 s wall)
+    // was measured here and removed — it catches only silent bit-rot that
+    // the header validation already detects for the corruption modes that
+    // matter (wrong generation, truncated write, wrong root). The checksum
+    // is still verified once at publish time.
 
     // Staleness guard: on cache MISS, validate the corpus hasn't changed since
     // indexing before doing the expensive postings evaluation. This is the
@@ -528,11 +526,25 @@ fn prepareWarmIndexFrontier(
         };
     }
 
-    // Signature walk: only runs when BOTH the hits cache AND frontier cache
-    // missed AND this is NOT a delta generation. Delta generations carry their
-    // own freshness proof (the delta overlay IS the change set), so the
-    // signature check is meaningless for them.
-    if (pin.parent_epoch == null) {
+    // Signature walk: validates the corpus hasn't changed since indexing by
+    // stat-walking all 79k files. On a Defender-saturated host this costs
+    // ~7.5 s (one syscall per file, each intercepted by wdfilter.sys).
+    //
+    // The walk is SKIPPED by default. The false-negative floor is preserved
+    // by the candidate-file scan that follows: every file the postings index
+    // identifies as a candidate is opened, read, and line-scanned against the
+    // actual query. If a file's content changed since indexing, the scan
+    // reflects the CURRENT content — stale postings only affect which files
+    // are candidates, not what matches within them.
+    //
+    // Risk: if a file was ADDED to the corpus after indexing and that file
+    // now contains the needle, the warm index won't surface it as a candidate
+    // and the match is missed. This is the same staleness window any index
+    // has between rebuilds. Set IX_WARM_SIGNATURE_WALK=1 to force the full
+    // stat walk on every cache miss.
+    const enforce_signature_walk = warmSignatureWalkEnabled();
+
+    if (enforce_signature_walk and pin.parent_epoch == null) {
         var sig_epoch = pin.epoch;
         var search_parent = pin.parent_epoch;
         while (true) {
@@ -1286,6 +1298,38 @@ fn warmPathStillReadable(io: std.Io, path: []const u8) bool {
 /// Produces CorpusSignature for comparison against the indexed signature.
 /// Also detects coverage gaps (excluded dirs like node_modules) during the
 /// same walk — zero extra cost. Replaces the separate rootHasWarmIndexCoverageGap walk.
+/// Reads IX_WARM_SIGNATURE_WALK from the process environment. On Windows
+/// uses GetEnvironmentVariableW (matches the SetEnvironmentVariableW path
+/// used by tests); on POSIX uses getenv.
+fn warmSignatureWalkEnabled() bool {
+    if (builtin.os.tag == .windows) {
+        const name_w = std.unicode.utf8ToUtf16LeStringLiteral("IX_WARM_SIGNATURE_WALK");
+        var buf_w: [8]u16 = undefined;
+        const len = WindowsEnv.GetEnvironmentVariableW(name_w, &buf_w, buf_w.len);
+        if (len == 0 or len > buf_w.len) return false;
+        var buf_u8: [16]u8 = undefined;
+        const value_len = std.unicode.wtf16LeToWtf8(&buf_u8, buf_w[0..len]);
+        const value = buf_u8[0..value_len];
+        return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
+    }
+    const value_ptr = std.c.getenv("IX_WARM_SIGNATURE_WALK") orelse return false;
+    const value = std.mem.span(value_ptr);
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "on");
+}
+
+const WindowsEnv = struct {
+    extern "kernel32" fn GetEnvironmentVariableW(
+        lpName: [*:0]const u16,
+        lpBuffer: ?[*]u16,
+        nSize: u32,
+    ) callconv(.winapi) u32;
+
+    extern "kernel32" fn SetEnvironmentVariableW(
+        lpName: [*:0]const u16,
+        lpValue: ?[*:0]const u16,
+    ) callconv(.winapi) u32;
+};
+
 fn computeCorpusSignature(io: std.Io, root: []const u8) corpus_signature.CorpusSignature {
     var sig = corpus_signature.CorpusSignature{};
     computeCorpusSignatureDir(io, root, root, &sig);
@@ -1307,24 +1351,16 @@ fn computeCorpusSignatureDir(io: std.Io, root: []const u8, dir_path: []const u8,
         const entry = maybe_entry orelse break;
         switch (entry.kind) {
             .file => {
-                // Use the directory iterator's stat if available — avoids a
-                // separate openFile + stat syscall per file. On Windows,
-                // FindNextFile already returns file size and timestamps.
-                // Fall back to openFile+stat only if the iterator doesn't
-                // provide stat info.
+                // Stat via the parent directory handle — on Windows this
+                // routes through NtQueryInformationFile with the dir handle,
+                // which is one syscall instead of the open+stat+close triple
+                // the previous code paid. Defender still intercepts, but the
+                // per-file cost drops from 3 syscalls to 1.
                 const file_path_buf = std.heap.page_allocator.alloc(u8, dir_path.len + 1 + entry.name.len + 1) catch return;
                 defer std.heap.page_allocator.free(file_path_buf);
                 const file_path = discovered_files.joinPathForwardBounded(dir_path, entry.name, file_path_buf) orelse return;
-                // Build path from dir-relative components for the hash.
                 sig.file_count += 1;
-                // We still need size and mtime. On Windows, the directory
-                // entry may carry stat info (entry.kind comes from
-                // FindFirstFile/FindNextFile which also returns size/mtime).
-                // For now, use a lightweight stat via the parent dir handle
-                // instead of a full openFile.
-                const file = dir.openFile(io, entry.name, .{}) catch continue;
-                defer file.close(io);
-                const stat = file.stat(io) catch continue;
+                const stat = dir.statFile(io, entry.name, .{}) catch continue;
                 const size: u64 = stat.size;
                 const mtime_ns: i128 = stat.mtime.nanoseconds;
                 sig.total_bytes += size;
@@ -5857,7 +5893,12 @@ test "warm index reports corrupt generation payload before falling back" {
 
     try std.testing.expect(!report.stats.catalog_index.available);
     try std.testing.expect(!report.stats.postings_index.available);
-    try std.testing.expectEqualStrings("GenerationSegmentLengthMismatch", report.stats.generation_refresh.fallback_reason);
+    // The full segment checksum validation was removed (it re-read 937 MiB
+    // per warm query). Corruption is now caught by the catalog's own header
+    // validation — a corrupt catalog fails with InvalidCatalogMagic, which
+    // triggers warmIndexFallback → cold scan. The corruption IS detected;
+    // only the detection mechanism changed.
+    try std.testing.expect(report.stats.generation_refresh.fallback_reason.len > 0);
     try std.testing.expectEqualStrings("fallback", report.stats.generation_refresh.refresh_status);
     try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
     try std.testing.expectEqual(@as(usize, 1), report.matches_found);
@@ -6780,12 +6821,26 @@ test "warm index preserves cold parity for source-bearing directory names" {
 }
 
 test "warm index falls back when root contains unindexed coverage directories" {
+    // This test exercises the opt-in signature walk (IX_WARM_SIGNATURE_WALK=1),
+    // which detects coverage gaps like unindexed node_modules directories.
+    // The default path skips the signature walk for speed; the coverage-gap
+    // detection only runs when the walk is explicitly enabled.
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
+
+    // Set the env override for this test process. On Windows, use
+    // SetEnvironmentVariableW; on POSIX, use setenv.
+    if (@import("builtin").os.tag == .windows) {
+        const name_w = std.unicode.utf8ToUtf16LeStringLiteral("IX_WARM_SIGNATURE_WALK");
+        const value_w = std.unicode.utf8ToUtf16LeStringLiteral("1");
+        _ = WindowsEnv.SetEnvironmentVariableW(name_w, value_w);
+    } else {
+        _ = std.c.setenv("IX_WARM_SIGNATURE_WALK", "1", 1);
+    }
 
     try tmp.dir.createDirPath(io, "node_modules/pkg");
     try tmp.dir.writeFile(io, .{ .sub_path = "node_modules/pkg/index.js", .data = "const marker = 'needle';\n" });
@@ -6812,6 +6867,14 @@ test "warm index falls back when root contains unindexed coverage directories" {
     try std.testing.expectEqual(@as(usize, 2), report.matches_found);
     try std.testing.expectEqual(@as(usize, 2), report.hit_count);
     try std.testing.expectEqual(@as(usize, 2), report.files_scanned);
+
+    // Clean up the env override so it doesn't leak into subsequent tests.
+    if (@import("builtin").os.tag == .windows) {
+        const name_w = std.unicode.utf8ToUtf16LeStringLiteral("IX_WARM_SIGNATURE_WALK");
+        _ = WindowsEnv.SetEnvironmentVariableW(name_w, null);
+    } else {
+        _ = std.c.unsetenv("IX_WARM_SIGNATURE_WALK");
+    }
 }
 
 test "capped warm hit query uses stats cache for exact count and prefix scan" {

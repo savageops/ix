@@ -909,11 +909,19 @@ fn readFileIdsForEntryFromOpenFile(
     const ids = try allocator.alloc(FileId, count);
     errdefer allocator.free(ids);
     const start = try fileIdByteOffset(header, entry.file_offset);
-    var offset = start;
+    // Batch-read all file IDs for this entry in ONE syscall instead of N
+    // individual readPositionalAll calls. Each syscall on a Defender-saturated
+    // host costs ~0.2 ms of filter-stack interception — reading 450 file IDs
+    // one-at-a-time was 90 ms per entry × many entries = seconds of pure
+    // syscall overhead against the 922 MiB postings segment.
+    const batch_bytes = count * SERIALIZED_FILE_ID_SIZE;
+    const batch_buf = try allocator.alloc(u8, batch_bytes);
+    defer allocator.free(batch_buf);
+    try readExactAt(io, file, batch_buf, start);
+    var cursor = Cursor{ .bytes = batch_buf };
     for (ids) |*file_id| {
-        file_id.* = try readU64At(io, file, offset);
+        file_id.* = try cursor.readU64();
         if (!catalog.isValidFileId(file_id.*)) return error.InvalidCatalogFileId;
-        offset += SERIALIZED_FILE_ID_SIZE;
     }
     var index: usize = 1;
     while (index < ids.len) : (index += 1) {
