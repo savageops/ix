@@ -3550,7 +3550,31 @@ fn scanOpenFileIntoShardImpl(
     }
     if (shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program))
     {
-        if (trigram_program.needsCasefold()) asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
+        if (trigram_program.needsCasefold()) {
+            // Quick scan: is ANY needle's first byte present in either case?
+            // If none present, guaranteed miss — skip casefold entirely.
+            var needs_fold = false;
+            outer: for (0..trigram_program.file_admission_group_count) |gi| {
+                const grp = &trigram_program.file_admission_groups[gi];
+                if (!grp.case_insensitive) continue;
+                for (0..grp.needle_count) |ni| {
+                    if (grp.lower_needle_lens[ni] == 0) continue;
+                    const lb = grp.lower_needles[ni][0];
+                    const ub = if (lb >= 'a' and lb <= 'z') lb - 32 else lb;
+                    if (simd.indexOfByte(read_buffer[0..first_read], lb) != null or
+                        (ub != lb and simd.indexOfByte(read_buffer[0..first_read], ub) != null))
+                    { needs_fold = true; break :outer; }
+                }
+            }
+            if (!needs_fold) {
+                recordEvidencePruned(shard, file_bytes);
+                const file_ms = elapsedMs(io, file_started);
+                recordShardScanFileBufferedMs(shard, file_ms);
+                if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+                return;
+            }
+            asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
+        }
         if (trigram_program.fileAdmissionMiss(read_buffer[0..first_read])) {
             recordEvidencePruned(shard, file_bytes);
             const file_ms = elapsedMs(io, file_started);
@@ -4438,7 +4462,31 @@ fn scanOpenFile(
     }
     if (shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program))
     {
-        if (trigram_program.needsCasefold()) asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
+        if (trigram_program.needsCasefold()) {
+            // Quick scan: is ANY needle's first byte present in either case?
+            // If none present, guaranteed miss — skip casefold entirely.
+            var needs_fold = false;
+            outer: for (0..trigram_program.file_admission_group_count) |gi| {
+                const grp = &trigram_program.file_admission_groups[gi];
+                if (!grp.case_insensitive) continue;
+                for (0..grp.needle_count) |ni| {
+                    if (grp.lower_needle_lens[ni] == 0) continue;
+                    const lb = grp.lower_needles[ni][0];
+                    const ub = if (lb >= 'a' and lb <= 'z') lb - 32 else lb;
+                    if (simd.indexOfByte(read_buffer[0..first_read], lb) != null or
+                        (ub != lb and simd.indexOfByte(read_buffer[0..first_read], ub) != null))
+                    { needs_fold = true; break :outer; }
+                }
+            }
+            if (!needs_fold) {
+                recordEvidencePruned(shard, file_bytes);
+                const file_ms = elapsedMs(io, file_started);
+                recordShardScanFileBufferedMs(shard, file_ms);
+                if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+                return;
+            }
+            asciiLowerBuf(read_buffer[0..first_read], read_buffer[0..first_read]);
+        }
         if (trigram_program.fileAdmissionMiss(read_buffer[0..first_read])) {
             const file_ms = elapsedMs(io, file_started);
             recordReportScanFileBufferedMs(report, file_ms);
