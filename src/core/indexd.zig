@@ -141,23 +141,35 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
             try recordPublishFailure(io, allocator, config, err);
             return err;
         };
-        if (config.mode != .foreground_once) {
-            if (builtin.os.tag == .windows) {
-                const live = try writeLiveMarker(io, allocator, config);
-                defer live.remove(io, allocator);
-                while (true) {
-                    holdLiveUntilRootMutation(io, config.root);
-                    settleRootMutationBurst(io);
-                    _ = compactCurrentRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes) catch |err| {
-                        try recordPublishFailure(io, allocator, config, err);
-                        return err;
-                    };
-                }
-            } else {
-                const live = try writeLiveMarker(io, allocator, config);
-                defer live.remove(io, allocator);
+        if (config.mode == .foreground_once) {
+            // Write live marker so warm-index search can use the freshly built index.
+            // foreground_once does NOT remove the marker on exit — the index persists
+            // until the next build or process cleanup detects a stale owner.
+            const live = writeLiveMarker(io, allocator, config) catch |err| {
+                try recordPublishFailure(io, allocator, config, err);
+                return err;
+            };
+            // Free the path allocation but leave the file on disk.
+            allocator.free(live.path);
+            _ = compactCurrentRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes) catch |err| {
+                try recordPublishFailure(io, allocator, config, err);
+                return err;
+            };
+        } else if (builtin.os.tag == .windows) {
+            const live = try writeLiveMarker(io, allocator, config);
+            defer live.remove(io, allocator);
+            while (true) {
                 holdLiveUntilRootMutation(io, config.root);
+                settleRootMutationBurst(io);
+                _ = compactCurrentRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes) catch |err| {
+                    try recordPublishFailure(io, allocator, config, err);
+                    return err;
+                };
             }
+        } else {
+            const live = try writeLiveMarker(io, allocator, config);
+            defer live.remove(io, allocator);
+            holdLiveUntilRootMutation(io, config.root);
         }
     }
     return .{

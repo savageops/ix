@@ -444,7 +444,7 @@ fn prepareWarmIndexFrontier(
     defer allocator.free(marker_path);
     const marker_bytes = std.Io.Dir.cwd().readFileAlloc(io, marker_path, allocator, .limited(WARM_INDEX_LIVE_READ_LIMIT)) catch return warmIndexFallback(report, "no_live_owner");
     defer allocator.free(marker_bytes);
-    if (!validateWarmIndexLiveMarker(marker_bytes, root)) return warmIndexFallback(report, "invalid_live_owner");
+    if (!validateWarmIndexLiveMarker(marker_bytes, root_identity.canonical_path)) return warmIndexFallback(report, "invalid_live_owner");
 
     const current_paths = generation.buildGenerationPathsInIndexDir(allocator, root_state.index_dir, 1) catch return warmIndexFallback(report, "paths_failed");
     defer current_paths.deinit(allocator);
@@ -923,7 +923,13 @@ fn validateWarmIndexLiveMarkerWithOwnerCheck(bytes: []const u8, expected_root: [
     const created_ns = std.fmt.parseInt(i128, created_line["created_ns=".len..], 10) catch return false;
     if (created_ns <= 0) return false;
     const marker_root = root_line["root=".len..];
-    if (!std.mem.eql(u8, marker_root, expected_root)) return false;
+    // Compare case-insensitively on the root path: the indexer writes the raw
+    // request root (may have uppercase drive letter), while the search may pass
+    // either the raw path or the canonicalized one. Both must match.
+    if (!std.ascii.eqlIgnoreCase(marker_root, expected_root)) {
+        // Fall back to exact match for non-ASCII roots.
+        if (!std.mem.eql(u8, marker_root, expected_root)) return false;
+    }
     if (check_owner and builtin.os.tag == .windows) {
         if (processStartNs(@intCast(owner_pid)) != owner_start_ns) return false;
     }
