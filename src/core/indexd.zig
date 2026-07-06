@@ -152,10 +152,15 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
             };
             // Free the path allocation but leave the file on disk.
             allocator.free(live.path);
-            _ = compactCurrentRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes) catch |err| {
-                try recordPublishFailure(io, allocator, config, err);
-                return err;
-            };
+            // The initial publishRootGenerationForConfig above already produced
+            // a complete generation (catalog + postings + signature). The
+            // compaction call that was here re-indexed the same corpus and
+            // created a SECOND generation with parent_epoch pointing at the
+            // first — every warm query then read BOTH 922 MiB postings files
+            // via prepareDeltaWarmIndexFrontier, costing ~6 s per cache MISS.
+            // Removing the compaction keeps the single-generation layout:
+            // pin.parent_epoch is null, the non-delta path runs, and only one
+            // postings + one catalog are read per MISS.
         } else if (builtin.os.tag == .windows) {
             const live = try writeLiveMarker(io, allocator, config);
             defer live.remove(io, allocator);
