@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import os from "node:os";
@@ -13,6 +13,26 @@ const REPORT_DIR = path.join(ROOT, "tools", "reports");
 const COMPETITOR_CONFIG = path.join(ROOT, "tools", "scripts", "competitors.json");
 const DEFAULT_CORPUS = path.join(ROOT, "tools", "data", "corpus");
 const DEFAULT_EXPR = "lit:ERROR && lit:timeout";
+
+/// Clears all files in every warm-index query cache directory under the IX
+/// state dir. This forces the next search to take the cache-MISS path
+/// (postings lookup + catalog read + candidate scan) instead of the
+/// sub-millisecond cache-HIT path. Used by the --clear-warm-cache benchmark
+/// mode to measure warm-MISS optimizations.
+function clearWarmQueryCache() {
+  const localAppData = process.env.LOCALAPPDATA || process.env.HOME || "";
+  if (!localAppData) return;
+  const ixStateDir = process.env.IX_STATE_DIR || path.join(localAppData, "ix");
+  const rootsDir = path.join(ixStateDir, "index", "roots");
+  if (!existsSync(rootsDir)) return;
+  for (const entry of readdirSync(rootsDir)) {
+    const queryDir = path.join(rootsDir, entry, "query");
+    if (!existsSync(queryDir)) continue;
+    for (const file of readdirSync(queryDir)) {
+      rmSync(path.join(queryDir, file), { force: true });
+    }
+  }
+}
 const DEFAULT_SCENARIO_ID = "cli_stats_only_search";
 let zigBuilt = false;
 
@@ -612,13 +632,16 @@ function measureIxSearch(binaryPath, context, measureOptions) {
   const args = buildIxSearchArgs(context);
   const warmup = Math.max(0, Number(measureOptions.warmup ?? 0));
   const samples = Math.max(1, Number(measureOptions.samples ?? 1));
+  const clearWarmCache = Boolean(measureOptions.clearWarmCache ?? false);
 
   for (let i = 0; i < warmup; i += 1) {
+    if (clearWarmCache) clearWarmQueryCache();
     runTimedCommand(binaryPath, args, [0], measureOptions);
   }
 
   const measuredRuns = [];
   for (let i = 0; i < samples; i += 1) {
+    if (clearWarmCache) clearWarmQueryCache();
     const result = runTimedCommand(binaryPath, args, [0], measureOptions);
     const report = parseIxReport(result.stdout);
     if (result.stdout?.trim() && !report) {
@@ -782,9 +805,12 @@ function measurePairedIxSearch(currentBinaryPath, previousBinaryPath, context, m
   const resolvedPreviousBinaryPath = resolveExplicitBinaryPath(previousBinaryPath);
   const warmup = Math.max(0, Number(measureOptions.warmup ?? 0));
   const samples = Math.max(1, Number(measureOptions.samples ?? 1));
+  const clearWarmCache = Boolean(measureOptions.clearWarmCache ?? false);
 
   for (let i = 0; i < warmup; i += 1) {
+    if (clearWarmCache) clearWarmQueryCache();
     runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions);
+    if (clearWarmCache) clearWarmQueryCache();
     runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions);
   }
 
@@ -795,10 +821,14 @@ function measurePairedIxSearch(currentBinaryPath, previousBinaryPath, context, m
     const previousFirst = i % 2 === 0;
     pairOrder.push(previousFirst ? "previous,current" : "current,previous");
     if (previousFirst) {
+      if (clearWarmCache) clearWarmQueryCache();
       previousRuns.push(measuredIxEntry(resolvedPreviousBinaryPath, previousArgs, runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions), i));
+      if (clearWarmCache) clearWarmQueryCache();
       currentRuns.push(measuredIxEntry(currentBinaryPath, currentArgs, runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions), i));
     } else {
+      if (clearWarmCache) clearWarmQueryCache();
       currentRuns.push(measuredIxEntry(currentBinaryPath, currentArgs, runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions), i));
+      if (clearWarmCache) clearWarmQueryCache();
       previousRuns.push(measuredIxEntry(resolvedPreviousBinaryPath, previousArgs, runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions), i));
     }
   }
@@ -1381,6 +1411,7 @@ export function describeBenchmarkScenario(options = {}) {
 }
 
 const RUN_ONE_BENCHMARK_OPTION_KEYS = new Set([
+  "clearWarmCache",
   "corpus",
   "expression",
   "ixBinaryPath",
@@ -1430,9 +1461,15 @@ export function runOneBenchmark(options = {}) {
   // opts in via --warm-index 1 / --nexus 1.
   const warmIndex = options.warmIndex ?? "0";
   const nexus = options.nexus ?? "0";
+  // clearWarmCache: delete the warm-index query cache before each sample so
+  // every sample measures the cache-MISS path (postings lookup + catalog read
+  // + candidate scan) instead of the cache-HIT path (sub-millisecond). This
+  // surfaces warm-MISS optimizations that the standard benchmark hides.
+  const clearWarmCache = Boolean(options.clearWarmCache ?? false);
   const measureOptions = {
     warmup,
     samples,
+    clearWarmCache,
     env: {
       IX_INDEX: String(warmIndex),
       IX_NEXUS: String(nexus),

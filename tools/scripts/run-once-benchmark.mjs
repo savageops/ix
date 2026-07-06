@@ -20,6 +20,7 @@ Options:
   --samples <n>                   Measured samples. Default: 1.
   --warm-index <0|1>              Enable IX warm index (IX_INDEX env). Default: 0.
   --nexus <0|1>                   Enable IX evidence frontier (IX_NEXUS env). Default: 0.
+  --clear-warm-cache              Clear warm-index query cache before each sample (measures MISS path).
   --quiet                         Write reports without printing JSON.
   --help, -h                      Print this help and exit without measuring.
 `);
@@ -40,6 +41,7 @@ const warmup = Number(warmupArg);
 const samples = Number(samplesArg);
 const warmIndex = argValue(args, "--warm-index", "0");
 const nexus = argValue(args, "--nexus", "0");
+const clearWarmCache = args.includes("--clear-warm-cache");
 const quiet = args.includes("--quiet");
 
 const run = runOneBenchmark({
@@ -55,6 +57,7 @@ const run = runOneBenchmark({
   samples,
   warmIndex,
   nexus,
+  clearWarmCache,
   write: true,
 });
 
