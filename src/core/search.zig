@@ -440,6 +440,19 @@ fn prepareWarmIndexFrontier(
     defer allocator.free(marker_bytes);
     if (!validateWarmIndexLiveMarker(marker_bytes, root_identity.canonical_path)) return warmIndexFallback(report, "invalid_live_owner");
 
+    // Capture freshness metadata for the report. The live-owner marker carries
+    // the index creation timestamp; compute age at report time so consumers can
+    // detect stale indexes. A stale index is a silent correctness defect —
+    // freshness is reported on every warm result, never assumed.
+    const freshness = parseWarmIndexFreshness(marker_bytes, root_identity.canonical_path);
+    if (freshness) |f| {
+        report.stats.postings_index.index_created_ns = f.created_ns;
+        const now_ns: u64 = @intCast(@max(std.Io.Timestamp.now(io, .real).nanoseconds, 0));
+        if (now_ns >= f.created_ns) {
+            report.stats.postings_index.index_age_ms = @divTrunc(now_ns - f.created_ns, std.time.ns_per_ms);
+        }
+    }
+
     const current_paths = generation.buildGenerationPathsInIndexDir(allocator, root_state.index_dir, 1) catch return warmIndexFallback(report, "paths_failed");
     defer current_paths.deinit(allocator);
 
@@ -1014,6 +1027,36 @@ fn validateWarmIndexLiveMarkerWithOwnerCheck(bytes: []const u8, expected_root: [
         if (processStartNs(@intCast(owner_pid)) != owner_start_ns) return false;
     }
     return true;
+}
+
+/// Freshness metadata extracted from the warm-index live-owner marker.
+const WarmIndexFreshness = struct {
+    created_ns: u64,
+};
+
+/// Parses the live-owner marker and returns freshness metadata on success.
+/// Returns null when the marker is absent or malformed — same semantics as
+/// validateWarmIndexLiveMarker but captures created_ns for freshness reporting.
+fn parseWarmIndexFreshness(bytes: []const u8, expected_root: []const u8) ?WarmIndexFreshness {
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return null, "\r"), WARM_INDEX_LIVE_MARKER_MAGIC)) return null;
+    const pid_line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+    const process_start_line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+    const created_line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+    const root_line = std.mem.trimEnd(u8, lines.next() orelse return null, "\r");
+    if (!std.mem.startsWith(u8, pid_line, "pid=")) return null;
+    if (!std.mem.startsWith(u8, process_start_line, "process_start_ns=")) return null;
+    if (!std.mem.startsWith(u8, created_line, "created_ns=")) return null;
+    if (!std.mem.startsWith(u8, root_line, "root=")) return null;
+    const owner_pid = std.fmt.parseInt(usize, pid_line["pid=".len..], 10) catch return null;
+    if (owner_pid == 0) return null;
+    const created_ns = std.fmt.parseInt(i128, created_line["created_ns=".len..], 10) catch return null;
+    if (created_ns <= 0) return null;
+    const marker_root = root_line["root=".len..];
+    if (!std.ascii.eqlIgnoreCase(marker_root, expected_root)) {
+        if (!std.mem.eql(u8, marker_root, expected_root)) return null;
+    }
+    return .{ .created_ns = @intCast(created_ns) };
 }
 
 fn warmIndexRelativePath(root: []const u8, path: []const u8) []const u8 {

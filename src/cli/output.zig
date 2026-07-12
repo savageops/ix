@@ -450,6 +450,18 @@ fn writePostingsIndexJson(writer: anytype, postings_index: core_stats.PostingsIn
         postings_index.block_prune_candidate_compressed_bytes,
     });
     try writeJsonString(writer, postings_index.fallback_reason);
+    try writer.writeAll(",\"index_created_ns\":");
+    if (postings_index.index_created_ns) |created| {
+        try writer.print("{}", .{created});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"index_age_ms\":");
+    if (postings_index.index_age_ms) |age| {
+        try writer.print("{}", .{age});
+    } else {
+        try writer.writeAll("null");
+    }
     try writer.writeAll("}");
 }
 

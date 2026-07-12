@@ -169,6 +169,12 @@ pub const PostingsIndexStats = struct {
     block_prune_candidate_postings: usize = 0,
     block_prune_candidate_compressed_bytes: usize = 0,
     fallback_reason: []const u8 = "not_wired",
+    /// Wall-clock nanoseconds (UNIX epoch) when the live-owner marker was created.
+    /// Null when the warm path was not activated or the marker was absent.
+    index_created_ns: ?u64 = null,
+    /// Age of the index in milliseconds at the time the report was generated.
+    /// Null when no index was available.
+    index_age_ms: ?u64 = null,
 };
 
 pub const GenerationRefreshStats = struct {
