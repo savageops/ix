@@ -268,6 +268,40 @@ pub fn writeExplain(writer: anytype, plan: expr.ExpressionPlan) !void {
     } else {
         try writer.writeAll("null");
     }
+    // Algorithmic kernel candidates for this query shape.
+    // Each kernel is a concrete matcher that can execute this plan; the
+    // planner selects one based on pattern length, case sensitivity, and
+    // index availability at query time.
+    try writer.writeAll(",\"kernel_candidates\":[");
+    var kernel_first = true;
+    for (plan.predicates[0..plan.predicate_count]) |predicate| {
+        const is_regex = predicate.kind == .regex;
+        _ = is_regex;
+        const value = predicate.value;
+        // Shift-Or: applicable for patterns ≤ 64 bytes (spec point 12).
+        if (value.len > 0 and value.len <= 64) {
+            if (!kernel_first) try writer.writeAll(",");
+            kernel_first = false;
+            try writer.writeAll("{\"kernel\":\"shift_or\",\"spec_point\":12,\"eligible\":true");
+            try writer.print(",\"reason\":\"pattern_len={d}<=64\"", .{value.len});
+            try writer.writeAll("}");
+        }
+        // FM-Index backward search: applicable for any pattern (spec point 11).
+        if (value.len > 0) {
+            if (!kernel_first) try writer.writeAll(",");
+            kernel_first = false;
+            try writer.writeAll("{\"kernel\":\"fm_index_backward_search\",\"spec_point\":11,\"eligible\":true");
+            try writer.writeAll(",\"reason\":\"O(p)_sublinear_in_corpus\"}");
+        }
+        // SWAR byte-value detection: applicable for single-byte classification (spec point 13).
+        if (value.len == 1) {
+            if (!kernel_first) try writer.writeAll(",");
+            kernel_first = false;
+            try writer.writeAll("{\"kernel\":\"swar_byte_detect\",\"spec_point\":13,\"eligible\":true");
+            try writer.writeAll(",\"reason\":\"single_byte_pattern\"}");
+        }
+    }
+    try writer.writeAll("]");
     try writer.writeAll("}}\n");
 }
 
