@@ -616,6 +616,7 @@ const report = {
   dependencyTrees: dependencyTreeSnapshot(ROOT),
   host,
   processScan,
+  interPairSettleMs: settleMs,
   decisionGrade: benchmarkDecisionGrade({
     preflightAborted: false,
     retainableStrictEvidence: strictFailures.length === 0,
