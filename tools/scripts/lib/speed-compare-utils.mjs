@@ -2034,7 +2034,7 @@ function cleanupBenchmarkOwnedIxProcesses({ matched, ixBinary, label }) {
   }
 }
 
-function scanIxProcessState({ ixBinary, env, label }) {
+function scanIxProcessState({ ixBinary, env, label, cleanupOwned = false }) {
   if (!ixBinary || !existsSync(ixBinary)) {
     return {
       ok: true,
@@ -2043,6 +2043,20 @@ function scanIxProcessState({ ixBinary, env, label }) {
       reason: "ix binary missing",
       report: null,
       failures: [],
+    };
+  }
+  const cleanup = cleanupOwned
+    ? run(ixBinary, ["process", "cleanup", "--json"], { env })
+    : null;
+  if (cleanup && cleanup.exitCode !== 0) {
+    return {
+      ok: false,
+      label,
+      command: cleanup.command,
+      report: null,
+      failures: [`${label}:process_cleanup_exit_${cleanup.exitCode}`],
+      stderr: cleanup.stderr.trim(),
+      stdout: cleanup.stdout.trim(),
     };
   }
   const result = run(ixBinary, ["process", "status", "--json"], { env });
@@ -2069,6 +2083,7 @@ function scanIxProcessState({ ixBinary, env, label }) {
       label,
       command: result.command,
       report,
+      cleanupCommand: cleanup?.command ?? null,
       failures,
     };
   } catch {
@@ -2091,9 +2106,9 @@ export function scanIxProcesses({ ixBinary, env, cleanupOwned = false } = {}) {
     "if ($null -eq $matches) { '[]' } else { $matches | ConvertTo-Json -Compress }",
   ].join("\n");
   const result = run("powershell", ["-NoProfile", "-Command", script]);
-  const defaultState = scanIxProcessState({ ixBinary, label: "default_state" });
+  const defaultState = scanIxProcessState({ ixBinary, label: "default_state", cleanupOwned });
   const benchmarkState = env?.IX_STATE_DIR
-    ? scanIxProcessState({ ixBinary, env, label: "benchmark_state" })
+    ? scanIxProcessState({ ixBinary, env, label: "benchmark_state", cleanupOwned })
     : null;
   const stateReports = [defaultState, benchmarkState].filter(Boolean);
   const stateFailures = stateReports.flatMap((entry) => entry.failures ?? []);
