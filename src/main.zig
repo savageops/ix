@@ -28,6 +28,7 @@ test {
     _ = @import("core/generation.zig");
     _ = @import("core/usn.zig");
     _ = @import("core/shift_or.zig");
+    _ = @import("core/fm_index.zig");
 }
 
 /// IX Zig binary entry point.
