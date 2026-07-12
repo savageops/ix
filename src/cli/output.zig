@@ -506,6 +506,58 @@ pub fn writeSearchHits(writer: anytype, report: search.SearchReport) !void {
     }
 }
 
+/// Files-with-matches output (spec point 29): unique file paths, no bodies.
+/// Mirrors ripgrep -l / --files-with-matches. Hits arrive in scan order
+/// (not path-sorted), so we sort an index array by path first, then collapse
+/// consecutive duplicates.
+pub fn writeFilesWithMatches(writer: anytype, report: search.SearchReport) !void {
+    if (report.hit_count == 0) return;
+    var indices: [search.MAX_RETAINED_HITS]usize = undefined;
+    for (0..report.hit_count) |i| indices[i] = i;
+    std.mem.sort(usize, indices[0..report.hit_count], report, struct {
+        fn lt(ctx: search.SearchReport, a: usize, b: usize) bool {
+            return std.mem.lessThan(u8, ctx.hits[a].path, ctx.hits[b].path);
+        }
+    }.lt);
+    var prev_path: []const u8 = "";
+    for (indices[0..report.hit_count]) |i| {
+        const path = report.hits[i].path;
+        if (prev_path.len == 0 or !std.mem.eql(u8, prev_path, path)) {
+            try writer.print("{s}\n", .{path});
+            prev_path = path;
+        }
+    }
+}
+
+/// Count output (spec point 29): per-file match cardinality.
+/// Mirrors ripgrep -c / --count. Groups hits by path (path-sorted) and
+/// emits "path:count" per file. When hits are truncated, the count
+/// reflects only retained hits — the sentinel reports the true total
+/// via matches_found.
+pub fn writeCountPerFile(writer: anytype, report: search.SearchReport) !void {
+    if (report.hit_count == 0) return;
+    var indices: [search.MAX_RETAINED_HITS]usize = undefined;
+    for (0..report.hit_count) |i| indices[i] = i;
+    std.mem.sort(usize, indices[0..report.hit_count], report, struct {
+        fn lt(ctx: search.SearchReport, a: usize, b: usize) bool {
+            return std.mem.lessThan(u8, ctx.hits[a].path, ctx.hits[b].path);
+        }
+    }.lt);
+    var current_path = report.hits[indices[0]].path;
+    var count: usize = 0;
+    for (indices[0..report.hit_count]) |i| {
+        const path = report.hits[i].path;
+        if (std.mem.eql(u8, path, current_path)) {
+            count += 1;
+        } else {
+            try writer.print("{s}:{}\n", .{ current_path, count });
+            current_path = path;
+            count = 1;
+        }
+    }
+    try writer.print("{s}:{}\n", .{ current_path, count });
+}
+
 pub fn writeMatchesJsonHits(writer: anytype, report: search.SearchReport) !void {
     try writer.writeAll("{\"hits\":[");
     for (report.hits[0..report.hit_count], 0..) |hit, index| {

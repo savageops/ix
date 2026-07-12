@@ -104,7 +104,13 @@ pub fn main(init: std.process.Init) !void {
             if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
             } else {
-                if (!effective_request.stats_only) try output.writeSearchHits(stdout, report);
+                switch (effective_request.output_mode) {
+                    .normal => {
+                        if (!effective_request.stats_only) try output.writeSearchHits(stdout, report);
+                    },
+                    .files_with_matches => try output.writeFilesWithMatches(stdout, report),
+                    .count => try output.writeCountPerFile(stdout, report),
+                }
                 try output.writeSearchReport(stdout, report);
             }
         },
