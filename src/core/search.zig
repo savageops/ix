@@ -79,6 +79,13 @@ extern "kernel32" fn GetProcessTimes(
 /// This bounds memory usage for searches that hit millions of lines.
 pub const MAX_RETAINED_HITS = 4096;
 
+/// Scan read buffer. Sized at 1 MiB to maximize single-chunk coverage:
+/// 99.5%+ of files in typical source corpora fit in one read, avoiding
+/// the mmap setup overhead (NtCreateSection + NtMapViewOfSection) for
+/// medium-sized files. The __chkstk page-probe cost (256 probes for 1 MiB)
+/// is negligible compared to the per-file mmap setup savings.
+const SCAN_READ_BUFFER_SIZE: usize = 1024 * 1024;
+
 const TRIGRAM_MIN_PRUNE_BYTES: usize = 64 * 1024;
 const FM_INDEX_ADMISSION_MAX_BYTES: usize = 16 * 1024; // Max file size for in-memory BWT build.
 const BYTE_SHARD_MIN_FILE_BYTES: usize = 8 * 1024 * 1024;
@@ -3544,11 +3551,11 @@ fn scanOpenFileIntoShardImpl(
     shard: *ShardReport,
     file_started: std.Io.Timestamp,
 ) anyerror!void {
-    var read_buffer: [1024 * 1024]u8 = undefined;
+    var read_buffer: [SCAN_READ_BUFFER_SIZE]u8 = undefined;
 
     // Read a full first chunk up front. Most files in the scan corpus fit in
-    // 1 MiB, so this avoids a metadata length query and the second read needed
-    // to fill the chunk after a small-prefix probe.
+    // the buffer, so this avoids a metadata length query and the second read
+    // needed to fill the chunk after a small-prefix probe.
     const first_read = file.readStreaming(io, &.{read_buffer[0..]}) catch |err| switch (err) {
         error.EndOfStream => 0,
         else => return err,
@@ -4528,7 +4535,7 @@ fn scanOpenFile(
     report: *SearchReport,
     file_started: std.Io.Timestamp,
 ) anyerror!void {
-    var read_buffer: [1024 * 1024]u8 = undefined;
+    var read_buffer: [SCAN_READ_BUFFER_SIZE]u8 = undefined;
 
     // Read first chunk before length lookup. Single-shot positional read avoids
     // the retry syscall that readPositionalAll pays on sub-1MiB files.

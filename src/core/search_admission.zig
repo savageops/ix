@@ -1,6 +1,7 @@
 const std = @import("std");
 const expr = @import("expr.zig");
 const literal_alternates = @import("literal_alternates.zig");
+const shift_or = @import("shift_or.zig");
 const sz = @import("sz.zig");
 const trigram = @import("trigram.zig");
 
@@ -96,6 +97,12 @@ pub const TrigramAdmissionProgram = struct {
     file_admission_groups: [FILE_ADMISSION_MAX_GROUPS]FileAdmissionGroup = [_]FileAdmissionGroup{.{}} ** FILE_ADMISSION_MAX_GROUPS,
     first_byte_set: sz.ByteSet = .{},
     first_byte_set_populated: bool = false,
+    /// Pre-built Shift-Or instances for case-insensitive admission needles.
+    /// When populated, these replace the casefold+indexOf path with a
+    /// zero-write bit-parallel scan (spec point 12).
+    shift_or_count: usize = 0,
+    shift_or_instances: [FILE_ADMISSION_MAX_GROUP_NEEDLES]shift_or.ShiftOr = [_]shift_or.ShiftOr{.{}} ** FILE_ADMISSION_MAX_GROUP_NEEDLES,
+    shift_or_eligible: bool = false,
 
     pub fn fileAdmissionEnabled(self: *const TrigramAdmissionProgram) bool {
         return self.file_admission_mode != .disabled and self.file_admission_group_count != 0;
@@ -159,8 +166,6 @@ pub const TrigramAdmissionProgram = struct {
         self.file_admission_groups[self.file_admission_group_count] = g;
         self.file_admission_group_count += 1;
         // Populate the first-byte set for the casefold-skip fast path.
-        // For each needle, add both lowercase and uppercase first bytes so a
-        // single indexOfByteSet call replaces N × 2 indexOfByte calls.
         for (0..g.needle_count) |ni| {
             const needle = if (g.case_insensitive)
                 g.lower_needles[ni][0..g.lower_needle_lens[ni]]
@@ -175,10 +180,58 @@ pub const TrigramAdmissionProgram = struct {
                 self.first_byte_set.add(lb + 32);
             }
             self.first_byte_set_populated = true;
+            // Pre-build Shift-Or instance for case-insensitive admission.
+            // This replaces casefold+indexOf with a zero-write bit-parallel scan.
+            if (g.case_insensitive and needle.len <= shift_or.MAX_PATTERN_LEN) {
+                if (self.shift_or_count < self.shift_or_instances.len) {
+                    if (shift_or.ShiftOr.init(needle, true)) |so| {
+                        self.shift_or_instances[self.shift_or_count] = so;
+                        self.shift_or_count += 1;
+                        self.shift_or_eligible = true;
+                    }
+                }
+            }
         }
     }
 
-    /// Returns true if any admission group is case-insensitive, so the caller
+    /// Zero-write case-insensitive admission via Shift-Or (spec point 12).
+    /// Returns true if the file CANNOT match (admission miss).
+    /// Unlike fileAdmissionMiss, this does NOT require the caller to
+    /// pre-casefold the buffer — the Shift-Or mask table already includes
+    /// both upper and lower case byte positions.
+    ///
+    /// For .any mode (alternates): miss iff NONE of the needles are found.
+    /// For .all mode (conjunction): miss iff ANY needle is absent.
+    /// Falls back to false (not a miss) if Shift-Or instances aren't populated.
+    pub fn fileAdmissionMissShiftOr(self: *const TrigramAdmissionProgram, bytes: []const u8) bool {
+        if (!self.shift_or_eligible or self.shift_or_count == 0) return false;
+        const groups = self.file_admission_groups[0..self.file_admission_group_count];
+        const instances = self.shift_or_instances[0..self.shift_or_count];
+        var soi: usize = 0;
+        for (groups) |grp| {
+            if (grp.mode == .any) {
+                // Alternates: file passes if ANY needle in this group is present.
+                // Skip needles that don't have a Shift-Or instance (too long or empty).
+                var any_found = false;
+                for (0..grp.needle_count) |_| {
+                    if (soi >= instances.len) break;
+                    if (instances[soi].contains(bytes)) any_found = true;
+                    soi += 1;
+                }
+                if (!any_found) return true;
+            } else {
+                // Conjunction: file passes only if ALL needles present.
+                for (0..grp.needle_count) |_| {
+                    if (soi >= instances.len) break;
+                    if (!instances[soi].contains(bytes)) return true;
+                    soi += 1;
+                }
+            }
+        }
+        return false;
+    }
+
+
     /// knows to casefold the haystack buffer before calling fileAdmissionMiss.
     pub fn needsCasefold(self: *const TrigramAdmissionProgram) bool {
         for (0..self.file_admission_group_count) |i| {
