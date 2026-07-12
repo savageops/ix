@@ -104,7 +104,9 @@ pub fn main(init: std.process.Init) !void {
             };
             if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
             if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
-            if (effective_request.json) {
+            if (effective_request.output_format == .agent) {
+                try output.writeSearchReportAgent(stdout, report);
+            } else if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
             } else {
                 switch (effective_request.output_mode) {

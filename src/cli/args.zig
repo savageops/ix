@@ -44,6 +44,7 @@ pub const SearchRequest = struct {
     nexus_disabled: bool,
     index_enabled: bool,
     output_mode: OutputMode = .normal,
+    output_format: OutputFormat = .default,
 };
 
 /// Adjacent Operations Vector output modes (spec point 29).
@@ -54,6 +55,14 @@ pub const OutputMode = enum {
     normal,
     files_with_matches,
     count,
+};
+
+/// Output format selector. Controls the serialization shape of search results.
+/// default: hit records + ix.result.v1 sentinel (ripgrep-compatible)
+/// agent: ix.result.v2 compact grouped format (LLM-optimized, token-minimal)
+pub const OutputFormat = enum {
+    default,
+    agent,
 };
 
 pub const InspectRequest = struct {
@@ -230,7 +239,13 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
             }
             continue;
         }
-        if (std.mem.eql(u8, arg, "--json") or std.mem.eql(u8, arg, "-j")) request.json = true else if (std.mem.eql(u8, arg, "--stats-only")) request.stats_only = true else if (std.mem.eql(u8, arg, "--files-with-matches") or std.mem.eql(u8, arg, "-l")) request.output_mode = .files_with_matches else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) request.output_mode = .count else if (std.mem.eql(u8, arg, "--hidden")) request.hidden = true else if (std.mem.eql(u8, arg, "--no-ignore")) request.no_ignore = true else if (std.mem.eql(u8, arg, "--unrestricted") or std.mem.eql(u8, arg, "-u")) {
+        if (std.mem.eql(u8, arg, "--json") or std.mem.eql(u8, arg, "-j")) request.json = true else if (std.mem.eql(u8, arg, "--stats-only")) request.stats_only = true else if (std.mem.eql(u8, arg, "--agent")) request.output_format = .agent else if (std.mem.eql(u8, arg, "--format")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            if (std.mem.eql(u8, args[index], "agent")) {
+                request.output_format = .agent;
+            } else return ParseError.UnsupportedFlag;
+        } else if (std.mem.eql(u8, arg, "--files-with-matches") or std.mem.eql(u8, arg, "-l")) request.output_mode = .files_with_matches else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) request.output_mode = .count else if (std.mem.eql(u8, arg, "--hidden")) request.hidden = true else if (std.mem.eql(u8, arg, "--no-ignore")) request.no_ignore = true else if (std.mem.eql(u8, arg, "--unrestricted") or std.mem.eql(u8, arg, "-u")) {
             request.hidden = true;
             request.no_ignore = true;
         } else if (std.mem.eql(u8, arg, "--ignore-file")) {

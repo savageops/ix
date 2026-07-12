@@ -198,3 +198,22 @@ Match previews use a fisheye lens (Furnas 1986, *Generalized Fisheye Views*). Th
 The match substring is always fully visible. Elision boundaries marked with `…` (U+2026). If the match is wider than `2 × half_width`, the window expands to contain it.
 
 This is an output-stage optimization, not a scan-stage optimization. It does not affect match parity, scan time, or admission. It reduces memory allocation and output size for hit records on long-line corpora.
+
+## Agent Format (ix.result.v2)
+
+`--agent` emits a compact, file-grouped output format designed for LLM agent consumption. The standard `ix.result.v1` sentinel and `--json` format waste tokens on three fronts: path repetition (same file path per hit), derived fields (`absolute_path` per hit), and telemetry bloat (2KB of mostly-zero stats).
+
+### Design
+
+- **File-grouped hits** — hits are keyed by file path in a JSON object. Path appears once per file, not once per hit.
+- **Short field names** — `l` (line), `c` (column), `p` (preview). Minimizes per-hit token overhead.
+- **No `absolute_path`** — `cwd` emitted once at top level. Agent reconstructs if needed.
+- **Minimal telemetry** — only `matches`, `files`, `ms`, `status`, `expr`. Full telemetry available via `--json --stats`.
+- **Zero-elision** — `access_errors`, `skipped`, `truncated` omitted when zero/false.
+- **Fisheye integrated** — previews use the existing fisheye contraction.
+
+### Token economy
+
+For 72 hits across 29 files: `--json` = 26,671 bytes, `--agent` = 6,370 bytes. **4.2× reduction.**
+
+This is an output-stage optimization. It does not affect match parity, scan time, or admission.

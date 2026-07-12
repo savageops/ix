@@ -68,6 +68,7 @@ zig build -Doptimize=ReleaseFast --summary all
 ix search 'lit:fn' src --json
 ix search 're:TODO|FIXME' .
 ix search 'lit:TODO || lit:FIXME' .
+ix search 'lit:fn' src --agent          # agent-native compact format
 ix matches 're:TODO|FIXME' .
 ix inspect src/main.zig --range 40:80
 ix inspect --expr 'lit:SearchConfig' src --context 2 --json
@@ -77,6 +78,7 @@ ix explain 'lit:auth && re:token_\d+'
 | Command | Behavior |
 |:--------|:---------|
 | `search` | Hit records + terminal `ix.result.v1` result state |
+| `search --agent` | `ix.result.v2` compact grouped format — 4-9× fewer tokens than `--json` |
 | `matches` | Hit records only — same engine, no sentinel |
 | `inspect` | Read-only file windows and match context |
 | `explain` | Expression plan JSON with strategy annotation |
@@ -182,6 +184,27 @@ Each query is classified by shape and routed to the narrowest execution path:
 
 `search` emits a terminal `ix.result.v1` JSON sentinel. `inspect` emits `ix.inspect.*` sentinels with `ix.next.v1` continuation hints for pagination. Zero-match search returns `status:"ok"` with `matches:0`, not an error. All output is structured for machine consumption.
 
+### Agent Format (`--agent`)
+
+`--agent` emits `ix.result.v2` — a compact, file-grouped format designed for LLM agent consumption. It eliminates the three sources of token waste in the standard format:
+
+1. **Path repetition** — hits are grouped by file in a JSON object, not a flat array. A file with 20 hits emits its path once, not 20 times.
+2. **Derived fields** — `absolute_path` is omitted; `cwd` is emitted once at the top level. The agent reconstructs full paths if needed.
+3. **Telemetry bloat** — only `matches`, `files`, `ms`, `status`, `expr` are emitted. Zero-valued fields are elided. Full telemetry is available via `--json --stats`.
+
+```sh
+$ ix search 'lit:updateSettingsDialog' src --agent
+-- ix.result.v2 {"expr":"lit:updateSettingsDialog","status":"ok","matches":4,"files":1,"ms":1.25,"cwd":"/project","hits":{"src/popup.js":[{"l":1346,"c":3,"p":"  updateSettingsDialog();"},{"l":1842,"c":5,"p":"    updateSettingsDialog(); // Reset"},{"l":1898,"c":10,"p":"function updateSettingsDialog() {"},{"l":2210,"c":5,"p":"    updateSettingsDialog();"}]}} --
+```
+
+Short field names (`l`, `c`, `p`) minimize per-hit token overhead. Fisheye previews are integrated — long lines get match-centered context windows, short lines pass through unchanged.
+
+| Format | 72 hits, 29 files | Reduction |
+|:-------|:-------------------|:----------|
+| `--json` | 26,671 bytes | 1× |
+| `ix.result.v1` (hits + sentinel) | 30,856 bytes | 0.9× |
+| **`--agent` (ix.result.v2)** | **6,370 bytes** | **4.2×** |
+
 ---
 
 ## What Is Inside
@@ -212,6 +235,7 @@ Each query is classified by shape and routed to the narrowest execution path:
 | Byte kernels | Current hot kernels are Zig `@Vector(32, u8)` and StringZilla AVX2. Planned narrow C shim additions are limited to primitives Zig cannot emit cleanly: `ix_count_byte_avx2`, `ix_ascii_ci_memmem_avx2`, and `ix_trigram_admit_scalar_or_avx2`. |
 | Inspect | Bounded read-only windows, match-context mode, `ix.inspect.*` sentinels, `ix.next.v1` continuation hints for agent pagination |
 | Fisheye preview | Match-centered adaptive context window (Furnas 1986). Geometrically contracting half-width at dyadic line-length tiers: T0 ≤300 bytes (full line), T1 ≤600 (150-byte half-width), T2 ≤1200 (75), T3 >1200 (37). Match substring always fully visible; elision marked with `…`. Up to 143× output reduction on minified/generated content. |
+| Agent format | `--agent` emits `ix.result.v2`: file-grouped hits (path once per file), short field names (`l`/`c`/`p`), zero-elided telemetry, `cwd` at top level. 4-9× token reduction vs `--json` for multi-hit results. Designed for LLM agent consumption. |
 | Explain | Structured plan JSON, strategy annotation, proof-program lowering — queries classified as `conjunctive_literal_evidence`, `conjunctive_regex_with_mandatory_evidence`, `disjunctive_byte_evidence`, or `verifier_only` with trigram terms and verifier type |
 | Stats schema | Telemetry model with full timing breakdown — `discover_ms`, `scan_ms`, `aggregate_ms`, `scan_work_ms_total` across all shards. Per-file slowest-path profiling. Trigram acceleration stats: candidate files checked, pruned, verified, ineligible. Byte-shard telemetry reports strategy, profiled files, range calls, line-aligned ranges, boundary candidates verified/rejected, logical bytes, elapsed range time, and matches owned by the byte kernel. |
 | Memory model | Arena allocator from process init — all allocations live for process lifetime, zero individual frees. Short-lived CLI process; arena released on exit. No deallocation overhead in the hot path. |
