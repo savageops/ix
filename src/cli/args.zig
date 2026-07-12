@@ -10,6 +10,7 @@ pub const CommandTag = enum {
     inspect,
     explain,
     process,
+    similar,
     nexus,
     indexd,
 };
@@ -21,6 +22,7 @@ pub const HelpTopic = enum {
     inspect,
     explain,
     process,
+    similar,
 };
 
 pub const SearchRequest = struct {
@@ -45,6 +47,7 @@ pub const SearchRequest = struct {
     index_enabled: bool,
     output_mode: OutputMode = .normal,
     output_format: OutputFormat = .default,
+    context: ?usize = null,
 };
 
 /// Adjacent Operations Vector output modes (spec point 29).
@@ -115,6 +118,16 @@ pub const ProcessRequest = struct {
     dry_run: bool,
 };
 
+pub const SimilarRequest = struct {
+    query: ?[]const u8,
+    paths: [MAX_SEARCH_PATHS][]const u8,
+    path_count: usize,
+    anti: bool,
+    json: bool,
+    max_results: usize,
+    output_format: OutputFormat = .default,
+};
+
 pub const Command = union(CommandTag) {
     help: HelpTopic,
     search: SearchRequest,
@@ -122,6 +135,7 @@ pub const Command = union(CommandTag) {
     inspect: InspectRequest,
     explain: ExplainRequest,
     process: ProcessRequest,
+    similar: SimilarRequest,
     nexus: SearchRequest,
     indexd: IndexdRequest,
 };
@@ -169,6 +183,10 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .process } };
         return .{ .command = .{ .process = try parseProcess(argv[2..]) } };
     }
+    if (std.mem.eql(u8, first, "similar")) {
+        if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .similar } };
+        return .{ .command = .{ .similar = try parseSimilar(argv[2..]) } };
+    }
     if (std.mem.eql(u8, first, "__ix_nexus")) {
         var request = try parseSearch(argv[2..]);
         request.stats_only = true;
@@ -193,6 +211,7 @@ fn helpTopic(arg: []const u8) ?HelpTopic {
     if (std.mem.eql(u8, arg, "inspect")) return .inspect;
     if (std.mem.eql(u8, arg, "explain")) return .explain;
     if (std.mem.eql(u8, arg, "process")) return .process;
+    if (std.mem.eql(u8, arg, "similar")) return .similar;
     return null;
 }
 
@@ -221,6 +240,47 @@ fn parseProcess(args: []const []const u8) ParseError!ProcessRequest {
         }
     }
     if (!action_seen and args.len != 0) return ParseError.MissingValue;
+    return request;
+}
+
+fn parseSimilar(args: []const []const u8) ParseError!SimilarRequest {
+    var request = SimilarRequest{
+        .query = null,
+        .paths = undefined,
+        .path_count = 0,
+        .anti = false,
+        .json = false,
+        .max_results = 20,
+        .output_format = .default,
+    };
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--anti")) {
+            request.anti = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            request.json = true;
+        } else if (std.mem.eql(u8, arg, "--agent")) {
+            request.output_format = .agent;
+        } else if (std.mem.eql(u8, arg, "--max-results")) {
+            return ParseError.MissingValue;
+        } else if (std.mem.startsWith(u8, arg, "--max-results=")) {
+            request.max_results = std.fmt.parseInt(usize, arg["--max-results=".len..], 10) catch return ParseError.MissingValue;
+            if (request.max_results == 0) return ParseError.MissingValue;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return ParseError.UnsupportedFlag;
+        } else {
+            // First non-flag arg is the query (text concept or file path).
+            // Remaining non-flag args are candidate paths.
+            if (request.query == null) {
+                request.query = arg;
+            } else {
+                if (request.path_count >= MAX_SEARCH_PATHS) return ParseError.MissingValue;
+                request.paths[request.path_count] = arg;
+                request.path_count += 1;
+            }
+        }
+    }
+    if (request.query == null) return ParseError.MissingValue;
+    if (request.path_count == 0) return ParseError.MissingValue;
     return request;
 }
 
@@ -267,6 +327,10 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
             index += 1;
             if (index >= args.len) return ParseError.MissingValue;
             request.emit_report = args[index];
+        } else if (std.mem.eql(u8, arg, "--context")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.context = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
         } else return ParseError.UnsupportedFlag;
     }
     request.expression = expression orelse return ParseError.MissingExpression;

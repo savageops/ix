@@ -14,6 +14,7 @@ pub fn writeHelp(writer: anytype, topic: cli.HelpTopic) !void {
         .inspect => writeInspectHelp(writer),
         .explain => writeExplainHelp(writer),
         .process => writeProcessHelp(writer),
+        .similar => writeSimilarHelp(writer),
     };
 }
 
@@ -24,46 +25,78 @@ fn writeTopHelp(writer: anytype) !void {
         \\Usage: ix.exe <COMMAND>
         \\
         \\Commands:
-        \\  search   Hit records plus terminal result state
-        \\  matches  Hit records only, same search engine
+        \\  search   Find matches in files
+        \\  similar  Semantic similarity ranking (requires IX_AI_API_KEY)
         \\  inspect  Read-only file windows and match context
         \\  explain  Expression plan JSON
-        \\  process  IX-owned state-dir process inspection and cleanup
-        \\  help     Print this message or the help of the given subcommand(s)
+        \\  process  State-dir inspection and cleanup
+        \\  help     Print this message or subcommand help
+        \\
+        \\Output:
+        \\  --agent        Compact grouped format (ix.result.v2, token-minimal)
+        \\  --json         Full structured JSON with telemetry
+        \\  --stats-only   Suppress hit records, emit sentinel only
+        \\  -l             Files with matches only
+        \\  -c             Count per file
+        \\  --context N    Surrounding lines per hit (fisheye-contracted)
+        \\
+        \\Search:
+        \\  --max-hits N   Limit hit records
+        \\  -t N           Thread count
+        \\  --hidden       Include hidden files
+        \\  --no-ignore    Disable ignore-file admission
+        \\
+        \\Similar:
+        \\  --anti         Rank least similar first (parity drift)
+        \\  --max-results  N Limit ranked candidates (default: 20)
+        \\
+        \\Config (similar):
+        \\  IX_AI_API_KEY        Required (DEEPINFRA_TOKEN also accepted)
+        \\  IX_AI_BASE_URL       Default: https://api.deepinfra.com/v1/openai
+        \\  IX_AI_EMBED_MODEL    Default: Qwen/Qwen3-Embedding-8B
+        \\  IX_AI_RERANK_MODEL   Default: cross-encoder/ms-marco-MiniLM-L-12-v2
+        \\
+        \\Expression:
+        \\  lit:text | re:pattern | prefix:x | suffix:x | A && B | A || B
+        \\  bare text is literal; regex requires re: prefix
+        \\
+        \\Examples:
+        \\  ix search 'lit:fn' src --agent
+        \\  ix search 're:TODO|FIXME' . --context 3
+        \\  ix similar "cancellation pattern" apps/src --agent
+        \\  ix similar "transport closure" apps/src --anti --max-results 10
+        \\  ix inspect src/main.zig --range 40:80
+        \\  ix explain 'lit:auth && re:token_\d+'
+        \\
+    );
+}
+
+fn writeSimilarHelp(writer: anytype) !void {
+    try writer.writeAll(
+        \\Semantic similarity for parity drift and parallel-system discovery.
+        \\
+        \\Usage: ix similar [OPTIONS] <QUERY> <PATH>...
+        \\
+        \\QUERY is a text concept or an anchor file path.
+        \\PATHs are candidate files or directories to discover from.
+        \\Embeddings provide recall; a reranker provides final precision.
         \\
         \\Options:
-        \\  -h, --help  Print help
+        \\  --anti              Rank least similar first (parity drift)
+        \\  --agent             Compact ix.similar.v1 format
+        \\  --json              Full structured JSON
+        \\  --max-results=N     Limit candidates (default: 20)
         \\
-        \\SCHEMA
-        \\  ix search EXPR is the canonical IX command surface
-        \\  bare text in ix search is a literal substring, so a|b means the bytes "a|b"
-        \\  regex syntax requires re:pattern; literal alternation uses lit:a || lit:b
-        \\  expr: lit:text | re:pattern | prefix:x | suffix:x | A && B | A || B
-        \\COMPAT TRANSLATOR
-        \\  top-level ix PATTERN [PATH]... accepts a narrow rg-shaped subset for agents
-        \\  supported: PATTERN, -e PATTERN, repeated -e, -F, -i, -j, -n, --json, --hidden, --no-ignore, -u, --ignore-file
-        \\  accepted input lowers into canonical IX search; unsupported flags fail guided
-        \\  raw regex patterns containing && or || are ambiguous and rejected
-        \\  use ix search <expr> [PATH]... for native IX boolean expressions
-        \\AGENT OUTPUT
-        \\  search prints one ix.result.v1 JSON sentinel unless --json is used
-        \\  zero-match search is status:"ok" with matches:0, not an error
-        \\  matches prints hit records only, no terminal result sentinel
-        \\  inspect grouped output prints ix.inspect.* sentinels and ix.next.v1 hints
-        \\  inspect without file bounds uses a bounded first window
-        \\  agent shorthand: -n N means line numbers plus max N hits
-        \\SNIPS
-        \\  ix error src
-        \\  ix -e timeout -e error src
-        \\  ix -F -i 'session timeout' logs
-        \\  ix search 'lit:fn' crates --json
-        \\  ix search 're:TODO|FIXME' .
-        \\  ix search 'lit:TODO || lit:FIXME' .
-        \\  ix matches 're:TODO|FIXME' .
-        \\  ix inspect src/main.rs
-        \\  ix inspect src/main.rs --range 40:80
-        \\  ix inspect --expr 'lit:SearchConfig' crates --context 2 --json
-        \\  ix explain 'lit:breach && lit:auth'
+        \\Config:
+        \\  IX_AI_API_KEY       Required (DEEPINFRA_TOKEN also accepted)
+        \\  IX_AI_BASE_URL      Default: https://api.deepinfra.com/v1/openai
+        \\  IX_AI_EMBED_MODEL   Default: Qwen/Qwen3-Embedding-8B
+        \\  IX_AI_RERANK_MODEL  Default: cross-encoder/ms-marco-MiniLM-L-12-v2
+        \\
+        \\Examples:
+        \\  ix similar "cancellation pattern" apps/src --agent
+        \\  ix similar "transport closure" apps/src --anti --max-results 10
+        \\  ix similar src/auth.zig src/session.zig src/transport.zig --json
         \\
     );
 }
