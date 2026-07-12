@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { classifyHotspot, computeRatio, computeSpeedupPct, summarizeSeries } from "./metrics.mjs";
-import { pairOrderSummary } from "./speed-compare-utils.mjs";
+import { interPairSettleMs, pairOrderSummary, sleepMs } from "./speed-compare-utils.mjs";
 import { benchmarkHostNoiseConfig } from "./benchmark-config.mjs";
 import { benchmarkIsolationPlan, defaultBenchmarkIsolationResult, mergedEnv, runWithWindowsBenchmarkIsolation } from "./benchmark-isolation.mjs";
 
@@ -806,6 +806,7 @@ function measurePairedIxSearch(currentBinaryPath, previousBinaryPath, context, m
   const warmup = Math.max(0, Number(measureOptions.warmup ?? 0));
   const samples = Math.max(1, Number(measureOptions.samples ?? 1));
   const clearWarmCache = Boolean(measureOptions.clearWarmCache ?? false);
+  const settleMs = interPairSettleMs(Number(measureOptions.interPairSettleMs));
 
   for (let i = 0; i < warmup; i += 1) {
     if (clearWarmCache) clearWarmQueryCache();
@@ -823,14 +824,17 @@ function measurePairedIxSearch(currentBinaryPath, previousBinaryPath, context, m
     if (previousFirst) {
       if (clearWarmCache) clearWarmQueryCache();
       previousRuns.push(measuredIxEntry(resolvedPreviousBinaryPath, previousArgs, runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions), i));
+      sleepMs(settleMs);
       if (clearWarmCache) clearWarmQueryCache();
       currentRuns.push(measuredIxEntry(currentBinaryPath, currentArgs, runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions), i));
     } else {
       if (clearWarmCache) clearWarmQueryCache();
       currentRuns.push(measuredIxEntry(currentBinaryPath, currentArgs, runTimedCommand(currentBinaryPath, currentArgs, [0], measureOptions), i));
+      sleepMs(settleMs);
       if (clearWarmCache) clearWarmQueryCache();
       previousRuns.push(measuredIxEntry(resolvedPreviousBinaryPath, previousArgs, runTimedCommand(resolvedPreviousBinaryPath, previousArgs, [0], measureOptions), i));
     }
+    sleepMs(settleMs);
   }
 
   return {

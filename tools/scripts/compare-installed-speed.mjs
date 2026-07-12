@@ -5,7 +5,7 @@ import { baseBenchEnv, defaultInstalledIxPath, defaultRepoIxPath, DEFAULT_ALTERN
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkDecisionGrade, benchmarkEvidenceFailures, benchmarkHostWarningFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, assertRepoBinaryFresh, benchmarkEnvSnapshot, binarySnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, assertRepoBinaryFresh, benchmarkEnvSnapshot, binarySnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, interPairSettleMs, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, sleepMs, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
@@ -44,6 +44,7 @@ Options:
   --min-installed-improvement-pct <n>
                                   Required repo improvement over installed. Default: 0.
   --identity-noise-multiplier <n> Effective target multiplier for same-binary drift. Default: 0.
+  --inter-pair-settle-ms <n>      Delay (ms) between paired launches. Default: 0 or IX_INTER_PAIR_SETTLE_MS.
   --scan-open-timing              Enable scan open/file subphase timing in IX telemetry.
   --linux-dominant-attribution    Enable Linux AMD ASIC register slow-file attribution in IX telemetry.
   --no-benchmark-lock             Disable the cross-script benchmark lock.
@@ -74,6 +75,7 @@ const benchmarkLock = !args.includes("--no-benchmark-lock");
 const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", process.env.IX_MIN_RETAINABLE_SPEED_SAMPLES ?? "12"));
 const minInstalledImprovementPct = Number(argValue(args, "--min-installed-improvement-pct", process.env.IX_MIN_INSTALLED_IMPROVEMENT_PCT ?? "0"));
 const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "0"));
+const settleMs = interPairSettleMs(Number(argValue(args, "--inter-pair-settle-ms", process.env.IX_INTER_PAIR_SETTLE_MS ?? "0")));
 const scanOpenTiming = args.includes("--scan-open-timing");
 const linuxDominantAttribution = args.includes("--linux-dominant-attribution");
 const experimentalEnvOverrides = experimentalBenchEnvOverrides();
@@ -103,10 +105,12 @@ function measurePairedIx() {
     const first = pair % 2 === 0 ? "installed" : "repo";
     const second = first === "installed" ? "repo" : "installed";
     pairOrder.push(`${first},${second}`);
-    for (const lane of [first, second]) {
-      const binaryPath = lane === "installed" ? installedIx : repoIx;
-      lanes[lane].push(measureIxOnce(binaryPath, ixArgs, lanes[lane].length + 1, { env: BENCH_ENV }));
-    }
+    const firstBinary = first === "installed" ? installedIx : repoIx;
+    const secondBinary = second === "installed" ? installedIx : repoIx;
+    lanes[first].push(measureIxOnce(firstBinary, ixArgs, lanes[first].length + 1, { env: BENCH_ENV }));
+    sleepMs(settleMs);
+    lanes[second].push(measureIxOnce(secondBinary, ixArgs, lanes[second].length + 1, { env: BENCH_ENV }));
+    sleepMs(settleMs);
   }
   return {
     installed: { command: installedIx, args: ixArgs, ...summarizeIxRuns(installedIx, "installed", lanes.installed) },
@@ -332,6 +336,7 @@ if (requireStrict && identityControlEnabled && identityControlSamples > 0) {
     env: BENCH_ENV,
     enabled: identityControlEnabled,
     label: "repo-control-preflight",
+    settleMs,
   });
   const preflightFailures = [
     ...hostPreflightFailures,
@@ -371,6 +376,7 @@ const ripgrep = measureRipgrepBracketed({
       env: BENCH_ENV,
       enabled: identityControlEnabled,
       label: "repo-control",
+      settleMs,
     });
     const effectiveInstalledImprovementPct = effectiveImprovementTargetPct({
       configuredPct: minInstalledImprovementPct,
@@ -573,6 +579,7 @@ const report = {
   threads,
   scanOpenTiming,
   linuxDominantAttribution,
+  interPairSettleMs: settleMs,
   experimentalEnvMode,
   experimentalEnvOverrides,
   diagnosticAttributionMode,
