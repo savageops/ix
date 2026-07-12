@@ -109,6 +109,11 @@ pub fn main(init: std.process.Init) !void {
             } else if (effective_request.json) {
                 try output.writeSearchJsonReport(stdout, report);
             } else {
+                const emitted_records = switch (effective_request.output_mode) {
+                    .normal => !effective_request.stats_only and report.hit_count > 0,
+                    .files_with_matches => report.hit_count > 0,
+                    .count => report.hit_count > 0,
+                };
                 switch (effective_request.output_mode) {
                     .normal => {
                         if (!effective_request.stats_only) try output.writeSearchHits(stdout, report);
@@ -116,7 +121,14 @@ pub fn main(init: std.process.Init) !void {
                     .files_with_matches => try output.writeFilesWithMatches(stdout, report),
                     .count => try output.writeCountPerFile(stdout, report),
                 }
-                try output.writeSearchReport(stdout, report);
+                // When hit records were already emitted as text lines, use the
+                // compact sentinel (no hits[] duplication). Otherwise emit the
+                // full sentinel with hits[] for stats-only and zero-match cases.
+                if (emitted_records) {
+                    try output.writeSearchReportCompact(stdout, report);
+                } else {
+                    try output.writeSearchReport(stdout, report);
+                }
             }
         },
         .matches => |request| {

@@ -327,6 +327,24 @@ pub fn writeSearchReport(writer: anytype, report: search.SearchReport) !void {
     try writer.print("],\"status\":\"{s}\"}} --\n", .{searchStatus(report)});
 }
 
+/// Compact sentinel variant: omits the hits[] array when hit records were
+/// already emitted as text lines (path:line:col:preview). Eliminates 100%
+/// duplication between text records and the sentinel's JSON hits array.
+/// The matches count, status, and telemetry remain for result-state parity.
+pub fn writeSearchReportCompact(writer: anytype, report: search.SearchReport) !void {
+    try writer.print(
+        "-- ix.result.v1 {{\"bytes\":{},\"cmd\":\"search\",\"dedupe\":{{\"discovered_duplicate_paths\":{},\"overlap_pruned_roots\":{}}},\"expr\":",
+        .{ report.bytes_scanned, report.discovered_duplicate_paths, report.overlap_pruned_roots },
+    );
+    try writeJsonString(writer, report.expression);
+    try writer.print(
+        ",\"access_errors\":{{\"total\":{},\"access_denied\":{}}},\"files\":{{\"discovered\":{},\"scanned\":{},\"skipped\":{}}},\"matches\":{},\"ms\":{{\"aggregate\":{d},\"discover\":{d},\"scan\":{d},\"total\":{d}}},\"slowest\":{{\"bytes\":{},\"ms\":{d},\"path\":",
+        .{ report.stats.access_errors.total, report.stats.access_errors.access_denied, report.files_discovered, report.files_scanned, report.files_skipped, report.matches_found, report.aggregate_ms, report.discover_ms, report.scan_ms, report.total_ms, report.slowest_bytes, report.slowest_ms },
+    );
+    try writeJsonString(writer, report.slowest_path);
+    try writer.print("}},\"status\":\"{s}\"}} --\n", .{searchStatus(report)});
+}
+
 /// Agent-native compact format (ix.result.v2). Groups hits by file path to
 /// eliminate per-hit path repetition. Uses short field names (l, c, p) and
 /// elides zero-valued telemetry. Optimized for LLM token economy — 3-9×
