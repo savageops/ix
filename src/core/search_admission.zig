@@ -80,6 +80,29 @@ pub const FileAdmissionGroup = struct {
             },
         };
     }
+
+    /// Zero-write case-insensitive admission check. Searches the RAW buffer
+    /// without pre-casefolding. Uses case-insensitive Horspool per needle.
+    /// Only valid when self.case_insensitive is true.
+    pub fn isMissZeroWrite(self: *const FileAdmissionGroup, bytes: []const u8) bool {
+        if (!self.case_insensitive) return self.isMiss(bytes);
+        return switch (self.mode) {
+            .all => {
+                for (0..self.needle_count) |i| {
+                    const lower_needle = self.lower_needles[i][0..self.lower_needle_lens[i]];
+                    if (sz.indexOfAdmissionCaseInsensitive(bytes, lower_needle) == null) return true;
+                }
+                return false;
+            },
+            .any => {
+                for (0..self.needle_count) |i| {
+                    const lower_needle = self.lower_needles[i][0..self.lower_needle_lens[i]];
+                    if (sz.indexOfAdmissionCaseInsensitive(bytes, lower_needle) != null) return false;
+                }
+                return self.needle_count != 0;
+            },
+        };
+    }
 };
 
 pub const TrigramAdmissionProgram = struct {
@@ -254,6 +277,40 @@ pub const TrigramAdmissionProgram = struct {
                     if (!group.isMiss(bytes)) return false;
                 }
                 return self.file_admission_group_count != 0;
+            },
+        };
+    }
+
+    /// Zero-write case-insensitive admission. Searches the RAW (un-casefolded)
+    /// buffer for each needle using case-insensitive Horspool. Eliminates the
+    /// O(n) asciiLowerBuf write that fileAdmissionMiss requires.
+    ///
+    /// For .any mode (alternates): miss iff NONE of the needles are found.
+    /// For .all mode (conjunction): miss iff ANY needle is absent.
+    /// Returns false (not a miss) for any group that isn't case-insensitive —
+    /// the caller must handle case-sensitive groups separately.
+    pub fn fileAdmissionMissZeroWrite(self: *const TrigramAdmissionProgram, bytes: []const u8) bool {
+        return switch (self.file_admission_mode) {
+            .disabled => false,
+            .all => blk: {
+                for (self.file_admission_groups[0..self.file_admission_group_count]) |group| {
+                    if (!group.case_insensitive) {
+                        // Case-sensitive group: caller must use the casefold path.
+                        break :blk false;
+                    }
+                    if (group.isMissZeroWrite(bytes)) break :blk true;
+                }
+                break :blk false;
+            },
+            .any => blk: {
+                for (self.file_admission_groups[0..self.file_admission_group_count]) |group| {
+                    if (!group.case_insensitive) {
+                        // Case-sensitive group in .any mode: can't prove miss.
+                        return false;
+                    }
+                    if (!group.isMissZeroWrite(bytes)) return false;
+                }
+                break :blk self.file_admission_group_count != 0;
             },
         };
     }

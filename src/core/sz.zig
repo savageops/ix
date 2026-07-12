@@ -84,6 +84,99 @@ pub fn indexOfAdmission(haystack: []const u8, needle: []const u8) ?usize {
     return indexOf(haystack, needle);
 }
 
+/// Case-insensitive existence probe that avoids casefolding the haystack.
+///
+/// Standard case-insensitive admission calls asciiLowerBuf on the full 1 MiB
+/// buffer, then runs exact indexOf on each lowercased needle. That write is
+/// expensive — it dirties cache lines across the entire buffer, evicting hot
+/// scan data from L1/L2.
+///
+/// This function eliminates the write by building a Horspool skip table that
+/// maps both ASCII case variants of each needle byte to the same skip distance,
+/// and verifying candidates with a case-folded byte comparison. The haystack
+/// is read-only throughout.
+///
+/// For needles <2 bytes or haystacks too small for Horspool's skip to pay off,
+/// falls back to a scalar case-insensitive scan.
+pub fn indexOfAdmissionCaseInsensitive(haystack: []const u8, lower_needle: []const u8) ?usize {
+    if (lower_needle.len == 0) return 0;
+    if (lower_needle.len > haystack.len) return null;
+
+    // Horspool benefits from needle length ≥3 (meaningful skip distances).
+    // For length 1-2, scalar case-insensitive search is faster.
+    if (lower_needle.len >= 3 and haystack.len >= 64) {
+        return indexOfBoyerMooreHorspoolCI(haystack, lower_needle);
+    }
+    return indexOfScalarCI(haystack, lower_needle);
+}
+
+/// Scalar case-insensitive substring search for short needles.
+fn indexOfScalarCI(haystack: []const u8, needle: []const u8) ?usize {
+    const limit = haystack.len - needle.len;
+    var i: usize = 0;
+    while (i <= limit) : (i += 1) {
+        var match = true;
+        for (needle, 0..) |nc, j| {
+            const hc = haystack[i + j];
+            const hl = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
+            if (hl != nc) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return i;
+    }
+    return null;
+}
+
+threadlocal var ci_skip_cache: AdmissionSkipCache = .{};
+
+/// Case-insensitive Boyer-Moore-Horspool. Skip table maps both case variants
+/// of each needle byte to the same distance. Candidate verification compares
+/// case-folded haystack bytes against the pre-lowercased needle.
+fn indexOfBoyerMooreHorspoolCI(haystack: []const u8, lower_needle: []const u8) ?usize {
+    if (!ci_skip_cache.initialized or
+        ci_skip_cache.ptr != lower_needle.ptr or
+        ci_skip_cache.len != lower_needle.len)
+    {
+        ci_skip_cache.initialized = true;
+        ci_skip_cache.ptr = lower_needle.ptr;
+        ci_skip_cache.len = lower_needle.len;
+        @memset(&ci_skip_cache.table, lower_needle.len);
+        for (lower_needle[0 .. lower_needle.len - 1], 0..) |byte, index| {
+            const skip = lower_needle.len - 1 - index;
+            ci_skip_cache.table[byte] = skip;
+            // Map uppercase variant to the same skip distance.
+            if (byte >= 'a' and byte <= 'z') {
+                ci_skip_cache.table[byte - 32] = skip;
+            }
+        }
+    }
+
+    var cursor: usize = 0;
+    const last = lower_needle.len - 1;
+    const limit = haystack.len - lower_needle.len;
+    while (cursor <= limit) {
+        const tail_raw = haystack[cursor + last];
+        const tail = if (tail_raw >= 'A' and tail_raw <= 'Z') tail_raw + 32 else tail_raw;
+        if (tail == lower_needle[last]) {
+            // Verify full match with case-folded comparison.
+            var match = true;
+            for (lower_needle[0..last], 0..) |nc, j| {
+                const hc_raw = haystack[cursor + j];
+                const hc = if (hc_raw >= 'A' and hc_raw <= 'Z') hc_raw + 32 else hc_raw;
+                if (hc != nc) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return cursor;
+        }
+        cursor += ci_skip_cache.table[tail_raw];
+    }
+    return null;
+}
+
 fn indexOfBoyerMooreHorspool(haystack: []const u8, needle: []const u8) ?usize {
     if (needle.len == 0) return 0;
     if (needle.len > haystack.len) return null;
