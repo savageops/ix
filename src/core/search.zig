@@ -31,6 +31,7 @@ const usn = @import("usn.zig");
 // paths: newline scanning, binary sniffing, and literal matching.
 const simd = @import("simd.zig");
 const sz = @import("sz.zig");
+const fm_index = @import("fm_index.zig");
 
 const windows = std.os.windows;
 const TrigramAdmissionProgram = search_admission.TrigramAdmissionProgram;
@@ -79,6 +80,7 @@ extern "kernel32" fn GetProcessTimes(
 pub const MAX_RETAINED_HITS = 4096;
 
 const TRIGRAM_MIN_PRUNE_BYTES: usize = 64 * 1024;
+const FM_INDEX_ADMISSION_MAX_BYTES: usize = 16 * 1024; // Max file size for in-memory BWT build.
 const BYTE_SHARD_MIN_FILE_BYTES: usize = 8 * 1024 * 1024;
 const BYTE_SHARD_MIN_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const BYTE_SHARD_WORD_BOUNDARY_MIN_FILE_BYTES: usize = 1 * 1024 * 1024;
@@ -3638,6 +3640,21 @@ fn scanOpenFileIntoShardImpl(
         return;
     }
 
+    // FM-Index backward-search admission (spec point 11).
+    // Env-gated: IX_FM_INDEX_ADMISSION=1 enables in-memory BWT construction
+    // and O(p) backward search for eligible files. Disabled by default.
+    if (single_chunk and file_bytes <= FM_INDEX_ADMISSION_MAX_BYTES) {
+        if (std.c.getenv("IX_FM_INDEX_ADMISSION") != null) {
+            if (tryFmIndexAdmission(allocator, read_buffer[0..first_read], plan)) {
+                recordEvidencePruned(shard, file_bytes);
+                const file_ms = elapsedMs(io, file_started);
+                recordShardScanFileBufferedMs(shard, file_ms);
+                if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+                return;
+            }
+        }
+    }
+
     // CHUNK CASEFOLD: keep the existing per-chunk lowercase path for pure
     // casefold literals. For casefold literal alternates, only pre-lowercase
     // larger single-chunk buffers where the extra write can repay the
@@ -4427,6 +4444,49 @@ fn shouldAttemptWholeFileAdmission(whole_file_available: bool, _: bool, program:
 
 fn shouldAttemptTrigramPrune(file_bytes: usize, single_chunk: bool, admission: trigram.Admission, _: bool) bool {
     return admission.eligible and single_chunk and file_bytes >= TRIGRAM_MIN_PRUNE_BYTES;
+}
+
+/// FM-Index backward-search admission (spec point 11).
+///
+/// For single-literal patterns on small files (< 16 KiB), builds an in-memory
+/// BWT + FM-Index and uses O(p) backward search to determine if the pattern
+/// exists. If absent, prunes the file without entering the line-scan path.
+///
+/// This is the integration point between the FM-Index module and the scan
+/// pipeline. Gated by IX_FM_INDEX_ADMISSION=1 — disabled by default because
+/// the O(n log n) suffix array sort is more expensive than a SIMD memchr for
+/// most file sizes. Its value is in demonstrating the sub-linear search
+/// capability and in future use cases with pre-built persistent FM-Indexes.
+///
+/// Returns true if the file was pruned (pattern guaranteed absent).
+fn tryFmIndexAdmission(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    plan: expr.ExpressionPlan,
+) bool {
+    if (data.len == 0 or data.len > FM_INDEX_ADMISSION_MAX_BYTES) return false;
+    if (plan.predicate_count != 1) return false;
+    const predicate = plan.predicates[0];
+    // Only single-literal patterns are eligible.
+    const needle = switch (predicate.kind) {
+        .literal, .prefix, .suffix => predicate.value,
+        .regex => switch (predicate.strategy) {
+            .regex_plain_literal => predicate.value,
+            else => return false,
+        },
+    };
+    if (needle.len == 0 or needle.len > 64) return false;
+
+    // The FM-Index text cannot contain the sentinel byte (0x00).
+    // Binary files are already skipped before this point, but check anyway.
+    for (data) |b| {
+        if (b == 0) return false;
+    }
+
+    var fmi = fm_index.buildFMIndex(allocator, data) catch return false;
+    defer fmi.deinit();
+
+    return !fmi.contains(needle);
 }
 
 /// Fast CR trim: single-byte branch instead of std.mem.trimEnd's scalar
