@@ -79,9 +79,41 @@ ix explain 'lit:auth && re:token_\d+'
 |:--------|:---------|
 | `search` | Hit records + terminal `ix.result.v1` result state |
 | `search --agent` | `ix.result.v2` compact grouped format — 4-9× fewer tokens than `--json` |
+| `search --context N` | Fisheye-contracted surrounding lines per hit |
+| `similar` | Semantic similarity ranking (requires `IX_AI_API_KEY`) |
 | `matches` | Hit records only — same engine, no sentinel |
 | `inspect` | Read-only file windows and match context |
 | `explain` | Expression plan JSON with strategy annotation |
+
+<details>
+<summary><strong>Semantic similarity (<code>ix similar</code>)</strong></summary>
+<br>
+
+IX can rank files by semantic similarity to a text concept using embedding models and a reranker. This enables parity drift detection, parallel-system discovery, and concept-based file search.
+
+```sh
+# Find files similar to a concept
+ix similar "cancellation token pattern" apps/src --agent
+
+# Find files antisimilar (parity drift detection)
+ix similar "transport closure" apps/src --anti --max-results 10
+
+# Compare specific files (legacy mode)
+ix similar src/auth.zig src/session.zig src/transport.zig --json
+```
+
+Configuration via environment variables:
+
+| Variable | Default | Purpose |
+|:---------|:--------|:--------|
+| `IX_AI_API_KEY` | *(required)* | API key (`DEEPINFRA_TOKEN` also accepted) |
+| `IX_AI_BASE_URL` | `https://api.deepinfra.com/v1/openai` | OpenAI-compatible endpoint |
+| `IX_AI_EMBED_MODEL` | `Qwen/Qwen3-Embedding-8B` | Embedding model |
+| `IX_AI_RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L-12-v2` | Reranker model |
+
+When unconfigured, `ix similar` fails clean: `set IX_AI_API_KEY to use ix similar`.
+
+</details>
 
 <details>
 <summary><strong>Expression syntax</strong></summary>
