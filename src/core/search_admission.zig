@@ -94,6 +94,8 @@ pub const TrigramAdmissionProgram = struct {
     file_admission_mode: FileAdmissionMode = .disabled,
     file_admission_group_count: usize = 0,
     file_admission_groups: [FILE_ADMISSION_MAX_GROUPS]FileAdmissionGroup = [_]FileAdmissionGroup{.{}} ** FILE_ADMISSION_MAX_GROUPS,
+    first_byte_set: sz.ByteSet = .{},
+    first_byte_set_populated: bool = false,
 
     pub fn fileAdmissionEnabled(self: *const TrigramAdmissionProgram) bool {
         return self.file_admission_mode != .disabled and self.file_admission_group_count != 0;
@@ -156,6 +158,24 @@ pub const TrigramAdmissionProgram = struct {
         g.prepareCaseInsensitive();
         self.file_admission_groups[self.file_admission_group_count] = g;
         self.file_admission_group_count += 1;
+        // Populate the first-byte set for the casefold-skip fast path.
+        // For each needle, add both lowercase and uppercase first bytes so a
+        // single indexOfByteSet call replaces N × 2 indexOfByte calls.
+        for (0..g.needle_count) |ni| {
+            const needle = if (g.case_insensitive)
+                g.lower_needles[ni][0..g.lower_needle_lens[ni]]
+            else
+                g.needles[ni];
+            if (needle.len == 0) continue;
+            const lb = needle[0];
+            self.first_byte_set.add(lb);
+            if (lb >= 'a' and lb <= 'z') {
+                self.first_byte_set.add(lb - 32);
+            } else if (lb >= 'A' and lb <= 'Z') {
+                self.first_byte_set.add(lb + 32);
+            }
+            self.first_byte_set_populated = true;
+        }
     }
 
     /// Returns true if any admission group is case-insensitive, so the caller
