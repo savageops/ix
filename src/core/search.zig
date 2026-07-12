@@ -19,6 +19,7 @@ const resource_profile = @import("resource_profile.zig");
 const scan_input_policy = @import("scan_input_policy.zig");
 const scan_timing = @import("scan_timing.zig");
 const search_admission = @import("search_admission.zig");
+const shift_or = @import("shift_or.zig");
 const state_dir = @import("state_dir.zig");
 const core_stats = @import("stats.zig");
 const literal_alternates = @import("literal_alternates.zig");
@@ -5442,7 +5443,15 @@ fn indexOfLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) 
 /// 2 KiB + 256 B stack buffers away from the case-sensitive hot path.
 /// Lowercase both line and needle into stack buffers via AVX2 vector ops,
 /// then search with simd.indexOf. O(n) casefold + O(n) SIMD search.
+///
+/// For needles ≤ 64 bytes, the Bit-Parallel Shift-Or path is used instead:
+/// it matches case-insensitively in a single O(n) pass with no stack buffer
+/// allocation, eliminating the casefold overhead and __chkstk page probes.
 fn indexOfLiteralCasefold(line: []const u8, needle: []const u8) ?usize {
+    if (needle.len <= shift_or.MAX_PATTERN_LEN) {
+        const so = shift_or.ShiftOr.init(needle, true) orelse return indexOfLiteralScalar(line, needle);
+        return so.indexOf(line);
+    }
     if (line.len <= CASEFOLD_LINE_MAX and needle.len <= CASEFOLD_NEEDLE_MAX) {
         var lower_line: [CASEFOLD_LINE_MAX]u8 = undefined;
         var lower_needle: [CASEFOLD_NEEDLE_MAX]u8 = undefined;
@@ -5478,7 +5487,18 @@ fn countLiteral(line: []const u8, needle: []const u8, case_insensitive: bool) us
 /// Casefold-once counting -- isolated from countLiteral to quarantine the
 /// casefold stack buffers. Lowercase the line once, then use the dedicated
 /// non-overlapping SIMD counter on the lowered copy.
+///
+/// For needles ≤ 64 bytes, the Bit-Parallel Shift-Or counter is used:
+/// single O(n) pass, no stack buffer, no __chkstk probes.
 fn countLiteralCasefold(line: []const u8, needle: []const u8) usize {
+    if (needle.len <= shift_or.MAX_PATTERN_LEN) {
+        const so = shift_or.ShiftOr.init(needle, true) orelse return countLiteralCasefoldBuffered(line, needle);
+        return so.count(line);
+    }
+    return countLiteralCasefoldBuffered(line, needle);
+}
+
+fn countLiteralCasefoldBuffered(line: []const u8, needle: []const u8) usize {
     if (line.len <= CASEFOLD_LINE_MAX and needle.len <= CASEFOLD_NEEDLE_MAX) {
         var lower_line: [CASEFOLD_LINE_MAX]u8 = undefined;
         var lower_needle: [CASEFOLD_NEEDLE_MAX]u8 = undefined;
