@@ -59,9 +59,11 @@ if ($AffinityMaskHex) {
   }
 }
 
-$stdout = if ($psi.RedirectStandardOutput) { $proc.StandardOutput.ReadToEnd() } else { "" }
-$stderr = if ($psi.RedirectStandardError) { $proc.StandardError.ReadToEnd() } else { "" }
+$stdoutTask = if ($psi.RedirectStandardOutput) { $proc.StandardOutput.ReadToEndAsync() } else { $null }
+$stderrTask = if ($psi.RedirectStandardError) { $proc.StandardError.ReadToEndAsync() } else { $null }
 $proc.WaitForExit()
+$stdout = if ($stdoutTask) { $stdoutTask.GetAwaiter().GetResult() } else { "" }
+$stderr = if ($stderrTask) { $stderrTask.GetAwaiter().GetResult() } else { "" }
 $sw.Stop()
 
 [pscustomobject]@{
