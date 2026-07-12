@@ -1686,7 +1686,6 @@ fn prepareEvidenceFrontier(
         std.Io.Dir.cwd().access(io, cache_path, .{}) catch return .{};
     }
     const signature = computeDiscoveredSignature(io, files) catch return .{};
-
     if (loadEvidenceFrontierCache(io, allocator, cache_path, key, signature, files)) |cache| {
         var evidence_files: std.ArrayList(DiscoveredFile) = .empty;
         for (files) |entry| {
@@ -1768,8 +1767,9 @@ fn computeContentSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
         var item = std.hash.Wyhash.init(0x4556_4944_4649_4c45);
         item.update(entry.path);
         hashU64(&item, stat.size);
-        hashU64(&item, @bitCast(stat.inode));
-        hashTimestamp(&item, stat.mtime);
+        // The discovered signature already owns inode/mtime identity. Keep
+        // this content signature deterministic across repeated Windows stats;
+        // its job is sampled-byte parity, not a second metadata clock.
         try hashFileContentSample(io, &file, stat.size, &item);
         const item_hash = item.final();
         xor_acc ^= item_hash;

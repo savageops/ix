@@ -7,6 +7,7 @@ const indexd = @import("core/indexd.zig");
 const inspect = @import("core/inspect.zig");
 const process_tool = @import("core/process_tool.zig");
 const search = @import("core/search.zig");
+const similar = @import("core/similar.zig");
 
 const NEXUS_MIN_BUILD_FRONTIER_FILES: usize = 4096;
 
@@ -228,6 +229,19 @@ pub fn main(init: std.process.Init) !void {
             };
             defer report.deinit(allocator);
             try process_tool.writeReport(stdout, report, request.json);
+        },
+        .similar => |request| {
+            similar.run(init.io, allocator, request, init.environ_map, stdout) catch |err| {
+                if (err == error.ApiKeyRequired) {
+                    try output.writeError(stderr, "similar_requires_api_key", "set IX_AI_API_KEY to use ix similar");
+                } else if (err == error.ApiRequestFailed) {
+                    try output.writeError(stderr, "similar_api_request_failed", "the configured embedding or reranker request failed");
+                } else {
+                    try output.writeError(stderr, "similar_failed", @errorName(err));
+                }
+                try stderr.flush();
+                std.process.exit(1);
+            };
         },
         .nexus => |request| {
             const effective_request = request;
