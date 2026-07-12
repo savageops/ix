@@ -47,12 +47,68 @@ pub inline fn indexOfByte(haystack: []const u8, needle: u8) ?usize {
         }
     }
 
-    // Scalar tail — at most 31 bytes.
+    // SWAR-accelerated tail — 8 bytes per iteration via algebraic
+    // zero-byte collision in a 64-bit register. For 8-31 byte remainders
+    // this avoids the byte-by-byte scalar loop, processing 8 bytes in
+    // 3 ALU ops (SUB, AND-NOT, AND) plus a TZCNT.
+    while (offset + 8 <= len) : (offset += 8) {
+        const word: u64 = std.mem.readInt(u64, haystack[offset..][0..8], .little);
+        if (hasByte64(word, needle)) |bit_pos| {
+            return offset + bit_pos;
+        }
+    }
+
+    // Byte-by-byte for the final <8 bytes.
     while (offset < len) : (offset += 1) {
         if (haystack[offset] == needle) return offset;
     }
 
     return null;
+}
+
+// ── SWAR Primitives (spec point 13) ─────────────────────────────────
+//
+// Branchless SWAR (SIMD-Within-A-Register) operations in 64-bit GP
+// registers. Evaluates 8 bytes per cycle via algebraic collision
+// formulas, eliminating branch misprediction on small buffers.
+//
+// Zero-byte collision formula (Myers 1999, adapted from Bitap):
+//   mask = (x - 0x0101010101010101) & ~x & 0x8080808080808080
+// A byte is zero iff the corresponding bit in `mask` is set.
+//
+// For byte-value search: XOR the word with a splat of the target byte,
+// then apply the zero-byte formula to detect matches.
+
+const ONES: u64 = 0x0101010101010101;
+const HIGHS: u64 = 0x8080808080808080;
+
+/// Returns the byte index (0-7) of the first zero byte in a u64 word,
+/// or null if none. Uses the algebraic zero-byte collision formula:
+///   mask = (x - 0x01...01) & ~x & 0x80...80
+/// Each byte that is zero produces a set high bit in the mask.
+pub fn firstZeroByteIndex(word: u64) ?u3 {
+    const mask = (word -% ONES) & ~word & HIGHS;
+    if (mask == 0) return null;
+    return @intCast(@ctz(mask) >> 3);
+}
+
+/// Returns true if the word contains a zero byte.
+pub fn hasZeroByte(word: u64) bool {
+    return ((word -% ONES) & ~word & HIGHS) != 0;
+}
+
+/// Returns the byte index (0-7) of the first occurrence of `byte` in a
+/// u64 word, or null. XOR-splat the target byte, then apply zero-byte
+/// detection.
+pub fn firstByteIndex(word: u64, byte: u8) ?u3 {
+    const splat: u64 = @as(u64, byte) * 0x0101010101010101;
+    return firstZeroByteIndex(word ^ splat);
+}
+
+/// Returns the byte index of the first matching byte, or null.
+/// Convenience wrapper for use in the SIMD tail path.
+pub fn hasByte64(word: u64, byte: u8) ?u3 {
+    return firstByteIndex(word, byte);
 }
 
 /// SIMD-accelerated substring search (memmem equivalent).
@@ -347,6 +403,54 @@ inline fn alphaCommonnessScore(byte: u8) u8 {
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
+
+test "SWAR firstZeroByteIndex — detects zero byte" {
+    // No zero byte
+    try std.testing.expectEqual(@as(?u3, null), firstZeroByteIndex(0x4142434445464748));
+    // Zero at position 0 (LSB)
+    try std.testing.expectEqual(@as(?u3, 0), firstZeroByteIndex(0x4142434445464700));
+    // Zero at position 4 (little-endian: 0x00 is the 5th byte from LSB)
+    try std.testing.expectEqual(@as(?u3, 4), firstZeroByteIndex(0x4142430045464748));
+    // Zero at position 7 (MSB)
+    try std.testing.expectEqual(@as(?u3, 7), firstZeroByteIndex(0x0042434445464748));
+    // All zeros
+    try std.testing.expectEqual(@as(?u3, 0), firstZeroByteIndex(0));
+}
+
+test "SWAR hasZeroByte — basic" {
+    try std.testing.expect(!hasZeroByte(0x4142434445464748));
+    try std.testing.expect(hasZeroByte(0x4142434445464700));
+    try std.testing.expect(hasZeroByte(0));
+    try std.testing.expect(!hasZeroByte(0xFFFFFFFFFFFFFFFF));
+}
+
+test "SWAR firstByteIndex — finds target byte" {
+    // Find 'B' (0x42) in "ABCDEFGH"
+    const word: u64 = 0x4847464544434241; // "ABCDEFGH" little-endian
+    try std.testing.expectEqual(@as(?u3, 1), firstByteIndex(word, 'B'));
+    try std.testing.expectEqual(@as(?u3, 0), firstByteIndex(word, 'A'));
+    try std.testing.expectEqual(@as(?u3, 7), firstByteIndex(word, 'H'));
+    try std.testing.expectEqual(@as(?u3, null), firstByteIndex(word, 'X'));
+}
+
+test "SWAR indexOfByte tail — finds byte in remainder" {
+    // 35 bytes: 32 A's + "BCD" — the 'C' is in the SWAR tail
+    var data: [35]u8 = undefined;
+    @memset(data[0..32], 'A');
+    data[32] = 'B';
+    data[33] = 'C';
+    data[34] = 'D';
+    try std.testing.expectEqual(@as(?usize, 33), indexOfByte(&data, 'C'));
+}
+
+test "SWAR indexOfByte tail — finds byte at exact boundary" {
+    // 40 bytes: 32 A's + 8 bytes "BBBBBBBC" — 'C' at position 39
+    var data: [40]u8 = undefined;
+    @memset(data[0..32], 'A');
+    @memset(data[32..39], 'B');
+    data[39] = 'C';
+    try std.testing.expectEqual(@as(?usize, 39), indexOfByte(&data, 'C'));
+}
 
 test "indexOfByte — basic" {
     const data = "hello world\nfoo bar\nbaz";
