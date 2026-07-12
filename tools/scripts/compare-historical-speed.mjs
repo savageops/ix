@@ -5,7 +5,7 @@ import { baseBenchEnv, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkDecisionGrade, benchmarkEvidenceFailures, benchmarkHostWarningFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, hardestComparableHistoricalLabel, preferHistoricalSelectionSeed, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, assertRepoBinaryFresh, benchmarkEnvSnapshot, binarySnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, assertRepoBinaryFresh, benchmarkEnvSnapshot, binarySnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, interPairSettleMs, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, sleepMs, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
@@ -44,6 +44,8 @@ Options:
   --min-previous-build-improvement-pct <n>
                                        Required improvement over previous builds. Default: 0.
   --identity-noise-multiplier <n>      Effective target multiplier for same-binary drift. Default: 0.
+  --inter-pair-settle-ms <n>           Delay (ms) between paired launches. Lets OS state settle.
+                                      Default: 0 or IX_INTER_PAIR_SETTLE_MS.
   --scan-open-timing                   Enable scan open/file subphase timing in IX telemetry.
   --linux-dominant-attribution         Enable Linux AMD ASIC register slow-file attribution in IX telemetry.
   --no-benchmark-lock                  Disable the cross-script benchmark lock.
@@ -70,6 +72,7 @@ const buildFirst = args.includes("--build");
 const minRetainableSamples = Number(argValue(args, "--min-retainable-samples", process.env.IX_MIN_RETAINABLE_SPEED_SAMPLES ?? "12"));
 const minPreviousBuildImprovementPct = Number(argValue(args, "--min-previous-build-improvement-pct", process.env.IX_MIN_PREVIOUS_BUILD_IMPROVEMENT_PCT ?? "0"));
 const identityNoiseMultiplier = Number(argValue(args, "--identity-noise-multiplier", process.env.IX_IDENTITY_NOISE_MULTIPLIER ?? "0"));
+const settleMs = interPairSettleMs(Number(argValue(args, "--inter-pair-settle-ms", process.env.IX_INTER_PAIR_SETTLE_MS ?? "0")));
 const scanOpenTiming = args.includes("--scan-open-timing");
 const linuxDominantAttribution = args.includes("--linux-dominant-attribution");
 const diagnosticAttributionMode = scanOpenTiming || linuxDominantAttribution;
@@ -96,11 +99,14 @@ function measurePairedHistory(history, ixArgs, effectivePreviousBuildImprovement
     pairOrder.push(historyFirst ? "history,current" : "current,history");
     if (historyFirst) {
       historyRuns.push(measureIxOnce(history.path, ixArgs, historyRuns.length + 1, { env: BENCH_ENV }));
+      sleepMs(settleMs);
       currentRuns.push(measureIxOnce(repoIx, ixArgs, currentRuns.length + 1, { env: BENCH_ENV }));
     } else {
       currentRuns.push(measureIxOnce(repoIx, ixArgs, currentRuns.length + 1, { env: BENCH_ENV }));
+      sleepMs(settleMs);
       historyRuns.push(measureIxOnce(history.path, ixArgs, historyRuns.length + 1, { env: BENCH_ENV }));
     }
+    sleepMs(settleMs);
   }
 
   const current = summarizeIxRuns(repoIx, "repo-current", currentRuns);
@@ -369,6 +375,7 @@ function writePreflightFailureReport({
     scanOpenTiming,
     linuxDominantAttribution,
     diagnosticAttributionMode,
+    interPairSettleMs: settleMs,
     benchEnv: BENCH_ENV,
     effectiveBenchEnv: benchmarkEnvSnapshot(BENCH_ENV),
     repoBinaryFreshness,
@@ -476,6 +483,7 @@ if (requireStrict && identityControlEnabled && identityControlSamples > 0) {
     env: BENCH_ENV,
     enabled: identityControlEnabled,
     label: "repo-control-preflight",
+    settleMs,
   });
   const preflightFailures = [
     ...hostPreflightFailures,
@@ -518,6 +526,7 @@ const ripgrep = measureRipgrepBracketed({
       env: BENCH_ENV,
       enabled: identityControlEnabled,
       label: "repo-control",
+      settleMs,
     });
     const effectivePreviousBuildImprovementPct = effectiveImprovementTargetPct({
       configuredPct: minPreviousBuildImprovementPct,

@@ -238,9 +238,21 @@ function benchmarkLockAgeMs(lockDir) {
   }
 }
 
-function sleepMs(durationMs) {
+export function sleepMs(durationMs) {
   if (!Number.isFinite(durationMs) || durationMs <= 0) return;
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, durationMs);
+}
+
+/// Returns the inter-pair settle delay (ms) from env or explicit override.
+/// Settle lets OS state (Defender real-time scan completion, page cache
+/// settling, CPU thermal headroom) return to baseline between the two
+/// launches of a paired sample. Without it, the second launch inherits
+/// disturbed state from the first, producing positional skew that inflates
+/// identity-control drift and masks sub-2% engine signals.
+export function interPairSettleMs(explicit) {
+  if (Number.isFinite(explicit) && explicit >= 0) return explicit;
+  const envValue = Number(process.env.IX_INTER_PAIR_SETTLE_MS);
+  return Number.isFinite(envValue) && envValue >= 0 ? envValue : 0;
 }
 
 function reclaimStaleBenchmarkLock(lockDir, { staleLockMs, pendingOwnerGraceMs }) {
@@ -1736,6 +1748,7 @@ function measureSameBinaryIdentityControlAttempt({
   env,
   label = "repo-control",
   attempt = 1,
+  settleMs = 0,
 } = {}) {
   const lanes = { first: [], second: [] };
   const pairOrder = [];
@@ -1743,9 +1756,10 @@ function measureSameBinaryIdentityControlAttempt({
     const firstLane = pair % 2 === 0 ? "first" : "second";
     const secondLane = firstLane === "first" ? "second" : "first";
     pairOrder.push(`${firstLane},${secondLane}`);
-    for (const lane of [firstLane, secondLane]) {
-      lanes[lane].push(measureIxOnce(binaryPath, ixArgs, lanes[lane].length + 1, { env }));
-    }
+    lanes[firstLane].push(measureIxOnce(binaryPath, ixArgs, lanes[firstLane].length + 1, { env }));
+    sleepMs(settleMs);
+    lanes[secondLane].push(measureIxOnce(binaryPath, ixArgs, lanes[secondLane].length + 1, { env }));
+    sleepMs(settleMs);
   }
 
   const first = summarizeIxRuns(binaryPath, `${label}-a`, lanes.first);
@@ -1829,6 +1843,7 @@ export function measureSameBinaryIdentityControl({
   enabled = true,
   label = "repo-control",
   attempts = 1,
+  settleMs = 0,
 } = {}) {
   if (!enabled || samples === 0) return null;
   const attemptCount = Math.max(1, Math.floor(Number(attempts) || 1));
@@ -1841,6 +1856,7 @@ export function measureSameBinaryIdentityControl({
       env,
       label: `${label}-attempt-${attempt}`,
       attempt,
+      settleMs,
     });
     attemptReports.push(report);
   }
