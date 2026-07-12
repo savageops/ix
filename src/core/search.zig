@@ -88,6 +88,12 @@ const SCAN_READ_BUFFER_SIZE: usize = 1024 * 1024;
 
 const TRIGRAM_MIN_PRUNE_BYTES: usize = 64 * 1024;
 const FM_INDEX_ADMISSION_MAX_BYTES: usize = 16 * 1024; // Max file size for in-memory BWT build.
+
+/// Cached FM-Index env check. Avoids calling getenv() on every file in the
+/// scan hot path — getenv scans the process environment block and on Windows
+/// takes the PEB lock. Checked once per thread, cached forever.
+threadlocal var fm_index_admission_cached: bool = false;
+threadlocal var fm_index_admission_checked: bool = false;
 const BYTE_SHARD_MIN_FILE_BYTES: usize = 8 * 1024 * 1024;
 const BYTE_SHARD_MIN_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const BYTE_SHARD_WORD_BOUNDARY_MIN_FILE_BYTES: usize = 1 * 1024 * 1024;
@@ -3650,15 +3656,18 @@ fn scanOpenFileIntoShardImpl(
     // FM-Index backward-search admission (spec point 11).
     // Env-gated: IX_FM_INDEX_ADMISSION=1 enables in-memory BWT construction
     // and O(p) backward search for eligible files. Disabled by default.
-    if (single_chunk and file_bytes <= FM_INDEX_ADMISSION_MAX_BYTES) {
-        if (std.c.getenv("IX_FM_INDEX_ADMISSION") != null) {
-            if (tryFmIndexAdmission(allocator, read_buffer[0..first_read], plan)) {
-                recordEvidencePruned(shard, file_bytes);
-                const file_ms = elapsedMs(io, file_started);
-                recordShardScanFileBufferedMs(shard, file_ms);
-                if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
-                return;
-            }
+    // The env check is cached per-thread to avoid getenv() on every file.
+    if (!fm_index_admission_checked) {
+        fm_index_admission_checked = true;
+        fm_index_admission_cached = std.c.getenv("IX_FM_INDEX_ADMISSION") != null;
+    }
+    if (fm_index_admission_cached and single_chunk and file_bytes <= FM_INDEX_ADMISSION_MAX_BYTES) {
+        if (tryFmIndexAdmission(allocator, read_buffer[0..first_read], plan)) {
+            recordEvidencePruned(shard, file_bytes);
+            const file_ms = elapsedMs(io, file_started);
+            recordShardScanFileBufferedMs(shard, file_ms);
+            if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            return;
         }
     }
 
@@ -3902,29 +3911,19 @@ fn dynamicShardWorker(io: std.Io, allocator: std.mem.Allocator, next_file: *usiz
         dispatchMonoDynamicLoop(io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
     } else {
         if (shard.capture_scan_open_timing) return dynamicShardWorkerTimed(io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
-        const BATCH: usize = 64;
         while (!shard.truncated) {
-            const batch_start = @atomicRmw(usize, next_file, .Add, BATCH, .monotonic);
-            if (batch_start >= files.len) break;
-            const batch_end = @min(batch_start + BATCH, files.len);
-            for (files[batch_start..batch_end]) |entry| {
-                if (shard.truncated) break;
-                scanFileIntoShard(io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
-            }
+            const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
+            if (index >= files.len) break;
+            scanFileIntoShard(io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
         }
     }
 }
 
 fn dynamicShardWorkerTimed(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
-    const BATCH: usize = 64;
     while (!shard.truncated) {
-        const batch_start = @atomicRmw(usize, next_file, .Add, BATCH, .monotonic);
-        if (batch_start >= files.len) break;
-        const batch_end = @min(batch_start + BATCH, files.len);
-        for (files[batch_start..batch_end]) |entry| {
-            if (shard.truncated) break;
-            scanFileIntoShardTimed(io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
-        }
+        const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
+        if (index >= files.len) break;
+        scanFileIntoShardTimed(io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
     }
 }
 
@@ -3971,31 +3970,18 @@ fn dispatchMonoDynamicLoop(io: std.Io, allocator: std.mem.Allocator, next_file: 
 
 fn monoDynamicLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     if (shard.capture_scan_open_timing) return monoDynamicLoopTimed(mono, io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
-    // Batch-claim files to reduce atomic contention on the shared counter.
-    // Each claim grabs BATCH files at once, reducing LOCK XADD operations by
-    // BATCH×. The inner loop processes the batch without any atomics.
-    const BATCH: usize = 64;
     while (!shard.truncated) {
-        const batch_start = @atomicRmw(usize, next_file, .Add, BATCH, .monotonic);
-        if (batch_start >= files.len) break;
-        const batch_end = @min(batch_start + BATCH, files.len);
-        for (files[batch_start..batch_end]) |entry| {
-            if (shard.truncated) break;
-            scanFileIntoShardMono(mono, io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
-        }
+        const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
+        if (index >= files.len) break;
+        scanFileIntoShardMono(mono, io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
     }
 }
 
 fn monoDynamicLoopTimed(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
-    const BATCH: usize = 64;
     while (!shard.truncated) {
-        const batch_start = @atomicRmw(usize, next_file, .Add, BATCH, .monotonic);
-        if (batch_start >= files.len) break;
-        const batch_end = @min(batch_start + BATCH, files.len);
-        for (files[batch_start..batch_end]) |entry| {
-            if (shard.truncated) break;
-            scanFileIntoShardMonoTimed(mono, io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
-        }
+        const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
+        if (index >= files.len) break;
+        scanFileIntoShardMonoTimed(mono, io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
     }
 }
 
