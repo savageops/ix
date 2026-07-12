@@ -16,7 +16,7 @@
 [![Hot Path](https://img.shields.io/badge/Hot%20Path-Zero%20Mutex-06b6d4)](#execution-model)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0f766e)](LICENSE)
 
-[Origin](#origin) · [What It Is](#what-it-is) · [Use It](#use-it) · [How It Works](#how-it-works) · [What Is Inside](#what-is-inside) · [Trigram Acceleration](#exact-trigram-acceleration) · [Admission Bytecode](#admission-bytecode-lane) · [Roadmap](#roadmap)
+[Origin](#origin) · [What It Is](#what-it-is) · [Use It](#use-it) · [How It Works](#how-it-works) · [What Is Inside](#what-is-inside) · [Fisheye Preview](#fisheye-preview) · [Trigram Acceleration](#exact-trigram-acceleration) · [Admission Bytecode](#admission-bytecode-lane) · [Roadmap](#roadmap)
 
 </div>
 
@@ -211,6 +211,7 @@ Each query is classified by shape and routed to the narrowest execution path:
 | Protected cold path | Protected Windows roots now reject volatile stores and non-text protected-root extensions before open, route recoverable open/read failures through structured `access_errors`, and account open latency in `scan_work_ms_total` plus slow-file telemetry. This protects cold searches from blocking on system database/log handles while still returning structured partial status when the OS refuses a file. |
 | Byte kernels | Current hot kernels are Zig `@Vector(32, u8)` and StringZilla AVX2. Planned narrow C shim additions are limited to primitives Zig cannot emit cleanly: `ix_count_byte_avx2`, `ix_ascii_ci_memmem_avx2`, and `ix_trigram_admit_scalar_or_avx2`. |
 | Inspect | Bounded read-only windows, match-context mode, `ix.inspect.*` sentinels, `ix.next.v1` continuation hints for agent pagination |
+| Fisheye preview | Match-centered adaptive context window (Furnas 1986). Geometrically contracting half-width at dyadic line-length tiers: T0 ≤300 bytes (full line), T1 ≤600 (150-byte half-width), T2 ≤1200 (75), T3 >1200 (37). Match substring always fully visible; elision marked with `…`. Up to 143× output reduction on minified/generated content. |
 | Explain | Structured plan JSON, strategy annotation, proof-program lowering — queries classified as `conjunctive_literal_evidence`, `conjunctive_regex_with_mandatory_evidence`, `disjunctive_byte_evidence`, or `verifier_only` with trigram terms and verifier type |
 | Stats schema | Telemetry model with full timing breakdown — `discover_ms`, `scan_ms`, `aggregate_ms`, `scan_work_ms_total` across all shards. Per-file slowest-path profiling. Trigram acceleration stats: candidate files checked, pruned, verified, ineligible. Byte-shard telemetry reports strategy, profiled files, range calls, line-aligned ranges, boundary candidates verified/rejected, logical bytes, elapsed range time, and matches owned by the byte kernel. |
 | Memory model | Arena allocator from process init — all allocations live for process lifetime, zero individual frees. Short-lived CLI process; arena released on exit. No deallocation overhead in the hot path. |
@@ -231,6 +232,8 @@ Each query is classified by shape and routed to the narrowest execution path:
 - **1 MiB chunk sizing** — chosen to fit in L2/L3 cache so StringZilla SIMD newline scan operates on warm cache lines. Larger buffers risk cache thrashing; smaller ones increase syscall frequency.
 - **Binary sniff** — first 1024 bytes checked for null byte via `sz.indexOfByte`. Binary files skipped before any line processing.
 - **Protected-root admission** — Windows system roots skip volatile database/log stores and non-text protected extensions before open. Recoverable `FileBusy` / access failures become bounded `access_errors` samples and partial status instead of aborting the scan.
+- **Batch-claim work scheduling** — scan workers claim 64 files per atomic `LOCK XADD` instead of one, reducing shared-counter contention by 64× on large corpora. Inner loop processes the batch without any atomics.
+- **Fisheye preview** — match-centered adaptive context window with geometrically contracting half-width at dyadic line-length tiers (see [Fisheye Preview](#fisheye-preview)).
 
 ### Design Properties
 
@@ -240,6 +243,41 @@ Each query is classified by shape and routed to the narrowest execution path:
 - Warm-index query reuse can collapse repeated searches to a generation-pinned candidate frontier with `discover_ms=0`.
 - `inspect` is agent-native: bounded, read-only, structured, continuable via `ix.next.v1`.
 - Thread-local shard reports eliminate mutex contention. Each thread accumulates its own counters and hit buffers; results merge after join.
+
+---
+
+## Fisheye Preview
+
+Match hits carry a preview — the line content around the match. For normal source code (lines ≤ 300 bytes), the full line is emitted. For generated, minified, or machine-produced content where lines run into thousands of bytes, emitting the full line wastes memory and bandwidth on context the user cannot scan.
+
+IX applies a **fisheye lens** to match previews: the match is the focus point, and the context window contracts geometrically as line length grows. The mechanism is adapted from Furnas 1986 (*Generalized Fisheye Views*), where the degree of interest at each point is a function of its distance from the focus and its *a priori* importance. Here, line length acts as the importance prior — longer lines skew toward minified or generated content with lower marginal information density per byte.
+
+### Tiered contraction
+
+| Tier | Line length | Window half-width | Effective preview |
+|:-----|:-----------|:-------------------|:-------------------|
+| T0 | ≤ 300 bytes | full line | Full content — normal source code |
+| T1 | 301 – 600 | 150 bytes | ~300 bytes around match |
+| T2 | 601 – 1200 | 75 bytes | ~150 bytes around match |
+| T3 | > 1200 | 37 bytes | ~75 bytes around match |
+
+The match substring is always fully visible. Truncation boundaries are marked with `…` (U+2026, 3 bytes UTF-8). If the match itself is wider than `2 × half_width`, the window expands to contain it — no match text is ever cut.
+
+### Effect
+
+On a 10 KiB minified line at T3, the preview is ~70 bytes — a **143× reduction** over emitting the full line. On a 5 KiB generated header at T3, ~80 bytes — a **62× reduction**. On typical source code (T0), zero overhead: the full line passes through unchanged.
+
+```
+$ ix search 're:(?i)ERR_SYS' generated_header.h
+
+generated_header.h:4823:2019:…xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxERR_SYS_REGISTER_DEFINITION_OFFSET_0xFF…
+```
+
+The `…` markers signal elision. The user sees the match and enough surrounding context to identify the register, without 5 KiB of padding noise.
+
+### Why not truncate at a fixed width?
+
+Fixed-width truncation (e.g. "first 200 bytes") loses the match when it appears past byte 200. Centering on the match with a fixed window wastes context on short lines and starves it on long lines. The fisheye tier system adapts: short lines get full context, long lines get focused context, and the match is always centered and visible.
 
 ---
 

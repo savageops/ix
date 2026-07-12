@@ -185,3 +185,16 @@ These are non-negotiable constraints on the hot path:
 - **Source comments** — WHY decisions, not WHAT the code does (the code says what)
 - **`explain` command** — surfaces the proof program for any query at runtime
 - **Roadmap** — tiered by depth: execution core → I/O architecture → memory hierarchy → codegen → algorithms → microarchitecture → persistent index → kernel bypass
+
+## Fisheye Preview
+
+Match previews use a fisheye lens (Furnas 1986, *Generalized Fisheye Views*). The match is the focus point; context window contracts geometrically as line length grows. Line length acts as the *a priori* importance prior — longer lines skew toward minified/generated content with lower marginal information density.
+
+- T0 (≤ 300 bytes): full line — normal source code, zero overhead
+- T1 (301–600): 150-byte half-width around match
+- T2 (601–1200): 75-byte half-width
+- T3 (> 1200): 37-byte half-width — up to 143× output reduction on minified content
+
+The match substring is always fully visible. Elision boundaries marked with `…` (U+2026). If the match is wider than `2 × half_width`, the window expands to contain it.
+
+This is an output-stage optimization, not a scan-stage optimization. It does not affect match parity, scan time, or admission. It reduces memory allocation and output size for hit records on long-line corpora.
