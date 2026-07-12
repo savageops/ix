@@ -245,13 +245,6 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         return report;
     }
 
-    if (prepareLiveEvidenceFrontier(io, allocator, request, plan, trigram_admission, &report)) |live_prepared| {
-        try scanPreparedFiles(io, allocator, live_prepared.active_files.?, request, plan, trigram_admission, &trigram_program, &report);
-        report.total_ms = elapsedMs(io, total_started);
-        refreshStats(&report);
-        return report;
-    }
-
     // Phase 1: Discover all files via serial directory walk.
     const discover_started = std.Io.Timestamp.now(io, .awake);
     var file_list = try FileList.initWithCapacity(allocator, 512);
@@ -1588,32 +1581,6 @@ const WarmStatsResultCacheContext = struct {
     file_count: usize = 0,
 };
 
-fn prepareLiveEvidenceFrontier(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    request: cli.SearchRequest,
-    plan: expr.ExpressionPlan,
-    admission: trigram.Admission,
-    report: *SearchReport,
-) ?EvidenceFrontierPrepared {
-    if (request.nexus_disabled) return null;
-    if (!evidenceFrontierEligible(request, plan, admission)) return null;
-    const key = evidenceFrontierKey(request, plan);
-    const cache_path = state_dir.evidenceCachePath(allocator, key) catch return null;
-    const live_path = evidenceFrontierLivePath(allocator, cache_path) catch return null;
-    if (!loadEvidenceFrontierLive(io, allocator, live_path, key)) return null;
-    const cache = loadEvidenceFrontierCacheFast(io, allocator, cache_path, key) orelse return null;
-
-    var evidence_files: std.ArrayList(DiscoveredFile) = .empty;
-    for (cache.candidates) |candidate| evidence_files.append(allocator, .{ .path = candidate }) catch return null;
-    report.files_discovered = cache.file_count;
-    report.files_scanned += cache.pruned_files;
-    report.bytes_scanned += cache.pruned_bytes;
-    report.files_skipped += cache.skipped_files;
-    report.stats.trigram_acceleration.pruned_files += cache.pruned_files;
-    return .{ .active_files = evidence_files.toOwnedSlice(allocator) catch return null };
-}
-
 pub fn tryClaimEvidenceFrontierBuild(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1646,6 +1613,9 @@ pub fn tryClaimEvidenceFrontierBuild(
     return true;
 }
 
+/// Reuses an evidence frontier only after discovery has established the live
+/// file set and its identity. A live marker coordinates the builder process;
+/// it is not a corpus proof and is therefore never sufficient by itself.
 fn prepareEvidenceFrontier(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -1657,10 +1627,12 @@ fn prepareEvidenceFrontier(
 ) EvidenceFrontierPrepared {
     if (request.nexus_disabled) return .{};
     if (!evidenceFrontierEligible(request, plan, admission)) return .{};
-    if (!request.nexus_build) return .{};
-    const signature = computeDiscoveredSignature(io, files) catch return .{};
     const key = evidenceFrontierKey(request, plan);
     const cache_path = state_dir.evidenceCachePath(allocator, key) catch return .{};
+    if (!request.nexus_build) {
+        std.Io.Dir.cwd().access(io, cache_path, .{}) catch return .{};
+    }
+    const signature = computeDiscoveredSignature(io, files) catch return .{};
 
     if (loadEvidenceFrontierCache(io, allocator, cache_path, key, signature, files)) |cache| {
         var evidence_files: std.ArrayList(DiscoveredFile) = .empty;
@@ -1673,6 +1645,8 @@ fn prepareEvidenceFrontier(
         report.stats.trigram_acceleration.pruned_files += cache.pruned_files;
         return .{ .active_files = evidence_files.toOwnedSlice(allocator) catch return .{} };
     }
+
+    if (!request.nexus_build) return .{};
 
     return .{ .runtime = .{
         .enabled = request.nexus_build,
@@ -1702,12 +1676,25 @@ fn evidenceFrontierKey(request: cli.SearchRequest, plan: expr.ExpressionPlan) u6
     return hasher.final();
 }
 
+/// Computes the discovery identity used to validate evidence-frontier reuse.
+///
+/// Why: a path-only signature lets a same-path mutation reuse a stale pruning
+/// decision. The cache may admit false positives, never a false negative.
+/// Preserves: order-independent identity over path, size, inode, and mtime;
+/// stat failures invalidate reuse instead of guessing.
 fn computeDiscoveredSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
-    _ = io;
     var xor_acc: u64 = 0;
     var sum_acc: u64 = 0;
     for (files) |entry| {
-        const item_hash = hashBytes64(0x4556_4944_5041_5448, entry.path);
+        var file = try nt_open.openFile(io, entry.path);
+        defer file.close(io);
+        const stat = try file.stat(io);
+        var item = std.hash.Wyhash.init(0x4556_4944_5041_5448);
+        item.update(entry.path);
+        hashU64(&item, stat.size);
+        hashU64(&item, @bitCast(stat.inode));
+        hashTimestamp(&item, stat.mtime);
+        const item_hash = item.final();
         xor_acc ^= item_hash;
         sum_acc +%= item_hash;
     }
@@ -1944,43 +1931,6 @@ fn loadEvidenceFrontierCache(
     };
 }
 
-fn loadEvidenceFrontierCacheFast(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    path: []const u8,
-    key: u64,
-) ?EvidenceFrontierCache {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(EVIDENCE_FRONTIER_CACHE_READ_LIMIT)) catch return null;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return null, "\r"), EVIDENCE_FRONTIER_CACHE_MAGIC)) return null;
-    if (parseCacheU64(lines.next() orelse return null, "key=") != key) return null;
-    _ = parseCacheU64(lines.next() orelse return null, "signature=");
-    const content_signature = parseCacheU64(lines.next() orelse return null, "content_signature=");
-    const file_count = parseCacheUsize(lines.next() orelse return null, "file_count=");
-    const pruned_files = parseCacheUsize(lines.next() orelse return null, "pruned_files=");
-    const pruned_bytes = parseCacheUsize(lines.next() orelse return null, "pruned_bytes=");
-    const skipped_files = parseCacheUsize(lines.next() orelse return null, "skipped_files=");
-    const candidate_count = parseCacheUsize(lines.next() orelse return null, "candidates=");
-    if (candidate_count > EVIDENCE_FRONTIER_CACHE_CANDIDATE_LIMIT) return null;
-    if (!std.mem.eql(u8, std.mem.trimEnd(u8, lines.next() orelse return null, "\r"), "--")) return null;
-
-    var candidates: std.ArrayList([]const u8) = .empty;
-    while (lines.next()) |raw_line| {
-        const line = trimCR(raw_line);
-        if (line.len == 0) continue;
-        candidates.append(allocator, line) catch return null;
-    }
-    if (candidates.items.len != candidate_count) return null;
-    return .{
-        .file_count = file_count,
-        .pruned_files = pruned_files,
-        .pruned_bytes = pruned_bytes,
-        .skipped_files = skipped_files,
-        .content_signature = content_signature,
-        .candidates = candidates.toOwnedSlice(allocator) catch return null,
-    };
-}
-
 fn evidenceFrontierLivePath(allocator: std.mem.Allocator, cache_path: []const u8) ![]const u8 {
     return std.fmt.allocPrint(allocator, "{s}.live", .{cache_path});
 }
@@ -2168,12 +2118,6 @@ fn parseCacheI96(line: []const u8, prefix: []const u8) ?i96 {
 fn hashU64(hasher: *std.hash.Wyhash, value: u64) void {
     var mutable = value;
     hasher.update(std.mem.asBytes(&mutable));
-}
-
-fn hashBytes64(seed: u64, bytes: []const u8) u64 {
-    var hasher = std.hash.Wyhash.init(seed);
-    hasher.update(bytes);
-    return hasher.final();
 }
 
 fn hashTimestamp(hasher: *std.hash.Wyhash, timestamp: std.Io.Timestamp) void {
@@ -6278,6 +6222,24 @@ test "content signature changes for same-length same-path mutations" {
     try std.testing.expect(before != after);
 }
 
+test "discovered signature changes when same-path file identity changes" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "identity.txt", .data = "absent\n" });
+    const file_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/identity.txt", .{&tmp.sub_path});
+    const files = [_]DiscoveredFile{.{ .path = file_path }};
+    const before = try computeDiscoveredSignature(io, &files);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "identity.txt", .data = "needle plus more bytes\n" });
+    const after = try computeDiscoveredSignature(io, &files);
+    try std.testing.expect(before != after);
+}
+
 test "evidence frontier prepare narrows active files and accounts cached prunes" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -6389,12 +6351,57 @@ test "search run consumes evidence frontier and scans only retained candidates" 
     writeEvidenceFrontierLive(io, cache_path, key);
 
     const report = try run(io, allocator, request, plan);
-    try std.testing.expectEqual(@as(f64, 0), report.discover_ms);
+    try std.testing.expectEqual(@as(usize, 2), report.files_discovered);
     try std.testing.expectEqual(@as(usize, 1), report.matches_found);
     try std.testing.expectEqual(@as(usize, 1), report.hit_count);
     try std.testing.expectEqualStrings(retained[0].path, report.hits[0].path);
     try std.testing.expectEqual(@as(usize, 1), report.stats.trigram_acceleration.pruned_files);
     try std.testing.expectEqual(@as(usize, 2), report.files_scanned);
+}
+
+test "live evidence frontier rejects same-path mutation before pruning" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const request = testSearchRequest("lit:needle", root_path);
+    const plan = try expr.parse(request.expression);
+    const key = evidenceFrontierKey(request, plan);
+    const cache_path = try state_dir.evidenceCachePath(allocator, key);
+    defer std.Io.Dir.cwd().deleteFile(io, cache_path) catch {};
+    const live_path = try evidenceFrontierLivePath(allocator, cache_path);
+    defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
+
+    var discovery_report = testSearchReport(request.expression, plan);
+    var discovered = try FileList.initWithCapacity(allocator, 4);
+    var admission_engine = path_admission.Engine.init(allocator, !request.no_ignore);
+    try discoverFiles(io, allocator, root_path, request, &admission_engine, &discovered, &discovery_report);
+    const files = discovered.mutableItems();
+    try std.testing.expectEqual(@as(usize, 2), files.len);
+    const signature = try computeDiscoveredSignature(io, files);
+    var retained = [_]DiscoveredFile{candidateFromDiscovered(files) orelse return error.TestExpectedCacheHit};
+    const content_signature = try computeContentSignature(io, files);
+    writeEvidenceFrontierCache(io, cache_path, key, signature, content_signature, files.len, .{
+        .pruned_files = 1,
+        .pruned_bytes = 64,
+        .skipped_files = 0,
+        .candidates = &retained,
+    });
+    writeEvidenceFrontierLive(io, cache_path, key);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "needle\n" });
+    const report = try run(io, allocator, request, plan);
+
+    try std.testing.expectEqual(@as(usize, 2), report.matches_found);
+    try std.testing.expectEqual(@as(usize, 2), report.hit_count);
+    try std.testing.expectEqual(@as(usize, 2), report.files_scanned);
+    try std.testing.expectEqual(@as(usize, 0), report.stats.trigram_acceleration.pruned_files);
 }
 
 test "search run consumes live warm postings and scans only candidate files" {
