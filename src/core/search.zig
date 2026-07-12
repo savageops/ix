@@ -6161,15 +6161,24 @@ test "evidence frontier cache rejects stale or malformed artifact headers" {
 
 test "evidence frontier signatures are independent of discovery order" {
     const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "alpha.txt", .data = "alpha\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "beta.txt", .data = "beta\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "gamma.txt", .data = "gamma\n" });
+    var path_buf: [3][256]u8 = undefined;
+    const alpha = try std.fmt.bufPrint(&path_buf[0], ".zig-cache/tmp/{s}/alpha.txt", .{&tmp.sub_path});
+    const beta = try std.fmt.bufPrint(&path_buf[1], ".zig-cache/tmp/{s}/beta.txt", .{&tmp.sub_path});
+    const gamma = try std.fmt.bufPrint(&path_buf[2], ".zig-cache/tmp/{s}/gamma.txt", .{&tmp.sub_path});
     const forward = [_]DiscoveredFile{
-        .{ .path = "src/main.zig" },
-        .{ .path = "src/core/search.zig" },
-        .{ .path = "src/core/stats.zig" },
+        .{ .path = alpha },
+        .{ .path = beta },
+        .{ .path = gamma },
     };
     const reversed = [_]DiscoveredFile{
-        .{ .path = "src/core/stats.zig" },
-        .{ .path = "src/core/search.zig" },
-        .{ .path = "src/main.zig" },
+        .{ .path = gamma },
+        .{ .path = beta },
+        .{ .path = alpha },
     };
 
     try std.testing.expectEqual(
@@ -6223,16 +6232,24 @@ test "evidence frontier prepare narrows active files and accounts cached prunes"
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\n" });
+    const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    const pruned_path = try std.fmt.allocPrint(allocator, "{s}/pruned.txt", .{root_path});
+    const candidate_path = try std.fmt.allocPrint(allocator, "{s}/candidate.txt", .{root_path});
 
-    var request = testSearchRequest("lit:needle", "fixture-root");
+    var request = testSearchRequest("lit:needle", root_path);
     request.nexus_build = true;
     const plan = try expr.parse(request.expression);
     const admission = trigram.admit(plan);
     const files = [_]DiscoveredFile{
-        .{ .path = "src/main.zig" },
-        .{ .path = "src/core/search.zig" },
+        .{ .path = pruned_path },
+        .{ .path = candidate_path },
     };
     var candidates = [_]DiscoveredFile{files[1]};
+    nt_open.initCwdPrefix(io);
     const signature = try computeDiscoveredSignature(io, &files);
     const key = evidenceFrontierKey(request, plan);
     const cache_path = try state_dir.evidenceCachePath(allocator, key);
@@ -6254,7 +6271,7 @@ test "evidence frontier prepare narrows active files and accounts cached prunes"
 
     try std.testing.expect(!prepared.runtime.enabled);
     try std.testing.expectEqual(@as(usize, 1), active.len);
-    try std.testing.expectEqualStrings("src/core/search.zig", active[0].path);
+    try std.testing.expectEqualStrings(candidate_path, active[0].path);
     try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
     try std.testing.expectEqual(@as(usize, 123), report.bytes_scanned);
     try std.testing.expectEqual(@as(usize, 4), report.files_skipped);
@@ -6313,9 +6330,12 @@ test "search run consumes evidence frontier and scans only retained candidates" 
     var discovery_report = testSearchReport(request.expression, plan);
     var discovered = try FileList.initWithCapacity(allocator, 4);
     var admission_engine = path_admission.Engine.init(allocator, !request.no_ignore);
-    try discoverFiles(io, allocator, root_path, request, &admission_engine, &discovered, &discovery_report);
+    const prepared_roots = try prepareRoots(io, allocator, request);
+    try std.testing.expectEqual(@as(usize, 1), prepared_roots.count);
+    try discoverFiles(io, allocator, prepared_roots.items[0].original, request, &admission_engine, &discovered, &discovery_report);
     const files = discovered.mutableItems();
     try std.testing.expectEqual(@as(usize, 2), files.len);
+    nt_open.initCwdPrefix(io);
     const signature = try computeDiscoveredSignature(io, files);
 
     var retained = [_]DiscoveredFile{candidateFromDiscovered(files) orelse return error.TestExpectedCacheHit};
@@ -6327,6 +6347,7 @@ test "search run consumes evidence frontier and scans only retained candidates" 
         .candidates = &retained,
     });
     writeEvidenceFrontierLive(io, cache_path, key);
+    try std.testing.expect(loadEvidenceFrontierCache(io, allocator, cache_path, key, signature, files) != null);
 
     const report = try run(io, allocator, request, plan);
     try std.testing.expectEqual(@as(usize, 2), report.files_discovered);
