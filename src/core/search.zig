@@ -3851,11 +3851,12 @@ fn recordLineIntoShardImpl(
         shard.matches_found += 1;
         const under_request_limit = if (request.max_hits) |max_hits| shard.hit_count < max_hits else true;
         if (under_request_limit and shard.hit_count < MAX_RETAINED_HITS) {
+            const match_len = if (mono != null and mono.?.kind != .regex) plan.predicates[0].value.len else fisheyeMatchLen(plan);
             shard.hits[shard.hit_count] = .{
                 .path = display_path,
                 .line = line_number,
                 .column = col,
-                .preview = allocator.dupe(u8, line) catch line,
+                .preview = fisheyePreview(allocator, line, col - 1, match_len) catch allocator.dupe(u8, line) catch line,
             };
             shard.hit_count += 1;
         }
@@ -3901,19 +3902,29 @@ fn dynamicShardWorker(io: std.Io, allocator: std.mem.Allocator, next_file: *usiz
         dispatchMonoDynamicLoop(io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
     } else {
         if (shard.capture_scan_open_timing) return dynamicShardWorkerTimed(io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
+        const BATCH: usize = 64;
         while (!shard.truncated) {
-            const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
-            if (index >= files.len) break;
-            scanFileIntoShard(io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
+            const batch_start = @atomicRmw(usize, next_file, .Add, BATCH, .monotonic);
+            if (batch_start >= files.len) break;
+            const batch_end = @min(batch_start + BATCH, files.len);
+            for (files[batch_start..batch_end]) |entry| {
+                if (shard.truncated) break;
+                scanFileIntoShard(io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
+            }
         }
     }
 }
 
 fn dynamicShardWorkerTimed(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    const BATCH: usize = 64;
     while (!shard.truncated) {
-        const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
-        if (index >= files.len) break;
-        scanFileIntoShardTimed(io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
+        const batch_start = @atomicRmw(usize, next_file, .Add, BATCH, .monotonic);
+        if (batch_start >= files.len) break;
+        const batch_end = @min(batch_start + BATCH, files.len);
+        for (files[batch_start..batch_end]) |entry| {
+            if (shard.truncated) break;
+            scanFileIntoShardTimed(io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
+        }
     }
 }
 
@@ -3960,18 +3971,31 @@ fn dispatchMonoDynamicLoop(io: std.Io, allocator: std.mem.Allocator, next_file: 
 
 fn monoDynamicLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     if (shard.capture_scan_open_timing) return monoDynamicLoopTimed(mono, io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
+    // Batch-claim files to reduce atomic contention on the shared counter.
+    // Each claim grabs BATCH files at once, reducing LOCK XADD operations by
+    // BATCH×. The inner loop processes the batch without any atomics.
+    const BATCH: usize = 64;
     while (!shard.truncated) {
-        const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
-        if (index >= files.len) break;
-        scanFileIntoShardMono(mono, io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
+        const batch_start = @atomicRmw(usize, next_file, .Add, BATCH, .monotonic);
+        if (batch_start >= files.len) break;
+        const batch_end = @min(batch_start + BATCH, files.len);
+        for (files[batch_start..batch_end]) |entry| {
+            if (shard.truncated) break;
+            scanFileIntoShardMono(mono, io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
+        }
     }
 }
 
 fn monoDynamicLoopTimed(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    const BATCH: usize = 64;
     while (!shard.truncated) {
-        const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
-        if (index >= files.len) break;
-        scanFileIntoShardMonoTimed(mono, io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
+        const batch_start = @atomicRmw(usize, next_file, .Add, BATCH, .monotonic);
+        if (batch_start >= files.len) break;
+        const batch_end = @min(batch_start + BATCH, files.len);
+        for (files[batch_start..batch_end]) |entry| {
+            if (shard.truncated) break;
+            scanFileIntoShardMonoTimed(mono, io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
+        }
     }
 }
 
@@ -4505,6 +4529,100 @@ inline fn trimCR(raw_line: []const u8) []const u8 {
     return raw_line;
 }
 
+// Fisheye preview — match-centered adaptive context window.
+//
+// Based on Furnas 1986 "Generalized Fisheye Views": the match is the focus
+// point, line length acts as a priori importance (API). Longer lines skew
+// toward minified/generated content with lower marginal information density,
+// so the preview budget contracts geometrically at dyadic tier thresholds.
+//
+//   Tier  Line length    Window half-width
+//   T0    <= 300         full line (normal source code)
+//   T1    301-600        150 bytes around match
+//   T2    601-1200       75 bytes around match
+//   T3    > 1200         37 bytes around match
+//
+// The match substring is always fully visible. Truncation marked with … (3
+// bytes UTF-8) at cut boundaries. For a 5000-char minified line at T3, the
+// preview is ~75 bytes centered on the match — a 66x reduction over emitting
+// the full line.
+
+const FISHEYE_T0_MAX: usize = 300;
+const FISHEYE_T1_MAX: usize = 600;
+const FISHEYE_T2_MAX: usize = 1200;
+const FISHEYE_HALF_WIDTH_T1: usize = 150;
+const FISHEYE_HALF_WIDTH_T2: usize = 75;
+const FISHEYE_HALF_WIDTH_T3: usize = 37;
+
+fn fisheyeHalfWidth(line_len: usize) usize {
+    if (line_len <= FISHEYE_T0_MAX) return line_len; // T0: full line
+    if (line_len <= FISHEYE_T1_MAX) return FISHEYE_HALF_WIDTH_T1;
+    if (line_len <= FISHEYE_T2_MAX) return FISHEYE_HALF_WIDTH_T2;
+    return FISHEYE_HALF_WIDTH_T3;
+}
+
+/// Produces a match-centered preview with geometrically contracting window.
+/// `match_byte_offset` is 0-based. `match_len` is best-effort (literal length
+/// or 0 for regex). The match substring is always preserved in the output.
+fn fisheyePreview(allocator: std.mem.Allocator, line: []const u8, match_byte_offset: usize, match_len: usize) ![]const u8 {
+    if (line.len <= FISHEYE_T0_MAX) return allocator.dupe(u8, line);
+
+    const half_width = fisheyeHalfWidth(line.len);
+    const match_end = @min(match_byte_offset + match_len, line.len);
+    const match_start = @min(match_byte_offset, line.len);
+
+    // Window must contain the full match plus symmetric context.
+    const window_start = if (match_start > half_width) match_start - half_width else 0;
+    var window_end = @min(match_end + half_width, line.len);
+
+    // If the match itself is wider than 2*half_width, the window is
+    // match-bounded with no side context — no ellipsis needed on the
+    // match-facing sides.
+    if (window_end <= window_start) window_end = @min(window_start + 1, line.len);
+
+    const elided_left = window_start > 0;
+    const elided_right = window_end < line.len;
+
+    // … is 3 bytes (0xE2 0x80 0xA6). Size the allocation precisely.
+    const ellipsis_len = 3;
+    var result_len: usize = window_end - window_start;
+    if (elided_left) result_len += ellipsis_len;
+    if (elided_right) result_len += ellipsis_len;
+
+    const result = try allocator.alloc(u8, result_len);
+    var pos: usize = 0;
+
+    if (elided_left) {
+        result[pos] = 0xE2;
+        result[pos + 1] = 0x80;
+        result[pos + 2] = 0xA6;
+        pos += ellipsis_len;
+    }
+
+    @memcpy(result[pos .. pos + (window_end - window_start)], line[window_start..window_end]);
+    pos += window_end - window_start;
+
+    if (elided_right) {
+        result[pos] = 0xE2;
+        result[pos + 1] = 0x80;
+        result[pos + 2] = 0xA6;
+    }
+
+    return result;
+}
+
+/// Best-effort match length for fisheye centering. Returns the first
+/// predicate's value length for literals/prefixes/suffixes, or 0 for regex
+/// where match length is variable and unknown at this point.
+fn fisheyeMatchLen(plan: expr.ExpressionPlan) usize {
+    if (plan.predicate_count == 0) return 0;
+    const predicate = plan.predicates[0];
+    return switch (predicate.kind) {
+        .literal, .prefix, .suffix => predicate.value.len,
+        .regex => 0,
+    };
+}
+
 fn availableThreads() usize {
     return std.Thread.getCpuCount() catch 1;
 }
@@ -4737,7 +4855,7 @@ fn recordLine(
                 .path = display_path,
                 .line = line_number,
                 .column = column,
-                .preview = try allocator.dupe(u8, line),
+                .preview = try fisheyePreview(allocator, line, column - 1, fisheyeMatchLen(plan)),
             };
             report.hit_count += 1;
         }
@@ -7225,4 +7343,62 @@ test "joined discovery child path falls back to owned allocation and persist dup
 
     borrowed_buffer[0] = 'X';
     try std.testing.expectEqualStrings("repo/child.txt", persisted);
+}
+
+test "fisheye preview returns full line for short lines (T0)" {
+    const line = "const x = 42;";
+    const preview = try fisheyePreview(std.testing.allocator, line, 6, 1);
+    defer std.testing.allocator.free(preview);
+    try std.testing.expectEqualStrings(line, preview);
+}
+
+test "fisheye preview contracts at T1 for medium lines" {
+    var line_buf: [500]u8 = undefined;
+    for (&line_buf, 0..) |*b, i| b.* = if (i == 250) 'X' else 'a';
+    const line = line_buf[0..500];
+
+    const preview = try fisheyePreview(std.testing.allocator, line, 250, 1);
+    defer std.testing.allocator.free(preview);
+
+    try std.testing.expect(preview.len < line.len);
+    try std.testing.expect(preview.len <= 150 + 150 + 1 + 6);
+    try std.testing.expectEqual(@as(u8, 0xE2), preview[0]);
+    try std.testing.expectEqual(@as(u8, 0xE2), preview[preview.len - 3]);
+    const match_in_preview = std.mem.indexOfScalar(u8, preview, 'X');
+    try std.testing.expect(match_in_preview != null);
+}
+
+test "fisheye preview contracts at T3 for very long lines" {
+    var line_buf: [5000]u8 = undefined;
+    for (&line_buf, 0..) |*b, i| b.* = if (i == 2500) 'Z' else 'a';
+    const line = line_buf[0..5000];
+
+    const preview = try fisheyePreview(std.testing.allocator, line, 2500, 1);
+    defer std.testing.allocator.free(preview);
+
+    try std.testing.expect(preview.len <= 37 + 37 + 1 + 6);
+    try std.testing.expectEqual(@as(u8, 0xE2), preview[0]);
+    try std.testing.expectEqual(@as(u8, 0xE2), preview[preview.len - 3]);
+    try std.testing.expect(std.mem.indexOfScalar(u8, preview, 'Z') != null);
+}
+
+test "fisheye preview preserves full match substring when wider than window" {
+    var line_buf: [2000]u8 = undefined;
+    for (&line_buf, 0..) |*b, i| {
+        b.* = if (i >= 900 and i < 1100) 'M' else 'a';
+    }
+    const line = line_buf[0..2000];
+
+    const preview = try fisheyePreview(std.testing.allocator, line, 900, 200);
+    defer std.testing.allocator.free(preview);
+
+    const match_count = std.mem.count(u8, preview, "M");
+    try std.testing.expect(match_count >= 200);
+}
+
+test "fisheye half width returns correct tier" {
+    try std.testing.expectEqual(@as(usize, 100), fisheyeHalfWidth(100));
+    try std.testing.expectEqual(@as(usize, 150), fisheyeHalfWidth(400));
+    try std.testing.expectEqual(@as(usize, 75), fisheyeHalfWidth(800));
+    try std.testing.expectEqual(@as(usize, 37), fisheyeHalfWidth(5000));
 }
