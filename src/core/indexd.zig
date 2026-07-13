@@ -351,9 +351,16 @@ fn fileTimeToUnixNs(file_time: windows.FILETIME) i128 {
 }
 
 fn configuredMemoryLimitBytes() usize {
-    const profile_default = resource_profile.current().indexdDefaultMemoryLimitBytes();
-    const value_ptr = std.c.getenv(MEMORY_LIMIT_ENV ++ "\x00") orelse return profile_default;
-    return parseMemoryLimitMb(std.mem.span(value_ptr)) orelse profile_default;
+    const framework_limit = resource_profile.memoryLimitBytes();
+    const value_ptr = std.c.getenv(MEMORY_LIMIT_ENV ++ "\x00") orelse return framework_limit;
+    const requested = parseMemoryLimitMb(std.mem.span(value_ptr)) orelse return framework_limit;
+    return boundedMemoryLimit(requested, framework_limit);
+}
+
+/// Environment configuration may lower the shared policy but cannot turn a
+/// lane-local setting into authority over the framework ceiling.
+fn boundedMemoryLimit(requested: usize, framework_limit: usize) usize {
+    return @min(requested, framework_limit);
 }
 
 fn parseMemoryLimitMb(value: []const u8) ?usize {
@@ -1400,6 +1407,11 @@ test "indexd memory limit parser is explicit and bounded" {
     try std.testing.expectEqual(@as(?usize, 0), parseMemoryLimitMb("0"));
     try std.testing.expectEqual(@as(?usize, null), parseMemoryLimitMb(""));
     try std.testing.expectEqual(@as(?usize, null), parseMemoryLimitMb("invalid"));
+}
+
+test "indexd memory override cannot raise the framework ceiling" {
+    try std.testing.expectEqual(@as(usize, 512), boundedMemoryLimit(4096, 512));
+    try std.testing.expectEqual(@as(usize, 128), boundedMemoryLimit(128, 512));
 }
 
 test "indexd memory budget rejects resident usage over cap" {

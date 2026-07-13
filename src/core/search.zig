@@ -174,7 +174,6 @@ pub const SearchReport = struct {
     scan_file_mmap_ms_total: f64 = 0,
     scan_file_buffered_ms_total: f64 = 0,
     scan_input_policy: scan_input_policy.Mode = .auto,
-    resource_profile: resource_profile.Profile = .low,
     capture_scan_open_timing: bool,
     capture_linux_dominant_attribution: bool,
     capture_discovery_skip_bytes: bool,
@@ -184,6 +183,7 @@ pub const SearchReport = struct {
     fast_count_range_overlap: ?usize,
     available_threads: usize,
     outer_scan_threads: usize,
+    scan_buffer: []u8 = &.{},
     hits: [MAX_RETAINED_HITS]SearchHit,
     hit_count: usize,
 };
@@ -204,7 +204,6 @@ pub const SearchReport = struct {
 pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest, plan: expr.ExpressionPlan) !SearchReport {
     const total_started = std.Io.Timestamp.now(io, .awake);
     const roots = try prepareRoots(io, allocator, request);
-    const profile = resource_profile.current();
     var report = SearchReport{
         .expression = request.expression,
         .cwd = try currentWorkingDirectory(io, allocator),
@@ -236,7 +235,6 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         .scan_file_mmap_ms_total = 0,
         .scan_file_buffered_ms_total = 0,
         .scan_input_policy = scan_input_policy.current(),
-        .resource_profile = profile,
         .capture_scan_open_timing = scan_timing.captureOpenTiming(),
         .capture_linux_dominant_attribution = linuxDominantAttributionEnabled(),
         .capture_discovery_skip_bytes = discoverySkipBytesEnabled(),
@@ -343,13 +341,12 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         refreshStats(&report);
         return report;
     }
-    const thread_count = effectiveThreadCount(report.resource_profile, request, active_files.len);
+    const thread_count = effectiveThreadCount(request, active_files.len);
     report.outer_scan_threads = thread_count;
 
-    // Shuffle file list to distribute NTFS directory lock contention across threads.
-    // Without shuffle, depth-first ordering causes all threads to contend on the same
-    // directory's FCB lock in NtCreateFile -- overhead inflates 13.6x at 32 threads.
-    // Only for parallel mode: single-threaded benefits from sequential FS locality.
+    // Shuffle file order to keep workers away from the same NTFS directory
+    // control block. Even two concurrent walkers regress when they repeatedly
+    // claim adjacent depth-first entries from one directory.
     if (thread_count > 1 and !request.stable_output) shuffleFiles(active_files);
     const discovered: []const DiscoveredFile = active_files;
     if (discovered.len == 0) {
@@ -395,7 +392,7 @@ fn scanPreparedFiles(
 ) !void {
     nt_open.initCwdPrefix(io);
     const scan_started = std.Io.Timestamp.now(io, .awake);
-    const thread_count = effectiveThreadCount(report.resource_profile, request, active_files.len);
+    const thread_count = effectiveThreadCount(request, active_files.len);
     report.outer_scan_threads = thread_count;
     if (thread_count > 1 and !request.stable_output) shuffleFiles(active_files);
     const discovered: []const DiscoveredFile = active_files;
@@ -448,18 +445,13 @@ fn scanPreparedHitPrefixFiles(
 ///   600 files -> 24 threads
 ///  1000 files -> 31 threads
 ///  5000 files -> capped at cpu count
-fn effectiveThreadCount(profile: resource_profile.Profile, request: cli.SearchRequest, file_count: usize) usize {
-    if (request.threads) |threads| return @max(threads, 1);
+fn effectiveThreadCount(request: cli.SearchRequest, file_count: usize) usize {
     const cpus = availableThreads();
-    if (file_count <= 4) return @min(cpus, @max(file_count, 1));
-    if (file_count <= 32) return @min(cpus, profile.smallCorpusThreadCap(cpus));
-    if (file_count >= 4096) {
-        const reserve = profile.largeCorpusThreadReserve(cpus);
-        if (reserve > 0 and cpus > reserve) return cpus - reserve;
-    }
+    if (request.threads) |threads| return resource_profile.clampThreads(threads, cpus);
+    if (file_count <= 4) return resource_profile.clampThreads(@max(file_count, 1), cpus);
     const sqrt_files = std.math.sqrt(@as(f64, @floatFromInt(file_count)));
     const scaled: usize = @intFromFloat(@min(sqrt_files, @as(f64, @floatFromInt(cpus))));
-    return @max(scaled, 4);
+    return resource_profile.clampThreads(@max(scaled, 1), cpus);
 }
 
 /// A discovered file entry -- path is arena-allocated and lives for the
@@ -2430,7 +2422,7 @@ fn skippedFileBytes(io: std.Io, path: []const u8) usize {
 
 fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) bool {
     if (request.max_hits != null and !request.stats_only and !request.stable_output) return false;
-    const requested_threads = request.threads orelse defaultParallelDiscoveryThreadBudget(resource_profile.current(), request);
+    const requested_threads = boundedRequestedThreads(request.threads, defaultParallelDiscoveryThreadBudget(request));
     if (requested_threads <= 1) return false;
     if (roots.count == 0) return false;
     for (roots.items[0..roots.count]) |root| {
@@ -2439,9 +2431,15 @@ fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) 
     return true;
 }
 
-fn defaultParallelDiscoveryThreadBudget(profile: resource_profile.Profile, request: cli.SearchRequest) usize {
+fn defaultParallelDiscoveryThreadBudget(request: cli.SearchRequest) usize {
     if (!request.stats_only and !request.stable_output) return 1;
-    return profile.discoveryThreadCap(availableThreads());
+    return resource_profile.threadLimit(availableThreads());
+}
+
+/// Centralizes explicit/default thread clamping so discovery cannot diverge
+/// from scan and byte-shard enforcement.
+fn boundedRequestedThreads(requested: ?usize, default: usize) usize {
+    return resource_profile.clampThreads(requested orelse default, availableThreads());
 }
 
 fn rootsAllProtectedWindows(roots: PreparedRoots) bool {
@@ -2475,7 +2473,7 @@ fn discoverRootsParallelTopLevel(
     const top_dir_items = top_dirs.mutableItems();
     if (top_dir_items.len == 0) return true;
 
-    const requested_threads = request.threads orelse defaultParallelDiscoveryThreadBudget(resource_profile.current(), request);
+    const requested_threads = boundedRequestedThreads(request.threads, defaultParallelDiscoveryThreadBudget(request));
     const actual_threads = @min(@max(requested_threads, 1), top_dir_items.len);
     if (actual_threads <= 1 or top_dir_items.len < 2) {
         var disabled_admission = path_admission.Engine.init(allocator, false);
@@ -2731,7 +2729,6 @@ const ShardReport = struct {
     scan_file_mmap_ms_total: f64 = 0,
     scan_file_buffered_ms_total: f64 = 0,
     scan_input_policy: scan_input_policy.Mode = .auto,
-    resource_profile: resource_profile.Profile = .low,
     capture_scan_open_timing: bool,
     capture_linux_dominant_attribution: bool,
     acceleration_bailouts: usize,
@@ -2756,6 +2753,7 @@ const ShardReport = struct {
     evidence_skipped_files: usize,
     evidence_had_error: bool,
     access_errors: core_stats.AccessErrorStats,
+    scan_buffer: []u8,
 
     const empty: ShardReport = .{
         .bytes_scanned = 0,
@@ -2792,8 +2790,8 @@ const ShardReport = struct {
         .evidence_skipped_files = 0,
         .evidence_had_error = false,
         .access_errors = .{},
+        .scan_buffer = &.{},
         .scan_input_policy = .auto,
-        .resource_profile = .low,
     };
 };
 
@@ -2880,6 +2878,7 @@ fn scanDiscoveredFile(
     trigram_program: *const TrigramAdmissionProgram,
     report: *SearchReport,
 ) anyerror!void {
+    if (report.scan_buffer.len == 0) report.scan_buffer = try allocator.alloc(u8, SCAN_READ_BUFFER_SIZE);
     if (shouldSkipProtectedBinaryContainer(request, display_path)) {
         report.files_skipped += 1;
         report.stats.admission.protected_entries_skipped += 1;
@@ -3071,7 +3070,7 @@ fn scanFileMmap(
     }
 
     if (request.stats_only and shouldRunByteShardBeforeAdmission(plan)) {
-        if (tryByteShardFastCount(io, allocator, shard.resource_profile, request, plan, data, &shard.byte_shard_stats, &shard.fast_count_density_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
+        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.fast_count_density_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
             if (linux_dominant_target) recordLinuxDominantFileActivation(shard);
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
@@ -3103,7 +3102,7 @@ fn scanFileMmap(
     // For casefold-literal patterns in stats_only mode, this handles the
     // case-insensitive counting without buffer modification.
     if (request.stats_only) {
-        if (tryByteShardFastCount(io, allocator, shard.resource_profile, request, plan, data, &shard.byte_shard_stats, &shard.fast_count_density_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
+        if (tryByteShardFastCount(io, allocator, request, plan, data, &shard.byte_shard_stats, &shard.fast_count_density_stats, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
             if (linux_dominant_target) recordLinuxDominantFileActivation(shard);
             shard.matches_found += count;
             recordEvidenceCandidate(shard, display_path);
@@ -3186,7 +3185,6 @@ fn trySerialMmapFastPath(
     shard.capture_scan_open_timing = report.capture_scan_open_timing;
     shard.capture_linux_dominant_attribution = report.capture_linux_dominant_attribution;
     shard.scan_input_policy = report.scan_input_policy;
-    shard.resource_profile = report.resource_profile;
     scanFileMmap(null, io, allocator, file, display_path, request, plan, trigram_admission, trigram_program, &shard, file_started) catch return false;
     var shards = [_]ShardReport{shard};
     mergeShardsIntoReport(shards[0..], request, report);
@@ -3284,7 +3282,6 @@ const ByteShardJob = struct {
 fn tryByteShardFastCount(
     io: std.Io,
     allocator: std.mem.Allocator,
-    profile: resource_profile.Profile,
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
     data: []const u8,
@@ -3303,7 +3300,10 @@ fn tryByteShardFastCount(
     };
     if (data.len < min_file_bytes) return null;
 
-    const requested_threads = request.threads orelse defaultByteShardThreadBudget(profile, availableThreads());
+    const requested_threads = resource_profile.clampThreads(
+        request.threads orelse defaultByteShardThreadBudget(availableThreads()),
+        availableThreads(),
+    );
     const max_threads = @max(@as(usize, 1), requested_threads);
     const min_range_bytes: usize = switch (shard_plan.strategy) {
         .word_boundary_line => BYTE_SHARD_WORD_BOUNDARY_MIN_RANGE_BYTES,
@@ -3434,8 +3434,8 @@ fn tryByteShardFastCount(
     return total;
 }
 
-fn defaultByteShardThreadBudget(profile: resource_profile.Profile, available: usize) usize {
-    return profile.byteShardThreadCap(available, BYTE_SHARD_DEFAULT_MAX_RANGES);
+fn defaultByteShardThreadBudget(available: usize) usize {
+    return resource_profile.clampThreads(BYTE_SHARD_DEFAULT_MAX_RANGES, available);
 }
 
 fn byteShardWorker(job: *ByteShardJob) void {
@@ -3628,7 +3628,8 @@ fn scanOpenFileIntoShardImpl(
     shard: *ShardReport,
     file_started: std.Io.Timestamp,
 ) anyerror!void {
-    var read_buffer: [SCAN_READ_BUFFER_SIZE]u8 = undefined;
+    const read_buffer = shard.scan_buffer;
+    if (read_buffer.len != SCAN_READ_BUFFER_SIZE) return error.OutOfMemory;
 
     // Read a full first chunk up front. Most files in the scan corpus fit in
     // the buffer, so this avoids a metadata length query and the second read
@@ -3959,6 +3960,12 @@ fn recordLineIntoShard(
 /// Worker thread entry point. For single-predicate plans, dispatches to a
 /// comptime-monomorphized file loop where per-line match overhead is zero.
 fn shardWorker(io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    const scan_buffer = allocator.alloc(u8, SCAN_READ_BUFFER_SIZE) catch {
+        shard.had_error = true;
+        return;
+    };
+    defer allocator.free(scan_buffer);
+    shard.scan_buffer = scan_buffer;
     if (plan.predicate_count == 1) {
         dispatchMonoShardLoop(io, allocator, files, request, plan, trigram_admission, trigram_program, shard);
     } else {
@@ -3978,6 +3985,12 @@ fn shardWorkerTimed(io: std.Io, allocator: std.mem.Allocator, files: []const Dis
 }
 
 fn dynamicShardWorker(io: std.Io, allocator: std.mem.Allocator, next_file: *usize, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
+    const scan_buffer = allocator.alloc(u8, SCAN_READ_BUFFER_SIZE) catch {
+        shard.had_error = true;
+        return;
+    };
+    defer allocator.free(scan_buffer);
+    shard.scan_buffer = scan_buffer;
     if (plan.predicate_count == 1) {
         dispatchMonoDynamicLoop(io, allocator, next_file, files, request, plan, trigram_admission, trigram_program, shard);
     } else {
@@ -4146,7 +4159,10 @@ fn parallelScanFiles(
     const shards = try allocator.alloc(ShardReport, actual_threads);
     for (shards) |*shard| shard.* = initShardReport(report.*, evidence_runtime, allocator);
 
-    if (!request.stable_output and shouldUseDynamicWorkClaim(plan, files.len)) {
+    // At the two-worker framework ceiling, static halves avoid one atomic
+    // claim per file and preserve a stable ownership frontier. Dynamic load
+    // balancing remains valuable only once enough workers can absorb skew.
+    if (actual_threads > 2 and !request.stable_output and shouldUseDynamicWorkClaim(plan, files.len)) {
         var next_file: usize = 0;
         const threads = try allocator.alloc(std.Thread, worker_count);
         for (0..worker_count) |i| {
@@ -4197,7 +4213,6 @@ fn initShardReport(report: SearchReport, evidence_runtime: EvidenceFrontierRunti
     shard.capture_scan_open_timing = report.capture_scan_open_timing;
     shard.capture_linux_dominant_attribution = report.capture_linux_dominant_attribution;
     shard.scan_input_policy = report.scan_input_policy;
-    shard.resource_profile = report.resource_profile;
     if (evidence_runtime.enabled) {
         shard.evidence_capture = true;
         shard.evidence_allocator = allocator;
@@ -4429,6 +4444,7 @@ fn refreshStats(report: *SearchReport) void {
         .available = memory_snapshot.available,
         .current_resident_bytes = memory_snapshot.current_resident_bytes,
         .peak_resident_bytes = memory_snapshot.peak_resident_bytes,
+        .allocation_limit_bytes = resource_profile.memoryLimitBytes(),
     };
     const byte_sharded = report.stats.byte_shard_kernel.enabled;
     const byte_shard_ranges = if (report.stats.byte_shard_kernel.files_profiled > 0)
@@ -4441,9 +4457,10 @@ fn refreshStats(report: *SearchReport) void {
         0;
     report.stats.concurrency = .{
         .available_threads = report.available_threads,
+        .thread_limit = resource_profile.threadLimit(report.available_threads),
         .outer_scan_threads = report.outer_scan_threads,
         .execution_mode = if (byte_sharded) "byte_sharded" else "materialized",
-        .resource_profile = report.resource_profile.label(),
+        .resource_policy = "hardware_5_percent",
         .scan_input_policy = report.scan_input_policy.label(),
         .sharding_enabled = byte_sharded,
         .sharded_files = report.stats.byte_shard_kernel.files_profiled,
@@ -4713,11 +4730,12 @@ fn scanOpenFile(
     report: *SearchReport,
     file_started: std.Io.Timestamp,
 ) anyerror!void {
-    var read_buffer: [SCAN_READ_BUFFER_SIZE]u8 = undefined;
+    const read_buffer = report.scan_buffer;
+    if (read_buffer.len != SCAN_READ_BUFFER_SIZE) return error.OutOfMemory;
 
     // Read first chunk before length lookup. Single-shot positional read avoids
     // the retry syscall that readPositionalAll pays on sub-1MiB files.
-    const first_read = try file.readPositional(io, &.{&read_buffer}, 0);
+    const first_read = try file.readPositional(io, &.{read_buffer}, 0);
     if (first_read == 0) {
         report.files_scanned += 1;
         try recordLine(allocator, display_path, "", 1, request, plan, report, false);
@@ -6253,10 +6271,9 @@ test "fixed word whitespace chain fast count matches regex count semantics" {
     try std.testing.expect(fixedWordWhitespaceChain("\\d{5}\\s+\\w{5}") == null);
 }
 
-test "byte shard default fanout caps implicit hardware thread count" {
-    try std.testing.expectEqual(@as(usize, BYTE_SHARD_DEFAULT_MAX_RANGES), defaultByteShardThreadBudget(.low, BYTE_SHARD_DEFAULT_MAX_RANGES + 14));
-    try std.testing.expectEqual(@as(usize, 8), defaultByteShardThreadBudget(.low, 8));
-    try std.testing.expectEqual(@as(usize, BYTE_SHARD_DEFAULT_MAX_RANGES + 14), defaultByteShardThreadBudget(.high, BYTE_SHARD_DEFAULT_MAX_RANGES + 14));
+test "byte shard fanout remains beneath the framework worker ceiling" {
+    try std.testing.expectEqual(@as(usize, 4), defaultByteShardThreadBudget(BYTE_SHARD_DEFAULT_MAX_RANGES + 14));
+    try std.testing.expectEqual(@as(usize, 1), defaultByteShardThreadBudget(8));
 }
 
 test "regex decomposition fast count verifies mandatory literal candidate lines" {

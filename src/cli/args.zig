@@ -3,6 +3,7 @@ const command_spec = @import("command_spec.zig");
 
 pub const MAX_SEARCH_PATHS = 128;
 pub const MAX_IGNORE_FILES = 32;
+pub const MAX_XO_SPANS = 128;
 
 pub const CommandTag = enum {
     help,
@@ -12,6 +13,7 @@ pub const CommandTag = enum {
     explain,
     process,
     similar,
+    xo,
     nexus,
     indexd,
 };
@@ -24,6 +26,7 @@ pub const HelpTopic = enum {
     explain,
     process,
     similar,
+    xo,
 };
 
 pub const SearchRequest = struct {
@@ -139,6 +142,17 @@ pub const SimilarRequest = struct {
     cursor_request_fingerprint: ?u64 = null,
 };
 
+pub const XoFormat = enum { grouped, json };
+
+pub const XoRequest = struct {
+    query: []const u8,
+    paths: [MAX_SEARCH_PATHS][]const u8,
+    path_count: usize,
+    max_bytes: usize = 8000,
+    max_spans: usize = 12,
+    format: XoFormat = .grouped,
+};
+
 pub const Command = union(CommandTag) {
     help: HelpTopic,
     search: SearchRequest,
@@ -147,6 +161,7 @@ pub const Command = union(CommandTag) {
     explain: ExplainRequest,
     process: ProcessRequest,
     similar: SimilarRequest,
+    xo: XoRequest,
     nexus: SearchRequest,
     indexd: IndexdRequest,
 };
@@ -199,6 +214,10 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .similar } };
         return .{ .command = .{ .similar = try parseSimilar(argv[2..]) } };
     }
+    if (std.mem.eql(u8, first, "xo")) {
+        if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .xo } };
+        return .{ .command = .{ .xo = try parseXo(argv[2..]) } };
+    }
     if (std.mem.eql(u8, first, "__ix_nexus")) {
         var request = try parseSearch(argv[2..]);
         request.stats_only = true;
@@ -234,6 +253,7 @@ fn helpTopic(arg: []const u8) ?HelpTopic {
     if (std.mem.eql(u8, arg, "explain")) return .explain;
     if (std.mem.eql(u8, arg, "process")) return .process;
     if (std.mem.eql(u8, arg, "similar")) return .similar;
+    if (std.mem.eql(u8, arg, "xo")) return .xo;
     return null;
 }
 
@@ -323,6 +343,49 @@ fn parseSimilar(args: []const []const u8) ParseError!SimilarRequest {
     if (request.path_count == 0) return ParseError.MissingValue;
     if (request.cursor != null and request.output_format == .text) request.output_format = .agent_v3;
     if (request.cursor != null and request.output_format != .agent_v3 and request.output_format != .json_compact) return ParseError.ConflictingOutputFormat;
+    return request;
+}
+
+/// Parses the bounded insight lane independently from exact search and inspect grammars.
+fn parseXo(args: []const []const u8) ParseError!XoRequest {
+    if (args.len == 0) return ParseError.MissingExpression;
+    var request = XoRequest{ .query = "", .paths = undefined, .path_count = 0 };
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--json")) {
+            request.format = .json;
+        } else if (std.mem.eql(u8, arg, "--format")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            if (std.mem.eql(u8, args[index], "grouped")) request.format = .grouped else if (std.mem.eql(u8, args[index], "json")) request.format = .json else return ParseError.UnsupportedFlag;
+        } else if (std.mem.eql(u8, arg, "--max-bytes")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.max_bytes = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
+            if (request.max_bytes == 0) return ParseError.MissingValue;
+        } else if (std.mem.startsWith(u8, arg, "--max-bytes=")) {
+            request.max_bytes = std.fmt.parseInt(usize, arg["--max-bytes=".len..], 10) catch return ParseError.MissingValue;
+            if (request.max_bytes == 0) return ParseError.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--max-spans")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.max_spans = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
+            if (request.max_spans == 0 or request.max_spans > MAX_XO_SPANS) return ParseError.MissingValue;
+        } else if (std.mem.startsWith(u8, arg, "--max-spans=")) {
+            request.max_spans = std.fmt.parseInt(usize, arg["--max-spans=".len..], 10) catch return ParseError.MissingValue;
+            if (request.max_spans == 0 or request.max_spans > MAX_XO_SPANS) return ParseError.MissingValue;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return ParseError.UnsupportedFlag;
+        } else if (request.query.len == 0) {
+            request.query = arg;
+        } else {
+            if (request.path_count >= MAX_SEARCH_PATHS) return ParseError.MissingValue;
+            request.paths[request.path_count] = normalizePathArgument(arg);
+            request.path_count += 1;
+        }
+    }
+    if (request.query.len == 0 or request.path_count == 0) return ParseError.MissingValue;
     return request;
 }
 
@@ -1042,4 +1105,15 @@ test "similar parses bounded versioned frontier controls" {
 
     const conflicting = [_][]const u8{ "ix-zig", "similar", "cache", "src", "--agent", "--json" };
     try std.testing.expectError(ParseError.ConflictingOutputFormat, parseInvocation(std.testing.allocator, &conflicting));
+}
+
+test "xo parses bounded grouped insight request" {
+    const argv = [_][]const u8{
+        "ix-zig", "xo", "agentSimulation worker events", "src", "--max-bytes", "4096", "--max-spans", "7", "--format", "json",
+    };
+    const request = (try parseInvocation(std.testing.allocator, &argv)).command.xo;
+    try std.testing.expectEqualStrings("agentSimulation worker events", request.query);
+    try std.testing.expectEqual(@as(usize, 4096), request.max_bytes);
+    try std.testing.expectEqual(@as(usize, 7), request.max_spans);
+    try std.testing.expectEqual(XoFormat.json, request.format);
 }

@@ -43,11 +43,16 @@ function Get-EvidenceIdentity($Json) {
   }
 }
 
-function Invoke-IxSearch($Bin, $Engine, $Profile, [bool]$DisableNexus, [int]$Sample) {
+function Invoke-IxSearch($Bin, $Engine, $Profile, [bool]$DisableNexus, [bool]$DisableIndex, [int]$Sample) {
   if ($DisableNexus) {
     $env:IX_NEXUS = "0"
   } else {
     Remove-Item Env:\IX_NEXUS -ErrorAction SilentlyContinue
+  }
+  if ($DisableIndex) {
+    $env:IX_INDEX = "0"
+  } else {
+    Remove-Item Env:\IX_INDEX -ErrorAction SilentlyContinue
   }
 
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -57,6 +62,7 @@ function Invoke-IxSearch($Bin, $Engine, $Profile, [bool]$DisableNexus, [int]$Sam
   $code = $LASTEXITCODE
   $sw.Stop()
   Remove-Item Env:\IX_NEXUS -ErrorAction SilentlyContinue
+  Remove-Item Env:\IX_INDEX -ErrorAction SilentlyContinue
 
   if ($code -ne 0) {
     return [pscustomobject]@{
@@ -240,25 +246,45 @@ $expectedBinaryHashes = @{
   zig = (Get-FileHash -LiteralPath $ZigBin -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
+function Wait-WarmRoute($Bin, $Profile, $Process, [int]$TimeoutSeconds = 60) {
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  do {
+    if ($Process.HasExited) { throw "indexd exited before the warm benchmark lane became ready" }
+    $raw = & $Bin search $Profile.expr $Profile.corpus --format json-compact 2>$null
+    if ($LASTEXITCODE -eq 0) {
+      $result = ($raw -join "`n") | ConvertFrom-Json
+      if ($result.route.lane -eq "warm") { return }
+    }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $deadline)
+  throw "warm benchmark lane did not become ready within $TimeoutSeconds seconds"
+}
+
 $rows = New-Object System.Collections.Generic.List[object]
+$indexd = $null
+try {
 foreach ($profile in $profiles) {
   for ($i = 1; $i -le $ColdRuns; $i++) {
-    $row = Invoke-IxSearch $RustBin "rust" $profile $false $i
+    $row = Invoke-IxSearch $RustBin "rust" $profile $false $true $i
     $rows.Add($row)
     Write-Host ("{0} rust #{1}: total={2} wall={3} discover={4} scan={5} matches={6}" -f $profile.name, $i, $row.total_ms, $row.wall_ms, $row.discover_ms, $row.scan_ms, $row.matches)
   }
   for ($i = 1; $i -le $ColdRuns; $i++) {
-    $row = Invoke-IxSearch $ZigBin "zig_cold_nexus_off" $profile $true $i
+    $row = Invoke-IxSearch $ZigBin "zig_cold_nexus_off" $profile $true $true $i
     $rows.Add($row)
     Write-Host ("{0} zig cold #{1}: total={2} wall={3} discover={4} scan={5} matches={6} pruned={7}" -f $profile.name, $i, $row.total_ms, $row.wall_ms, $row.discover_ms, $row.scan_ms, $row.matches, $row.pruned)
   }
+  if ($null -eq $indexd) {
+    $indexd = Start-Process -FilePath $ZigBin -ArgumentList @("__ix_indexd", $LinuxCorpus, "--foreground") -WindowStyle Hidden -PassThru
+  }
+  Wait-WarmRoute $ZigBin $profile $indexd
   for ($i = 1; $i -le $TransitionRuns; $i++) {
-    $row = Invoke-IxSearch $ZigBin "zig_transition_default" $profile $false $i
+    $row = Invoke-IxSearch $ZigBin "zig_transition_default" $profile $false $false $i
     $rows.Add($row)
     Write-Host ("{0} zig transition #{1}: total={2} wall={3} discover={4} scan={5} matches={6} pruned={7}" -f $profile.name, $i, $row.total_ms, $row.wall_ms, $row.discover_ms, $row.scan_ms, $row.matches, $row.pruned)
   }
   for ($i = 1; $i -le $SteadyRuns; $i++) {
-    $row = Invoke-IxSearch $ZigBin "zig_steady_hot" $profile $false $i
+    $row = Invoke-IxSearch $ZigBin "zig_steady_hot" $profile $false $false $i
     $rows.Add($row)
     Write-Host ("{0} zig steady #{1}: total={2} wall={3} discover={4} scan={5} matches={6} pruned={7}" -f $profile.name, $i, $row.total_ms, $row.wall_ms, $row.discover_ms, $row.scan_ms, $row.matches, $row.pruned)
   }
@@ -334,3 +360,11 @@ $reportPath = Join-Path $dir "summary.json"
 } | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $reportPath -Encoding UTF8
 
 Write-Host "REPORT $reportPath"
+} finally {
+  Remove-Item Env:\IX_NEXUS -ErrorAction SilentlyContinue
+  Remove-Item Env:\IX_INDEX -ErrorAction SilentlyContinue
+  if ($null -ne $indexd -and -not $indexd.HasExited) {
+    Stop-Process -Id $indexd.Id -Force -ErrorAction SilentlyContinue
+    $indexd.WaitForExit()
+  }
+}

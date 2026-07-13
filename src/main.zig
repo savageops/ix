@@ -11,6 +11,8 @@ const process_tool = @import("core/process_tool.zig");
 const pcre_regex = @import("core/pcre_regex.zig");
 const search = @import("core/search.zig");
 const similar = @import("core/similar.zig");
+const resource_profile = @import("core/resource_profile.zig");
+const xo = @import("core/xo.zig");
 
 const NEXUS_MIN_BUILD_FRONTIER_FILES: usize = 4096;
 
@@ -33,7 +35,6 @@ test {
     _ = @import("core/usn.zig");
     _ = @import("core/shift_or.zig");
     _ = @import("core/fm_index.zig");
-    _ = @import("core/iocp_batch.zig");
     _ = @import("core/preview.zig");
     _ = @import("cli/command_spec.zig");
     _ = @import("cli/cursor.zig");
@@ -50,11 +51,14 @@ test {
 /// pipeline at crates/iex-cli/src/main.rs.
 ///
 /// MEMORY STRATEGY:
-/// Uses Zig's arena allocator from process init for short-lived command paths.
-/// The hidden indexd watch command is long-lived and switches to a freeing
-/// allocator at dispatch so regeneration cycles can release indexed buffers.
+/// Every command shares one accounting allocator capped at 5% of detected
+/// physical memory. Long-lived and short-lived lanes therefore obey the same
+/// owner instead of maintaining command-specific ceilings.
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.arena.allocator();
+    var framework_budget = resource_profile.CappedAllocator.init(std.heap.page_allocator, resource_profile.memoryLimitBytes());
+    var framework_arena = std.heap.ArenaAllocator.init(framework_budget.allocator());
+    defer framework_arena.deinit();
+    const allocator = framework_arena.allocator();
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(init.io, &stdout_buffer);
@@ -260,6 +264,18 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
         },
+        .xo => |request| {
+            xo.run(init.io, allocator, request, stdout) catch |err| {
+                if (err == error.ByteBudgetTooSmall)
+                    try output.writeError(stderr, "byte_budget_too_small", "increase --max-bytes; the budget cannot fit one complete insight span")
+                else if (err == error.OutOfMemory)
+                    try output.writeError(stderr, "xo_resource_limit", "the command reached the framework-wide 5% memory ceiling")
+                else
+                    try output.writeError(stderr, "xo_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
+        },
         .nexus => |request| {
             const effective_request = request;
             const plan = parseExpression(effective_request.expression) catch std.process.exit(0);
@@ -267,7 +283,9 @@ pub fn main(init: std.process.Init) !void {
             search.holdEvidenceFrontierLive(init.io, allocator, effective_request, plan);
         },
         .indexd => |request| {
-            _ = indexd.run(init.io, indexdCommandAllocator(), .{
+            // The daemon frees generation-owned buffers between refreshes;
+            // use the same capped owner directly rather than the command arena.
+            _ = indexd.run(init.io, framework_budget.allocator(), .{
                 .root = request.root,
                 .foreground = request.foreground,
                 .once = request.once,
@@ -294,10 +312,6 @@ fn parseExpression(source: []const u8) !expr.ExpressionPlan {
 test "expression validation rejects malformed regex before search" {
     try std.testing.expectError(error.CompileFailed, parseExpression("re:["));
     _ = try parseExpression("re:needle-[0-9]+");
-}
-
-fn indexdCommandAllocator() std.mem.Allocator {
-    return std.heap.page_allocator;
 }
 
 /// Decodes one opaque cursor at the composition root and keeps the scan owner free of string parsing.
@@ -835,11 +849,12 @@ test "indexd sidecar launch keeps hidden argv shape" {
     try std.testing.expectEqualStrings("E:\\Workspaces\\ix-zig", argv.items[2]);
 }
 
-test "indexd command uses freeing allocator for watch lifecycle" {
-    const allocator = indexdCommandAllocator();
-    try std.testing.expectEqual(std.heap.page_allocator.vtable, allocator.vtable);
+test "indexd command shares the framework allocator owner" {
+    var budget = resource_profile.CappedAllocator.init(std.testing.allocator, 4096);
+    const allocator = budget.allocator();
     const bytes = try allocator.alloc(u8, 4096);
     allocator.free(bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.usedBytes());
 }
 
 fn testSearchReportForSidecar(pruned_files: usize) search.SearchReport {

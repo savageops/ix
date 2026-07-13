@@ -17,6 +17,7 @@ pub fn writeHelp(writer: anytype, topic: cli.HelpTopic) !void {
         .explain => writeExplainHelp(writer),
         .process => writeProcessHelp(writer),
         .similar => writeSimilarHelp(writer),
+        .xo => writeXoHelp(writer),
     };
 }
 
@@ -29,6 +30,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\Commands:
         \\  search   Find matches in files
         \\  similar  Semantic similarity ranking (requires IX_AI_API_KEY)
+        \\  xo       Context-guided insight spans for agents
         \\  inspect  Read-only file windows and match context
         \\  explain  Expression plan JSON
         \\  process  State-dir inspection and cleanup
@@ -72,7 +74,27 @@ fn writeTopHelp(writer: anytype) !void {
         \\  ix similar "cancellation pattern" apps/src --agent
         \\  ix similar "transport closure" apps/src --anti --max-results 10
         \\  ix inspect src/main.zig --range 40:80
+        \\  ix xo "agentSimulation code with system administration ENV_VAR and a function for worker events" src
         \\  ix explain 'lit:auth && re:token_\d+'
+        \\
+    );
+}
+
+/// Teaches the one-call context workflow and its grouped-versus-machine projections.
+fn writeXoHelp(writer: anytype) !void {
+    try writer.writeAll(
+        \\Context-guided insight spans for agent reading.
+        \\
+        \\Usage: ix xo [OPTIONS] <QUERY> <PATH>...
+        \\
+        \\The query guides bounded context selection; this lane is separate from search.
+        \\Grouped output reduces repeated paths while preserving narrative order. JSON is for programs.
+        \\
+        \\Options:
+        \\  --max-bytes N       Output budget (default: 8000)
+        \\  --max-spans N       Maximum context spans (default: 12)
+        \\  --format grouped|json
+        \\  --json              Equivalent to --format json
         \\
     );
 }
@@ -558,8 +580,8 @@ pub fn writeStats(writer: anytype, stats: core_stats.SearchStats, visibility: ou
             try writeAdmissionJson(writer, stats.admission);
             try writer.writeAll(",");
             try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"scan_open_ms_total\":{d},\"scan_file_ms_total\":{d},\"scan_file_mmap_ms_total\":{d},\"scan_file_buffered_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ stats.timings.discover_ms, stats.timings.scan_ms, stats.timings.aggregate_ms, stats.timings.total_ms, stats.timings.scan_work_ms_total, stats.timings.scan_open_ms_total, stats.timings.scan_file_ms_total, stats.timings.scan_file_mmap_ms_total, stats.timings.scan_file_buffered_ms_total, stats.timings.aggregate_merge_ms, stats.timings.aggregate_finalize_ms });
-            try writer.print("\"process_memory\":{{\"available\":{s},\"current_resident_bytes\":{},\"peak_resident_bytes\":{}}},", .{ boolText(stats.process_memory.available), stats.process_memory.current_resident_bytes, stats.process_memory.peak_resident_bytes });
-            try writer.print("\"concurrency\":{{\"available_threads\":{},\"outer_scan_threads\":{},\"execution_mode\":\"{s}\",\"resource_profile\":\"{s}\",\"scan_input_policy\":\"{s}\",\"sharding_enabled\":{s},\"sharded_files\":{},\"max_shard_threads\":{},\"max_shard_ranges\":{},\"max_shard_chunk_bytes\":{}}},", .{ stats.concurrency.available_threads, stats.concurrency.outer_scan_threads, stats.concurrency.execution_mode, stats.concurrency.resource_profile, stats.concurrency.scan_input_policy, boolText(stats.concurrency.sharding_enabled), stats.concurrency.sharded_files, stats.concurrency.max_shard_threads, stats.concurrency.max_shard_ranges, stats.concurrency.max_shard_chunk_bytes });
+            try writer.print("\"process_memory\":{{\"available\":{s},\"current_resident_bytes\":{},\"peak_resident_bytes\":{},\"allocation_limit_bytes\":{}}},", .{ boolText(stats.process_memory.available), stats.process_memory.current_resident_bytes, stats.process_memory.peak_resident_bytes, stats.process_memory.allocation_limit_bytes });
+            try writer.print("\"concurrency\":{{\"available_threads\":{},\"thread_limit\":{},\"outer_scan_threads\":{},\"execution_mode\":\"{s}\",\"resource_policy\":\"{s}\",\"scan_input_policy\":\"{s}\",\"sharding_enabled\":{s},\"sharded_files\":{},\"max_shard_threads\":{},\"max_shard_ranges\":{},\"max_shard_chunk_bytes\":{}}},", .{ stats.concurrency.available_threads, stats.concurrency.thread_limit, stats.concurrency.outer_scan_threads, stats.concurrency.execution_mode, stats.concurrency.resource_policy, stats.concurrency.scan_input_policy, boolText(stats.concurrency.sharding_enabled), stats.concurrency.sharded_files, stats.concurrency.max_shard_threads, stats.concurrency.max_shard_ranges, stats.concurrency.max_shard_chunk_bytes });
             try writer.writeAll("\"slowest_files\":[");
             for (stats.slowest_files[0..stats.slowest_file_count], 0..) |slowest, index| {
                 if (index != 0) try writer.writeAll(",");
@@ -1287,7 +1309,7 @@ test "search json emits bounded slowest file attribution list" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_file_mmap_ms_total\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_file_buffered_ms_total\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_input_policy\":\"auto\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"resource_profile\":\"low\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"resource_policy\":\"hardware_5_percent\"") != null);
     const slow_index = std.mem.indexOf(u8, out, "\"path\":\"slow.h\"") orelse return error.MissingSlowFile;
     const fast_index = std.mem.indexOf(u8, out, "\"path\":\"fast.h\"") orelse return error.MissingFastFile;
 

@@ -151,7 +151,7 @@ pub fn run(
     if (candidate_document_count == 0) {
         if (isVersioned(request.output_format)) {
             const next_cursor = try semanticNextCursor(allocator, candidates, frontier_order, frontier_end, corpus_signature, request_fingerprint);
-            try writeVersionedResult(writer, request, query, corpus_signature, request_fingerprint, coverage, &.{}, 0, next_cursor, null);
+            try writeVersionedResult(writer, request, config, query, corpus_signature, request_fingerprint, coverage, &.{}, 0, next_cursor, null);
             return;
         }
         return error.MissingValue;
@@ -174,7 +174,7 @@ pub fn run(
         .model = config.embedding_model,
         .input = inputs,
         .encoding_format = "float",
-    })) catch |err| return reportSemanticFailure(writer, request, query, corpus_signature, request_fingerprint, coverage, "embedding", err);
+    })) catch |err| return reportSemanticFailure(writer, request, config, query, corpus_signature, request_fingerprint, coverage, "embedding", err);
     defer allocator.free(embedding_response);
     const embeddings = try parseEmbeddings(allocator, embedding_response, documents.len);
     for (documents, 0..) |*document, index| document.embedding = embeddings[index];
@@ -188,7 +188,7 @@ pub fn run(
             .model = config.embedding_model,
             .input = &query_input,
             .encoding_format = "float",
-        })) catch |err| return reportSemanticFailure(writer, request, query, corpus_signature, request_fingerprint, coverage, "query_embedding", err);
+        })) catch |err| return reportSemanticFailure(writer, request, config, query, corpus_signature, request_fingerprint, coverage, "query_embedding", err);
         defer allocator.free(query_response);
         const query_embeddings = try parseEmbeddings(allocator, query_response, 1);
         break :blk query_embeddings[0];
@@ -214,7 +214,7 @@ pub fn run(
     const rerank_response = postJson(io, allocator, rerank_url, key, try jsonPayload(allocator, .{
         .query = if (query_is_file) documents[0].text else query,
         .documents = rerank_documents,
-    })) catch |err| return reportSemanticFailure(writer, request, query, corpus_signature, request_fingerprint, coverage, "rerank", err);
+    })) catch |err| return reportSemanticFailure(writer, request, config, query, corpus_signature, request_fingerprint, coverage, "rerank", err);
     defer allocator.free(rerank_response);
     const rerank_scores = try parseScores(allocator, rerank_response, candidate_count);
 
@@ -239,7 +239,7 @@ pub fn run(
 
     // Output. Legacy surfaces remain byte-compatible; the versioned surface owns coverage.
     if (isVersioned(request.output_format)) {
-        try writeVersionedResult(writer, request, query, corpus_signature, request_fingerprint, coverage, results, count, next_cursor, null);
+        try writeVersionedResult(writer, request, config, query, corpus_signature, request_fingerprint, coverage, results, count, next_cursor, null);
     } else if (request.output_format == .agent_v2) {
         try writeAgentResult(writer, query, request.anti, results, count);
     } else if (request.json) {
@@ -531,6 +531,7 @@ fn semanticNextCursor(
 fn writeVersionedResult(
     writer: anytype,
     request: cli.SimilarRequest,
+    config: Config,
     query: []const u8,
     corpus_signature: u64,
     request_fingerprint: u64,
@@ -551,6 +552,20 @@ fn writeVersionedResult(
         corpus_signature,
         request_fingerprint,
     });
+    // Provenance is deliberately descriptive: expose the retrieval recipe, never
+    // credentials or transport identity. This lets agents judge ranking evidence
+    // without turning provider secrets or deployment topology into output data.
+    try writer.writeAll(",\"retrieval\":{\"candidate_strategy\":\"lexical_frontier\",\"provider_class\":\"openai_compatible\",\"embedding_model\":");
+    try writeJsonString(writer, config.embedding_model);
+    try writer.writeAll(",\"rerank_model\":");
+    try writeJsonString(writer, config.rerank_model);
+    try writer.writeAll(",\"passage_unit\":\"whole_file\",\"limits\":{");
+    try writer.print("\"candidate_budget\":{},\"max_results\":{},\"max_file_bytes\":{}", .{
+        request.candidate_budget,
+        request.max_results,
+        MAX_FILE_BYTES,
+    });
+    try writer.writeAll("}}");
     const coverage_partial = coverage.candidates_omitted != 0 or coverage.discovery_errors != 0 or coverage.read_errors != 0;
     try writer.writeAll(",\"coverage\":{\"state\":");
     try writeJsonString(writer, if (coverage_partial) "partial" else "complete");
@@ -604,6 +619,7 @@ fn writeVersionedResult(
 fn reportSemanticFailure(
     writer: anytype,
     request: cli.SimilarRequest,
+    config: Config,
     query: []const u8,
     corpus_signature: u64,
     request_fingerprint: u64,
@@ -612,12 +628,47 @@ fn reportSemanticFailure(
     source_error: anyerror,
 ) !void {
     if (!isVersioned(request.output_format)) return source_error;
-    try writeVersionedResult(writer, request, query, corpus_signature, request_fingerprint, coverage, &.{}, 0, null, .{
+    try writeVersionedResult(writer, request, config, query, corpus_signature, request_fingerprint, coverage, &.{}, 0, null, .{
         .phase = phase,
         .code = "provider_request_failed",
     });
     try writer.flush();
     return error.SemanticFailureReported;
+}
+
+test "versioned similar output records retrieval provenance without transport secrets" {
+    const argv = [_][]const u8{ "ix-zig", "similar", "cache ownership", "src", "--format", "json-compact" };
+    const request = (try cli.parseInvocation(std.testing.allocator, &argv)).command.similar;
+    const coverage = Coverage{
+        .files_eligible = 1,
+        .frontier_start = 0,
+        .candidates_evaluated = 1,
+        .files_read = 1,
+        .chunks_embedded = 1,
+        .bytes_submitted = 12,
+        .candidates_omitted = 0,
+        .skipped_binary = 0,
+        .skipped_empty = 0,
+        .skipped_oversize = 0,
+        .discovery_errors = 0,
+        .read_errors = 0,
+    };
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    const config = Config{
+        .base_url = "https://secret.invalid/v1",
+        .api_key = "never-emit-this",
+        .embedding_model = "embed-test",
+        .rerank_model = "rerank-test",
+    };
+    try writeVersionedResult(&writer, request, config, "cache ownership", 1, 2, coverage, &.{}, 0, null, null);
+    const out = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "candidate_strategy") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "embed-test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "rerank-test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "whole_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "secret.invalid") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "never-emit-this") == null);
 }
 
 /// Uses the canonical JSON stringifier for every public semantic string.
