@@ -38,6 +38,8 @@ function Invoke-IxSearch($Bin, $Engine, $Profile, [bool]$DisableNexus, [int]$Sam
       engine = $Engine
       sample = $Sample
       ok = $false
+      comparison_valid = $false
+      comparison_reason = "process_failed"
       wall_ms = [math]::Round($sw.Elapsed.TotalMilliseconds, 4)
       error = ($out -join "`n")
     }
@@ -59,6 +61,10 @@ function Invoke-IxSearch($Bin, $Engine, $Profile, [bool]$DisableNexus, [int]$Sam
     discovered = [int64]$json.stats.files_discovered
     scanned = [int64]$json.stats.files_scanned
     skipped = [int64]$json.stats.files_skipped
+    access_errors = if ($null -eq $json.stats.access_errors -or $null -eq $json.stats.access_errors.total) { $null } else { [int64]$json.stats.access_errors.total }
+    access_errors_known = $null -ne $json.stats.access_errors -and $null -ne $json.stats.access_errors.total
+    comparison_valid = $false
+    comparison_reason = "pending_parity_check"
     pruned = [int64]$json.stats.trigram_acceleration.pruned_files
     verified = [int64]$json.stats.trigram_acceleration.verified_files
     byte_shard = $json.stats.byte_shard_kernel
@@ -71,9 +77,11 @@ function Invoke-IxSearch($Bin, $Engine, $Profile, [bool]$DisableNexus, [int]$Sam
 }
 
 function Summarize($Rows, $ProfileName, $Engine) {
-  $set = @($Rows | Where-Object { $_.ok -and $_.profile -eq $ProfileName -and $_.engine -eq $Engine })
+  $all = @($Rows | Where-Object { $_.profile -eq $ProfileName -and $_.engine -eq $Engine })
+  $set = @($all | Where-Object { $_.ok -and $_.comparison_valid })
+  $invalid = @($all | Where-Object { -not $_.comparison_valid })
   if ($set.Count -eq 0) {
-    return [pscustomobject]@{ profile = $ProfileName; engine = $Engine; runs = 0 }
+    return [pscustomobject]@{ profile = $ProfileName; engine = $Engine; runs = 0; comparison_invalid_rows = $invalid.Count }
   }
   $first = $set | Select-Object -First 1
   $totals = @($set | ForEach-Object { [double]$_.total_ms })
@@ -86,6 +94,7 @@ function Summarize($Rows, $ProfileName, $Engine) {
     profile = $ProfileName
     engine = $Engine
     runs = $set.Count
+    comparison_invalid_rows = $invalid.Count
     median_total_ms = Median $totals
     best_total_ms = (@($totals | Sort-Object))[0]
     median_wall_ms = Median $walls
@@ -143,6 +152,10 @@ function Compress-Row($Row) {
     discovered = $Row.discovered
     scanned = $Row.scanned
     skipped = $Row.skipped
+    access_errors = $Row.access_errors
+    access_errors_known = $Row.access_errors_known
+    comparison_valid = $Row.comparison_valid
+    comparison_reason = $Row.comparison_reason
     pruned = $Row.pruned
     verified = $Row.verified
     byte_shard = [pscustomobject]@{
@@ -206,6 +219,33 @@ foreach ($profile in $profiles) {
     $row = Invoke-IxSearch $ZigBin "zig_steady_hot" $profile $false $i
     $rows.Add($row)
     Write-Host ("{0} zig steady #{1}: total={2} wall={3} discover={4} scan={5} matches={6} pruned={7}" -f $profile.name, $i, $row.total_ms, $row.wall_ms, $row.discover_ms, $row.scan_ms, $row.matches, $row.pruned)
+  }
+}
+
+foreach ($profile in $profiles) {
+  $reference = @($rows | Where-Object { $_.profile -eq $profile.name -and $_.engine -eq "rust" -and $_.ok } | Select-Object -First 1)
+  if ($reference.Count -eq 0) { throw "no valid Rust predecessor row for $($profile.name)" }
+  $baseline = $reference[0]
+  foreach ($row in @($rows | Where-Object { $_.profile -eq $profile.name })) {
+    if (-not $row.ok) {
+      $row.comparison_valid = $false
+      $row.comparison_reason = "process_failed"
+      continue
+    }
+    $match_ok = [int64]$row.matches -eq [int64]$baseline.matches
+    $route_ok = $row.access_errors_known -and $baseline.access_errors_known -and
+      ([int64]$row.discovered -eq [int64]$baseline.discovered) -and
+      ([int64]$row.scanned -eq [int64]$baseline.scanned) -and
+      ([int64]$row.skipped -eq [int64]$baseline.skipped) -and
+      ([int64]$row.access_errors -eq [int64]$baseline.access_errors)
+    $row.comparison_valid = $match_ok -and $route_ok
+    if ($row.comparison_valid) {
+      $row.comparison_reason = "match_and_route_parity"
+    } elseif (-not $match_ok) {
+      $row.comparison_reason = "match_parity_mismatch"
+    } else {
+      $row.comparison_reason = "route_parity_mismatch"
+    }
   }
 }
 
