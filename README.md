@@ -79,7 +79,8 @@ ix explain 'lit:auth && re:token_\d+'
 |:--------|:---------|
 | `search` | Hit records + terminal `ix.result.v1` result state |
 | `search --agent` | `ix.result.v2` compact grouped format — 4-9× fewer tokens than `--json` |
-| `search --context N` | Fisheye-contracted surrounding lines per hit |
+| `search --format agent-v3` | Bounded `ix.result.v3` with typed coverage, exact spans, and cursors |
+| `search --context N` | Exact coalesced source lines embedded in the versioned result |
 | `similar` | Semantic similarity ranking (requires `IX_AI_API_KEY`) |
 | `matches` | Hit records only — same engine, no sentinel |
 | `inspect` | Read-only file windows and match context |
@@ -94,6 +95,9 @@ IX can rank files by semantic similarity to a text concept using embedding model
 ```sh
 # Find files similar to a concept
 ix similar "cancellation token pattern" apps/src --agent
+
+# Bound provider work and expose semantic coverage and continuation
+ix similar "cancellation token pattern" apps/src --format agent-v3 --candidate-budget 128
 
 # Find files antisimilar (parity drift detection)
 ix similar "transport closure" apps/src --anti --max-results 10
@@ -112,6 +116,8 @@ Configuration via environment variables:
 | `IX_AI_RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L-12-v2` | Reranker model |
 
 When unconfigured, `ix similar` fails clean: `set IX_AI_API_KEY to use ix similar`.
+
+`ix.similar.v2` builds each first page from a deterministic union of lexical path signal and corpus-wide coverage. Lexical evidence prioritizes work but never defines semantic eligibility. The envelope reports eligible/read files, embedded whole-file ranges, provider bytes, omissions, policy skips, and a corpus-bound cursor. Whole-file ranges remain the default until a labeled recall/latency/cost benchmark proves a chunk policy; every result carries `start_line` and `end_line` for exact inspection.
 
 </details>
 
@@ -214,7 +220,7 @@ Each query is classified by shape and routed to the narrowest execution path:
 
 ### Output Protocol
 
-`search` emits a terminal `ix.result.v1` JSON sentinel. `inspect` emits `ix.inspect.*` sentinels with `ix.next.v1` continuation hints for pagination. Zero-match search returns `status:"ok"` with `matches:0`, not an error. All output is structured for machine consumption.
+`search` emits a terminal `ix.result.v1` JSON sentinel. `inspect` emits `ix.inspect.*` sentinels with `ix.next.v1` continuation hints for pagination. Zero-match legacy search returns `status:"ok"` with `matches:0`, not an error; this is a request result, not a claim about inaccessible or policy-excluded files.
 
 ### Agent Format (`--agent`)
 
@@ -222,7 +228,7 @@ Each query is classified by shape and routed to the narrowest execution path:
 
 1. **Path repetition** — hits are grouped by file in a JSON object, not a flat array. A file with 20 hits emits its path once, not 20 times.
 2. **Derived fields** — `absolute_path` is omitted; `cwd` is emitted once at the top level. The agent reconstructs full paths if needed.
-3. **Telemetry bloat** — only `matches`, `files`, `ms`, `status`, `expr` are emitted. Zero-valued fields are elided. Full telemetry is available via `--json --stats`.
+3. **Telemetry bloat** — only the compact agent telemetry projection is emitted. Full compatible telemetry is available via `--json`; telemetry without hit records is available via `--stats-only` or `--format stats`.
 
 ```sh
 $ ix search 'lit:updateSettingsDialog' src --agent
@@ -230,6 +236,17 @@ $ ix search 'lit:updateSettingsDialog' src --agent
 ```
 
 Short field names (`l`, `c`, `p`) minimize per-hit token overhead. Fisheye previews are integrated — long lines get match-centered context windows, short lines pass through unchanged.
+
+### Bounded Agent Format (`--format agent-v3`)
+
+`ix.result.v3` separates canonical positive verification, scan coverage, and projection completeness. Hits include exact match byte length plus the source window represented by each fisheye preview. `--max-hits` and `--max-bytes` stop only at complete records and emit a typed reason plus `next_cursor`; the cursor is bound to the request and corpus or warm-index generation and is rejected after either changes. `--format json-compact` emits the same schema as one raw JSON object.
+
+```sh
+ix search 're:token_[0-9]+' src --format agent-v3 --max-hits 40 --max-bytes 8192
+ix search 'lit:owner' src --context 2 --format json-compact
+```
+
+Fisheye applies to lossy search previews in v1, v2, and v3. It does not contract `inspect` windows or `search --context` lines: those surfaces are exact source evidence.
 
 | Format | 72 hits, 29 files | Reduction |
 |:-------|:-------------------|:----------|
@@ -461,7 +478,7 @@ Cold-lane word-boundary byte-shard verifier erasure:
 Target:
   expression: re:\bPM_RESUME\b
   corpus: E:\Workspaces\01_Projects\01_Github\iEx\.refs\ripgrep\benchsuite\linux
-  mode: IX_NEXUS=0, --json --stats-only --threads 32
+  mode: IX_NEXUS=0, --stats-only --threads 32
 
 Planner:
   strategy: regex_word_boundary_literal -> ByteShardPlan.word_boundary_literal
@@ -499,9 +516,9 @@ Nexus evidence-frontier sidecar:
 
 ```text
 Foreground cold search:
-  command: ix-zig search "re:\bPM_RESUME\b" <linux bench corpus> --json --stats-only
+  command: ix-zig search "re:\bPM_RESUME\b" <linux bench corpus> --stats-only
   foreground cache writes: 0
-  sidecar: __ix_nexus <expression> <root> --json --stats-only
+  sidecar: __ix_nexus <expression> <root> --stats-only
   Windows launch: CreateProcessW, DETACHED_PROCESS, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW
   artifact: .ix-evidence-e98d5d68a37c0b3.cache
   artifact magic: IXEVIDENCE2
@@ -544,7 +561,7 @@ Warm indexed query reuse:
 
 ```text
 First compatible warm query:
-  IX_INDEX=1 ix-zig search "re:\bPM_RESUME\b" <linux bench corpus> --json --stats-only
+  IX_INDEX=1 ix-zig search "re:\bPM_RESUME\b" <linux bench corpus> --stats-only
   └─ require .ix/index/index.live
   └─ pin .ix/index/current.ixgen
   └─ load IXCAT001 catalog snapshot

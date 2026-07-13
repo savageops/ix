@@ -5,6 +5,8 @@ const corpus = @import("../core/corpus.zig");
 const inspect = @import("../core/inspect.zig");
 const search = @import("../core/search.zig");
 const core_stats = @import("../core/stats.zig");
+const command_spec = @import("command_spec.zig");
+const output_contract = @import("output_contract.zig");
 
 pub fn writeHelp(writer: anytype, topic: cli.HelpTopic) !void {
     return switch (topic) {
@@ -38,7 +40,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  --stats-only   Suppress hit records, emit sentinel only
         \\  -l             Files with matches only
         \\  -c             Count per file
-        \\  --context N    Surrounding lines per hit (fisheye-contracted)
+        \\  --context N    Exact coalesced source lines in the versioned result
         \\
         \\Search:
         \\  --max-hits N   Limit hit records
@@ -48,7 +50,8 @@ fn writeTopHelp(writer: anytype) !void {
         \\
         \\Similar:
         \\  --anti         Rank least similar first (parity drift)
-        \\  --max-results  N Limit ranked candidates (default: 20)
+        \\  --max-results N     Limit returned rankings (default: 20)
+        \\  --candidate-budget N Bound provider candidates per page (default: 512)
         \\
         \\Config (similar):
         \\  IX_AI_API_KEY        Required (DEEPINFRA_TOKEN also accepted)
@@ -85,7 +88,11 @@ fn writeSimilarHelp(writer: anytype) !void {
         \\  --anti              Rank least similar first (parity drift)
         \\  --agent             Compact ix.similar.v1 format
         \\  --json              Full structured JSON
-        \\  --max-results=N     Limit candidates (default: 20)
+        \\  --format agent-v3   Versioned ix.similar.v2 with coverage and cursor
+        \\  --format json-compact Raw ix.similar.v2 JSON
+        \\  --max-results N     Limit returned rankings (default: 20)
+        \\  --candidate-budget N Bound provider candidates per page (default: 512)
+        \\  --cursor VALUE      Continue the same candidate frontier
         \\
         \\Config:
         \\  IX_AI_API_KEY       Required (DEEPINFRA_TOKEN also accepted)
@@ -95,6 +102,7 @@ fn writeSimilarHelp(writer: anytype) !void {
         \\
         \\Examples:
         \\  ix similar "cancellation pattern" apps/src --agent
+        \\  ix similar "cancellation pattern" apps/src --format agent-v3 --candidate-budget 128
         \\  ix similar "transport closure" apps/src --anti --max-results 10
         \\  ix similar src/auth.zig src/session.zig src/transport.zig --json
         \\
@@ -102,6 +110,7 @@ fn writeSimilarHelp(writer: anytype) !void {
 }
 
 fn writeSearchHelp(writer: anytype, summary: []const u8, command: []const u8) !void {
+    const is_search = std.mem.eql(u8, command, "search");
     try writer.print(
         \\{s}
         \\
@@ -119,8 +128,6 @@ fn writeSearchHelp(writer: anytype, summary: []const u8, command: []const u8) !v
         \\      --follow-symlinks            
         \\      --json
         \\      --stats-only
-        \\      --agent                       Agent-native compact output (ix.result.v2)
-        \\      --format <FORMAT>             Output format: agent
         \\      --max-hits <MAX_HITS>
         \\  -t, --threads <THREADS>
         \\      --emit-report <EMIT_REPORT>
@@ -138,10 +145,25 @@ fn writeSearchHelp(writer: anytype, summary: []const u8, command: []const u8) !v
         \\  zero-match search is status:"ok" with matches:0, not an error
         \\  ix matches emits hit records only, no terminal result sentinel
         \\  --json emits the structured SearchReport contract
-        \\  --agent emits ix.result.v2: file-grouped hits, short field names, minimal telemetry
         \\  agent shorthand: -n N means line numbers plus max N hits
         \\
     , .{ summary, command });
+    if (is_search) {
+        try writer.writeAll(
+            \\  --agent emits ix.result.v2: file-grouped hits, short field names, minimal telemetry
+            \\  --format agent-v3 emits canonical spans, completeness, byte budgets, and cursors
+            \\  --format json-compact emits the same v3 payload as raw JSON
+            \\  --context N upgrades text/agent output to v3 and embeds exact coalesced windows
+            \\  --max-bytes N bounds a complete v3 result, including its envelope and context
+            \\  --cursor TOKEN continues a v3 result without repeating hits
+            \\  formats:
+        );
+        try writer.writeAll("    ");
+        try command_spec.writeFormatNames(writer);
+    } else {
+        try writer.writeAll("  formats: text, json, files, count, stats\n");
+    }
+    try writer.writeAll("\n");
 }
 
 fn writeInspectHelp(writer: anytype) !void {
@@ -405,7 +427,12 @@ pub fn writeSearchReportAgent(writer: anytype, report: search.SearchReport) !voi
         for (0..report.hit_count) |i| indices[i] = i;
         std.mem.sort(usize, indices[0..report.hit_count], report, struct {
             fn lt(ctx: search.SearchReport, a: usize, b: usize) bool {
-                return std.mem.lessThan(u8, ctx.hits[a].path, ctx.hits[b].path);
+                const lhs = ctx.hits[a];
+                const rhs = ctx.hits[b];
+                const path_order = std.mem.order(u8, lhs.path, rhs.path);
+                if (path_order != .eq) return path_order == .lt;
+                if (lhs.line != rhs.line) return lhs.line < rhs.line;
+                return lhs.column < rhs.column;
             }
         }.lt);
 
@@ -431,7 +458,7 @@ pub fn writeSearchReportAgent(writer: anytype, report: search.SearchReport) !voi
         if (report.files_skipped > 0) {
             try writer.print(",\"skipped\":{}", .{report.files_skipped});
         }
-        if (report.truncated) {
+        if (report.truncated or report.matches_found > report.hit_count) {
             try writer.writeAll(",\"truncated\":true");
         }
 
@@ -489,39 +516,52 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
         if (index > 0) try writer.writeAll(",");
         try writeSearchHitJson(writer, report, hit);
     }
-    try writer.print(
-        "],\"stats\":{{\"input_roots\":{},\"effective_roots\":{},\"pruned_roots\":{},\"overlap_pruned_roots\":{},\"discovered_duplicate_paths\":{},\"acceleration_bailouts\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped\":{},\"matches_found\":{},\"bytes_scanned\":{},",
-        .{ report.stats.input_roots, report.stats.effective_roots, report.stats.pruned_roots, report.stats.overlap_pruned_roots, report.stats.discovered_duplicate_paths, report.stats.acceleration_bailouts, report.stats.files_discovered, report.stats.files_scanned, report.stats.files_skipped, report.stats.matches_found, report.stats.bytes_scanned },
-    );
-    try writer.print("\"linux_strategy\":{{\"selector_eligible\":{s},\"current_strategy\":\"{s}\",\"matcher_strategy_supported\":{s},\"effective_roots\":{},\"directory_roots\":{},\"root_entry_count\":{},\"files_discovered\":{},\"collect_hits\":{s},\"outer_parallel_shard_safe\":{s}}},", .{ boolText(report.stats.linux_strategy.selector_eligible), report.stats.linux_strategy.current_strategy, boolText(report.stats.linux_strategy.matcher_strategy_supported), report.stats.linux_strategy.effective_roots, report.stats.linux_strategy.directory_roots, report.stats.linux_strategy.root_entry_count, report.stats.linux_strategy.files_discovered, boolText(report.stats.linux_strategy.collect_hits), boolText(report.stats.linux_strategy.outer_parallel_shard_safe) });
-    try writer.print("\"linux_dominant_file\":{{\"target_class\":\"{s}\",\"min_bytes\":{},\"targeted_files_scanned\":{},\"targeted_bytes_scanned\":{},\"targeted_slowest_files\":{},\"targeted_slowest_bytes\":{},\"eligible_files\":{},\"activated_files\":{},\"bailout_files\":{},\"max_shard_threads\":{},\"max_range_count\":{},\"max_chunk_bytes\":{}}},", .{ report.stats.linux_dominant_file.target_class, report.stats.linux_dominant_file.min_bytes, report.stats.linux_dominant_file.targeted_files_scanned, report.stats.linux_dominant_file.targeted_bytes_scanned, report.stats.linux_dominant_file.targeted_slowest_files, report.stats.linux_dominant_file.targeted_slowest_bytes, report.stats.linux_dominant_file.eligible_files, report.stats.linux_dominant_file.activated_files, report.stats.linux_dominant_file.bailout_files, report.stats.linux_dominant_file.max_shard_threads, report.stats.linux_dominant_file.max_range_count, report.stats.linux_dominant_file.max_chunk_bytes });
-    try writer.print("\"regex_decomposition\":{{\"eligible_files\":{},\"counted_files\":{},\"bailout_files\":{},\"candidate_lines_checked\":{},\"duplicate_candidate_hits_skipped\":{},\"candidate_lines_matched\":{}}},", .{ report.stats.regex_decomposition.eligible_files, report.stats.regex_decomposition.counted_files, report.stats.regex_decomposition.bailout_files, report.stats.regex_decomposition.candidate_lines_checked, report.stats.regex_decomposition.duplicate_candidate_hits_skipped, report.stats.regex_decomposition.candidate_lines_matched });
-    try writer.writeAll("\"unicode_casefold_prefilter\":{\"full_scan_calls\":0,\"range_scan_calls\":0,\"candidate_prefix_hits\":0,\"candidate_windows_verified\":0,\"confirmed_matches\":0,\"rejected_candidates\":0,\"candidate_gap_bytes_total\":0,\"candidate_gap_samples\":0,\"max_prefix_variant_count\":0,\"max_prefix_len\":0,\"max_match_len\":0},");
-    try writeFastCountDensityJson(writer, report.stats.fast_count_density);
-    try writer.writeAll(",");
-    try writer.print("\"byte_shard_kernel\":{{\"enabled\":{s},\"strategy\":\"{s}\",\"files_profiled\":{},\"range_calls\":{},\"line_aligned_ranges\":{},\"logical_range_bytes\":{},\"widened_range_bytes\":{},\"overlap_bytes\":{},\"boundary_verified_candidates\":{},\"boundary_rejected_candidates\":{},\"range_elapsed_ns_total\":{},\"max_range_elapsed_ns\":{},\"reduce_elapsed_ns_total\":{},\"max_reduce_elapsed_ns\":{},\"matches\":{}}},", .{ boolText(report.stats.byte_shard_kernel.enabled), report.stats.byte_shard_kernel.strategy, report.stats.byte_shard_kernel.files_profiled, report.stats.byte_shard_kernel.range_calls, report.stats.byte_shard_kernel.line_aligned_ranges, report.stats.byte_shard_kernel.logical_range_bytes, report.stats.byte_shard_kernel.widened_range_bytes, report.stats.byte_shard_kernel.overlap_bytes, report.stats.byte_shard_kernel.boundary_verified_candidates, report.stats.byte_shard_kernel.boundary_rejected_candidates, report.stats.byte_shard_kernel.range_elapsed_ns_total, report.stats.byte_shard_kernel.max_range_elapsed_ns, report.stats.byte_shard_kernel.reduce_elapsed_ns_total, report.stats.byte_shard_kernel.max_reduce_elapsed_ns, report.stats.byte_shard_kernel.matches });
-    try writer.print("\"trigram_acceleration\":{{\"eligible\":{s},\"mode\":\"{s}\",\"mandatory_groups\":{},\"mandatory_trigrams\":{},\"candidate_files_checked\":{},\"pruned_files\":{},\"verified_files\":{},\"ineligible_files\":{}}},", .{ boolText(report.stats.trigram_acceleration.eligible), report.stats.trigram_acceleration.mode, report.stats.trigram_acceleration.mandatory_groups, report.stats.trigram_acceleration.mandatory_trigrams, report.stats.trigram_acceleration.candidate_files_checked, report.stats.trigram_acceleration.pruned_files, report.stats.trigram_acceleration.verified_files, report.stats.trigram_acceleration.ineligible_files });
-    try writeCatalogIndexJson(writer, report.stats.catalog_index);
-    try writer.writeAll(",");
-    try writePostingsIndexJson(writer, report.stats.postings_index);
-    try writer.writeAll(",");
-    try writeGenerationRefreshJson(writer, report.stats.generation_refresh);
-    try writer.writeAll(",");
-    try writeAccessErrorsJson(writer, report.stats.access_errors);
-    try writer.writeAll(",");
-    try writeAdmissionJson(writer, report.stats.admission);
-    try writer.writeAll(",");
-    try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"scan_open_ms_total\":{d},\"scan_file_ms_total\":{d},\"scan_file_mmap_ms_total\":{d},\"scan_file_buffered_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ report.stats.timings.discover_ms, report.stats.timings.scan_ms, report.stats.timings.aggregate_ms, report.stats.timings.total_ms, report.stats.timings.scan_work_ms_total, report.stats.timings.scan_open_ms_total, report.stats.timings.scan_file_ms_total, report.stats.timings.scan_file_mmap_ms_total, report.stats.timings.scan_file_buffered_ms_total, report.stats.timings.aggregate_merge_ms, report.stats.timings.aggregate_finalize_ms });
-    try writer.print("\"process_memory\":{{\"available\":{s},\"current_resident_bytes\":{},\"peak_resident_bytes\":{}}},", .{ boolText(report.stats.process_memory.available), report.stats.process_memory.current_resident_bytes, report.stats.process_memory.peak_resident_bytes });
-    try writer.print("\"concurrency\":{{\"available_threads\":{},\"outer_scan_threads\":{},\"execution_mode\":\"{s}\",\"resource_profile\":\"{s}\",\"scan_input_policy\":\"{s}\",\"sharding_enabled\":{s},\"sharded_files\":{},\"max_shard_threads\":{},\"max_shard_ranges\":{},\"max_shard_chunk_bytes\":{}}},", .{ report.stats.concurrency.available_threads, report.stats.concurrency.outer_scan_threads, report.stats.concurrency.execution_mode, report.stats.concurrency.resource_profile, report.stats.concurrency.scan_input_policy, boolText(report.stats.concurrency.sharding_enabled), report.stats.concurrency.sharded_files, report.stats.concurrency.max_shard_threads, report.stats.concurrency.max_shard_ranges, report.stats.concurrency.max_shard_chunk_bytes });
-    try writer.writeAll("\"slowest_files\":[");
-    for (report.stats.slowest_files[0..report.stats.slowest_file_count], 0..) |slowest, index| {
-        if (index != 0) try writer.writeAll(",");
-        try writer.writeAll("{\"path\":");
-        try writeJsonString(writer, slowest.path);
-        try writer.print(",\"duration_ms\":{d},\"bytes\":{},\"linux_dominant_target\":{s}}}", .{ slowest.duration_ms, slowest.bytes, boolText(slowest.linux_dominant_target) });
+    try writer.writeAll("],\"stats\":");
+    try writeStats(writer, report.stats, .debug);
+    try writer.writeAll("}\n");
+}
+
+/// Serializes telemetry through one visibility policy owner.
+pub fn writeStats(writer: anytype, stats: core_stats.SearchStats, visibility: output_contract.StatsVisibility) !void {
+    switch (visibility) {
+        .agent => try writer.print("{{\"files_discovered\":{},\"files_scanned\":{},\"matches_found\":{},\"bytes_scanned\":{},\"access_errors\":{},\"total_ms\":{d}}}", .{ stats.files_discovered, stats.files_scanned, stats.matches_found, stats.bytes_scanned, stats.access_errors.total, stats.timings.total_ms }),
+        .standard => try writer.print("{{\"files_discovered\":{},\"files_scanned\":{},\"files_skipped\":{},\"matches_found\":{},\"bytes_scanned\":{},\"access_errors\":{},\"discover_ms\":{d},\"scan_ms\":{d},\"total_ms\":{d}}}", .{ stats.files_discovered, stats.files_scanned, stats.files_skipped, stats.matches_found, stats.bytes_scanned, stats.access_errors.total, stats.timings.discover_ms, stats.timings.scan_ms, stats.timings.total_ms }),
+        .debug => {
+            try writer.print(
+                "{{\"input_roots\":{},\"effective_roots\":{},\"pruned_roots\":{},\"overlap_pruned_roots\":{},\"discovered_duplicate_paths\":{},\"acceleration_bailouts\":{},\"files_discovered\":{},\"files_scanned\":{},\"files_skipped\":{},\"matches_found\":{},\"bytes_scanned\":{},",
+                .{ stats.input_roots, stats.effective_roots, stats.pruned_roots, stats.overlap_pruned_roots, stats.discovered_duplicate_paths, stats.acceleration_bailouts, stats.files_discovered, stats.files_scanned, stats.files_skipped, stats.matches_found, stats.bytes_scanned },
+            );
+            try writer.print("\"linux_strategy\":{{\"selector_eligible\":{s},\"current_strategy\":\"{s}\",\"matcher_strategy_supported\":{s},\"effective_roots\":{},\"directory_roots\":{},\"root_entry_count\":{},\"files_discovered\":{},\"collect_hits\":{s},\"outer_parallel_shard_safe\":{s}}},", .{ boolText(stats.linux_strategy.selector_eligible), stats.linux_strategy.current_strategy, boolText(stats.linux_strategy.matcher_strategy_supported), stats.linux_strategy.effective_roots, stats.linux_strategy.directory_roots, stats.linux_strategy.root_entry_count, stats.linux_strategy.files_discovered, boolText(stats.linux_strategy.collect_hits), boolText(stats.linux_strategy.outer_parallel_shard_safe) });
+            try writer.print("\"linux_dominant_file\":{{\"target_class\":\"{s}\",\"min_bytes\":{},\"targeted_files_scanned\":{},\"targeted_bytes_scanned\":{},\"targeted_slowest_files\":{},\"targeted_slowest_bytes\":{},\"eligible_files\":{},\"activated_files\":{},\"bailout_files\":{},\"max_shard_threads\":{},\"max_range_count\":{},\"max_chunk_bytes\":{}}},", .{ stats.linux_dominant_file.target_class, stats.linux_dominant_file.min_bytes, stats.linux_dominant_file.targeted_files_scanned, stats.linux_dominant_file.targeted_bytes_scanned, stats.linux_dominant_file.targeted_slowest_files, stats.linux_dominant_file.targeted_slowest_bytes, stats.linux_dominant_file.eligible_files, stats.linux_dominant_file.activated_files, stats.linux_dominant_file.bailout_files, stats.linux_dominant_file.max_shard_threads, stats.linux_dominant_file.max_range_count, stats.linux_dominant_file.max_chunk_bytes });
+            try writer.print("\"regex_decomposition\":{{\"eligible_files\":{},\"counted_files\":{},\"bailout_files\":{},\"candidate_lines_checked\":{},\"duplicate_candidate_hits_skipped\":{},\"candidate_lines_matched\":{}}},", .{ stats.regex_decomposition.eligible_files, stats.regex_decomposition.counted_files, stats.regex_decomposition.bailout_files, stats.regex_decomposition.candidate_lines_checked, stats.regex_decomposition.duplicate_candidate_hits_skipped, stats.regex_decomposition.candidate_lines_matched });
+            try writer.writeAll("\"unicode_casefold_prefilter\":{\"full_scan_calls\":0,\"range_scan_calls\":0,\"candidate_prefix_hits\":0,\"candidate_windows_verified\":0,\"confirmed_matches\":0,\"rejected_candidates\":0,\"candidate_gap_bytes_total\":0,\"candidate_gap_samples\":0,\"max_prefix_variant_count\":0,\"max_prefix_len\":0,\"max_match_len\":0},");
+            try writeFastCountDensityJson(writer, stats.fast_count_density);
+            try writer.writeAll(",");
+            try writer.print("\"byte_shard_kernel\":{{\"enabled\":{s},\"strategy\":\"{s}\",\"files_profiled\":{},\"range_calls\":{},\"line_aligned_ranges\":{},\"logical_range_bytes\":{},\"widened_range_bytes\":{},\"overlap_bytes\":{},\"boundary_verified_candidates\":{},\"boundary_rejected_candidates\":{},\"range_elapsed_ns_total\":{},\"max_range_elapsed_ns\":{},\"reduce_elapsed_ns_total\":{},\"max_reduce_elapsed_ns\":{},\"matches\":{}}},", .{ boolText(stats.byte_shard_kernel.enabled), stats.byte_shard_kernel.strategy, stats.byte_shard_kernel.files_profiled, stats.byte_shard_kernel.range_calls, stats.byte_shard_kernel.line_aligned_ranges, stats.byte_shard_kernel.logical_range_bytes, stats.byte_shard_kernel.widened_range_bytes, stats.byte_shard_kernel.overlap_bytes, stats.byte_shard_kernel.boundary_verified_candidates, stats.byte_shard_kernel.boundary_rejected_candidates, stats.byte_shard_kernel.range_elapsed_ns_total, stats.byte_shard_kernel.max_range_elapsed_ns, stats.byte_shard_kernel.reduce_elapsed_ns_total, stats.byte_shard_kernel.max_reduce_elapsed_ns, stats.byte_shard_kernel.matches });
+            try writer.print("\"trigram_acceleration\":{{\"eligible\":{s},\"mode\":\"{s}\",\"mandatory_groups\":{},\"mandatory_trigrams\":{},\"candidate_files_checked\":{},\"pruned_files\":{},\"verified_files\":{},\"ineligible_files\":{}}},", .{ boolText(stats.trigram_acceleration.eligible), stats.trigram_acceleration.mode, stats.trigram_acceleration.mandatory_groups, stats.trigram_acceleration.mandatory_trigrams, stats.trigram_acceleration.candidate_files_checked, stats.trigram_acceleration.pruned_files, stats.trigram_acceleration.verified_files, stats.trigram_acceleration.ineligible_files });
+            try writeCatalogIndexJson(writer, stats.catalog_index);
+            try writer.writeAll(",");
+            try writePostingsIndexJson(writer, stats.postings_index);
+            try writer.writeAll(",");
+            try writeGenerationRefreshJson(writer, stats.generation_refresh);
+            try writer.writeAll(",");
+            try writeAccessErrorsJson(writer, stats.access_errors);
+            try writer.writeAll(",");
+            try writeAdmissionJson(writer, stats.admission);
+            try writer.writeAll(",");
+            try writer.print("\"timings\":{{\"discover_ms\":{d},\"scan_ms\":{d},\"aggregate_ms\":{d},\"total_ms\":{d},\"scan_work_ms_total\":{d},\"scan_open_ms_total\":{d},\"scan_file_ms_total\":{d},\"scan_file_mmap_ms_total\":{d},\"scan_file_buffered_ms_total\":{d},\"aggregate_merge_ms\":{d},\"aggregate_finalize_ms\":{d}}},", .{ stats.timings.discover_ms, stats.timings.scan_ms, stats.timings.aggregate_ms, stats.timings.total_ms, stats.timings.scan_work_ms_total, stats.timings.scan_open_ms_total, stats.timings.scan_file_ms_total, stats.timings.scan_file_mmap_ms_total, stats.timings.scan_file_buffered_ms_total, stats.timings.aggregate_merge_ms, stats.timings.aggregate_finalize_ms });
+            try writer.print("\"process_memory\":{{\"available\":{s},\"current_resident_bytes\":{},\"peak_resident_bytes\":{}}},", .{ boolText(stats.process_memory.available), stats.process_memory.current_resident_bytes, stats.process_memory.peak_resident_bytes });
+            try writer.print("\"concurrency\":{{\"available_threads\":{},\"outer_scan_threads\":{},\"execution_mode\":\"{s}\",\"resource_profile\":\"{s}\",\"scan_input_policy\":\"{s}\",\"sharding_enabled\":{s},\"sharded_files\":{},\"max_shard_threads\":{},\"max_shard_ranges\":{},\"max_shard_chunk_bytes\":{}}},", .{ stats.concurrency.available_threads, stats.concurrency.outer_scan_threads, stats.concurrency.execution_mode, stats.concurrency.resource_profile, stats.concurrency.scan_input_policy, boolText(stats.concurrency.sharding_enabled), stats.concurrency.sharded_files, stats.concurrency.max_shard_threads, stats.concurrency.max_shard_ranges, stats.concurrency.max_shard_chunk_bytes });
+            try writer.writeAll("\"slowest_files\":[");
+            for (stats.slowest_files[0..stats.slowest_file_count], 0..) |slowest, index| {
+                if (index != 0) try writer.writeAll(",");
+                try writer.writeAll("{\"path\":");
+                try writeJsonString(writer, slowest.path);
+                try writer.print(",\"duration_ms\":{d},\"bytes\":{},\"linux_dominant_target\":{s}}}", .{ slowest.duration_ms, slowest.bytes, boolText(slowest.linux_dominant_target) });
+            }
+            try writer.writeAll("]}");
+        },
     }
-    try writer.writeAll("]}}\n");
 }
 
 fn searchStatus(report: search.SearchReport) []const u8 {

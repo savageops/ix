@@ -157,9 +157,21 @@ const CachedRegex = struct {
 
 threadlocal var cache: CachedRegex = .{};
 
+/// Exact zero-based byte span returned by PCRE2's first ovector pair.
+pub const MatchSpan = struct {
+    start: usize,
+    end: usize,
+};
+
 /// Returns the 1-based column of the first regex match, or null if no match.
 /// Returns error.CompileFailed if PCRE2 cannot compile the pattern.
 pub fn column(line: []const u8, pattern: []const u8, case_insensitive: bool) error{CompileFailed}!?usize {
+    const matched = try span(line, pattern, case_insensitive);
+    return if (matched) |value| value.start + 1 else null;
+}
+
+/// Returns the exact byte span of the first regex match.
+pub fn span(line: []const u8, pattern: []const u8, case_insensitive: bool) error{CompileFailed}!?MatchSpan {
     if (!cache.ensureCompiled(pattern, case_insensitive)) return error.CompileFailed;
     // Empty subjects need zero-width regex semantics. Use the native fallback
     // instead of collapsing every empty line into no-match.
@@ -195,7 +207,7 @@ pub fn column(line: []const u8, pattern: []const u8, case_insensitive: bool) err
     if (rc < 0) return null;
 
     const ovector = pcre2_get_ovector_pointer_8(cache.match_data.?);
-    return ovector[0] + 1;
+    return .{ .start = ovector[0], .end = ovector[1] };
 }
 
 /// Counts non-overlapping regex matches in a line.
@@ -258,6 +270,12 @@ test "pcre2_jit_match column returns correct offset for supported pattern" {
     const line = "error: PME_TURN_OFF received at line 42";
     const col = (column(line, "PME_TURN_OFF", false) catch return error.CompileFailed) orelse return error.NoMatch;
     try std.testing.expectEqual(@as(usize, 8), col);
+}
+
+test "pcre2 span preserves variable-width match length" {
+    const matched = (span("before item-2048 after", "item-\\d+", false) catch return error.CompileFailed) orelse return error.NoMatch;
+    try std.testing.expectEqual(@as(usize, 7), matched.start);
+    try std.testing.expectEqual(@as(usize, 16), matched.end);
 }
 
 test "pcre2_jit_match column returns null for no match" {

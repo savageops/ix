@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const path_admission = @import("admission.zig");
 const byte_shard = @import("byte_shard.zig");
 const cli = @import("../cli/args.zig");
+const search_cursor = @import("../cli/cursor.zig");
 const catalog = @import("catalog.zig");
 const corpus_signature = @import("corpus_signature.zig");
 const discovered_files = @import("discovered_files.zig");
@@ -13,6 +14,7 @@ const nt_open = @import("nt_open.zig");
 const regex = @import("regex.zig");
 const pcre_regex = @import("pcre_regex.zig");
 const postings = @import("postings.zig");
+const preview = @import("preview.zig");
 const process_memory = @import("process_memory.zig");
 const protected_paths = @import("protected_paths.zig");
 const resource_profile = @import("resource_profile.zig");
@@ -133,6 +135,11 @@ pub const SearchHit = struct {
     line: usize,
     column: usize,
     preview: []const u8,
+    match_len: usize = 0,
+    preview_start: usize = 0,
+    preview_end: usize = 0,
+    preview_elided_left: bool = false,
+    preview_elided_right: bool = false,
 };
 
 pub const SearchReport = struct {
@@ -150,7 +157,10 @@ pub const SearchReport = struct {
     files_scanned: usize,
     files_skipped: usize,
     matches_found: usize,
+    matches_after_cursor: usize = 0,
     truncated: bool,
+    corpus_signature: ?u64 = null,
+    request_fingerprint: u64 = 0,
     slowest_path: []const u8,
     slowest_bytes: usize,
     slowest_ms: f64,
@@ -210,7 +220,9 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
         .files_scanned = 0,
         .files_skipped = 0,
         .matches_found = 0,
+        .matches_after_cursor = 0,
         .truncated = false,
+        .request_fingerprint = search_cursor.requestFingerprint(request),
         .slowest_path = "",
         .slowest_bytes = 0,
         .slowest_ms = 0,
@@ -244,16 +256,30 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     report.stats.admission.enabled = !request.no_ignore;
 
     if (prepareWarmIndexFrontier(io, allocator, request, plan, &report)) |warm_prepared| {
-        if (!request.stats_only and request.max_hits != null and warm_prepared.known_matches != null) {
+        if (request.stable_output) {
+            std.mem.sort(DiscoveredFile, warm_prepared.active_files, {}, struct {
+                fn lessThan(_: void, lhs: DiscoveredFile, rhs: DiscoveredFile) bool {
+                    return std.mem.lessThan(u8, lhs.path, rhs.path);
+                }
+            }.lessThan);
+            report.corpus_signature = warmCorpusSignature(warm_prepared);
+            if (request.cursor_request_fingerprint) |expected| {
+                if (expected != report.request_fingerprint) return error.CursorRequestMismatch;
+            }
+            if (request.cursor_corpus_signature) |expected| {
+                if (expected != report.corpus_signature.?) return error.StaleCursor;
+            }
+        }
+        if (!request.stable_output and !request.stats_only and request.max_hits != null and warm_prepared.known_matches != null) {
             try scanPreparedHitPrefixFiles(io, allocator, warm_prepared.active_files, request, plan, trigram_admission, &trigram_program, &report);
             report.matches_found = warm_prepared.known_matches.?;
         } else {
             try scanPreparedFiles(io, allocator, warm_prepared.active_files, request, plan, trigram_admission, &trigram_program, &report);
         }
-        if (!report.truncated and !warm_prepared.stats_result_cache_hit and !warm_prepared.hit_result_cache_hit) {
+        if (!request.stable_output and !report.truncated and !warm_prepared.stats_result_cache_hit and !warm_prepared.hit_result_cache_hit) {
             writeWarmQueryStatsResult(io, allocator, warm_prepared, request, report);
         }
-        if (!request.stats_only and !report.truncated and !warm_prepared.hit_result_cache_hit) {
+        if (!request.stable_output and !request.stats_only and !report.truncated and !warm_prepared.hit_result_cache_hit) {
             writeWarmQueryHitResult(io, allocator, warm_prepared, request, report);
         }
         report.total_ms = elapsedMs(io, total_started);
@@ -286,9 +312,26 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     // All workers read the NT CWD prefix without contention (immutable after init).
     nt_open.initCwdPrefix(io);
 
+    // Versioned projections use a canonical source order and bind continuation
+    // to the full discovered corpus before any evidence frontier narrows it.
+    const discovered_mut = file_list.mutableItems();
+    if (request.stable_output) {
+        std.mem.sort(DiscoveredFile, discovered_mut, {}, struct {
+            fn lessThan(_: void, lhs: DiscoveredFile, rhs: DiscoveredFile) bool {
+                return std.mem.lessThan(u8, lhs.path, rhs.path);
+            }
+        }.lessThan);
+        report.corpus_signature = try computeDiscoveredSignature(io, discovered_mut);
+        if (request.cursor_request_fingerprint) |expected| {
+            if (expected != report.request_fingerprint) return error.CursorRequestMismatch;
+        }
+        if (request.cursor_corpus_signature) |expected| {
+            if (expected != report.corpus_signature.?) return error.StaleCursor;
+        }
+    }
+
     // Phase 2: Scan files -- thread count adapts to corpus size after discovery.
     const scan_started = std.Io.Timestamp.now(io, .awake);
-    const discovered_mut = file_list.mutableItems();
     const evidence_prepared = prepareEvidenceFrontier(io, allocator, request, plan, trigram_admission, discovered_mut, &report);
     const active_files = evidence_prepared.active_files orelse discovered_mut;
     var warm_stats_cache: WarmStatsResultCacheContext = .{};
@@ -307,7 +350,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     // Without shuffle, depth-first ordering causes all threads to contend on the same
     // directory's FCB lock in NtCreateFile -- overhead inflates 13.6x at 32 threads.
     // Only for parallel mode: single-threaded benefits from sequential FS locality.
-    if (thread_count > 1) shuffleFiles(active_files);
+    if (thread_count > 1 and !request.stable_output) shuffleFiles(active_files);
     const discovered: []const DiscoveredFile = active_files;
     if (discovered.len == 0) {
         // No files discovered -- nothing to scan.
@@ -344,7 +387,7 @@ fn scanPreparedFiles(
     const scan_started = std.Io.Timestamp.now(io, .awake);
     const thread_count = effectiveThreadCount(report.resource_profile, request, active_files.len);
     report.outer_scan_threads = thread_count;
-    if (thread_count > 1) shuffleFiles(active_files);
+    if (thread_count > 1 and !request.stable_output) shuffleFiles(active_files);
     const discovered: []const DiscoveredFile = active_files;
     if (discovered.len == 0) {
         // Fully pruned frontier.
@@ -422,6 +465,16 @@ const WarmIndexFrontier = struct {
     stats_result_cache_hit: bool = false,
     hit_result_cache_hit: bool = false,
 };
+
+/// Binds continuation to the pinned index generation without paying for a
+/// cold stat walk. A generation change invalidates every cursor immediately.
+fn warmCorpusSignature(frontier: WarmIndexFrontier) u64 {
+    var hasher = std.hash.Wyhash.init(0x4958_5741_524d_4355);
+    hasher.update(std.mem.asBytes(&frontier.root_fingerprint));
+    hasher.update(std.mem.asBytes(&frontier.epoch));
+    hasher.update(std.mem.asBytes(&frontier.discovered));
+    return hasher.final();
+}
 
 fn prepareWarmIndexFrontier(
     io: std.Io,
@@ -501,7 +554,16 @@ fn prepareWarmIndexFrontier(
     // cache file already carries the validated candidate list from the first
     // cold-indexed query — trust it until the next index rebuild.
     var known_matches: ?usize = null;
-    if (request.stats_only) {
+    if (request.stable_output) {
+        // Cached legacy projections do not carry v3 spans, preview windows, or
+        // cursor accounting. Keep the warm candidate frontier, then rescan only
+        // those candidates through the canonical current hit owner.
+        if (request.max_hits != null) {
+            if (loadWarmQueryStatsCount(io, allocator, root_state.index_dir, root_identity.fingerprint, pin.epoch, request)) |record| {
+                known_matches = record.matches;
+            }
+        }
+    } else if (request.stats_only) {
         if (loadWarmQueryStatsResult(io, allocator, root_state.index_dir, root, root_identity.fingerprint, pin.epoch, request, report)) |cached| {
             return cached;
         }
@@ -1738,7 +1800,7 @@ fn evidenceFrontierKey(request: cli.SearchRequest, plan: expr.ExpressionPlan) u6
 ///
 /// Why: a path-only signature lets a same-path mutation reuse a stale pruning
 /// decision. The cache may admit false positives, never a false negative.
-/// Preserves: order-independent identity over path, size, inode, and mtime;
+/// Preserves: order-independent identity over path, size, stable inode, and mtime;
 /// stat failures invalidate reuse instead of guessing.
 fn computeDiscoveredSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
     var xor_acc: u64 = 0;
@@ -1750,7 +1812,10 @@ fn computeDiscoveredSignature(io: std.Io, files: []const DiscoveredFile) !u64 {
         var item = std.hash.Wyhash.init(0x4556_4944_5041_5448);
         item.update(entry.path);
         hashU64(&item, stat.size);
-        hashU64(&item, @bitCast(stat.inode));
+        // Some Windows filesystems synthesize a different FileIndex for each
+        // open. Binding a cursor to that value rejects an unchanged corpus.
+        // POSIX inode numbers remain useful replacement evidence.
+        if (comptime builtin.os.tag != .windows) hashU64(&item, @bitCast(stat.inode));
         hashTimestamp(&item, stat.mtime);
         const item_hash = item.final();
         xor_acc ^= item_hash;
@@ -2359,7 +2424,7 @@ fn skippedFileBytes(io: std.Io, path: []const u8) usize {
 }
 
 fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) bool {
-    if (request.max_hits != null and !request.stats_only) return false;
+    if (request.max_hits != null and !request.stats_only and !request.stable_output) return false;
     const requested_threads = request.threads orelse defaultParallelDiscoveryThreadBudget(resource_profile.current(), request);
     if (requested_threads <= 1) return false;
     if (roots.count == 0) return false;
@@ -2370,7 +2435,7 @@ fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) 
 }
 
 fn defaultParallelDiscoveryThreadBudget(profile: resource_profile.Profile, request: cli.SearchRequest) usize {
-    if (!request.stats_only) return 1;
+    if (!request.stats_only and !request.stable_output) return 1;
     return profile.discoveryThreadCap(availableThreads());
 }
 
@@ -2654,6 +2719,7 @@ const ShardReport = struct {
     files_scanned: usize,
     files_skipped: usize,
     matches_found: usize,
+    matches_after_cursor: usize,
     scan_work_ms_total: f64,
     scan_open_ms_total: f64,
     scan_file_ms_total: f64,
@@ -2691,6 +2757,7 @@ const ShardReport = struct {
         .files_scanned = 0,
         .files_skipped = 0,
         .matches_found = 0,
+        .matches_after_cursor = 0,
         .scan_work_ms_total = 0,
         .scan_open_ms_total = 0,
         .scan_file_ms_total = 0,
@@ -3417,7 +3484,6 @@ fn countLiteralLogicalRange(data: []const u8, needle: []const u8, logical_start:
     return total;
 }
 
-
 fn streamingLiteralNeedle(plan: expr.ExpressionPlan) ?[]const u8 {
     const shard_plan = byte_shard.plan(plan) orelse return null;
     if (shard_plan.strategy != .literal_occurrence or shard_plan.case_insensitive) return null;
@@ -3613,8 +3679,7 @@ fn scanOpenFileIntoShardImpl(
             } else |_| {}
         }
     }
-    if (shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program))
-    {
+    if (shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program)) {
         if (trigram_program.needsCasefold()) {
             // Single SIMD byteset scan: if none of the needle first bytes
             // (lower + upper) appear, skip casefold entirely. Replaces the
@@ -3743,8 +3808,7 @@ fn scanOpenFileIntoShardImpl(
         // the per-line loop. Count newlines with SIMD to maintain line_number,
         // then set up the carry buffer for the trailing partial line.
         if (chunk_prefilter_group) |group| {
-            if (carry.items.len == 0 and group.isMiss(chunk))
-            {
+            if (carry.items.len == 0 and group.isMiss(chunk)) {
                 // Fast newline count: count newlines in bulk via SIMD.
                 if (!request.stats_only) {
                     line_number += std.mem.count(u8, chunk, "\n");
@@ -3858,14 +3922,18 @@ fn recordLineIntoShardImpl(
         matchingColumn(line, plan, request.case_insensitive);
     if (column) |col| {
         shard.matches_found += 1;
+        if (!isAfterCursor(request, display_path, line_number, col)) return;
+        shard.matches_after_cursor += 1;
         const under_request_limit = if (request.max_hits) |max_hits| shard.hit_count < max_hits else true;
         if (under_request_limit and shard.hit_count < MAX_RETAINED_HITS) {
-            const match_len = if (mono != null and mono.?.kind != .regex) plan.predicates[0].value.len else fisheyeMatchLen(plan);
-            shard.hits[shard.hit_count] = .{
+            const span = exactMatchSpan(line, plan, request.case_insensitive, col);
+            shard.hits[shard.hit_count] = makeSearchHit(allocator, display_path, line_number, col, line, span) catch .{
                 .path = display_path,
                 .line = line_number,
                 .column = col,
-                .preview = fisheyePreview(allocator, line, col - 1, match_len) catch allocator.dupe(u8, line) catch line,
+                .preview = allocator.dupe(u8, line) catch line,
+                .match_len = span.end - span.start,
+                .preview_end = line.len,
             };
             shard.hit_count += 1;
         }
@@ -4085,7 +4153,7 @@ fn parallelScanFiles(
         }
     }
 
-    if (shouldUseDynamicWorkClaim(plan, files.len)) {
+    if (!request.stable_output and shouldUseDynamicWorkClaim(plan, files.len)) {
         var next_file: usize = 0;
         const threads = try allocator.alloc(std.Thread, worker_count);
         for (0..worker_count) |i| {
@@ -4137,6 +4205,7 @@ fn mergeShardsIntoReport(shards: []const ShardReport, request: cli.SearchRequest
         report.files_scanned += shard.files_scanned;
         report.files_skipped += shard.files_skipped;
         report.matches_found += shard.matches_found;
+        report.matches_after_cursor += shard.matches_after_cursor;
         report.scan_work_ms_total += shard.scan_work_ms_total;
         report.scan_open_ms_total += shard.scan_open_ms_total;
         report.scan_file_mmap_ms_total += shard.scan_file_mmap_ms_total;
@@ -4515,98 +4584,96 @@ inline fn trimCR(raw_line: []const u8) []const u8 {
     return raw_line;
 }
 
-// Fisheye preview — match-centered adaptive context window.
-//
-// Based on Furnas 1986 "Generalized Fisheye Views": the match is the focus
-// point, line length acts as a priori importance (API). Longer lines skew
-// toward minified/generated content with lower marginal information density,
-// so the preview budget contracts geometrically at dyadic tier thresholds.
-//
-//   Tier  Line length    Window half-width
-//   T0    <= 300         full line (normal source code)
-//   T1    301-600        150 bytes around match
-//   T2    601-1200       75 bytes around match
-//   T3    > 1200         37 bytes around match
-//
-// The match substring is always fully visible. Truncation marked with … (3
-// bytes UTF-8) at cut boundaries. For a 5000-char minified line at T3, the
-// preview is ~75 bytes centered on the match — a 66x reduction over emitting
-// the full line.
-
-const FISHEYE_T0_MAX: usize = 300;
-const FISHEYE_T1_MAX: usize = 600;
-const FISHEYE_T2_MAX: usize = 1200;
-const FISHEYE_HALF_WIDTH_T1: usize = 150;
-const FISHEYE_HALF_WIDTH_T2: usize = 75;
-const FISHEYE_HALF_WIDTH_T3: usize = 37;
-
-fn fisheyeHalfWidth(line_len: usize) usize {
-    if (line_len <= FISHEYE_T0_MAX) return line_len; // T0: full line
-    if (line_len <= FISHEYE_T1_MAX) return FISHEYE_HALF_WIDTH_T1;
-    if (line_len <= FISHEYE_T2_MAX) return FISHEYE_HALF_WIDTH_T2;
-    return FISHEYE_HALF_WIDTH_T3;
-}
-
-/// Produces a match-centered preview with geometrically contracting window.
-/// `match_byte_offset` is 0-based. `match_len` is best-effort (literal length
-/// or 0 for regex). The match substring is always preserved in the output.
-fn fisheyePreview(allocator: std.mem.Allocator, line: []const u8, match_byte_offset: usize, match_len: usize) ![]const u8 {
-    if (line.len <= FISHEYE_T0_MAX) return allocator.dupe(u8, line);
-
-    const half_width = fisheyeHalfWidth(line.len);
-    const match_end = @min(match_byte_offset + match_len, line.len);
-    const match_start = @min(match_byte_offset, line.len);
-
-    // Window must contain the full match plus symmetric context.
-    const window_start = if (match_start > half_width) match_start - half_width else 0;
-    var window_end = @min(match_end + half_width, line.len);
-
-    // If the match itself is wider than 2*half_width, the window is
-    // match-bounded with no side context — no ellipsis needed on the
-    // match-facing sides.
-    if (window_end <= window_start) window_end = @min(window_start + 1, line.len);
-
-    const elided_left = window_start > 0;
-    const elided_right = window_end < line.len;
-
-    // … is 3 bytes (0xE2 0x80 0xA6). Size the allocation precisely.
-    const ellipsis_len = 3;
-    var result_len: usize = window_end - window_start;
-    if (elided_left) result_len += ellipsis_len;
-    if (elided_right) result_len += ellipsis_len;
-
-    const result = try allocator.alloc(u8, result_len);
-    var pos: usize = 0;
-
-    if (elided_left) {
-        result[pos] = 0xE2;
-        result[pos + 1] = 0x80;
-        result[pos + 2] = 0xA6;
-        pos += ellipsis_len;
-    }
-
-    @memcpy(result[pos .. pos + (window_end - window_start)], line[window_start..window_end]);
-    pos += window_end - window_start;
-
-    if (elided_right) {
-        result[pos] = 0xE2;
-        result[pos + 1] = 0x80;
-        result[pos + 2] = 0xA6;
-    }
-
-    return result;
-}
-
-/// Best-effort match length for fisheye centering. Returns the first
-/// predicate's value length for literals/prefixes/suffixes, or 0 for regex
-/// where match length is variable and unknown at this point.
-fn fisheyeMatchLen(plan: expr.ExpressionPlan) usize {
-    if (plan.predicate_count == 0) return 0;
-    const predicate = plan.predicates[0];
-    return switch (predicate.kind) {
-        .literal, .prefix, .suffix => predicate.value.len,
-        .regex => 0,
+/// Materializes the canonical hit and records how its compact preview maps back to source bytes.
+fn makeSearchHit(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    line_number: usize,
+    column: usize,
+    line: []const u8,
+    span: preview.MatchSpan,
+) !SearchHit {
+    const compact = try preview.make(allocator, line, span);
+    return .{
+        .path = path,
+        .line = line_number,
+        .column = column,
+        .preview = compact.text,
+        .match_len = span.end - span.start,
+        .preview_start = compact.source_start,
+        .preview_end = compact.source_end,
+        .preview_elided_left = compact.elided_left,
+        .preview_elided_right = compact.elided_right,
     };
+}
+
+/// Resolves the exact span belonging to the earliest predicate column selected by the expression plan.
+fn exactMatchSpan(line: []const u8, plan: expr.ExpressionPlan, case_insensitive: bool, column: usize) preview.MatchSpan {
+    const start = column - 1;
+    var best = preview.MatchSpan{ .start = start, .end = start };
+    var found = false;
+    for (plan.predicates[0..plan.predicate_count]) |predicate| {
+        const predicate_column = predicateColumn(line, predicate, case_insensitive) orelse continue;
+        if (predicate_column != column) continue;
+        const candidate = predicateSpanAtColumn(line, predicate, case_insensitive, column);
+        if (!found or candidate.end < best.end) {
+            best = candidate;
+            found = true;
+        }
+    }
+    return best;
+}
+
+/// Converts a proved predicate column into its exact byte extent, using the regex ovector for variable-width matches.
+fn predicateSpanAtColumn(line: []const u8, predicate: expr.Predicate, case_insensitive: bool, column: usize) preview.MatchSpan {
+    const start = column - 1;
+    const literal_end = switch (predicate.kind) {
+        .literal, .prefix, .suffix => @min(line.len, start + predicate.value.len),
+        .regex => regexLiteralEnd(line, predicate, start) orelse {
+            const matched: ?preview.MatchSpan = if (pcre_regex.span(line, predicate.value, case_insensitive) catch null) |value|
+                .{ .start = value.start, .end = value.end }
+            else if (regex.span(line, predicate.value, case_insensitive)) |value|
+                .{ .start = value.start, .end = value.end }
+            else
+                null;
+            if (matched) |value| {
+                if (value.start == start) return .{ .start = value.start, .end = value.end };
+            }
+            return .{ .start = start, .end = start };
+        },
+    };
+    return .{ .start = start, .end = literal_end };
+}
+
+/// Returns exact lengths for regex strategies whose matched body is already classified as one literal.
+fn regexLiteralEnd(line: []const u8, predicate: expr.Predicate, start: usize) ?usize {
+    const body: ?[]const u8 = switch (predicate.strategy) {
+        .regex_plain_literal => if (std.mem.indexOfScalar(u8, predicate.value, '\\') == null) predicate.value else null,
+        .regex_ascii_casefold_literal => blk: {
+            const value = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            break :blk if (std.mem.indexOfScalar(u8, value, '\\') == null) value else null;
+        },
+        .regex_word_boundary_literal => expr.stripWordBoundaryAnchors(predicate.value),
+        .regex_ascii_casefold_word_boundary_literal => blk: {
+            const value = if (std.mem.startsWith(u8, predicate.value, "(?i)")) predicate.value[4..] else predicate.value;
+            break :blk expr.stripWordBoundaryAnchors(value);
+        },
+        else => null,
+    };
+    const literal = body orelse return null;
+    return @min(line.len, start + literal.len);
+}
+
+/// Filters canonical hits at the scan boundary so cursor pages never repeat the prior terminal key.
+fn isAfterCursor(request: cli.SearchRequest, path: []const u8, line: usize, column: usize) bool {
+    const after_path = request.cursor_path orelse return true;
+    return search_cursor.keyAfter(path, line, column, .{
+        .corpus_signature = request.cursor_corpus_signature orelse 0,
+        .request_fingerprint = request.cursor_request_fingerprint orelse 0,
+        .path = after_path,
+        .line = request.cursor_line,
+        .column = request.cursor_column,
+    });
 }
 
 fn availableThreads() usize {
@@ -4671,8 +4738,7 @@ fn scanOpenFile(
         report.slowest_path = display_path;
         report.slowest_bytes = file_bytes;
     }
-    if (shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program))
-    {
+    if (shouldAttemptWholeFileAdmission(single_chunk, request.case_insensitive, trigram_program)) {
         if (trigram_program.needsCasefold()) {
             // Single SIMD byteset scan replaces per-needle indexOfByte loop.
             if (trigram_program.first_byte_set_populated and
@@ -4835,14 +4901,12 @@ fn recordLine(
     }
     if (matchingColumn(line, plan, request.case_insensitive)) |column| {
         report.matches_found += 1;
+        if (!isAfterCursor(request, display_path, line_number, column)) return;
+        report.matches_after_cursor += 1;
         const under_request_limit = if (request.max_hits) |max_hits| report.hit_count < max_hits else true;
         if (!request.stats_only and under_request_limit and report.hit_count < MAX_RETAINED_HITS) {
-            report.hits[report.hit_count] = .{
-                .path = display_path,
-                .line = line_number,
-                .column = column,
-                .preview = try fisheyePreview(allocator, line, column - 1, fisheyeMatchLen(plan)),
-            };
+            const span = exactMatchSpan(line, plan, request.case_insensitive, column);
+            report.hits[report.hit_count] = try makeSearchHit(allocator, display_path, line_number, column, line, span);
             report.hit_count += 1;
         }
     }
@@ -6461,6 +6525,22 @@ test "discovered signature changes when same-path file identity changes" {
     try std.testing.expect(before != after);
 }
 
+test "discovered signature remains stable across repeated stats" {
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "stable.txt", .data = "needle\n" });
+    const file_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/stable.txt", .{&tmp.sub_path});
+    const files = [_]DiscoveredFile{.{ .path = file_path }};
+    const first = try computeDiscoveredSignature(io, &files);
+    const second = try computeDiscoveredSignature(io, &files);
+    try std.testing.expectEqual(first, second);
+}
+
 test "evidence frontier prepare narrows active files and accounts cached prunes" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -7222,6 +7302,8 @@ test "protected Windows stats-only roots allow parallel discovery under default 
         request.max_hits = 1;
         request.stats_only = false;
         try std.testing.expect(!shouldUseParallelDiscovery(request, roots));
+        request.stable_output = true;
+        try std.testing.expect(shouldUseParallelDiscovery(request, roots));
     }
 }
 
@@ -7329,62 +7411,4 @@ test "joined discovery child path falls back to owned allocation and persist dup
 
     borrowed_buffer[0] = 'X';
     try std.testing.expectEqualStrings("repo/child.txt", persisted);
-}
-
-test "fisheye preview returns full line for short lines (T0)" {
-    const line = "const x = 42;";
-    const preview = try fisheyePreview(std.testing.allocator, line, 6, 1);
-    defer std.testing.allocator.free(preview);
-    try std.testing.expectEqualStrings(line, preview);
-}
-
-test "fisheye preview contracts at T1 for medium lines" {
-    var line_buf: [500]u8 = undefined;
-    for (&line_buf, 0..) |*b, i| b.* = if (i == 250) 'X' else 'a';
-    const line = line_buf[0..500];
-
-    const preview = try fisheyePreview(std.testing.allocator, line, 250, 1);
-    defer std.testing.allocator.free(preview);
-
-    try std.testing.expect(preview.len < line.len);
-    try std.testing.expect(preview.len <= 150 + 150 + 1 + 6);
-    try std.testing.expectEqual(@as(u8, 0xE2), preview[0]);
-    try std.testing.expectEqual(@as(u8, 0xE2), preview[preview.len - 3]);
-    const match_in_preview = std.mem.indexOfScalar(u8, preview, 'X');
-    try std.testing.expect(match_in_preview != null);
-}
-
-test "fisheye preview contracts at T3 for very long lines" {
-    var line_buf: [5000]u8 = undefined;
-    for (&line_buf, 0..) |*b, i| b.* = if (i == 2500) 'Z' else 'a';
-    const line = line_buf[0..5000];
-
-    const preview = try fisheyePreview(std.testing.allocator, line, 2500, 1);
-    defer std.testing.allocator.free(preview);
-
-    try std.testing.expect(preview.len <= 37 + 37 + 1 + 6);
-    try std.testing.expectEqual(@as(u8, 0xE2), preview[0]);
-    try std.testing.expectEqual(@as(u8, 0xE2), preview[preview.len - 3]);
-    try std.testing.expect(std.mem.indexOfScalar(u8, preview, 'Z') != null);
-}
-
-test "fisheye preview preserves full match substring when wider than window" {
-    var line_buf: [2000]u8 = undefined;
-    for (&line_buf, 0..) |*b, i| {
-        b.* = if (i >= 900 and i < 1100) 'M' else 'a';
-    }
-    const line = line_buf[0..2000];
-
-    const preview = try fisheyePreview(std.testing.allocator, line, 900, 200);
-    defer std.testing.allocator.free(preview);
-
-    const match_count = std.mem.count(u8, preview, "M");
-    try std.testing.expect(match_count >= 200);
-}
-
-test "fisheye half width returns correct tier" {
-    try std.testing.expectEqual(@as(usize, 100), fisheyeHalfWidth(100));
-    try std.testing.expectEqual(@as(usize, 150), fisheyeHalfWidth(400));
-    try std.testing.expectEqual(@as(usize, 75), fisheyeHalfWidth(800));
-    try std.testing.expectEqual(@as(usize, 37), fisheyeHalfWidth(5000));
 }

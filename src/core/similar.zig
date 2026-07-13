@@ -1,5 +1,7 @@
 const std = @import("std");
 const cli = @import("../cli/args.zig");
+const semantic_cursor = @import("../cli/cursor.zig");
+const output_contract = @import("../cli/output_contract.zig");
 
 pub const Config = struct {
     base_url: []const u8,
@@ -25,16 +27,39 @@ pub const Config = struct {
 const Document = struct {
     path: []const u8,
     text: []const u8,
+    start_line: usize = 1,
+    end_line: usize,
     embedding: []f64 = &.{},
 };
 
 const Result = struct {
     path: []const u8,
+    start_line: usize,
+    end_line: usize,
     embedding_score: f64,
     rerank_score: f64,
 };
 
-const MAX_FILES: usize = 512;
+const Candidate = struct {
+    path: []const u8,
+    size: u64,
+    mtime_ns: i128,
+};
+
+const Coverage = struct {
+    files_eligible: usize,
+    frontier_start: usize,
+    candidates_evaluated: usize,
+    files_read: usize,
+    chunks_embedded: usize,
+    bytes_submitted: usize,
+    candidates_omitted: usize,
+    skipped_binary: usize,
+    skipped_empty: usize,
+    skipped_oversize: usize,
+    read_errors: usize,
+};
+
 const MAX_FILE_BYTES: usize = 256 * 1024;
 const BINARY_SNIFF_BYTES: usize = 1024;
 
@@ -70,24 +95,63 @@ pub fn run(
         break :blk true;
     };
 
-    var document_list = std.ArrayList(Document).empty;
+    var candidate_list = std.ArrayList(Candidate).empty;
+    var skipped_oversize: usize = 0;
+    for (request.paths[0..request.path_count]) |path| {
+        try collectCandidatePath(io, allocator, &candidate_list, path, query_is_file, query, &skipped_oversize);
+    }
+    canonicalizeCandidates(&candidate_list);
+    const candidates = candidate_list.items;
+    const corpus_signature = candidateCorpusSignature(candidates);
+    const request_fingerprint = semantic_cursor.similarRequestFingerprint(request);
+    if (request.cursor_request_fingerprint) |expected| {
+        if (expected != request_fingerprint) return error.CursorRequestMismatch;
+    }
+    if (request.cursor_corpus_signature) |expected| {
+        if (expected != corpus_signature) return error.StaleCursor;
+    }
 
-    if (query_is_file and request.path_count >= 1) {
-        // Legacy mode: query is the anchor file, paths are candidates.
-        const anchor_bytes = try std.Io.Dir.cwd().readFileAlloc(io, query, allocator, .limited(MAX_FILE_BYTES));
-        try document_list.append(allocator, .{ .path = query, .text = anchor_bytes });
-        for (request.paths[0..request.path_count]) |path| {
-            if (std.mem.eql(u8, path, query)) continue;
-            _ = try collectFile(io, allocator, &document_list, path);
-        }
-    } else {
-        // Text-query mode: query is the concept, discover files from paths.
-        for (request.paths[0..request.path_count]) |path| {
-            try collectPath(io, allocator, &document_list, path);
+    const frontier_order = try buildFrontierOrder(allocator, candidates, query, request.candidate_budget);
+    defer allocator.free(frontier_order);
+    const frontier_start = request.cursor_ordinal;
+    if (frontier_start > frontier_order.len) return error.StaleCursor;
+    const frontier_end = @min(frontier_start + request.candidate_budget, frontier_order.len);
+
+    var coverage = Coverage{
+        .files_eligible = candidates.len,
+        .frontier_start = frontier_start,
+        .candidates_evaluated = frontier_end - frontier_start,
+        .files_read = 0,
+        .chunks_embedded = 0,
+        .bytes_submitted = 0,
+        .candidates_omitted = frontier_order.len - frontier_end,
+        .skipped_binary = 0,
+        .skipped_empty = 0,
+        .skipped_oversize = skipped_oversize,
+        .read_errors = 0,
+    };
+
+    var document_list = std.ArrayList(Document).empty;
+    if (query_is_file) {
+        const anchor = try readAnchorDocument(io, allocator, query);
+        try document_list.append(allocator, anchor);
+    }
+    for (frontier_order[frontier_start..frontier_end]) |candidate_index| {
+        if (try readCandidateDocument(io, allocator, candidates[candidate_index], &coverage)) |document| {
+            try document_list.append(allocator, document);
         }
     }
 
-    if (document_list.items.len < 2) return error.MissingValue;
+    const candidate_document_count = document_list.items.len - @intFromBool(query_is_file);
+    coverage.chunks_embedded = candidate_document_count;
+    if (candidate_document_count == 0) {
+        if (isVersioned(request.output_format)) {
+            const next_cursor = try semanticNextCursor(allocator, candidates, frontier_order, frontier_end, corpus_signature, request_fingerprint);
+            try writeVersionedResult(writer, request, query, corpus_signature, request_fingerprint, coverage, &.{}, 0, next_cursor, null);
+            return;
+        }
+        return error.MissingValue;
+    }
 
     var documents = try document_list.toOwnedSlice(allocator);
     defer allocator.free(documents);
@@ -95,15 +159,18 @@ pub fn run(
     // Embed all documents (including anchor if legacy mode).
     const inputs = try allocator.alloc([]const u8, documents.len);
     defer allocator.free(inputs);
-    for (documents, 0..) |document, index| inputs[index] = document.text;
+    for (documents, 0..) |document, index| {
+        inputs[index] = document.text;
+        coverage.bytes_submitted += document.text.len;
+    }
 
     const embedding_url = try std.fmt.allocPrint(allocator, "{s}/embeddings", .{config.base_url});
     defer allocator.free(embedding_url);
-    const embedding_response = try postJson(io, allocator, embedding_url, key, try jsonPayload(allocator, .{
+    const embedding_response = postJson(io, allocator, embedding_url, key, try jsonPayload(allocator, .{
         .model = config.embedding_model,
         .input = inputs,
         .encoding_format = "float",
-    }));
+    })) catch |err| return reportSemanticFailure(writer, request, query, corpus_signature, request_fingerprint, coverage, "embedding", err);
     defer allocator.free(embedding_response);
     const embeddings = try parseEmbeddings(allocator, embedding_response, documents.len);
     for (documents, 0..) |*document, index| document.embedding = embeddings[index];
@@ -112,11 +179,12 @@ pub fn run(
     const anchor_embedding: []f64 = if (query_is_file) documents[0].embedding else blk: {
         // Embed the query text separately.
         const query_input = [_][]const u8{query};
-        const query_response = try postJson(io, allocator, embedding_url, key, try jsonPayload(allocator, .{
+        coverage.bytes_submitted += query.len;
+        const query_response = postJson(io, allocator, embedding_url, key, try jsonPayload(allocator, .{
             .model = config.embedding_model,
             .input = &query_input,
             .encoding_format = "float",
-        }));
+        })) catch |err| return reportSemanticFailure(writer, request, query, corpus_signature, request_fingerprint, coverage, "query_embedding", err);
         defer allocator.free(query_response);
         const query_embeddings = try parseEmbeddings(allocator, query_response, 1);
         break :blk query_embeddings[0];
@@ -131,20 +199,26 @@ pub fn run(
 
     const rerank_documents = try allocator.alloc([]const u8, candidate_count);
     defer allocator.free(rerank_documents);
-    for (documents[candidate_start..], 0..) |document, index| rerank_documents[index] = document.text;
+    for (documents[candidate_start..], 0..) |document, index| {
+        rerank_documents[index] = document.text;
+        coverage.bytes_submitted += document.text.len;
+    }
+    coverage.bytes_submitted += if (query_is_file) documents[0].text.len else query.len;
 
     const rerank_url = try rerankUrl(allocator, config.base_url, config.rerank_model);
     defer allocator.free(rerank_url);
-    const rerank_response = try postJson(io, allocator, rerank_url, key, try jsonPayload(allocator, .{
+    const rerank_response = postJson(io, allocator, rerank_url, key, try jsonPayload(allocator, .{
         .query = if (query_is_file) documents[0].text else query,
         .documents = rerank_documents,
-    }));
+    })) catch |err| return reportSemanticFailure(writer, request, query, corpus_signature, request_fingerprint, coverage, "rerank", err);
     defer allocator.free(rerank_response);
     const rerank_scores = try parseScores(allocator, rerank_response, candidate_count);
 
     for (documents[candidate_start..], 0..) |document, index| {
         results[index] = .{
             .path = document.path,
+            .start_line = document.start_line,
+            .end_line = document.end_line,
             .embedding_score = cosine(anchor_embedding, document.embedding),
             .rerank_score = rerank_scores[index],
         };
@@ -157,8 +231,12 @@ pub fn run(
     if (request.anti) std.mem.reverse(Result, results);
     const count = @min(request.max_results, results.len);
 
-    // Output.
-    if (request.output_format == .agent) {
+    const next_cursor = try semanticNextCursor(allocator, candidates, frontier_order, frontier_end, corpus_signature, request_fingerprint);
+
+    // Output. Legacy surfaces remain byte-compatible; the versioned surface owns coverage.
+    if (isVersioned(request.output_format)) {
+        try writeVersionedResult(writer, request, query, corpus_signature, request_fingerprint, coverage, results, count, next_cursor, null);
+    } else if (request.output_format == .agent_v2) {
         try writeAgentResult(writer, query, request.anti, results, count);
     } else if (request.json) {
         try writer.writeAll("{\"status\":\"ok\",\"query\":");
@@ -195,59 +273,325 @@ fn writeAgentResult(writer: anytype, query: []const u8, anti: bool, results: []c
     try writer.writeAll("]} --\n");
 }
 
-/// Collects a single file into the document list. Skips binary files
-/// (null byte in first 1024 bytes) and files larger than MAX_FILE_BYTES.
-fn collectFile(io: std.Io, allocator: std.mem.Allocator, list: *std.ArrayList(Document), path: []const u8) !bool {
-    if (list.items.len >= MAX_FILES) return false;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(MAX_FILE_BYTES)) catch return false;
-    // Binary sniff: skip files with null bytes in first 1024 bytes.
-    const sniff_len = @min(BINARY_SNIFF_BYTES, bytes.len);
-    for (bytes[0..sniff_len]) |b| {
-        if (b == 0) {
-            allocator.free(bytes);
-            return false;
-        }
-    }
-    // Skip empty files.
-    if (bytes.len == 0) {
-        allocator.free(bytes);
-        return false;
-    }
-    try list.append(allocator, .{ .path = path, .text = bytes });
-    return true;
-}
-
-/// Collects files from a path. If the path is a directory, recursively
-/// discovers files within it. If it's a file, collects it directly.
-fn collectPath(io: std.Io, allocator: std.mem.Allocator, list: *std.ArrayList(Document), path: []const u8) !void {
-    // Check if path is a directory.
+/// Discovers semantic candidates without reading their bodies or defining
+/// eligibility through lexical overlap. Oversized files are explicit policy skips.
+fn collectCandidatePath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Candidate),
+    path: []const u8,
+    exclude_anchor: bool,
+    anchor: []const u8,
+    skipped_oversize: *usize,
+) !void {
     const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return;
     if (stat.kind == .directory) {
         var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
         defer dir.close(io);
         var iterator = dir.iterate();
-        while (true) {
-            const entry = iterator.next(io) catch break;
-            const e = entry orelse break;
-            if (e.kind == .file) {
-                if (list.items.len >= MAX_FILES) break;
-                // Join path with entry name.
-                const child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, e.name });
-                const kept = collectFile(io, allocator, list, child_path) catch {
-                    allocator.free(child_path);
-                    continue;
-                };
-                if (!kept) allocator.free(child_path);
-            } else if (e.kind == .directory) {
-                if (e.name.len > 0 and e.name[0] == '.') continue;
-                const child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, e.name });
-                collectPath(io, allocator, list, child_path) catch {};
-                allocator.free(child_path);
+        while (try iterator.next(io)) |entry| {
+            if (entry.kind == .directory and entry.name.len > 0 and entry.name[0] == '.') continue;
+            if (entry.kind != .file and entry.kind != .directory) continue;
+            const child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name });
+            defer allocator.free(child_path);
+            try collectCandidatePath(io, allocator, list, child_path, exclude_anchor, anchor, skipped_oversize);
+        }
+        return;
+    }
+    if (stat.kind != .file or (exclude_anchor and std.mem.eql(u8, path, anchor))) return;
+    if (stat.size > MAX_FILE_BYTES) {
+        skipped_oversize.* += 1;
+        return;
+    }
+    try list.append(allocator, .{
+        .path = try allocator.dupe(u8, path),
+        .size = stat.size,
+        .mtime_ns = stat.mtime.nanoseconds,
+    });
+}
+
+/// Sorts and de-duplicates overlapping roots so one file is never paid for twice.
+fn canonicalizeCandidates(list: *std.ArrayList(Candidate)) void {
+    std.mem.sort(Candidate, list.items, {}, struct {
+        fn lessThan(_: void, lhs: Candidate, rhs: Candidate) bool {
+            return std.mem.lessThan(u8, lhs.path, rhs.path);
+        }
+    }.lessThan);
+    var write_index: usize = 0;
+    for (list.items) |candidate| {
+        if (write_index != 0 and std.mem.eql(u8, list.items[write_index - 1].path, candidate.path)) continue;
+        list.items[write_index] = candidate;
+        write_index += 1;
+    }
+    list.items.len = write_index;
+}
+
+/// Binds continuation to the exact deterministic candidate corpus.
+fn candidateCorpusSignature(candidates: []const Candidate) u64 {
+    var hasher = std.hash.Wyhash.init(0x4958_5345_4d43_4f52);
+    for (candidates) |candidate| {
+        hasher.update(candidate.path);
+        hasher.update(std.mem.asBytes(&candidate.size));
+        hasher.update(std.mem.asBytes(&candidate.mtime_ns));
+    }
+    return hasher.final();
+}
+
+const RankedCandidate = struct { index: usize, lexical_score: usize };
+
+/// Orders the first bounded batch as a union of lexical signal and evenly
+/// distributed corpus coverage, then appends every remaining path canonically.
+fn buildFrontierOrder(allocator: std.mem.Allocator, candidates: []const Candidate, query: []const u8, budget: usize) ![]usize {
+    const order = try allocator.alloc(usize, candidates.len);
+    errdefer allocator.free(order);
+    if (candidates.len == 0) return order;
+    const selected = try allocator.alloc(bool, candidates.len);
+    defer allocator.free(selected);
+    @memset(selected, false);
+    const ranked = try allocator.alloc(RankedCandidate, candidates.len);
+    defer allocator.free(ranked);
+    for (candidates, 0..) |candidate, index| ranked[index] = .{ .index = index, .lexical_score = lexicalPathScore(candidate.path, query) };
+    std.mem.sort(RankedCandidate, ranked, candidates, struct {
+        fn lessThan(paths: []const Candidate, lhs: RankedCandidate, rhs: RankedCandidate) bool {
+            if (lhs.lexical_score != rhs.lexical_score) return lhs.lexical_score > rhs.lexical_score;
+            return std.mem.lessThan(u8, paths[lhs.index].path, paths[rhs.index].path);
+        }
+    }.lessThan);
+
+    const first_batch = @min(budget, candidates.len);
+    const lexical_target = @min((first_batch + 1) / 2, first_batch);
+    var written: usize = 0;
+    for (ranked) |candidate| {
+        if (written >= lexical_target or candidate.lexical_score == 0) break;
+        order[written] = candidate.index;
+        selected[candidate.index] = true;
+        written += 1;
+    }
+    const coverage_target = first_batch - written;
+    var slot: usize = 0;
+    while (slot < coverage_target) : (slot += 1) {
+        const target = @min(((slot * 2 + 1) * candidates.len) / (coverage_target * 2), candidates.len - 1);
+        const picked = nearestUnselected(selected, target) orelse break;
+        order[written] = picked;
+        selected[picked] = true;
+        written += 1;
+    }
+    for (candidates, 0..) |_, index| {
+        if (selected[index]) continue;
+        order[written] = index;
+        written += 1;
+    }
+    std.debug.assert(written == candidates.len);
+    return order;
+}
+
+/// Finds the closest still-unselected corpus position with stable forward tie-breaking.
+fn nearestUnselected(selected: []const bool, target: usize) ?usize {
+    var distance: usize = 0;
+    while (distance < selected.len) : (distance += 1) {
+        const forward = target + distance;
+        if (forward < selected.len and !selected[forward]) return forward;
+        if (distance <= target) {
+            const backward = target - distance;
+            if (!selected[backward]) return backward;
+        }
+    }
+    return null;
+}
+
+/// Scores path-name evidence only as prioritization; zero-scored files remain eligible.
+fn lexicalPathScore(path: []const u8, query: []const u8) usize {
+    var score: usize = 0;
+    var start: usize = 0;
+    while (start < query.len) {
+        while (start < query.len and !std.ascii.isAlphanumeric(query[start])) : (start += 1) {}
+        var end = start;
+        while (end < query.len and std.ascii.isAlphanumeric(query[end])) : (end += 1) {}
+        if (end > start + 1 and containsIgnoreCase(path, query[start..end])) score += 1;
+        start = if (end == start) start + 1 else end;
+    }
+    return score;
+}
+
+/// Performs allocation-free ASCII-insensitive token lookup over one path.
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or needle.len > haystack.len) return false;
+    var offset: usize = 0;
+    while (offset + needle.len <= haystack.len) : (offset += 1) {
+        var equal = true;
+        for (needle, 0..) |byte, index| {
+            if (std.ascii.toLower(haystack[offset + index]) != std.ascii.toLower(byte)) {
+                equal = false;
+                break;
             }
         }
-    } else {
-        _ = try collectFile(io, allocator, list, path);
+        if (equal) return true;
     }
+    return false;
+}
+
+/// Reads the explicit file anchor through the same bounded whole-file policy.
+fn readAnchorDocument(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Document {
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+    if (stat.kind != .file or stat.size > MAX_FILE_BYTES) return error.MissingValue;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(MAX_FILE_BYTES));
+    if (bytes.len == 0 or isBinary(bytes)) return error.MissingValue;
+    return .{ .path = path, .text = bytes, .end_line = sourceLineCount(bytes) };
+}
+
+/// Reads one selected candidate and records every non-embedded outcome explicitly.
+fn readCandidateDocument(io: std.Io, allocator: std.mem.Allocator, candidate: Candidate, coverage: *Coverage) !?Document {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, candidate.path, allocator, .limited(MAX_FILE_BYTES)) catch {
+        coverage.read_errors += 1;
+        return null;
+    };
+    coverage.files_read += 1;
+    if (bytes.len == 0) {
+        coverage.skipped_empty += 1;
+        allocator.free(bytes);
+        return null;
+    }
+    if (isBinary(bytes)) {
+        coverage.skipped_binary += 1;
+        allocator.free(bytes);
+        return null;
+    }
+    return .{ .path = candidate.path, .text = bytes, .end_line = sourceLineCount(bytes) };
+}
+
+/// Applies the bounded binary sniff used by the semantic body reader.
+fn isBinary(bytes: []const u8) bool {
+    const sniff_len = @min(BINARY_SNIFF_BYTES, bytes.len);
+    return std.mem.indexOfScalar(u8, bytes[0..sniff_len], 0) != null;
+}
+
+/// Counts addressable source lines without inventing a trailing empty line.
+fn sourceLineCount(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    var lines = std.mem.count(u8, bytes, "\n");
+    if (bytes[bytes.len - 1] != '\n') lines += 1;
+    return @max(lines, 1);
+}
+
+/// Identifies the semantic formats with explicit coverage and continuation.
+fn isVersioned(format: cli.OutputFormat) bool {
+    return format == .agent_v3 or format == .json_compact;
+}
+
+/// Encodes the next frontier ordinal against corpus and request identity.
+fn semanticNextCursor(
+    allocator: std.mem.Allocator,
+    candidates: []const Candidate,
+    order: []const usize,
+    frontier_end: usize,
+    corpus_signature: u64,
+    request_fingerprint: u64,
+) !?[]const u8 {
+    if (frontier_end == 0 or frontier_end >= order.len) return null;
+    return try semantic_cursor.encode(allocator, .{
+        .corpus_signature = corpus_signature,
+        .request_fingerprint = request_fingerprint,
+        .path = candidates[order[frontier_end - 1]].path,
+        .line = frontier_end,
+        .column = 1,
+    });
+}
+
+/// Emits the one versioned semantic envelope with exact ranges and coverage.
+fn writeVersionedResult(
+    writer: anytype,
+    request: cli.SimilarRequest,
+    query: []const u8,
+    corpus_signature: u64,
+    request_fingerprint: u64,
+    coverage: Coverage,
+    results: []const Result,
+    count: usize,
+    next_cursor: ?[]const u8,
+    failure: ?struct { phase: []const u8, code: []const u8 },
+) !void {
+    const raw = request.output_format == .json_compact;
+    if (!raw) try writer.writeAll("-- ix.similar.v2 ");
+    try writer.writeAll("{\"schema\":\"ix.similar.v2\",\"status\":");
+    try writeJsonString(writer, if (failure == null) "ok" else "error");
+    try writer.writeAll(",\"query\":");
+    try writeJsonString(writer, query);
+    try writer.print(",\"anti\":{s},\"corpus_signature\":\"{x}\",\"request_fingerprint\":\"{x}\"", .{
+        if (request.anti) "true" else "false",
+        corpus_signature,
+        request_fingerprint,
+    });
+    const coverage_partial = coverage.candidates_omitted != 0 or coverage.read_errors != 0;
+    try writer.writeAll(",\"coverage\":{\"state\":");
+    try writeJsonString(writer, if (coverage_partial) "partial" else "complete");
+    try writer.print(",\"files_eligible\":{},\"frontier_start\":{},\"candidates_evaluated\":{},\"files_read\":{},\"chunks_embedded\":{},\"bytes_submitted\":{},\"candidates_omitted\":{},\"skipped_binary\":{},\"skipped_empty\":{},\"skipped_oversize\":{},\"read_errors\":{}", .{
+        coverage.files_eligible,
+        coverage.frontier_start,
+        coverage.candidates_evaluated,
+        coverage.files_read,
+        coverage.chunks_embedded,
+        coverage.bytes_submitted,
+        coverage.candidates_omitted,
+        coverage.skipped_binary,
+        coverage.skipped_empty,
+        coverage.skipped_oversize,
+        coverage.read_errors,
+    });
+    if (coverage.candidates_omitted != 0) {
+        try writer.writeAll(",\"truncation_reason\":");
+        try writeJsonString(writer, @tagName(output_contract.TruncationReason.similar_candidate_budget));
+    }
+    if (next_cursor) |value| {
+        try writer.writeAll(",\"next_cursor\":");
+        try writeJsonString(writer, value);
+    }
+    try writer.writeByte('}');
+    if (failure) |value| {
+        try writer.writeAll(",\"error\":{\"phase\":");
+        try writeJsonString(writer, value.phase);
+        try writer.writeAll(",\"code\":");
+        try writeJsonString(writer, value.code);
+        try writer.writeAll(",\"recovery\":\"verify semantic endpoint, model, credentials, and retry this cursor page\"}");
+    }
+    try writer.writeAll(",\"results\":[");
+    for (results[0..count], 0..) |result, index| {
+        if (index != 0) try writer.writeByte(',');
+        try writer.writeAll("{\"path\":");
+        try writeJsonString(writer, result.path);
+        try writer.print(",\"start_line\":{},\"end_line\":{},\"embedding\":{d:.6},\"rerank\":{d:.6}}}", .{
+            result.start_line,
+            result.end_line,
+            result.embedding_score,
+            result.rerank_score,
+        });
+    }
+    try writer.writeAll("]}");
+    if (raw) try writer.writeByte('\n') else try writer.writeAll(" --\n");
+}
+
+/// Preserves partial semantic coverage when a remote provider rejects a page.
+fn reportSemanticFailure(
+    writer: anytype,
+    request: cli.SimilarRequest,
+    query: []const u8,
+    corpus_signature: u64,
+    request_fingerprint: u64,
+    coverage: Coverage,
+    phase: []const u8,
+    source_error: anyerror,
+) !void {
+    if (!isVersioned(request.output_format)) return source_error;
+    try writeVersionedResult(writer, request, query, corpus_signature, request_fingerprint, coverage, &.{}, 0, null, .{
+        .phase = phase,
+        .code = "provider_request_failed",
+    });
+    try writer.flush();
+    return error.SemanticFailureReported;
+}
+
+/// Uses the canonical JSON stringifier for every public semantic string.
+fn writeJsonString(writer: anytype, value: []const u8) !void {
+    try std.json.Stringify.value(value, .{}, writer);
 }
 
 fn jsonPayload(allocator: std.mem.Allocator, value: anytype) ![]u8 {
@@ -343,4 +687,38 @@ test "similar rerank URL derives from OpenAI-compatible base" {
     const url = try rerankUrl(std.testing.allocator, "https://api.deepinfra.com/v1/openai", "model");
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://api.deepinfra.com/v1/inference/model", url);
+}
+
+test "semantic frontier unions lexical signal with corpus coverage without hard filtering" {
+    const candidates = [_]Candidate{
+        .{ .path = "00/a.zig", .size = 1, .mtime_ns = 1 },
+        .{ .path = "10/b.zig", .size = 1, .mtime_ns = 1 },
+        .{ .path = "20/cache_owner.zig", .size = 1, .mtime_ns = 1 },
+        .{ .path = "30/d.zig", .size = 1, .mtime_ns = 1 },
+        .{ .path = "40/e.zig", .size = 1, .mtime_ns = 1 },
+        .{ .path = "50/f.zig", .size = 1, .mtime_ns = 1 },
+        .{ .path = "60/g.zig", .size = 1, .mtime_ns = 1 },
+        .{ .path = "70/h.zig", .size = 1, .mtime_ns = 1 },
+    };
+    const first = try buildFrontierOrder(std.testing.allocator, &candidates, "cache ownership", 4);
+    defer std.testing.allocator.free(first);
+    const second = try buildFrontierOrder(std.testing.allocator, &candidates, "cache ownership", 4);
+    defer std.testing.allocator.free(second);
+    try std.testing.expectEqualSlices(usize, first, second);
+    try std.testing.expectEqual(@as(usize, 2), first[0]);
+
+    var seen = [_]bool{false} ** candidates.len;
+    var zero_score_in_first_batch = false;
+    for (first, 0..) |index, position| {
+        try std.testing.expect(!seen[index]);
+        seen[index] = true;
+        if (position < 4 and lexicalPathScore(candidates[index].path, "cache ownership") == 0) zero_score_in_first_batch = true;
+    }
+    try std.testing.expect(zero_score_in_first_batch);
+}
+
+test "whole-file semantic coordinates remain exact until chunking is measured" {
+    try std.testing.expectEqual(@as(usize, 1), sourceLineCount("one"));
+    try std.testing.expectEqual(@as(usize, 2), sourceLineCount("one\ntwo"));
+    try std.testing.expectEqual(@as(usize, 2), sourceLineCount("one\ntwo\n"));
 }

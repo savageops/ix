@@ -1,4 +1,5 @@
 const std = @import("std");
+const command_spec = @import("command_spec.zig");
 
 pub const MAX_SEARCH_PATHS = 128;
 pub const MAX_IGNORE_FILES = 32;
@@ -46,8 +47,16 @@ pub const SearchRequest = struct {
     nexus_disabled: bool,
     index_enabled: bool,
     output_mode: OutputMode = .normal,
-    output_format: OutputFormat = .default,
+    output_format: OutputFormat = .text,
     context: ?usize = null,
+    max_bytes: ?usize = null,
+    cursor: ?[]const u8 = null,
+    stable_output: bool = false,
+    cursor_path: ?[]const u8 = null,
+    cursor_line: usize = 0,
+    cursor_column: usize = 0,
+    cursor_corpus_signature: ?u64 = null,
+    cursor_request_fingerprint: ?u64 = null,
 };
 
 /// Adjacent Operations Vector output modes (spec point 29).
@@ -63,10 +72,7 @@ pub const OutputMode = enum {
 /// Output format selector. Controls the serialization shape of search results.
 /// default: hit records + ix.result.v1 sentinel (ripgrep-compatible)
 /// agent: ix.result.v2 compact grouped format (LLM-optimized, token-minimal)
-pub const OutputFormat = enum {
-    default,
-    agent,
-};
+pub const OutputFormat = command_spec.OutputFormat;
 
 pub const InspectRequest = struct {
     paths: [MAX_SEARCH_PATHS][]const u8,
@@ -125,7 +131,12 @@ pub const SimilarRequest = struct {
     anti: bool,
     json: bool,
     max_results: usize,
-    output_format: OutputFormat = .default,
+    output_format: OutputFormat = .text,
+    candidate_budget: usize = 512,
+    cursor: ?[]const u8 = null,
+    cursor_ordinal: usize = 0,
+    cursor_corpus_signature: ?u64 = null,
+    cursor_request_fingerprint: ?u64 = null,
 };
 
 pub const Command = union(CommandTag) {
@@ -149,6 +160,7 @@ pub const ParseError = error{
     MissingExpression,
     MissingValue,
     UnsupportedFlag,
+    ConflictingOutputFormat,
     AmbiguousBooleanRegex,
 };
 
@@ -168,7 +180,7 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
     }
     if (std.mem.eql(u8, first, "matches")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .matches } };
-        return .{ .command = .{ .matches = try parseSearch(argv[2..]) } };
+        return .{ .command = .{ .matches = try parseMatches(argv[2..]) } };
     }
     if (std.mem.eql(u8, first, "inspect")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .inspect } };
@@ -199,6 +211,16 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
     }
 
     return .{ .command = .{ .search = try parseCompatSearch(allocator, argv[1..]) } };
+}
+
+/// Keeps the record-only command from accepting projections that require a terminal envelope.
+fn parseMatches(args: []const []const u8) ParseError!SearchRequest {
+    const request = try parseSearch(args);
+    if (request.context != null or request.max_bytes != null or request.cursor != null) return ParseError.UnsupportedFlag;
+    switch (request.output_format) {
+        .agent_v2, .agent_v3 => return ParseError.UnsupportedFlag,
+        else => return request,
+    }
 }
 
 fn isHelpArg(arg: []const u8) bool {
@@ -251,20 +273,38 @@ fn parseSimilar(args: []const []const u8) ParseError!SimilarRequest {
         .anti = false,
         .json = false,
         .max_results = 20,
-        .output_format = .default,
+        .output_format = .text,
     };
-    for (args) |arg| {
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
         if (std.mem.eql(u8, arg, "--anti")) {
             request.anti = true;
         } else if (std.mem.eql(u8, arg, "--json")) {
-            request.json = true;
+            try selectSimilarOutputFormat(&request, .json);
         } else if (std.mem.eql(u8, arg, "--agent")) {
-            request.output_format = .agent;
+            try selectSimilarOutputFormat(&request, .agent_v2);
+        } else if (std.mem.eql(u8, arg, "--format")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            try selectSimilarOutputFormat(&request, command_spec.parseFormat(args[index]) orelse return ParseError.UnsupportedFlag);
         } else if (std.mem.eql(u8, arg, "--max-results")) {
-            return ParseError.MissingValue;
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.max_results = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
+            if (request.max_results == 0) return ParseError.MissingValue;
         } else if (std.mem.startsWith(u8, arg, "--max-results=")) {
             request.max_results = std.fmt.parseInt(usize, arg["--max-results=".len..], 10) catch return ParseError.MissingValue;
             if (request.max_results == 0) return ParseError.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--candidate-budget")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.candidate_budget = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
+            if (request.candidate_budget == 0) return ParseError.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--cursor")) {
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return ParseError.MissingValue;
+            request.cursor = args[index];
         } else if (std.mem.startsWith(u8, arg, "-")) {
             return ParseError.UnsupportedFlag;
         } else {
@@ -281,7 +321,20 @@ fn parseSimilar(args: []const []const u8) ParseError!SimilarRequest {
     }
     if (request.query == null) return ParseError.MissingValue;
     if (request.path_count == 0) return ParseError.MissingValue;
+    if (request.cursor != null and request.output_format == .text) request.output_format = .agent_v3;
+    if (request.cursor != null and request.output_format != .agent_v3 and request.output_format != .json_compact) return ParseError.ConflictingOutputFormat;
     return request;
+}
+
+/// Keeps the semantic lane's compatibility formats explicit while reusing the public format vocabulary.
+fn selectSimilarOutputFormat(request: *SimilarRequest, format: OutputFormat) ParseError!void {
+    switch (format) {
+        .text, .agent_v2, .agent_v3, .json, .json_compact => {},
+        else => return ParseError.UnsupportedFlag,
+    }
+    if (request.output_format != .text and request.output_format != format) return ParseError.ConflictingOutputFormat;
+    request.output_format = format;
+    request.json = format == .json or format == .json_compact;
 }
 
 fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
@@ -299,13 +352,21 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
             }
             continue;
         }
-        if (std.mem.eql(u8, arg, "--json") or std.mem.eql(u8, arg, "-j")) request.json = true else if (std.mem.eql(u8, arg, "--stats-only")) request.stats_only = true else if (std.mem.eql(u8, arg, "--agent")) request.output_format = .agent else if (std.mem.eql(u8, arg, "--format")) {
+        if (std.mem.eql(u8, arg, "--json") or std.mem.eql(u8, arg, "-j")) {
+            try selectOutputFormat(&request, .json);
+        } else if (std.mem.eql(u8, arg, "--stats-only")) {
+            try selectOutputFormat(&request, .stats);
+        } else if (std.mem.eql(u8, arg, "--agent")) {
+            try selectOutputFormat(&request, .agent_v2);
+        } else if (std.mem.eql(u8, arg, "--format")) {
             index += 1;
             if (index >= args.len) return ParseError.MissingValue;
-            if (std.mem.eql(u8, args[index], "agent")) {
-                request.output_format = .agent;
-            } else return ParseError.UnsupportedFlag;
-        } else if (std.mem.eql(u8, arg, "--files-with-matches") or std.mem.eql(u8, arg, "-l")) request.output_mode = .files_with_matches else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) request.output_mode = .count else if (std.mem.eql(u8, arg, "--hidden")) request.hidden = true else if (std.mem.eql(u8, arg, "--no-ignore")) request.no_ignore = true else if (std.mem.eql(u8, arg, "--unrestricted") or std.mem.eql(u8, arg, "-u")) {
+            try selectOutputFormat(&request, command_spec.parseFormat(args[index]) orelse return ParseError.UnsupportedFlag);
+        } else if (std.mem.eql(u8, arg, "--files-with-matches") or std.mem.eql(u8, arg, "-l")) {
+            try selectOutputFormat(&request, .files);
+        } else if (std.mem.eql(u8, arg, "--count") or std.mem.eql(u8, arg, "-c")) {
+            try selectOutputFormat(&request, .count);
+        } else if (std.mem.eql(u8, arg, "--hidden")) request.hidden = true else if (std.mem.eql(u8, arg, "--no-ignore")) request.no_ignore = true else if (std.mem.eql(u8, arg, "--unrestricted") or std.mem.eql(u8, arg, "-u")) {
             request.hidden = true;
             request.no_ignore = true;
         } else if (std.mem.eql(u8, arg, "--ignore-file")) {
@@ -319,6 +380,7 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
             index += 1;
             if (index >= args.len) return ParseError.MissingValue;
             request.max_hits = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
+            if (request.max_hits.? == 0) return ParseError.MissingValue;
         } else if (std.mem.eql(u8, arg, "--threads") or std.mem.eql(u8, arg, "-t")) {
             index += 1;
             if (index >= args.len) return ParseError.MissingValue;
@@ -331,9 +393,30 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
             index += 1;
             if (index >= args.len) return ParseError.MissingValue;
             request.context = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--max-bytes")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.max_bytes = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
+            if (request.max_bytes.? == 0) return ParseError.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--cursor")) {
+            index += 1;
+            if (index >= args.len or args[index].len == 0) return ParseError.MissingValue;
+            request.cursor = args[index];
         } else return ParseError.UnsupportedFlag;
     }
     request.expression = expression orelse return ParseError.MissingExpression;
+    if (request.context != null) {
+        request.output_format = switch (request.output_format) {
+            .text, .agent_v2 => .agent_v3,
+            .json => .json_compact,
+            else => request.output_format,
+        };
+    }
+    if (request.max_bytes != null or request.cursor != null) {
+        if (request.output_format == .text) request.output_format = .agent_v3;
+        if (request.output_format != .agent_v3 and request.output_format != .json_compact) return ParseError.ConflictingOutputFormat;
+    }
+    request.stable_output = request.output_format == .agent_v3 or request.output_format == .json_compact;
     return request;
 }
 
@@ -384,6 +467,19 @@ fn emptySearchRequest(expression: []const u8) SearchRequest {
         .nexus_build = false,
         .nexus_disabled = false,
         .index_enabled = false,
+    };
+}
+
+/// Lowers every legacy selector into one format and rejects ambiguous writer policy.
+fn selectOutputFormat(request: *SearchRequest, format: OutputFormat) ParseError!void {
+    if (request.output_format != .text and request.output_format != format) return ParseError.ConflictingOutputFormat;
+    request.output_format = format;
+    request.json = format == .json or format == .json_compact;
+    request.stats_only = format == .stats;
+    request.output_mode = switch (format) {
+        .files => .files_with_matches,
+        .count => .count,
+        else => .normal,
     };
 }
 
@@ -552,7 +648,7 @@ fn parseCompatSearch(allocator: std.mem.Allocator, args: []const []const u8) !Se
                 if (index >= args.len) return ParseError.MissingValue;
                 request.threads = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
             } else {
-                request.json = true;
+                try selectOutputFormat(&request, .json);
             }
         } else if (std.mem.startsWith(u8, arg, "-j") and arg.len > 2) {
             request.threads = std.fmt.parseInt(usize, arg[2..], 10) catch return ParseError.MissingValue;
@@ -862,4 +958,64 @@ test "process command parses status and cleanup flags" {
     try std.testing.expect(cleanup_invocation.command == .process);
     try std.testing.expectEqual(.cleanup, cleanup_invocation.command.process.action);
     try std.testing.expect(cleanup_invocation.command.process.dry_run);
+}
+
+test "versioned search formats enable deterministic traversal" {
+    const argv = [_][]const u8{
+        "ix-zig", "search", "re:needle.+", "src", "--format", "agent-v3", "--max-hits", "7", "--max-bytes", "4096",
+    };
+    const invocation = try parseInvocation(std.testing.allocator, &argv);
+    const request = invocation.command.search;
+    try std.testing.expectEqual(OutputFormat.agent_v3, request.output_format);
+    try std.testing.expect(request.stable_output);
+    try std.testing.expectEqual(@as(?usize, 7), request.max_hits);
+    try std.testing.expectEqual(@as(?usize, 4096), request.max_bytes);
+}
+
+test "matches rejects terminal-envelope projections and accepts record-only JSON" {
+    const versioned = [_][]const u8{ "ix-zig", "matches", "lit:needle", "src", "--format", "agent-v3" };
+    try std.testing.expectError(ParseError.UnsupportedFlag, parseInvocation(std.testing.allocator, &versioned));
+
+    const contextual = [_][]const u8{ "ix-zig", "matches", "lit:needle", "src", "--context", "2" };
+    try std.testing.expectError(ParseError.UnsupportedFlag, parseInvocation(std.testing.allocator, &contextual));
+
+    const json = [_][]const u8{ "ix-zig", "matches", "lit:needle", "src", "--json" };
+    const request = (try parseInvocation(std.testing.allocator, &json)).command.matches;
+    try std.testing.expectEqual(OutputFormat.json, request.output_format);
+}
+
+test "search context upgrades compatible legacy projections to exact v3" {
+    const text_argv = [_][]const u8{ "ix-zig", "search", "lit:needle", "src", "--context", "2" };
+    const text_request = (try parseInvocation(std.testing.allocator, &text_argv)).command.search;
+    try std.testing.expectEqual(OutputFormat.agent_v3, text_request.output_format);
+    try std.testing.expect(text_request.stable_output);
+
+    const json_argv = [_][]const u8{ "ix-zig", "search", "lit:needle", "src", "--json", "--context", "2" };
+    const json_request = (try parseInvocation(std.testing.allocator, &json_argv)).command.search;
+    try std.testing.expectEqual(OutputFormat.json_compact, json_request.output_format);
+    try std.testing.expect(json_request.json);
+}
+
+test "search rejects ambiguous format and bounded legacy combinations" {
+    const conflicting = [_][]const u8{ "ix-zig", "search", "lit:needle", "src", "--agent", "--json" };
+    try std.testing.expectError(ParseError.ConflictingOutputFormat, parseInvocation(std.testing.allocator, &conflicting));
+
+    const bounded_legacy = [_][]const u8{ "ix-zig", "search", "lit:needle", "src", "--json", "--max-bytes", "1000" };
+    try std.testing.expectError(ParseError.ConflictingOutputFormat, parseInvocation(std.testing.allocator, &bounded_legacy));
+
+    const zero_budget = [_][]const u8{ "ix-zig", "search", "lit:needle", "src", "--max-bytes", "0" };
+    try std.testing.expectError(ParseError.MissingValue, parseInvocation(std.testing.allocator, &zero_budget));
+}
+
+test "similar parses bounded versioned frontier controls" {
+    const argv = [_][]const u8{
+        "ix-zig", "similar", "cache ownership", "src", "--format", "agent-v3", "--candidate-budget", "64", "--max-results", "9",
+    };
+    const request = (try parseInvocation(std.testing.allocator, &argv)).command.similar;
+    try std.testing.expectEqual(OutputFormat.agent_v3, request.output_format);
+    try std.testing.expectEqual(@as(usize, 64), request.candidate_budget);
+    try std.testing.expectEqual(@as(usize, 9), request.max_results);
+
+    const conflicting = [_][]const u8{ "ix-zig", "similar", "cache", "src", "--agent", "--json" };
+    try std.testing.expectError(ParseError.ConflictingOutputFormat, parseInvocation(std.testing.allocator, &conflicting));
 }

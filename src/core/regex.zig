@@ -21,22 +21,17 @@ const sz = @import("sz.zig");
 ///
 /// Returns the 1-based column of the first match, or null.
 pub fn column(line: []const u8, pattern: []const u8, case_insensitive: bool) ?usize {
+    const matched = span(line, pattern, case_insensitive) orelse return null;
+    return matched.start + 1;
+}
+
+/// Returns the exact byte span of the first native-regex match.
+pub fn span(line: []const u8, pattern: []const u8, case_insensitive: bool) ?MatchSpan {
     // (?i) prefix triggers case-insensitive mode regardless of the flag.
     // This matches Rust's regex crate behavior for inline mode modifiers.
     const effective_case_insensitive = case_insensitive or std.mem.startsWith(u8, pattern, "(?i)");
     const effective_pattern = if (std.mem.startsWith(u8, pattern, "(?i)")) pattern[4..] else pattern;
-    var best: ?usize = null;
-    var branch_start: usize = 0;
-    while (branch_start <= effective_pattern.len) {
-        const branch_end = findTopLevelAlternation(effective_pattern, branch_start) orelse effective_pattern.len;
-        const branch = effective_pattern[branch_start..branch_end];
-        if (branchColumn(line, branch, effective_case_insensitive)) |candidate| {
-            if (best == null or candidate < best.?) best = candidate;
-        }
-        if (branch_end == effective_pattern.len) break;
-        branch_start = branch_end + 1;
-    }
-    return best;
+    return earliestMatch(line, effective_pattern, 0, effective_case_insensitive);
 }
 
 /// Counts non-overlapping regex matches in a line.
@@ -57,7 +52,7 @@ pub fn count(line: []const u8, pattern: []const u8, case_insensitive: bool) usiz
     return total;
 }
 
-const MatchSpan = struct {
+pub const MatchSpan = struct {
     start: usize,
     end: usize,
 };

@@ -311,6 +311,8 @@ pub fn writeRepairState(io: std.Io, allocator: std.mem.Allocator, config: Config
 }
 
 pub fn writeLiveMarker(io: std.Io, allocator: std.mem.Allocator, config: Config) !LiveMarker {
+    const root_identity = try catalog.identifyRoot(allocator, config.root);
+    defer root_identity.deinit(allocator);
     try std.Io.Dir.cwd().createDirPath(io, config.index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ config.index_dir, LIVE_MARKER_NAME });
     errdefer allocator.free(live_path);
@@ -324,7 +326,7 @@ pub fn writeLiveMarker(io: std.Io, allocator: std.mem.Allocator, config: Config)
         currentProcessId(),
         try currentProcessStartNs(),
         std.Io.Timestamp.now(io, .real).nanoseconds,
-        config.root,
+        root_identity.canonical_path,
     });
     try writer.interface.flush();
     return .{ .path = live_path };
@@ -1032,6 +1034,23 @@ test "indexd heartbeat marker records process ownership" {
     try std.testing.expect(std.mem.indexOf(u8, contents, "process_start_ns=") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "created_ns=") != null);
     try std.testing.expect(std.mem.indexOf(u8, contents, "mode=foreground_once") != null);
+}
+
+test "warm live marker stores the canonical root consumed by search" {
+    const root = ".zig-cache\\ix-indexd-live-root-test";
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    const config = try buildConfig(std.testing.allocator, .{ .root = root, .foreground = true, .once = true });
+    defer config.deinit(std.testing.allocator);
+    const marker = try writeLiveMarker(std.testing.io, std.testing.allocator, config);
+    defer marker.remove(std.testing.io, std.testing.allocator);
+    const identity = try catalog.identifyRoot(std.testing.allocator, root);
+    defer identity.deinit(std.testing.allocator);
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, marker.path, std.testing.allocator, .limited(4096));
+    defer std.testing.allocator.free(bytes);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "root={s}\n", .{identity.canonical_path});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, expected) != null);
 }
 
 test "indexd diagnostics render manifest journal and lock state" {

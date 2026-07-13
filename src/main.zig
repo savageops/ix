@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const cli = @import("cli/args.zig");
+const agent_output = @import("cli/agent_output.zig");
+const search_cursor = @import("cli/cursor.zig");
 const output = @import("cli/output.zig");
 const expr = @import("core/expr.zig");
 const indexd = @import("core/indexd.zig");
@@ -31,6 +33,9 @@ test {
     _ = @import("core/shift_or.zig");
     _ = @import("core/fm_index.zig");
     _ = @import("core/iocp_batch.zig");
+    _ = @import("core/preview.zig");
+    _ = @import("cli/command_spec.zig");
+    _ = @import("cli/cursor.zig");
 }
 
 /// IX Zig binary entry point.
@@ -88,13 +93,22 @@ pub fn main(init: std.process.Init) !void {
             var effective_request = request;
             effective_request.nexus_disabled = nexusDisabled(init);
             effective_request.index_enabled = indexdEnabled(init);
+            applySearchCursor(allocator, &effective_request) catch |err| {
+                try output.writeError(stderr, "invalid_cursor", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
             const plan = expr.parse(request.expression) catch |err| {
                 try output.writeError(stderr, "invalid_expression", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
             };
             const report = search.run(init.io, allocator, effective_request, plan) catch |err| {
-                try output.writeError(stderr, "search_failed", @errorName(err));
+                switch (err) {
+                    error.StaleCursor => try output.writeError(stderr, "stale_cursor", "corpus or index identity changed; restart the search without --cursor"),
+                    error.CursorRequestMismatch => try output.writeError(stderr, "cursor_request_mismatch", "expression, roots, or membership flags changed; restart the search without --cursor"),
+                    else => try output.writeError(stderr, "search_failed", @errorName(err)),
+                }
                 try stderr.flush();
                 std.process.exit(1);
             };
@@ -105,32 +119,7 @@ pub fn main(init: std.process.Init) !void {
             };
             if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
             if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
-            if (effective_request.output_format == .agent) {
-                try output.writeSearchReportAgent(stdout, report);
-            } else if (effective_request.json) {
-                try output.writeSearchJsonReport(stdout, report);
-            } else {
-                const emitted_records = switch (effective_request.output_mode) {
-                    .normal => !effective_request.stats_only and report.hit_count > 0,
-                    .files_with_matches => report.hit_count > 0,
-                    .count => report.hit_count > 0,
-                };
-                switch (effective_request.output_mode) {
-                    .normal => {
-                        if (!effective_request.stats_only) try output.writeSearchHits(stdout, report);
-                    },
-                    .files_with_matches => try output.writeFilesWithMatches(stdout, report),
-                    .count => try output.writeCountPerFile(stdout, report),
-                }
-                // When hit records were already emitted as text lines, use the
-                // compact sentinel (no hits[] duplication). Otherwise emit the
-                // full sentinel with hits[] for stats-only and zero-match cases.
-                if (emitted_records) {
-                    try output.writeSearchReportCompact(stdout, report);
-                } else {
-                    try output.writeSearchReport(stdout, report);
-                }
-            }
+            try writeSearchResult(init.io, effective_request, report, stdout);
         },
         .matches => |request| {
             var effective_request = request;
@@ -153,10 +142,12 @@ pub fn main(init: std.process.Init) !void {
             };
             if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
             if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
-            if (effective_request.json) {
-                try output.writeMatchesJsonHits(stdout, report);
-            } else if (!effective_request.stats_only) {
-                try output.writeSearchHits(stdout, report);
+            switch (effective_request.output_format) {
+                .json, .json_compact => try output.writeMatchesJsonHits(stdout, report),
+                .files => try output.writeFilesWithMatches(stdout, report),
+                .count => try output.writeCountPerFile(stdout, report),
+                .stats => {},
+                else => try output.writeSearchHits(stdout, report),
             }
         },
         .inspect => |request| {
@@ -231,11 +222,23 @@ pub fn main(init: std.process.Init) !void {
             try process_tool.writeReport(stdout, report, request.json);
         },
         .similar => |request| {
-            similar.run(init.io, allocator, request, init.environ_map, stdout) catch |err| {
-                if (err == error.ApiKeyRequired) {
+            var effective_request = request;
+            applySimilarCursor(allocator, &effective_request) catch |err| {
+                try output.writeError(stderr, "invalid_cursor", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            similar.run(init.io, allocator, effective_request, init.environ_map, stdout) catch |err| {
+                if (err == error.SemanticFailureReported) {
+                    std.process.exit(1);
+                } else if (err == error.ApiKeyRequired) {
                     try output.writeError(stderr, "similar_requires_api_key", "set IX_AI_API_KEY to use ix similar");
                 } else if (err == error.ApiRequestFailed) {
-                    try output.writeError(stderr, "similar_api_request_failed", "the configured embedding or reranker request failed");
+                    try output.writeError(stderr, "similar_api_request_failed", "the configured semantic provider rejected the request; verify endpoint, model, credentials, and retry");
+                } else if (err == error.StaleCursor) {
+                    try output.writeError(stderr, "stale_cursor", "semantic corpus identity changed; restart similar without --cursor");
+                } else if (err == error.CursorRequestMismatch) {
+                    try output.writeError(stderr, "cursor_request_mismatch", "semantic query, roots, or candidate budget changed; restart similar without --cursor");
                 } else {
                     try output.writeError(stderr, "similar_failed", @errorName(err));
                 }
@@ -267,6 +270,144 @@ pub fn main(init: std.process.Init) !void {
 
 fn indexdCommandAllocator() std.mem.Allocator {
     return std.heap.page_allocator;
+}
+
+/// Decodes one opaque cursor at the composition root and keeps the scan owner free of string parsing.
+fn applySearchCursor(allocator: std.mem.Allocator, request: *cli.SearchRequest) !void {
+    const raw = request.cursor orelse return;
+    const parsed = try search_cursor.decode(allocator, raw);
+    request.cursor_path = parsed.path;
+    request.cursor_line = parsed.line;
+    request.cursor_column = parsed.column;
+    request.cursor_corpus_signature = parsed.corpus_signature;
+    request.cursor_request_fingerprint = parsed.request_fingerprint;
+}
+
+/// Decodes semantic continuation at the composition root; the lane consumes typed identity only.
+fn applySimilarCursor(allocator: std.mem.Allocator, request: *cli.SimilarRequest) !void {
+    const raw = request.cursor orelse return;
+    const parsed = try search_cursor.decode(allocator, raw);
+    request.cursor_ordinal = parsed.line;
+    request.cursor_corpus_signature = parsed.corpus_signature;
+    request.cursor_request_fingerprint = parsed.request_fingerprint;
+}
+
+/// Selects exactly one writer from the typed format contract.
+fn writeSearchResult(io: std.Io, request: cli.SearchRequest, report: search.SearchReport, writer: anytype) !void {
+    switch (request.output_format) {
+        .agent_v2 => try output.writeSearchReportAgent(writer, report),
+        .agent_v3, .json_compact => try writeVersionedSearchResult(io, request, report, writer),
+        .json => try output.writeSearchJsonReport(writer, report),
+        .files => {
+            try output.writeFilesWithMatches(writer, report);
+            if (report.hit_count > 0) try output.writeSearchReportCompact(writer, report) else try output.writeSearchReport(writer, report);
+        },
+        .count => {
+            try output.writeCountPerFile(writer, report);
+            if (report.hit_count > 0) try output.writeSearchReportCompact(writer, report) else try output.writeSearchReport(writer, report);
+        },
+        .stats => try output.writeSearchReport(writer, report),
+        .text => {
+            if (report.hit_count > 0) {
+                try output.writeSearchHits(writer, report);
+                try output.writeSearchReportCompact(writer, report);
+            } else {
+                try output.writeSearchReport(writer, report);
+            }
+        },
+    }
+}
+
+/// Finds the largest whole-record v3 page that fits the explicit aggregate byte budget.
+fn writeVersionedSearchResult(io: std.Io, request: cli.SearchRequest, report: search.SearchReport, writer: anytype) !void {
+    const budget = request.max_bytes;
+    if (budget == null) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const bytes = try renderVersionedSearchResult(io, arena.allocator(), request, report, report.hit_count, false);
+        try writer.writeAll(bytes);
+        return;
+    }
+
+    const full_len = try versionedSearchResultLength(io, request, report, report.hit_count, false);
+    if (full_len <= budget.?) {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const bytes = try renderVersionedSearchResult(io, arena.allocator(), request, report, report.hit_count, false);
+        try writer.writeAll(bytes);
+        return;
+    }
+
+    var low: usize = 0;
+    var high: usize = report.hit_count;
+    while (low < high) {
+        const middle = low + (high - low + 1) / 2;
+        const length = try versionedSearchResultLength(io, request, report, middle, true);
+        if (length <= budget.?) low = middle else high = middle - 1;
+    }
+    if (low == 0 and report.matches_after_cursor > 0) return error.ByteBudgetTooSmall;
+    const final_len = try versionedSearchResultLength(io, request, report, low, low < report.hit_count);
+    if (final_len > budget.?) return error.ByteBudgetTooSmall;
+
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const bytes = try renderVersionedSearchResult(io, arena.allocator(), request, report, low, low < report.hit_count);
+    try writer.writeAll(bytes);
+}
+
+/// Measures a complete candidate envelope in an isolated arena so budget trials do not accumulate memory.
+fn versionedSearchResultLength(io: std.Io, request: cli.SearchRequest, report: search.SearchReport, visible_count: usize, byte_truncated: bool) !usize {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const bytes = try renderVersionedSearchResult(io, arena.allocator(), request, report, visible_count, byte_truncated);
+    return bytes.len;
+}
+
+/// Builds context only for the selected page, then renders one internally consistent envelope.
+fn renderVersionedSearchResult(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    request: cli.SearchRequest,
+    report: search.SearchReport,
+    visible_count: usize,
+    byte_truncated: bool,
+) ![]u8 {
+    var visible_report = report;
+    visible_report.hit_count = @min(visible_count, report.hit_count);
+    const context_reports: []const inspect.ContextReport = if (request.context != null and visible_report.hit_count > 0)
+        try inspect.contextReportsFromSearchReport(io, allocator, searchContextRequest(request), visible_report)
+    else
+        &.{};
+    return agent_output.render(allocator, request, report, context_reports, .{
+        .visible_count = visible_report.hit_count,
+        .byte_truncated = byte_truncated,
+        .raw_json = request.output_format == .json_compact,
+    });
+}
+
+/// Projects search context options into the exact bounded-reader owner.
+fn searchContextRequest(request: cli.SearchRequest) cli.InspectRequest {
+    return .{
+        .paths = request.paths,
+        .path_count = request.path_count,
+        .expression = request.expression,
+        .range = null,
+        .start_line = null,
+        .end_line = null,
+        .limit = null,
+        .total_count = null,
+        .skip = null,
+        .all = false,
+        .context = request.context,
+        .before_context = null,
+        .after_context = null,
+        .hidden = request.hidden,
+        .follow_symlinks = request.follow_symlinks,
+        .threads = request.threads,
+        .max_hits = request.max_hits,
+        .json = true,
+        .format = .json,
+    };
 }
 
 fn nexusDisabled(init: std.process.Init) bool {
