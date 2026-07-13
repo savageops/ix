@@ -3940,6 +3940,10 @@ fn recordLineIntoShardImpl(
             };
             shard.hits[shard.hit_count] = hit;
             shard.hit_count += 1;
+        } else {
+            // Hit the retention or request limit — signal early-exit so the
+            // scan loop stops reading files after the limit is reached.
+            shard.truncated = true;
         }
     }
 }
@@ -4933,6 +4937,8 @@ fn recordLine(
             const span = exactMatchSpan(line, plan, request.case_insensitive, column);
             report.hits[report.hit_count] = try makeSearchHit(allocator, display_path, line_number, column, line, span);
             report.hit_count += 1;
+        } else {
+            report.truncated = true;
         }
     }
 }

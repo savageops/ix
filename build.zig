@@ -55,14 +55,19 @@ fn createIxModule(
 
     // StringZilla SIMD search kernels are compiled from a C shim that wraps
     // the header-only library into linkable symbols for Zig's extern fn FFI.
+    // -mavx2 is x86-only; gate it so the build works on ARM/AArch64.
+    const arch = target.result.cpu.arch;
+    const is_x86 = arch == .x86_64 or arch == .x86;
+    var sz_flags: std.ArrayList([]const u8) = .empty;
+    sz_flags.appendSlice(b.allocator, &.{
+        "-O3",
+        "-DNDEBUG",
+        "-std=c11",
+    }) catch unreachable;
+    if (is_x86) sz_flags.append(b.allocator, "-mavx2") catch unreachable;
     root_module.addCSourceFile(.{
         .file = b.path("src/sz_shim.c"),
-        .flags = &.{
-            "-mavx2",
-            "-O3",
-            "-DNDEBUG",
-            "-std=c11",
-        },
+        .flags = sz_flags.items,
     });
     root_module.addIncludePath(b.path(".refs/stringzilla/include"));
 

@@ -1,6 +1,7 @@
 const std = @import("std");
 const cli = @import("../cli/args.zig");
 const output = @import("../cli/output.zig");
+const preview = @import("preview.zig");
 
 const MAX_QUERY_TERMS = 16;
 const MAX_FILES = 1024;
@@ -8,7 +9,7 @@ const MAX_FILE_BYTES = 1024 * 1024;
 const MAX_INPUT_BYTES = 16 * 1024 * 1024;
 const MAX_CANDIDATE_LINES = 65_536;
 const MAX_RADIUS = 8;
-const MAX_OUTPUT_SPANS = 128;
+const MAX_OUTPUT_SPANS = cli.MAX_XO_SPANS;
 
 const Coverage = struct {
     files_discovered: usize = 0,
@@ -52,6 +53,7 @@ const Candidate = struct {
     line_index: usize,
     frequencies: [MAX_QUERY_TERMS]u8,
     score: f64 = 0,
+    focus_column: usize = 0,
 };
 
 const Span = struct {
@@ -60,6 +62,7 @@ const Span = struct {
     start_line_index: usize,
     end_line_index: usize,
     score: f64,
+    focus_column: usize = 0,
 };
 
 /// Builds one deterministic, bounded context projection without entering the search hot path.
@@ -276,7 +279,13 @@ fn appendSourceFile(
         }
         if (!matched) continue;
         coverage.candidate_lines += 1;
-        try candidates.append(allocator, .{ .file_index = file_index, .line_index = line_index, .frequencies = frequencies });
+        var focus_column: usize = 0;
+        for (terms, 0..) |term, term_index| {
+            if (frequencies[term_index] == 0) continue;
+            focus_column = findFirstFold(line.text, term.text) orelse 0;
+            break;
+        }
+        try candidates.append(allocator, .{ .file_index = file_index, .line_index = line_index, .frequencies = frequencies, .focus_column = focus_column });
     }
 }
 
@@ -321,6 +330,16 @@ fn containsFold(haystack: []const u8, needle: []const u8) bool {
     return countFold(haystack, needle) != 0;
 }
 
+/// Returns the 0-based byte offset of the first case-insensitive occurrence, or null.
+fn findFirstFold(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return null;
+    var offset: usize = 0;
+    while (offset + needle.len <= haystack.len) : (offset += 1) {
+        if (std.ascii.eqlIgnoreCase(haystack[offset .. offset + needle.len], needle)) return offset;
+    }
+    return null;
+}
+
 /// Computes standard BM25 line relevance; structural/path priors only break lexical ties.
 fn scoreCandidates(files: []const SourceFile, terms: []const QueryTerm, candidates: []Candidate, total_lines: usize) void {
     var total_tokens: usize = 0;
@@ -348,11 +367,14 @@ fn scoreCandidates(files: []const SourceFile, terms: []const QueryTerm, candidat
 }
 
 /// Gives declarations and rationale comments a small tie-breaker, never lexical eligibility.
+/// Checks comment prefix first to avoid false-positive keyword matches inside comments.
+/// Anchors declaration markers to the start of the trimmed line to avoid matching
+/// keywords inside string literals.
 fn structuralPrior(line: []const u8) f64 {
-    const markers = [_][]const u8{ "fn ", "function ", "class ", "struct ", "const ", "pub ", "export ", "impl ", "interface " };
-    for (markers) |marker| if (containsFold(line, marker)) return 0.18;
     const trimmed = std.mem.trimStart(u8, line, " \t");
     if (std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "#")) return 0.08;
+    const markers = [_][]const u8{ "fn ", "function ", "class ", "struct ", "const ", "pub ", "export ", "impl ", "interface " };
+    for (markers) |marker| if (std.mem.startsWith(u8, trimmed, marker)) return 0.18;
     return 0;
 }
 
@@ -388,6 +410,7 @@ fn selectSpans(allocator: std.mem.Allocator, files: []const SourceFile, candidat
             .start_line_index = candidate.line_index,
             .end_line_index = candidate.line_index,
             .score = candidate.score,
+            .focus_column = candidate.focus_column,
         });
     }
     return spans.toOwnedSlice(allocator);
@@ -463,7 +486,15 @@ fn writeGrouped(writer: anytype, request: cli.XoRequest, files: []const SourceFi
             const last = files[next_file].lines[span.end_line_index].number;
             if (previous_end) |end_line| if (first > end_line + 1) try writer.print("  ... {} lines omitted ...\n", .{first - end_line - 1});
             try writer.print("  lines {}:{} focus={} score={d:.4}\n", .{ first, last, files[next_file].lines[span.focus_line_index].number, span.score });
-            for (files[next_file].lines[span.start_line_index .. span.end_line_index + 1]) |line| try writer.print("  {} | {s}\n", .{ line.number, line.text });
+            for (files[next_file].lines[span.start_line_index .. span.end_line_index + 1]) |line| {
+                if (line.text.len > 300) {
+                    const span_start = if (line.number == files[next_file].lines[span.focus_line_index].number) span.focus_column else 0;
+                    const compact = preview.make(std.heap.page_allocator, line.text, .{ .start = span_start, .end = span_start }) catch line.text;
+                    try writer.print("  {} | {s}\n", .{ line.number, compact.text });
+                } else {
+                    try writer.print("  {} | {s}\n", .{ line.number, line.text });
+                }
+            }
             previous_end = last;
         }
     }
@@ -542,13 +573,22 @@ fn writeJson(writer: anytype, request: cli.XoRequest, files: []const SourceFile,
             for (files[next_file].lines[span.start_line_index .. span.end_line_index + 1], 0..) |line, line_index| {
                 if (line_index != 0) try writer.writeByte(',');
                 try writer.print("{{\"line\":{},\"text\":", .{line.number});
-                try output.writeJsonString(writer, line.text);
+                if (line.text.len > 300) {
+                    const span_start = if (line.number == files[next_file].lines[span.focus_line_index].number) span.focus_column else 0;
+                    const compact = preview.make(std.heap.page_allocator, line.text, .{ .start = span_start, .end = span_start }) catch line.text;
+                    try output.writeJsonString(writer, compact.text);
+                } else {
+                    try output.writeJsonString(writer, line.text);
+                }
                 try writer.writeByte('}');
             }
             try writer.writeAll("]}");
             previous_end = last;
         }
-        try writer.writeAll("]}");
+        // Emit trailing omission count so agents can see if the file continues past the last span.
+        const total_lines_in_file = files[next_file].lines.len;
+        const omitted_after: usize = if (previous_end) |last_line| total_lines_in_file -| last_line else total_lines_in_file;
+        try writer.print(",\"omitted_after\":{}}}", .{omitted_after});
     }
     try writer.writeAll("]}\n");
 }
