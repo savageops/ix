@@ -97,3 +97,13 @@ This separation already exists conceptually (xo doesn't touch search internals) 
 | 10% regression tolerance | GAP | Route insight lanes through separate evidence lane |
 | Every test better than last | GAP | Create monotonic build ledger |
 | Search lane isolation | DONE | xo doesn't touch search path; just needs gate separation |
+
+## Maintainer Revalidation — 2026-07-13
+
+- **Framework envelope:** the 5% ceiling is one process-wide allocation and worker policy. It is not assigned to search, `xo`, embeddings, reranking, indexing, or any other individual subsystem. All concurrent work shares the same ceiling.
+- **CLI grammar repaired:** search now accepts `--format records` and `--total-count N` through the existing text projection and `max_hits` owner. The reported command returns 10 records with exit code 0. No parallel renderer was added.
+- **Warm-lane regression removed:** the prior truncation patch stopped scanning after the first over-limit hit, changed exact counts, and prevented warm hit-cache population. It was removed; bounded output remains a projection concern. Debug tests return to 517/517 and warm/cold parity is exact.
+- **Fisheye allocation repaired:** `xo` serialization no longer allocates every long-line preview from the page allocator while repeatedly measuring candidate envelopes. A bounded stack allocator now serves the maximum fisheye preview and the serializer compiles in both grouped and JSON modes.
+- **Native platform proof:** ReleaseSmall cross-builds pass for `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-macos`, and `aarch64-macos`; Windows native build and tests pass. The non-Windows evidence-frontier wait now uses `std.Io.sleep`, replacing a Windows-only-compiling `std.Thread.sleep` call.
+- **Filesystem proof:** the CLI parser retains normalized Windows relative-path tests, while cross-target builds prove no unconditional Windows filesystem symbol leaks into Linux or Darwin.
+- **Remaining promotion gate:** the equal-envelope regex predecessor regression recorded in the projection/insight pass remains unresolved. These repairs are correctness and portability wins, not authority to promote over the installed predecessor.

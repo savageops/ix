@@ -148,6 +148,10 @@ try {
   Assert-True ($regexHit.n -eq 10) "variable-width regex span was not exact"
   Assert-True ($regexHit.p.Contains("needle-777")) "UTF-8 preview lost the match"
 
+  $records = Invoke-Raw @("search", "re:needle|token", $root, "--format", "records", "--total-count", "3")
+  Assert-True ($records.ExitCode -eq 0) "shared records/total-count vocabulary failed: $($records.Stderr)"
+  Assert-True (([regex]::Matches($records.Stdout, "(?m)^.+:\d+:")).Count -eq 3) "total-count did not bound record output"
+
   $pageOne = Invoke-Raw @("search", "lit:needle", $root, "--format", "agent-v3", "--max-hits", "2")
   Assert-True ($pageOne.ExitCode -eq 0) "first cursor page failed: $($pageOne.Stderr)"
   $pageOneObject = Parse-Frame $pageOne.Stdout "-- ix.result.v3 "

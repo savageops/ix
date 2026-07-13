@@ -2150,7 +2150,7 @@ pub fn holdEvidenceFrontierLive(io: std.Io, allocator: std.mem.Allocator, reques
     if (builtin.os.tag == .windows) {
         holdEvidenceFrontierLiveWindows(io, request.paths[0]);
     } else {
-        std.Thread.sleep(@as(u64, 120) * std.time.ns_per_s);
+        io.sleep(std.Io.Duration.fromSeconds(120), .awake) catch {};
     }
 }
 
@@ -3940,10 +3940,6 @@ fn recordLineIntoShardImpl(
             };
             shard.hits[shard.hit_count] = hit;
             shard.hit_count += 1;
-        } else {
-            // Hit the retention or request limit — signal early-exit so the
-            // scan loop stops reading files after the limit is reached.
-            shard.truncated = true;
         }
     }
 }
@@ -4937,8 +4933,6 @@ fn recordLine(
             const span = exactMatchSpan(line, plan, request.case_insensitive, column);
             report.hits[report.hit_count] = try makeSearchHit(allocator, display_path, line_number, column, line, span);
             report.hit_count += 1;
-        } else {
-            report.truncated = true;
         }
     }
 }

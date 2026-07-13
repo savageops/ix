@@ -489,7 +489,9 @@ fn writeGrouped(writer: anytype, request: cli.XoRequest, files: []const SourceFi
             for (files[next_file].lines[span.start_line_index .. span.end_line_index + 1]) |line| {
                 if (line.text.len > 300) {
                     const span_start = if (line.number == files[next_file].lines[span.focus_line_index].number) span.focus_column else 0;
-                    const compact = preview.make(std.heap.page_allocator, line.text, .{ .start = span_start, .end = span_start }) catch line.text;
+                    var preview_storage: [512]u8 = undefined;
+                    var preview_allocator = std.heap.FixedBufferAllocator.init(&preview_storage);
+                    const compact = try preview.make(preview_allocator.allocator(), line.text, .{ .start = span_start, .end = span_start });
                     try writer.print("  {} | {s}\n", .{ line.number, compact.text });
                 } else {
                     try writer.print("  {} | {s}\n", .{ line.number, line.text });
@@ -575,7 +577,9 @@ fn writeJson(writer: anytype, request: cli.XoRequest, files: []const SourceFile,
                 try writer.print("{{\"line\":{},\"text\":", .{line.number});
                 if (line.text.len > 300) {
                     const span_start = if (line.number == files[next_file].lines[span.focus_line_index].number) span.focus_column else 0;
-                    const compact = preview.make(std.heap.page_allocator, line.text, .{ .start = span_start, .end = span_start }) catch line.text;
+                    var preview_storage: [512]u8 = undefined;
+                    var preview_allocator = std.heap.FixedBufferAllocator.init(&preview_storage);
+                    const compact = try preview.make(preview_allocator.allocator(), line.text, .{ .start = span_start, .end = span_start });
                     try output.writeJsonString(writer, compact.text);
                 } else {
                     try output.writeJsonString(writer, line.text);

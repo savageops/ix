@@ -21,6 +21,7 @@ pub const FormatSpec = struct {
 
 /// One table owns accepted format names, migration posture, and help text.
 pub const formats = [_]FormatSpec{
+    .{ .name = "records", .format = .text, .compatibility = "current", .help = "Hit records with the v1 terminal result" },
     .{ .name = "text", .format = .text, .compatibility = "current", .help = "Hit records with the v1 terminal result" },
     .{ .name = "agent", .format = .agent_v2, .compatibility = "current", .help = "Compact grouped ix.result.v2" },
     .{ .name = "agent-v3", .format = .agent_v3, .compatibility = "versioned", .help = "Bounded, cursorable ix.result.v3" },

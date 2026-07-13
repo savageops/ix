@@ -439,7 +439,7 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
             try pushIgnoreFile(&request, args[index]);
         } else if (std.mem.eql(u8, arg, "--line-number") or std.mem.eql(u8, arg, "-n")) {
             try parseLineNumberLimit(args, &index, &request);
-        } else if (std.mem.eql(u8, arg, "--fixed-strings") or std.mem.eql(u8, arg, "-F")) request.fixed_strings = true else if (std.mem.eql(u8, arg, "--ignore-case") or std.mem.eql(u8, arg, "-i")) request.case_insensitive = true else if (std.mem.eql(u8, arg, "--follow-symlinks")) request.follow_symlinks = true else if (std.mem.eql(u8, arg, "--max-hits")) {
+        } else if (std.mem.eql(u8, arg, "--fixed-strings") or std.mem.eql(u8, arg, "-F")) request.fixed_strings = true else if (std.mem.eql(u8, arg, "--ignore-case") or std.mem.eql(u8, arg, "-i")) request.case_insensitive = true else if (std.mem.eql(u8, arg, "--follow-symlinks")) request.follow_symlinks = true else if (std.mem.eql(u8, arg, "--max-hits") or std.mem.eql(u8, arg, "--total-count")) {
             index += 1;
             if (index >= args.len) return ParseError.MissingValue;
             request.max_hits = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
@@ -1043,6 +1043,15 @@ test "versioned search formats enable deterministic traversal" {
     try std.testing.expect(request.stable_output);
     try std.testing.expectEqual(@as(?usize, 7), request.max_hits);
     try std.testing.expectEqual(@as(?usize, 4096), request.max_bytes);
+}
+
+test "search accepts the shared records and total-count vocabulary" {
+    const argv = [_][]const u8{
+        "ix-zig", "search", "re:insightMemoryLimitBytes|INSIGHT_MEMORY_PERCENT|Thread\\.spawn|effectiveThreadCount|requested_threads", "src", "--format", "records", "--total-count", "300",
+    };
+    const request = (try parseInvocation(std.testing.allocator, &argv)).command.search;
+    try std.testing.expectEqual(OutputFormat.text, request.output_format);
+    try std.testing.expectEqual(@as(?usize, 300), request.max_hits);
 }
 
 test "matches rejects terminal-envelope projections and accepts record-only JSON" {

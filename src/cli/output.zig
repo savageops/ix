@@ -40,7 +40,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  --agent        Compact grouped format (ix.result.v2, token-minimal)
         \\  --json         Full structured JSON with telemetry
         \\  --stats-only   Suppress hit records, emit sentinel only
-        \\  --format NAME  Select text, agent, agent-v3, json, json-compact, files, count, or stats
+        \\  --format NAME  Select records, text, agent, agent-v3, json, json-compact, files, count, or stats
         \\  -l             Files with matches only
         \\  -c             Count per file
         \\  --context N    Exact coalesced source lines in the versioned result
@@ -49,6 +49,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\
         \\Search:
         \\  --max-hits N   Limit hit records
+        \\  --total-count N  Limit hit records (shared bounded-read spelling)
         \\  -t N           Thread count
         \\  --hidden       Include hidden files
         \\  --no-ignore    Disable ignore-file admission
