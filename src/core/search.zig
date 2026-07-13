@@ -3109,6 +3109,9 @@ fn scanFileMmap(
             const file_ms = elapsedMs(io, file_started);
             recordShardScanFileMmapMs(shard, file_ms);
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            if (request.max_hits) |max_hits| {
+                if (shard.matches_found >= max_hits) shard.truncated = true;
+            }
             return;
         }
         if (regexDecompositionFastCount(data, plan, request.case_insensitive, &shard.regex_decomposition_stats, &shard.acceleration_bailouts)) |count| {
@@ -3117,6 +3120,9 @@ fn scanFileMmap(
             const file_ms = elapsedMs(io, file_started);
             recordShardScanFileMmapMs(shard, file_ms);
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            if (request.max_hits) |max_hits| {
+                if (shard.matches_found >= max_hits) shard.truncated = true;
+            }
             return;
         }
         if (wholeBufferFastCount(data, plan, request.case_insensitive, false)) |count| {
@@ -3133,6 +3139,9 @@ fn scanFileMmap(
             const file_ms = elapsedMs(io, file_started);
             recordShardScanFileMmapMs(shard, file_ms);
             if (file_ms >= shard.slowest_ms) shard.slowest_ms = file_ms;
+            if (request.max_hits) |max_hits| {
+                if (shard.matches_found >= max_hits) shard.truncated = true;
+            }
             return;
         }
     }
@@ -3920,6 +3929,9 @@ fn recordLineIntoShardImpl(
         else
             statsOnlyMatchCount(line, plan, ci, chunk_casefolded);
         shard.matches_found += count;
+        if (request.max_hits) |max_hits| {
+            if (shard.matches_found >= max_hits) shard.truncated = true;
+        }
         return;
     }
     const column = if (mono) |m|
