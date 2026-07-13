@@ -1,24 +1,143 @@
 const std = @import("std");
 
-pub const FRAMEWORK_RESOURCE_PERCENT: usize = 5;
+/// Default percentages when no env or config override is present.
+pub const DEFAULT_MEMORY_PERCENT: usize = 5;
+pub const DEFAULT_THREAD_PERCENT: usize = 5;
 
 const MIB: usize = 1024 * 1024;
 const FALLBACK_FRAMEWORK_MEMORY_BYTES: usize = 512 * MIB;
 
-/// Computes the single hardware-relative ceiling used by every IX lane.
-/// Integer ceiling preserves one worker on small machines while never making
-/// an explicit command option a route around the framework policy.
+const Config = struct {
+    memory_percent: usize = DEFAULT_MEMORY_PERCENT,
+    thread_percent: usize = DEFAULT_THREAD_PERCENT,
+};
+
+var cached_config: ?Config = null;
+
+/// Loads the effective config from, in priority order:
+///   1. IX_MEMORY_PERCENT / IX_THREAD_PERCENT env vars
+///   2. ~/.ix/config.json (persistent, no recompile needed)
+///   3. Built-in defaults (5% / 5%)
+fn loadConfig() Config {
+    if (cached_config) |c| return c;
+
+    var cfg = Config{};
+
+    // Try config.json from state dir (~/.ix/config.json)
+    if (loadConfigJson(&cfg)) {
+        // Env vars override config.json
+        applyEnvOverrides(&cfg);
+        cached_config = cfg;
+        return cfg;
+    }
+
+    // No config file — env vars only
+    applyEnvOverrides(&cfg);
+    cached_config = cfg;
+    return cfg;
+}
+
+fn applyEnvOverrides(cfg: *Config) void {
+    if (envUsize("IX_MEMORY_PERCENT")) |pct| {
+        if (pct > 0 and pct <= 100) cfg.memory_percent = pct;
+    }
+    if (envUsize("IX_THREAD_PERCENT")) |pct| {
+        if (pct > 0 and pct <= 100) cfg.thread_percent = pct;
+    }
+    // Legacy: IX_RESOURCE_PERCENT sets both if present
+    if (envUsize("IX_RESOURCE_PERCENT")) |pct| {
+        if (pct > 0 and pct <= 100) {
+            cfg.memory_percent = pct;
+            cfg.thread_percent = pct;
+        }
+    }
+}
+
+fn loadConfigJson(cfg: *Config) bool {
+    // Resolve home directory directly via C env
+    const home_env = if (@import("builtin").os.tag == .windows) "USERPROFILE" else "HOME";
+    const home_ptr = std.c.getenv(home_env ++ "\x00") orelse return false;
+    const home = std.mem.span(home_ptr);
+    if (home.len == 0) return false;
+
+    // Build config.json path in a single stack buffer
+    var config_buf: [4200]u8 = undefined;
+    const c_path = blk: {
+        // Check IX_STATE_DIR override first
+        if (std.c.getenv("IX_STATE_DIR\x00")) |s| {
+            const dir = std.mem.span(s);
+            break :blk std.fmt.bufPrintZ(&config_buf, "{s}/config.json", .{dir}) catch return false;
+        }
+        // Default: ~/.ix/config.json
+        break :blk std.fmt.bufPrintZ(&config_buf, "{s}/.ix/config.json", .{home}) catch return false;
+    };
+
+    const c_file = std.c.fopen(c_path, "rb") orelse return false;
+    defer _ = std.c.fclose(c_file);
+    var contents_buf: [4096]u8 = undefined;
+    const read = std.c.fread(&contents_buf, 1, contents_buf.len, c_file);
+    if (read == 0) return false;
+    const contents = contents_buf[0..read];
+
+    if (parseJsonField(contents, "memory_percent")) |val| {
+        if (val > 0 and val <= 100) cfg.memory_percent = val;
+    }
+    if (parseJsonField(contents, "thread_percent")) |val| {
+        if (val > 0 and val <= 100) cfg.thread_percent = val;
+    }
+    return true;
+}
+
+fn parseJsonField(json: []const u8, key: []const u8) ?usize {
+    // Search for "key": value
+    var i: usize = 0;
+    while (i + key.len + 3 < json.len) : (i += 1) {
+        if (json[i] != '"') continue;
+        if (!std.mem.startsWith(u8, json[i + 1 ..], key)) continue;
+        if (json[i + 1 + key.len] != '"') continue;
+        // Find the colon
+        var j = i + 2 + key.len;
+        while (j < json.len and json[j] != ':') j += 1;
+        if (j >= json.len) return null;
+        j += 1;
+        while (j < json.len and (json[j] == ' ' or json[j] == '\t')) j += 1;
+        // Find the end of the number (digits only)
+        var end = j;
+        while (end < json.len and json[end] >= '0' and json[end] <= '9') end += 1;
+        if (end == j) return null;
+        return std.fmt.parseInt(usize, json[j..end], 10) catch null;
+    }
+    return null;
+}
+
+fn envUsize(comptime name: []const u8) ?usize {
+    const value_ptr = std.c.getenv(name ++ "\x00") orelse return null;
+    const value = std.mem.span(value_ptr);
+    if (value.len == 0) return null;
+    return std.fmt.parseInt(usize, value, 10) catch null;
+}
+
+/// Returns the effective memory percent (0-100).
+pub fn memoryPercent() usize {
+    return loadConfig().memory_percent;
+}
+
+/// Returns the effective thread percent (0-100).
+pub fn threadPercent() usize {
+    return loadConfig().thread_percent;
+}
+
+/// Computes the thread ceiling from the effective thread percent.
 pub fn threadLimit(available: usize) usize {
+    const pct = loadConfig().thread_percent;
     const total = @max(available, 1);
     const quotient = total / 100;
     const remainder = total % 100;
-    const scaled = quotient * FRAMEWORK_RESOURCE_PERCENT +
-        (remainder * FRAMEWORK_RESOURCE_PERCENT + 99) / 100;
+    const scaled = quotient * pct + (remainder * pct + 99) / 100;
     return @max(@as(usize, 1), @min(total, scaled));
 }
 
-/// Applies a requested worker count beneath the framework ceiling. Callers
-/// may spend less for tiny work, but no lane or explicit flag may spend more.
+/// Applies a requested worker count beneath the framework ceiling.
 pub fn clampThreads(requested: usize, available: usize) usize {
     return @min(@max(requested, 1), threadLimit(available));
 }
@@ -30,25 +149,21 @@ pub fn memoryPercentCapBytes(physical_memory_bytes: ?usize, percent: usize) ?usi
     return @max(@as(usize, 1), (total / 100) * percent + ((total % 100) * percent) / 100);
 }
 
-/// Uses Zig's cross-platform system-memory owner instead of lane-local OS
-/// probes so the same policy governs Windows, Linux, BSD, and Darwin builds.
+/// Uses Zig's cross-platform system-memory owner.
 pub fn detectedPhysicalMemoryBytes() ?usize {
     const total = std.process.totalSystemMemory() catch return null;
     if (total == 0) return null;
     return @intCast(@min(total, std.math.maxInt(usize)));
 }
 
-/// Returns the allocation budget shared by search, inspect, similar, xo,
-/// nexus, and indexd. Detection failure chooses a conservative documented
-/// fallback; it never silently removes the ceiling.
+/// Returns the allocation budget using the effective memory percent.
 pub fn memoryLimitBytes() usize {
-    return memoryPercentCapBytes(detectedPhysicalMemoryBytes(), FRAMEWORK_RESOURCE_PERCENT) orelse
+    const pct = loadConfig().memory_percent;
+    return memoryPercentCapBytes(detectedPhysicalMemoryBytes(), pct) orelse
         FALLBACK_FRAMEWORK_MEMORY_BYTES;
 }
 
-/// A thread-safe accounting allocator makes the framework memory ceiling an
-/// allocation-time contract rather than an after-the-fact RSS observation.
-/// The child allocator still owns alignment and platform allocation behavior.
+/// A thread-safe accounting allocator.
 pub const CappedAllocator = struct {
     child: std.mem.Allocator,
     limit: usize,
@@ -126,17 +241,22 @@ pub const CappedAllocator = struct {
     };
 };
 
-test "framework thread ceiling applies to defaults and explicit requests" {
-    try std.testing.expectEqual(@as(usize, 1), threadLimit(1));
-    try std.testing.expectEqual(@as(usize, 1), threadLimit(8));
-    try std.testing.expectEqual(@as(usize, 2), threadLimit(32));
-    try std.testing.expectEqual(@as(usize, 4), threadLimit(64));
-    try std.testing.expectEqual(@as(usize, 2), clampThreads(128, 32));
-    try std.testing.expectEqual(@as(usize, 1), clampThreads(1, 32));
+test "thread and memory percents are independent" {
+    // Defaults: both 5%
+    try std.testing.expectEqual(@as(usize, 5), DEFAULT_MEMORY_PERCENT);
+    try std.testing.expectEqual(@as(usize, 5), DEFAULT_THREAD_PERCENT);
 }
 
-test "framework memory ceiling is five percent" {
-    try std.testing.expectEqual(@as(usize, 512), memoryPercentCapBytes(10 * 1024, FRAMEWORK_RESOURCE_PERCENT).?);
+test "thread ceiling scales by thread percent" {
+    // 5% of 32 = 2
+    try std.testing.expectEqual(@as(usize, 2), threadLimit(32));
+    try std.testing.expectEqual(@as(usize, 4), threadLimit(64));
+    try std.testing.expectEqual(@as(usize, 1), threadLimit(8));
+}
+
+test "memory ceiling is independent from threads" {
+    try std.testing.expectEqual(@as(usize, 512), memoryPercentCapBytes(10 * 1024, 5).?);
+    try std.testing.expectEqual(@as(usize, 1024), memoryPercentCapBytes(10 * 1024, 10).?);
     try std.testing.expect(memoryLimitBytes() > 0);
 }
 

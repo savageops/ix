@@ -4472,7 +4472,7 @@ fn refreshStats(report: *SearchReport) void {
         .thread_limit = resource_profile.threadLimit(report.available_threads),
         .outer_scan_threads = report.outer_scan_threads,
         .execution_mode = if (byte_sharded) "byte_sharded" else "materialized",
-        .resource_policy = "hardware_5_percent",
+        .resource_policy = "hardware_percent",
         .scan_input_policy = report.scan_input_policy.label(),
         .sharding_enabled = byte_sharded,
         .sharded_files = report.stats.byte_shard_kernel.files_profiled,
