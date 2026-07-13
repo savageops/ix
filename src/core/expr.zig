@@ -176,9 +176,11 @@ pub const ExpressionPlan = struct {
 pub const ParseError = error{
     EmptyExpression,
     EmptyLiteral,
+    EmptyRegex,
     EmptyPrefix,
     EmptySuffix,
     EmptyPredicate,
+    MixedOperators,
     TooManyPredicates,
 };
 
@@ -200,6 +202,8 @@ pub fn parse(source: []const u8) ParseError!ExpressionPlan {
     const trimmed_source = std.mem.trim(u8, source, " \t\r\n");
     if (trimmed_source.len == 0) return ParseError.EmptyExpression;
     const has_or = std.mem.indexOf(u8, trimmed_source, "||") != null;
+    const has_and = std.mem.indexOf(u8, trimmed_source, "&&") != null;
+    if (has_or and has_and) return ParseError.MixedOperators;
 
     var plan = ExpressionPlan{
         .source = trimmed_source,
@@ -215,11 +219,10 @@ pub fn parse(source: []const u8) ParseError!ExpressionPlan {
         const next = std.mem.indexOf(u8, rest, delimiter);
         const end = if (next) |offset| cursor + offset else trimmed_source.len;
         const segment = std.mem.trim(u8, trimmed_source[cursor..end], " \t\r\n");
-        if (segment.len > 0) {
-            if (plan.predicate_count >= MAX_PREDICATES) return ParseError.TooManyPredicates;
-            plan.predicates[plan.predicate_count] = try parsePredicate(segment);
-            plan.predicate_count += 1;
-        }
+        if (segment.len == 0) return ParseError.EmptyPredicate;
+        if (plan.predicate_count >= MAX_PREDICATES) return ParseError.TooManyPredicates;
+        plan.predicates[plan.predicate_count] = try parsePredicate(segment);
+        plan.predicate_count += 1;
         if (next == null) break;
         cursor = end + delimiter.len;
     }
@@ -231,6 +234,7 @@ pub fn parse(source: []const u8) ParseError!ExpressionPlan {
 fn parsePredicate(source: []const u8) ParseError!Predicate {
     if (std.mem.startsWith(u8, source, "re:")) {
         const value = source[3..];
+        if (value.len == 0) return ParseError.EmptyRegex;
         return .{
             .kind = .regex,
             .value = value,
@@ -504,14 +508,21 @@ test "regex literal alternates may be wrapped in one full pattern group" {
     try std.testing.expectEqualStrings("ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT", literalAlternatesBody(grouped_casefold.predicates[0].value));
 }
 
-test "parser trims source and splits rust-style boolean tokens" {
-    const plan = try parse(" lit:alpha|| prefix:beta && suffix:gamma ");
+test "parser trims source and splits boolean tokens" {
+    const plan = try parse(" lit:alpha|| prefix:beta ");
     try std.testing.expectEqual(LogicMode.any, plan.mode);
     try std.testing.expectEqual(@as(usize, 2), plan.predicate_count);
-    try std.testing.expectEqualStrings("lit:alpha|| prefix:beta && suffix:gamma", plan.source);
+    try std.testing.expectEqualStrings("lit:alpha|| prefix:beta", plan.source);
     try std.testing.expectEqual(PredicateKind.literal, plan.predicates[0].kind);
     try std.testing.expectEqual(PredicateKind.prefix, plan.predicates[1].kind);
-    try std.testing.expectEqualStrings("beta && suffix:gamma", plan.predicates[1].value);
+    try std.testing.expectEqualStrings("beta", plan.predicates[1].value);
+}
+
+test "parser rejects incomplete mixed and empty regex expressions" {
+    try std.testing.expectError(ParseError.EmptyPredicate, parse("lit:alpha &&"));
+    try std.testing.expectError(ParseError.EmptyPredicate, parse("|| lit:alpha"));
+    try std.testing.expectError(ParseError.MixedOperators, parse("lit:alpha || prefix:beta && suffix:gamma"));
+    try std.testing.expectError(ParseError.EmptyRegex, parse("re:"));
 }
 
 test "plan exposes rust capability predicates" {

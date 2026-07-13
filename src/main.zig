@@ -8,6 +8,7 @@ const expr = @import("core/expr.zig");
 const indexd = @import("core/indexd.zig");
 const inspect = @import("core/inspect.zig");
 const process_tool = @import("core/process_tool.zig");
+const pcre_regex = @import("core/pcre_regex.zig");
 const search = @import("core/search.zig");
 const similar = @import("core/similar.zig");
 
@@ -98,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
                 try stderr.flush();
                 std.process.exit(1);
             };
-            const plan = expr.parse(request.expression) catch |err| {
+            const plan = parseExpression(request.expression) catch |err| {
                 try output.writeError(stderr, "invalid_expression", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
@@ -125,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
             var effective_request = request;
             effective_request.nexus_disabled = nexusDisabled(init);
             effective_request.index_enabled = indexdEnabled(init);
-            const plan = expr.parse(request.expression) catch |err| {
+            const plan = parseExpression(request.expression) catch |err| {
                 try output.writeError(stderr, "invalid_expression", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
@@ -152,7 +153,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .inspect => |request| {
             if (request.expression) |expression| {
-                const plan = expr.parse(expression) catch |err| {
+                const plan = parseExpression(expression) catch |err| {
                     try output.writeError(stderr, "invalid_expression", @errorName(err));
                     try stderr.flush();
                     std.process.exit(1);
@@ -198,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
             }
         },
         .explain => |request| {
-            const plan = expr.parse(request.expression) catch |err| {
+            const plan = parseExpression(request.expression) catch |err| {
                 try output.writeError(stderr, "invalid_expression", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
@@ -248,7 +249,7 @@ pub fn main(init: std.process.Init) !void {
         },
         .nexus => |request| {
             const effective_request = request;
-            const plan = expr.parse(effective_request.expression) catch std.process.exit(0);
+            const plan = parseExpression(effective_request.expression) catch std.process.exit(0);
             _ = search.run(init.io, allocator, effective_request, plan) catch std.process.exit(0);
             search.holdEvidenceFrontierLive(init.io, allocator, effective_request, plan);
         },
@@ -266,6 +267,20 @@ pub fn main(init: std.process.Init) !void {
         },
     }
     try stdout.flush();
+}
+
+/// Parses the expression grammar and proves every regex compiles before any file discovery begins.
+fn parseExpression(source: []const u8) !expr.ExpressionPlan {
+    const plan = try expr.parse(source);
+    for (plan.predicates[0..plan.predicate_count]) |predicate| {
+        if (predicate.kind == .regex) try pcre_regex.validate(predicate.value, false);
+    }
+    return plan;
+}
+
+test "expression validation rejects malformed regex before search" {
+    try std.testing.expectError(error.CompileFailed, parseExpression("re:["));
+    _ = try parseExpression("re:needle-[0-9]+");
 }
 
 fn indexdCommandAllocator() std.mem.Allocator {

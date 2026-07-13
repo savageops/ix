@@ -157,6 +157,26 @@ const CachedRegex = struct {
 
 threadlocal var cache: CachedRegex = .{};
 
+/// Validates public regex syntax before discovery so compile failure cannot masquerade as no matches.
+pub fn validate(pattern: []const u8, case_insensitive: bool) error{CompileFailed}!void {
+    if (pattern.len <= MAX_CACHED_PATTERN) {
+        if (!cache.ensureCompiled(pattern, case_insensitive)) return error.CompileFailed;
+        return;
+    }
+    var error_code: c_int = undefined;
+    var error_offset: PCRE2_SIZE = undefined;
+    const flags: c_uint = if (case_insensitive) PCRE2_CASELESS else 0;
+    const code = pcre2_compile_8(
+        @ptrCast(pattern.ptr),
+        pattern.len,
+        flags,
+        &error_code,
+        &error_offset,
+        null,
+    ) orelse return error.CompileFailed;
+    pcre2_code_free_8(code);
+}
+
 /// Exact zero-based byte span returned by PCRE2's first ovector pair.
 pub const MatchSpan = struct {
     start: usize,
