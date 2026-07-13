@@ -110,4 +110,4 @@ Pass 009 is complete. Exact inspect limits, argument provenance, parser-owned he
 - Native sync verifies source freshness, the full ReleaseSmall gate when building, v3 serialization, warm/cold evidence parity, staged hash identity, `.old.ddmmyy[.N].exe` rollback rotation, installed smoke, and rollback-on-failure.
 - Debug suite passes. Full ReleaseSmall passes 522/522. A real isolated install transaction preserved exact hashes on both aliases.
 - A final tight-budget native probe caught and repaired a missing `spans` array closure in `xo` JSON. The serializer now has a real JSON parser regression, and the 2,000-byte installed response parses with 1 byte to spare.
-- Final native promotion installed SHA-256 `8A65178047A679F6A051BC9FE342BC9D04F42EE710AE5DD168EEE3180C18FD48` to `ix.exe` and `iex.exe`; displaced binaries remain independently hash-addressable under `.old.130726[.N].exe` names.
+- Final native promotion installed SHA-256 `8A65178047A679F6A051BC9FE342BC9D04F42EE710AE5DD168EEE3180C18FD48` to the sole live executable, `ix.exe`. The obsolete `iex.exe` alias and every predecessor are preserved under `ix/backups/`.

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -14,8 +14,8 @@ const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
   console.log(`Usage: node tools/scripts/sync-native-install.mjs [options]
 
-Proves the repo IX candidate, stages it beside the native aliases, rotates exact
-rollback binaries, atomically promotes, and verifies the installed owner path.
+Proves the repo IX candidate, stages the single native executable, archives every
+predecessor under ix/backups, atomically promotes, and verifies the owner path.
 
 Options:
   --build                 Run tests and build repo IX ReleaseSmall before syncing.
@@ -32,7 +32,8 @@ const buildFirst = args.includes("--build");
 const dryRun = args.includes("--dry-run");
 const repoIx = path.resolve(argValue(args, "--repo-ix", DEFAULT_REPO_IX));
 const installDir = path.resolve(argValue(args, "--install-dir", DEFAULT_INSTALL_DIR));
-const aliases = ["ix.exe", "iex.exe"].map((name) => path.join(installDir, name));
+const installedIx = path.join(installDir, "ix.exe");
+const backupDir = path.join(installDir, "ix", "backups");
 
 function sha256File(filePath) {
   return createHash("sha256").update(readFileSync(filePath)).digest("hex").toUpperCase();
@@ -61,13 +62,38 @@ function rollbackPath(aliasPath) {
   const pad = (value) => String(value).padStart(2, "0");
   const date = `${pad(now.getDate())}${pad(now.getMonth() + 1)}${String(now.getFullYear()).slice(-2)}`;
   const extension = path.extname(aliasPath);
-  const stem = aliasPath.slice(0, -extension.length);
-  const base = `${stem}.old.${date}${extension}`;
+  const stem = path.basename(aliasPath, extension);
+  const base = path.join(backupDir, `${stem}.old.${date}${extension}`);
   if (!existsSync(base)) return base;
   for (let suffix = 2; ; suffix += 1) {
-    const candidate = `${stem}.old.${date}.${suffix}${extension}`;
+    const candidate = path.join(backupDir, `${stem}.old.${date}.${suffix}${extension}`);
     if (!existsSync(candidate)) return candidate;
   }
+}
+
+function uniqueBackupPath(fileName) {
+  const base = path.join(backupDir, fileName);
+  if (!existsSync(base)) return base;
+  for (let suffix = 2; ; suffix += 1) {
+    const candidate = path.join(backupDir, `${fileName}.${suffix}`);
+    if (!existsSync(candidate)) return candidate;
+  }
+}
+
+/// Removes the obsolete iex alias and root-level predecessor sprawl without deleting evidence.
+function archiveLegacySiblings() {
+  const moves = [];
+  if (!existsSync(installDir)) return moves;
+  for (const entry of readdirSync(installDir, { withFileTypes: true })) {
+    if (!entry.isFile() || entry.name.toLowerCase() === "ix.exe") continue;
+    const lower = entry.name.toLowerCase();
+    if (!lower.startsWith("ix") && !lower.startsWith("iex")) continue;
+    const source = path.join(installDir, entry.name);
+    const destination = uniqueBackupPath(entry.name);
+    if (!dryRun) renameSync(source, destination);
+    moves.push({ source, destination });
+  }
+  return moves;
 }
 
 function verifyCandidate(binaryPath) {
@@ -93,31 +119,31 @@ function verifyCandidate(binaryPath) {
   }
 }
 
-function promoteAlias(aliasPath, repoHash) {
-  const beforeHash = existsSync(aliasPath) ? sha256File(aliasPath) : null;
-  if (beforeHash === repoHash) return { alias: aliasPath, beforeHash, afterHash: repoHash, backup: null, changed: false };
-  const backupPath = existsSync(aliasPath) ? rollbackPath(aliasPath) : null;
-  const stagedPath = `${aliasPath}.candidate-${process.pid}`;
-  if (dryRun) return { alias: aliasPath, beforeHash, afterHash: repoHash, backup: backupPath, changed: true };
+function promoteInstalledIx(installedPath, repoHash) {
+  const beforeHash = existsSync(installedPath) ? sha256File(installedPath) : null;
+  if (beforeHash === repoHash) return { path: installedPath, beforeHash, afterHash: repoHash, backup: null, changed: false };
+  const backupPath = existsSync(installedPath) ? rollbackPath(installedPath) : null;
+  const stagedPath = `${installedPath}.candidate-${process.pid}`;
+  if (dryRun) return { path: installedPath, beforeHash, afterHash: repoHash, backup: backupPath, changed: true };
 
   copyFileSync(repoIx, stagedPath);
   if (sha256File(stagedPath) !== repoHash) {
     rmSync(stagedPath, { force: true });
-    throw new Error(`${aliasPath}: staged candidate hash mismatch`);
+    throw new Error(`${installedPath}: staged candidate hash mismatch`);
   }
   try {
-    if (backupPath) renameSync(aliasPath, backupPath);
-    renameSync(stagedPath, aliasPath);
-    verifyCandidate(aliasPath);
-    if (sha256File(aliasPath) !== repoHash) throw new Error(`${aliasPath}: installed hash mismatch`);
+    if (backupPath) renameSync(installedPath, backupPath);
+    renameSync(stagedPath, installedPath);
+    verifyCandidate(installedPath);
+    if (sha256File(installedPath) !== repoHash) throw new Error(`${installedPath}: installed hash mismatch`);
   } catch (error) {
     rmSync(stagedPath, { force: true });
-    rmSync(aliasPath, { force: true });
-    if (backupPath && existsSync(backupPath)) renameSync(backupPath, aliasPath);
+    rmSync(installedPath, { force: true });
+    if (backupPath && existsSync(backupPath)) renameSync(backupPath, installedPath);
     throw error;
   }
   return {
-    alias: aliasPath,
+    path: installedPath,
     beforeHash,
     afterHash: repoHash,
     backup: backupPath ? { path: backupPath, bytes: statSync(backupPath).size, sha256: sha256File(backupPath) } : null,
@@ -140,21 +166,25 @@ if (!existsSync(repoIx)) {
 const repoHash = sha256File(repoIx);
 const freshness = assertRepoBinaryFresh({ root: ROOT, repoIx });
 const actions = [];
-if (!dryRun) mkdirSync(installDir, { recursive: true });
+if (!dryRun) {
+  mkdirSync(installDir, { recursive: true });
+  mkdirSync(backupDir, { recursive: true });
+}
 verifyCandidate(repoIx);
 
 try {
-  for (const aliasPath of aliases) actions.push(promoteAlias(aliasPath, repoHash));
+  actions.push(promoteInstalledIx(installedIx, repoHash));
 } catch (error) {
   if (!dryRun) {
     for (const action of actions.reverse()) {
       if (!action.changed) continue;
-      rmSync(action.alias, { force: true });
-      if (action.backup?.path && existsSync(action.backup.path)) renameSync(action.backup.path, action.alias);
+      rmSync(action.path, { force: true });
+      if (action.backup?.path && existsSync(action.backup.path)) renameSync(action.backup.path, action.path);
     }
   }
   throw error;
 }
+const archived = archiveLegacySiblings();
 
 console.log(JSON.stringify({
   status: "ok",
@@ -165,5 +195,7 @@ console.log(JSON.stringify({
     freshness,
   },
   installDir,
+  backupDir,
   actions,
+  archived,
 }, null, 2));
