@@ -10,7 +10,6 @@ export function createNativeInstallGateValidation({
   latestTeddyDecisionPath,
   nativeInstallDir,
   nativeInstallIx,
-  nativeInstallIex,
   findBuiltIx,
   lane,
 }) {
@@ -42,18 +41,14 @@ export function createNativeInstallGateValidation({
     }
     const repoIx = findBuiltIx();
     if (!repoIx) return lane("native_install_identity", "skipped", { reason: "zig-out binary missing; run build first" });
-    const missing = [nativeInstallIx, nativeInstallIex].filter((candidate) => !existsSync(candidate));
-    if (missing.length > 0) {
+    if (!existsSync(nativeInstallIx)) {
       return lane("native_install_identity", "skipped", {
-        reason: "native installed IX alias missing",
-        missing,
+        reason: "native installed IX executable missing",
+        missing: [nativeInstallIx],
       });
     }
     const repoHash = sha256File(repoIx);
-    const installed = [
-      { path: nativeInstallIx, sha256: sha256File(nativeInstallIx) },
-      { path: nativeInstallIex, sha256: sha256File(nativeInstallIex) },
-    ];
+    const installed = [{ path: nativeInstallIx, sha256: sha256File(nativeInstallIx) }];
     const mismatched = installed.filter((entry) => entry.sha256 !== repoHash);
     if (mismatched.length > 0) {
       const decision = latestTeddyDecisionForRepoHash(repoHash);
@@ -82,10 +77,12 @@ export function createNativeInstallGateValidation({
 
   function latestDistinctNativeBackup(repoHash) {
     if (!existsSync(nativeInstallDir)) return null;
-    return readdirSync(nativeInstallDir)
-      .filter((name) => /^ix\.exe\.backup-/.test(name))
+    const backupDir = path.join(nativeInstallDir, "backups");
+    if (!existsSync(backupDir)) return null;
+    return readdirSync(backupDir)
+      .filter((name) => /^ix(?:\.exe)?[.-]/.test(name))
       .map((name) => {
-        const fullPath = path.join(nativeInstallDir, name);
+        const fullPath = path.join(backupDir, name);
         return { path: fullPath, label: name.replace(/^ix\.exe\./, ""), mtimeMs: statSync(fullPath).mtimeMs };
       })
       .sort((left, right) => right.mtimeMs - left.mtimeMs)

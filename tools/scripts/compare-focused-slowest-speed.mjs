@@ -7,7 +7,7 @@ import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "focused-slowest-speed");
 const MANUAL_REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
-const DEFAULT_BACKUP = path.join(path.dirname(defaultInstalledIxPath()), "ix.exe.backup-2026-06-30T19-36-32-721Z");
+const DEFAULT_BACKUP = path.join(path.dirname(defaultInstalledIxPath()), "backups", "ix.exe.backup-2026-06-30T19-36-32-721Z");
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {

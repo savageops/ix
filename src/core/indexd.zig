@@ -994,15 +994,19 @@ test "indexd background config uses central state for generated-looking roots" {
 }
 
 test "indexd config owns IX state index directory" {
+    const scanned_root = ".zig-cache\\ix-indexd-config-root";
     const config = try buildConfig(std.testing.allocator, .{
-        .root = "E:\\Workspaces\\ix-zig",
+        .root = scanned_root,
         .repair = true,
     });
     defer config.deinit(std.testing.allocator);
+    const state_root = try state_dir.resolveStateDir(std.testing.allocator);
+    defer std.testing.allocator.free(state_root);
 
     try std.testing.expectEqual(Mode.foreground_repair, config.mode);
+    try std.testing.expect(std.mem.startsWith(u8, config.index_dir, state_root));
     try std.testing.expect(std.mem.indexOf(u8, config.index_dir, "roots") != null);
-    try std.testing.expect(std.mem.indexOf(u8, config.index_dir, ".ix\\index") == null);
+    try std.testing.expect(std.mem.indexOf(u8, config.index_dir, scanned_root) == null);
 }
 
 test "indexd root lock prevents overlapping mutation owner" {

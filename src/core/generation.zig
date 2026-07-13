@@ -822,11 +822,14 @@ test "generation storage paths reject invalid visible epoch" {
 }
 
 test "generation root helper uses canonical state directory outside scanned root" {
-    const paths = try buildGenerationPaths(std.testing.allocator, ".zig-cache\\ix-generation-canonical-root-test", 43);
+    const scanned_root = ".zig-cache\\ix-generation-canonical-root-test";
+    const paths = try buildGenerationPaths(std.testing.allocator, scanned_root, 43);
     defer paths.deinit(std.testing.allocator);
+    const state_root = try state_dir.resolveStateDir(std.testing.allocator);
+    defer std.testing.allocator.free(state_root);
 
-    try std.testing.expect(std.mem.indexOf(u8, paths.index_dir, ".ix\\index") == null);
-    try std.testing.expect(std.mem.indexOf(u8, paths.index_dir, ".ix/index") == null);
+    try std.testing.expect(std.mem.startsWith(u8, paths.index_dir, state_root));
+    try std.testing.expect(std.mem.indexOf(u8, paths.index_dir, scanned_root) == null);
     try std.testing.expect(std.mem.indexOf(u8, paths.index_dir, "roots") != null);
 }
 

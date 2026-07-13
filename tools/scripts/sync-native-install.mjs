@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
@@ -8,7 +8,10 @@ import { assertRepoBinaryFresh } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const DEFAULT_REPO_IX = path.join(ROOT, "zig-out", "bin", "ix-zig.exe");
-const DEFAULT_INSTALL_DIR = path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin");
+const DEFAULT_INSTALL_DIR = path.join(os.homedir(), "AppData", "ix");
+const LEGACY_INSTALL_DIR = path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin");
+const DEFAULT_STATE_DIR = path.join(os.homedir(), ".ix");
+const LEGACY_STATE_DIR = path.join(os.homedir(), "AppData", "Local", "ix");
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -21,7 +24,7 @@ Options:
   --build                 Run tests and build repo IX ReleaseSmall before syncing.
   --repo-ix <path>        Repo IX binary. Default: zig-out/bin/ix-zig.exe.
   --install-dir <path>    Native install directory.
-                          Default: ~/AppData/Local/Programs/iEx/bin.
+                          Default: ~/AppData/ix.
   --dry-run               Print planned actions without copying files.
   --help, -h              Print this help.
 `);
@@ -33,7 +36,8 @@ const dryRun = args.includes("--dry-run");
 const repoIx = path.resolve(argValue(args, "--repo-ix", DEFAULT_REPO_IX));
 const installDir = path.resolve(argValue(args, "--install-dir", DEFAULT_INSTALL_DIR));
 const installedIx = path.join(installDir, "ix.exe");
-const backupDir = path.join(installDir, "ix", "backups");
+const backupDir = path.join(installDir, "backups");
+const isDefaultInstall = path.resolve(installDir) === path.resolve(DEFAULT_INSTALL_DIR);
 
 function sha256File(filePath) {
   return createHash("sha256").update(readFileSync(filePath)).digest("hex").toUpperCase();
@@ -96,26 +100,103 @@ function archiveLegacySiblings() {
   return moves;
 }
 
+/// Moves a directory only when the canonical destination is absent; conflicts are
+/// archived whole so partially compatible index generations are never interleaved.
+function migrateStateRoot(source, destination, label) {
+  if (!existsSync(source) || path.resolve(source) === path.resolve(destination)) return null;
+  if (dryRun) return { source, destination: existsSync(destination) ? uniqueBackupPath(`${label}-state`) : destination, conflict: existsSync(destination) };
+  if (!existsSync(destination)) {
+    mkdirSync(path.dirname(destination), { recursive: true });
+    renameSync(source, destination);
+    return { source, destination, conflict: false };
+  }
+  const archived = uniqueBackupPath(`${label}-state`);
+  renameSync(source, archived);
+  return { source, destination: archived, conflict: true };
+}
+
+/// Consolidates predecessor files from an older backup directory without overwriting evidence.
+function migrateBackupDirectory(sourceDir) {
+  const moves = [];
+  if (!existsSync(sourceDir) || path.resolve(sourceDir) === path.resolve(backupDir)) return moves;
+  for (const entry of readdirSync(sourceDir, { withFileTypes: true })) {
+    const source = path.join(sourceDir, entry.name);
+    const destination = uniqueBackupPath(entry.name);
+    if (!dryRun) renameSync(source, destination);
+    moves.push({ source, destination });
+  }
+  if (!dryRun) rmSync(sourceDir, { recursive: true, force: true });
+  return moves;
+}
+
+/// Retires the previous Programs/iEx/bin layout after its state and backups are safe.
+function migrateLegacyInstall() {
+  const moves = migrateBackupDirectory(path.join(LEGACY_INSTALL_DIR, "ix", "backups"));
+  if (!existsSync(LEGACY_INSTALL_DIR)) return moves;
+  for (const entry of readdirSync(LEGACY_INSTALL_DIR, { withFileTypes: true })) {
+    const source = path.join(LEGACY_INSTALL_DIR, entry.name);
+    if (entry.isDirectory()) continue;
+    const lower = entry.name.toLowerCase();
+    if (!lower.startsWith("ix") && !lower.startsWith("iex")) continue;
+    const destination = uniqueBackupPath(entry.name);
+    if (!dryRun) renameSync(source, destination);
+    moves.push({ source, destination });
+  }
+  if (!dryRun) {
+    const ixDir = path.join(LEGACY_INSTALL_DIR, "ix");
+    if (existsSync(ixDir) && readdirSync(ixDir).length === 0) rmSync(ixDir, { recursive: true, force: true });
+    if (readdirSync(LEGACY_INSTALL_DIR).length === 0) rmSync(LEGACY_INSTALL_DIR, { recursive: true, force: true });
+  }
+  return moves;
+}
+
+/// Updates only the persistent user PATH and removes the retired install entry.
+/// The parent shell keeps its current process environment until restarted.
+function updateUserPath() {
+  if (dryRun || !isDefaultInstall) return { changed: false, reason: dryRun ? "dry_run" : "custom_install_dir" };
+  const script = [
+    "$parts = @([Environment]::GetEnvironmentVariable('Path','User') -split ';' | Where-Object { $_ })",
+    "$legacy = $env:IX_LEGACY_INSTALL",
+    "$current = $env:IX_CURRENT_INSTALL",
+    "$next = @($parts | Where-Object { -not [string]::Equals($_.TrimEnd('\\'), $legacy.TrimEnd('\\'), [StringComparison]::OrdinalIgnoreCase) })",
+    "if (-not ($next | Where-Object { [string]::Equals($_.TrimEnd('\\'), $current.TrimEnd('\\'), [StringComparison]::OrdinalIgnoreCase) })) { $next += $current }",
+    "[Environment]::SetEnvironmentVariable('Path', ($next -join ';'), 'User')",
+  ].join("; ");
+  const result = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+    windowsHide: true,
+    env: { ...process.env, IX_LEGACY_INSTALL: LEGACY_INSTALL_DIR, IX_CURRENT_INSTALL: installDir },
+  });
+  if (result.status !== 0) throw new Error(`user PATH migration failed: ${result.stderr.trim()}`);
+  return { changed: true, removed: LEGACY_INSTALL_DIR, added: installDir };
+}
+
 function verifyCandidate(binaryPath) {
-  run(binaryPath, ["help", "search"], { quiet: true });
-  const probe = (indexEnabled) => {
-    const result = spawnSync(binaryPath, ["search", "lit:pub", "src/main.zig", "--format", "json-compact", "--total-count", "1", "--max-bytes", "4096"], {
-      cwd: ROOT,
-      encoding: "utf8",
-      windowsHide: true,
-      env: { ...process.env, IX_INDEX: indexEnabled ? "1" : "0" },
-    });
-    if (result.status !== 0) throw new Error(`${binaryPath}: ${indexEnabled ? "warm" : "cold"} output-contract probe failed: ${result.stderr.trim()}`);
-    const payload = JSON.parse(result.stdout);
-    if (payload.schema !== "ix.result.v3" || payload.scan?.state !== "complete") {
-      throw new Error(`${binaryPath}: invalid ${indexEnabled ? "warm" : "cold"} v3 output contract`);
+  // Promotion proof must never create, mutate, or warm the user's real index.
+  const verificationState = mkdtempSync(path.join(os.tmpdir(), "ix-native-verify-"));
+  try {
+    run(binaryPath, ["help", "search"], { quiet: true });
+    const probe = (indexEnabled) => {
+      const result = spawnSync(binaryPath, ["search", "lit:pub", "src/main.zig", "--format", "json-compact", "--total-count", "1", "--max-bytes", "4096"], {
+        cwd: ROOT,
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, IX_INDEX: indexEnabled ? "1" : "0", IX_STATE_DIR: verificationState },
+      });
+      if (result.status !== 0) throw new Error(`${binaryPath}: ${indexEnabled ? "warm" : "cold"} output-contract probe failed: ${result.stderr.trim()}`);
+      const payload = JSON.parse(result.stdout);
+      if (payload.schema !== "ix.result.v3" || payload.scan?.state !== "complete") {
+        throw new Error(`${binaryPath}: invalid ${indexEnabled ? "warm" : "cold"} v3 output contract`);
+      }
+      return payload;
+    };
+    const cold = probe(false);
+    const warm = probe(true);
+    if (cold.stats?.matches_found !== warm.stats?.matches_found || JSON.stringify(cold.hits) !== JSON.stringify(warm.hits)) {
+      throw new Error(`${binaryPath}: warm/cold evidence parity failed`);
     }
-    return payload;
-  };
-  const cold = probe(false);
-  const warm = probe(true);
-  if (cold.stats?.matches_found !== warm.stats?.matches_found || JSON.stringify(cold.hits) !== JSON.stringify(warm.hits)) {
-    throw new Error(`${binaryPath}: warm/cold evidence parity failed`);
+  } finally {
+    rmSync(verificationState, { recursive: true, force: true });
   }
 }
 
@@ -185,6 +266,12 @@ try {
   throw error;
 }
 const archived = archiveLegacySiblings();
+const stateMigrations = isDefaultInstall ? [
+  migrateStateRoot(LEGACY_STATE_DIR, DEFAULT_STATE_DIR, "localappdata-ix"),
+  migrateStateRoot(path.join(LEGACY_INSTALL_DIR, ".ix"), DEFAULT_STATE_DIR, "install-dot-ix"),
+].filter(Boolean) : [];
+const legacyInstallMoves = isDefaultInstall ? migrateLegacyInstall() : [];
+const pathMigration = updateUserPath();
 
 console.log(JSON.stringify({
   status: "ok",
@@ -198,4 +285,7 @@ console.log(JSON.stringify({
   backupDir,
   actions,
   archived,
+  stateMigrations,
+  legacyInstallMoves,
+  pathMigration,
 }, null, 2));

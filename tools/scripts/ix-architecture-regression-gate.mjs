@@ -30,9 +30,8 @@ const REPORT_DIR = path.join(ROOT, "tools", "reports", "architecture-gate");
 const LATEST_TEDDY_DECISION = path.join(ROOT, "tools", "reports", "teddy-kernel-decision", "latest-teddy-kernel-decision.json");
 const LATEST_HISTORICAL_SPEED = path.join(ROOT, "tools", "reports", "historical-speed", "latest-historical-speed.json");
 const LATEST_NONDIAGNOSTIC_HISTORICAL_SPEED = path.join(ROOT, "tools", "reports", "historical-speed", "latest-nondiagnostic-historical-speed.json");
-const NATIVE_INSTALL_DIR = path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin");
+const NATIVE_INSTALL_DIR = path.join(os.homedir(), "AppData", "ix");
 const NATIVE_INSTALL_IX = path.join(NATIVE_INSTALL_DIR, "ix.exe");
-const NATIVE_INSTALL_IEX = path.join(NATIVE_INSTALL_DIR, "iex.exe");
 const DEFAULT_BENCH_CORPUS = "E:\\Workspaces\\01_Projects\\01_Github\\iEx\\.refs\\ripgrep\\benchsuite\\linux";
 
 const args = process.argv.slice(2);
@@ -319,7 +318,6 @@ const {
   latestTeddyDecisionPath: LATEST_TEDDY_DECISION,
   nativeInstallDir: NATIVE_INSTALL_DIR,
   nativeInstallIx: NATIVE_INSTALL_IX,
-  nativeInstallIex: NATIVE_INSTALL_IEX,
   findBuiltIx,
   lane,
 });

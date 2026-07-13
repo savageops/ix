@@ -25,6 +25,9 @@ pub fn build(b: *std.Build) void {
     });
 
     const test_cmd = b.addRunArtifact(unit_tests);
+    // Tests exercise persistent-index behavior against disposable repo state,
+    // never the operator's ~/.ix ownership root.
+    test_cmd.setEnvironmentVariable("IX_STATE_DIR", b.pathFromRoot(".zig-cache/ix-test-state"));
     const test_step = b.step("test", "Run Zig unit tests");
     test_step.dependOn(&test_cmd.step);
 
@@ -36,6 +39,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const delta_overlay_test_cmd = b.addRunArtifact(delta_overlay_tests);
+    delta_overlay_test_cmd.setEnvironmentVariable("IX_STATE_DIR", b.pathFromRoot(".zig-cache/ix-test-state"));
     test_step.dependOn(&delta_overlay_test_cmd.step);
 }
 

@@ -6,16 +6,13 @@ const builtin = @import("builtin");
 /// IX stores all runtime state (index, query cache, process markers) in a
 /// single state directory. The resolution is simple and explicit:
 ///
-///   Windows:  %LOCALAPPDATA%\ix\
-///   Linux:    $XDG_STATE_HOME/ix/  (or ~/.local/state/ix/)
-///   macOS:    ~/Library/Application Support/ix/
+///   Every platform:  ~/.ix/
 ///
 /// Override with IX_STATE_DIR environment variable.
 ///
-/// No legacy .ix-next-to-exe detection. No fallbacks. One path per platform.
-/// This matches the convention used by fzf (%LOCALAPPDATA%\fzf),
-/// zoxide (%LOCALAPPDATA%\zoxide), and eza (%LOCALAPPDATA%\eza).
-
+/// The home-owned root keeps indexes, caches, configuration, credentials, and
+/// process state independent from the replaceable executable. Installation owns
+/// legacy migration; runtime never probes multiple roots or silently merges state.
 pub const STATE_ENV = "IX_STATE_DIR";
 
 pub const RootIndexState = struct {
@@ -31,29 +28,14 @@ pub const RootIndexState = struct {
 pub fn resolveStateDir(allocator: std.mem.Allocator) ![]const u8 {
     if (getenvOwned(allocator, STATE_ENV)) |override| return override;
 
-    if (builtin.os.tag == .windows) {
-        const local_appdata = getenvOwned(allocator, "LOCALAPPDATA") orelse
-            return error.StateDirResolutionFailed;
-        defer allocator.free(local_appdata);
-        return std.fs.path.join(allocator, &.{ local_appdata, "ix" });
-    }
-
-    if (builtin.os.tag == .macos) {
-        const home = getenvOwned(allocator, "HOME") orelse
-            return error.StateDirResolutionFailed;
-        defer allocator.free(home);
-        return std.fs.path.join(allocator, &.{ home, "Library", "Application Support", "ix" });
-    }
-
-    // Linux / FreeBSD: XDG_STATE_HOME or ~/.local/state
-    if (getenvOwned(allocator, "XDG_STATE_HOME")) |xdg| {
-        defer allocator.free(xdg);
-        return std.fs.path.join(allocator, &.{ xdg, "ix" });
-    }
-    const home = getenvOwned(allocator, "HOME") orelse
+    const home = if (builtin.os.tag == .windows)
+        getenvOwned(allocator, "USERPROFILE") orelse getenvOwned(allocator, "HOME")
+    else
+        getenvOwned(allocator, "HOME");
+    const owned_home = home orelse
         return error.StateDirResolutionFailed;
-    defer allocator.free(home);
-    return std.fs.path.join(allocator, &.{ home, ".local", "state", "ix" });
+    defer allocator.free(owned_home);
+    return std.fs.path.join(allocator, &.{ owned_home, ".ix" });
 }
 
 pub fn buildRootIndexState(allocator: std.mem.Allocator, root_fingerprint: u128) !RootIndexState {
@@ -145,8 +127,12 @@ const WindowsApi = struct {
 test "resolveStateDir respects IX_STATE_DIR override" {
     const dir = try resolveStateDir(std.testing.allocator);
     defer std.testing.allocator.free(dir);
-    // Without IX_STATE_DIR set in tests, falls through to platform default.
     try std.testing.expect(dir.len > 0);
+    const override = getenvOwned(std.testing.allocator, STATE_ENV);
+    defer if (override) |value| std.testing.allocator.free(value);
+    if (override == null) {
+        try std.testing.expect(std.mem.endsWith(u8, dir, ".ix"));
+    }
 }
 
 test "buildRootIndexState joins index roots path" {

@@ -403,29 +403,30 @@ export function createRuntimeStateGateValidation({
     }
 
     const base = path.join(os.tmpdir(), `ix-default-state-location-${process.pid}`);
-    const localAppData = path.join(base, "localappdata");
+    const userProfile = path.join(base, "home");
     const rootA = path.join(base, "root-a");
     const rootB = path.join(base, "root-b");
     const cwdA = path.join(base, "cwd-a");
     const cwdB = path.join(base, "cwd-b");
     rmSync(base, { recursive: true, force: true });
-    for (const dir of [localAppData, rootA, rootB, cwdA, cwdB]) mkdirSync(dir, { recursive: true });
+    for (const dir of [userProfile, rootA, rootB, cwdA, cwdB]) mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(rootA, "a.txt"), "needle a\n");
     writeFileSync(path.join(rootB, "b.txt"), "needle b\n");
 
     const env = {
-      LOCALAPPDATA: localAppData,
+      USERPROFILE: userProfile,
+      HOME: userProfile,
       IX_STATE_DIR: undefined,
       IX_INDEXD_MEMORY_LIMIT_MB: "256",
     };
     const first = run(ix, ["__ix_indexd", rootA, "--foreground", "--once"], { cwd: cwdA, env });
     const second = run(ix, ["__ix_indexd", rootB, "--foreground", "--once"], { cwd: cwdB, env });
-    const stateRoot = path.join(localAppData, "iEx", "ix");
+    const stateRoot = path.join(userProfile, ".ix");
     const currentMarkers = findFilesByName(stateRoot, "current.ixgen");
     const failures = [];
     if (first.exitCode !== 0) failures.push(`first default-state indexd exited ${first.exitCode}`);
     if (second.exitCode !== 0) failures.push(`second default-state indexd exited ${second.exitCode}`);
-    if (!existsSync(stateRoot)) failures.push("default state root was not created under LOCALAPPDATA/iEx/ix");
+    if (!existsSync(stateRoot)) failures.push("default state root was not created under ~/.ix");
     if (currentMarkers.length < 2) failures.push(`expected at least 2 current.ixgen markers under default state root, got ${currentMarkers.length}`);
     if (existsSync(path.join(rootA, ".ix"))) failures.push("first scanned root received .ix state");
     if (existsSync(path.join(rootB, ".ix"))) failures.push("second scanned root received .ix state");

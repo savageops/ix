@@ -162,7 +162,7 @@ IX_INDEXD_MEMORY_LIMIT_MB=16384 ix.exe __ix_indexd "/path/to/corpus" --foregroun
 IX_INDEX=1 ix.exe "lit:search_term" "/path/to/corpus" --json
 ```
 
-Set `IX_INDEX=1` (or `true`/`on`) to enable foreground warm-index admission. The index lives at `%LOCALAPPDATA%\iEx\ix\index\` and persists across invocations. Rebuild after large corpus changes.
+Set `IX_INDEX=1` (or `true`/`on`) to enable foreground warm-index admission. The index lives at `~/.ix/index/` and persists across invocations. `~/.ix/` is the single owner for mutable IX state, including future `config.json` and `auth.json` contracts; the replaceable executable never owns user state. Rebuild after large corpus changes.
 
 > The index rejects candidates. It never creates matches. The exact verifier confirms every emitted result.
 

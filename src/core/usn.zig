@@ -1170,11 +1170,14 @@ test "journal cursor publishes atomically under journals directory" {
 }
 
 test "journal root helper uses canonical state directory outside scanned root" {
-    const paths = try buildJournalPaths(std.testing.allocator, ".zig-cache\\ix-usn-canonical-root-test");
+    const scanned_root = ".zig-cache\\ix-usn-canonical-root-test";
+    const paths = try buildJournalPaths(std.testing.allocator, scanned_root);
     defer paths.deinit(std.testing.allocator);
+    const state_root = try state_dir.resolveStateDir(std.testing.allocator);
+    defer std.testing.allocator.free(state_root);
 
-    try std.testing.expect(std.mem.indexOf(u8, paths.journals_dir, ".ix\\index") == null);
-    try std.testing.expect(std.mem.indexOf(u8, paths.journals_dir, ".ix/index") == null);
+    try std.testing.expect(std.mem.startsWith(u8, paths.journals_dir, state_root));
+    try std.testing.expect(std.mem.indexOf(u8, paths.journals_dir, scanned_root) == null);
     try std.testing.expect(std.mem.indexOf(u8, paths.journals_dir, "roots") != null);
     try std.testing.expect(std.mem.endsWith(u8, paths.journals_dir, "journals"));
 }
