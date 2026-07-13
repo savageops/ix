@@ -25,7 +25,9 @@ function Invoke-IxSearch($Bin, $Engine, $Profile, [bool]$DisableNexus, [int]$Sam
   }
 
   $sw = [System.Diagnostics.Stopwatch]::StartNew()
-  $out = & $Bin search $Profile.expr $Profile.corpus --json --stats-only 2>&1
+  # Full JSON is the diagnostic projection; --stats-only is the framed v1
+  # sentinel and cannot be combined with --json under the canonical parser.
+  $out = & $Bin search $Profile.expr $Profile.corpus --json 2>&1
   $code = $LASTEXITCODE
   $sw.Stop()
   Remove-Item Env:\IX_NEXUS -ErrorAction SilentlyContinue

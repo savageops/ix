@@ -120,7 +120,11 @@ pub fn main(init: std.process.Init) !void {
             };
             if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
             if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
-            try writeSearchResult(init.io, effective_request, report, stdout);
+            writeSearchResult(init.io, effective_request, report, stdout) catch |err| {
+                try output.writeError(stderr, "output_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
         },
         .matches => |request| {
             var effective_request = request;

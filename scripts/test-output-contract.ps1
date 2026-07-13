@@ -105,6 +105,11 @@ try {
     Assert-True ($boundedObject.projection.reason -eq "byte_budget") "byte budget did not own truncation at $budget bytes"
   }
 
+  $tooSmall = Invoke-Raw @("search", "lit:needle", $root, "--format", "agent-v3", "--max-bytes", "512")
+  Assert-True ($tooSmall.ExitCode -ne 0) "an impossible envelope budget was accepted"
+  Assert-True ($tooSmall.Stderr.Contains('"code":"output_failed"')) "impossible envelope budget was not typed"
+  Assert-True ($tooSmall.Stderr.Contains('ByteBudgetTooSmall')) "impossible envelope budget lost its cause"
+
   [System.IO.File]::AppendAllText((Join-Path $root "many.txt"), "mutated needle-999`n", [System.Text.UTF8Encoding]::new($false))
   $stale = Invoke-Raw @("search", "lit:needle", $root, "--format", "agent-v3", "--max-hits", "2", "--cursor", $pageOneObject.projection.next_cursor)
   Assert-True ($stale.ExitCode -ne 0) "stale cursor was accepted after corpus mutation"
