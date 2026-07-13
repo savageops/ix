@@ -535,11 +535,21 @@ fn emptySearchRequest(expression: []const u8) SearchRequest {
 
 /// Lowers every legacy selector into one format and rejects ambiguous writer policy.
 fn selectOutputFormat(request: *SearchRequest, format: OutputFormat) ParseError!void {
-    if (request.output_format != .text and request.output_format != format) return ParseError.ConflictingOutputFormat;
-    request.output_format = format;
-    request.json = format == .json or format == .json_compact;
-    request.stats_only = format == .stats;
-    request.output_mode = switch (format) {
+    if ((request.output_format == .json and format == .stats) or
+        (request.output_format == .stats and format == .json))
+    {
+        request.output_format = .json;
+        request.json = true;
+        request.stats_only = true;
+        request.output_mode = .normal;
+        return;
+    }
+    const selected = format;
+    if (request.output_format != .text and request.output_format != selected) return ParseError.ConflictingOutputFormat;
+    request.output_format = selected;
+    request.json = selected == .json or selected == .json_compact;
+    request.stats_only = selected == .stats;
+    request.output_mode = switch (selected) {
         .files => .files_with_matches,
         .count => .count,
         else => .normal,
@@ -1052,6 +1062,17 @@ test "search accepts the shared records and total-count vocabulary" {
     const request = (try parseInvocation(std.testing.allocator, &argv)).command.search;
     try std.testing.expectEqual(OutputFormat.text, request.output_format);
     try std.testing.expectEqual(@as(?usize, 300), request.max_hits);
+}
+
+test "legacy json stats composition preserves raw telemetry without hit collection" {
+    const json_first = [_][]const u8{ "ix-zig", "search", "lit:needle", "src", "--json", "--stats-only" };
+    const stats_first = [_][]const u8{ "ix-zig", "search", "lit:needle", "src", "--stats-only", "--json" };
+    for ([_][]const []const u8{ &json_first, &stats_first }) |argv| {
+        const request = (try parseInvocation(std.testing.allocator, argv)).command.search;
+        try std.testing.expectEqual(OutputFormat.json, request.output_format);
+        try std.testing.expect(request.stats_only);
+        try std.testing.expect(request.json);
+    }
 }
 
 test "matches rejects terminal-envelope projections and accepts record-only JSON" {
