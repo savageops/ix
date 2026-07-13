@@ -274,6 +274,8 @@ pub fn main(init: std.process.Init) !void {
                     try output.writeError(stderr, "byte_budget_too_small", "increase --max-bytes; the budget cannot fit one complete insight span")
                 else if (err == error.OutOfMemory)
                     try output.writeError(stderr, "xo_resource_limit", "the command reached the framework-wide 5% memory ceiling")
+                else if (err == error.EmptyInsightQuery)
+                    try output.writeError(stderr, "empty_insight_query", "the query contained no usable terms after stop-word removal; provide at least one identifying code term")
                 else
                     try output.writeError(stderr, "xo_failed", @errorName(err));
                 try stderr.flush();

@@ -995,14 +995,16 @@ pub fn writeInspectContextJson(writer: anytype, report: inspect.ContextReport) !
 }
 
 pub fn writeInspectWindowRecords(writer: anytype, window: inspect.InspectWindow) !void {
+    try writer.print("{s}:\n", .{window.path});
     for (window.lines[0..window.line_count]) |line| {
-        try writer.print("{s}:{}:{s}\n", .{ window.path, line.number, line.text });
+        try writer.print("  {} | {s}\n", .{ line.number, line.text });
     }
 }
 
 pub fn writeInspectContextRecords(writer: anytype, report: inspect.ContextReport) !void {
+    try writer.print("{s}:\n", .{report.path});
     for (report.lines[0..report.line_count]) |line| {
-        try writer.print("{s}:{}:{s}:{s}\n", .{ report.path, line.number, line.role, line.text });
+        try writer.print("  {} {s} | {s}\n", .{ line.number, line.role, line.text });
     }
 }
 
