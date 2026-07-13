@@ -12,14 +12,38 @@ function Assert-True([bool]$Condition, [string]$Message) {
   if (-not $Condition) { throw $Message }
 }
 
+function ConvertTo-NativeArgument([string]$Argument) {
+  if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') { return $Argument }
+  $builder = [System.Text.StringBuilder]::new()
+  [void]$builder.Append('"')
+  $backslashes = 0
+  foreach ($character in $Argument.ToCharArray()) {
+    if ($character -eq '\') {
+      $backslashes++
+      continue
+    }
+    if ($character -eq '"') {
+      for ($index = 0; $index -lt ($backslashes * 2 + 1); $index++) { [void]$builder.Append('\') }
+      [void]$builder.Append('"')
+      $backslashes = 0
+      continue
+    }
+    for ($index = 0; $index -lt $backslashes; $index++) { [void]$builder.Append('\') }
+    $backslashes = 0
+    [void]$builder.Append($character)
+  }
+  for ($index = 0; $index -lt ($backslashes * 2); $index++) { [void]$builder.Append('\') }
+  [void]$builder.Append('"')
+  return $builder.ToString()
+}
+
 function Invoke-Raw([string[]]$Arguments) {
   $start = [System.Diagnostics.ProcessStartInfo]::new()
   $start.FileName = $Ix
   $start.UseShellExecute = $false
   $start.RedirectStandardOutput = $true
   $start.RedirectStandardError = $true
-  Assert-True (-not ($Arguments | Where-Object { $_ -match '[\s"]' })) "test harness arguments must remain shell-free single tokens"
-  $start.Arguments = $Arguments -join " "
+  $start.Arguments = (($Arguments | ForEach-Object { ConvertTo-NativeArgument $_ }) -join ' ')
   $process = [System.Diagnostics.Process]::new()
   $process.StartInfo = $start
   [void]$process.Start()
@@ -53,6 +77,10 @@ try {
   }
   [System.IO.File]::WriteAllLines((Join-Path $root "many.txt"), $lines, [System.Text.UTF8Encoding]::new($false))
   [System.IO.File]::WriteAllText((Join-Path $root "unicode.txt"), "alpha`nβeta needle-777 界界界`nomega`n", [System.Text.UTF8Encoding]::new($false))
+  [System.IO.File]::WriteAllBytes((Join-Path $root "control.txt"), [System.Text.Encoding]::ASCII.GetBytes(("x" * 1024) + "`fneedle-control"))
+  $spaceRoot = Join-Path $root "space corpus"
+  [void][System.IO.Directory]::CreateDirectory($spaceRoot)
+  [System.IO.File]::WriteAllText((Join-Path $spaceRoot "quoted name.txt"), "needle-space`n", [System.Text.UTF8Encoding]::new($false))
 
   for ($run = 0; $run -lt 20; $run++) {
     $raw = Invoke-Raw @("search", "lit:needle", $root, "--format", "agent-v3", "--max-hits", "3")
@@ -69,6 +97,42 @@ try {
   $fullObject = $fullJson.Stdout | ConvertFrom-Json
   Assert-True ($null -ne $fullObject.stats.timings) "legacy JSON lost debug telemetry"
   Assert-True ($fullObject.hits.Count -eq 3) "legacy JSON hit limit changed"
+
+  $controlJson = Invoke-Raw @("search", "lit:needle-control", (Join-Path $root "control.txt"), "--json")
+  Assert-True ($controlJson.ExitCode -eq 0) "control-byte JSON search failed"
+  $null = $controlJson.Stdout | ConvertFrom-Json
+  Assert-True ($controlJson.Stdout.Contains('\fneedle-control')) "control byte was not escaped"
+
+  $filesOnly = Invoke-Raw @("search", "lit:needle", $root, "--format", "files")
+  Assert-True ($filesOnly.ExitCode -eq 0) "files projection failed"
+  Assert-True (-not $filesOnly.Stdout.Contains("ix.result")) "files projection mixed in a terminal envelope"
+  Assert-True ($filesOnly.Stdout.Trim().Length -gt 0) "files projection returned no records"
+
+  $countOnly = Invoke-Raw @("search", "lit:needle", $root, "--format", "count")
+  Assert-True ($countOnly.ExitCode -eq 0) "count projection failed"
+  Assert-True (-not $countOnly.Stdout.Contains("ix.result")) "count projection mixed in a terminal envelope"
+  Assert-True ($countOnly.Stdout -match ':\d+\r?\n') "count projection lost its record grammar"
+
+  foreach ($format in @("files", "count")) {
+    $emptyProjection = Invoke-Raw @("search", "lit:not-present", $root, "--format", $format)
+    Assert-True ($emptyProjection.ExitCode -eq 0) "empty $format projection failed"
+    Assert-True ($emptyProjection.Stdout.Length -eq 0) "empty $format projection emitted non-record output"
+    $incompleteProjection = Invoke-Raw @("search", "lit:needle", $root, "--format", $format, "--max-hits", "1")
+    Assert-True ($incompleteProjection.ExitCode -ne 0) "incomplete $format projection claimed success"
+    Assert-True ($incompleteProjection.Stderr.Contains('"code":"projection_incomplete"')) "incomplete $format projection was not typed"
+  }
+
+  $spacePath = Invoke-Raw @("search", "lit:needle-space", $spaceRoot, "--format", "json-compact")
+  Assert-True ($spacePath.ExitCode -eq 0) "space-bearing path was not passed losslessly: $($spacePath.Stderr)"
+  $spaceObject = $spacePath.Stdout | ConvertFrom-Json
+  Assert-True (@($spaceObject.hits.PSObject.Properties).Count -eq 1) "space-bearing path evidence was lost"
+
+  $matchesStats = Invoke-Raw @("matches", "lit:needle", $root, "--stats-only")
+  Assert-True ($matchesStats.ExitCode -ne 0) "matches silently accepted a format that emits no records"
+  Assert-True ($matchesStats.Stderr.Contains('"code":"invalid_arguments"')) "matches stats rejection was not typed"
+  $matchesFormatStats = Invoke-Raw @("matches", "lit:needle", $root, "--format", "stats")
+  Assert-True ($matchesFormatStats.ExitCode -ne 0) "matches --format stats silently emitted nothing"
+  Assert-True ($matchesFormatStats.Stderr.Contains('"code":"invalid_arguments"')) "matches --format stats rejection was not typed"
 
   $context = Invoke-Raw @("search", "lit:needle-777", $root, "--context", "1", "--format", "json-compact")
   Assert-True ($context.ExitCode -eq 0) "context search failed"
@@ -107,8 +171,8 @@ try {
 
   $tooSmall = Invoke-Raw @("search", "lit:needle", $root, "--format", "agent-v3", "--max-bytes", "512")
   Assert-True ($tooSmall.ExitCode -ne 0) "an impossible envelope budget was accepted"
-  Assert-True ($tooSmall.Stderr.Contains('"code":"output_failed"')) "impossible envelope budget was not typed"
-  Assert-True ($tooSmall.Stderr.Contains('ByteBudgetTooSmall')) "impossible envelope budget lost its cause"
+  Assert-True ($tooSmall.Stderr.Contains('"code":"byte_budget_too_small"')) "impossible envelope budget was not typed"
+  Assert-True ($tooSmall.Stderr.Contains('increase --max-bytes')) "impossible envelope budget lost its recovery hint"
 
   [System.IO.File]::AppendAllText((Join-Path $root "many.txt"), "mutated needle-999`n", [System.Text.UTF8Encoding]::new($false))
   $stale = Invoke-Raw @("search", "lit:needle", $root, "--format", "agent-v3", "--max-hits", "2", "--cursor", $pageOneObject.projection.next_cursor)

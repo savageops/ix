@@ -218,7 +218,7 @@ fn parseMatches(args: []const []const u8) ParseError!SearchRequest {
     const request = try parseSearch(args);
     if (request.context != null or request.max_bytes != null or request.cursor != null) return ParseError.UnsupportedFlag;
     switch (request.output_format) {
-        .agent_v2, .agent_v3 => return ParseError.UnsupportedFlag,
+        .agent_v2, .agent_v3, .stats => return ParseError.UnsupportedFlag,
         else => return request,
     }
 }
@@ -314,7 +314,7 @@ fn parseSimilar(args: []const []const u8) ParseError!SimilarRequest {
                 request.query = arg;
             } else {
                 if (request.path_count >= MAX_SEARCH_PATHS) return ParseError.MissingValue;
-                request.paths[request.path_count] = arg;
+                request.paths[request.path_count] = normalizePathArgument(arg);
                 request.path_count += 1;
             }
         }
@@ -485,8 +485,17 @@ fn selectOutputFormat(request: *SearchRequest, format: OutputFormat) ParseError!
 
 fn pushPath(request: *SearchRequest, path: []const u8) ParseError!void {
     if (request.path_count >= MAX_SEARCH_PATHS) return ParseError.MissingValue;
-    request.paths[request.path_count] = path;
+    request.paths[request.path_count] = normalizePathArgument(path);
     request.path_count += 1;
+}
+
+/// Canonicalizes the shell's equivalent relative-root spellings once at the CLI boundary.
+fn normalizePathArgument(path: []const u8) []const u8 {
+    var normalized = path;
+    while (normalized.len >= 2 and normalized[0] == '.' and (normalized[1] == '/' or normalized[1] == '\\')) {
+        normalized = normalized[2..];
+    }
+    return if (normalized.len == 0) "." else normalized;
 }
 
 fn pushIgnoreFile(request: *SearchRequest, path: []const u8) ParseError!void {
@@ -500,6 +509,7 @@ fn parseLineNumberLimit(args: []const []const u8, index: *usize, request: *Searc
     const next_index = index.* + 1;
     if (next_index >= args.len or request.max_hits != null or !isUnsignedDecimal(args[next_index])) return;
     request.max_hits = std.fmt.parseInt(usize, args[next_index], 10) catch return ParseError.MissingValue;
+    if (request.max_hits.? == 0) return ParseError.MissingValue;
     index.* = next_index;
 }
 
@@ -609,7 +619,7 @@ fn parseInspect(args: []const []const u8) ParseError!InspectRequest {
 
 fn pushInspectPath(request: *InspectRequest, path: []const u8) ParseError!void {
     if (request.path_count >= MAX_SEARCH_PATHS) return ParseError.MissingValue;
-    request.paths[request.path_count] = path;
+    request.paths[request.path_count] = normalizePathArgument(path);
     request.path_count += 1;
 }
 
@@ -979,9 +989,23 @@ test "matches rejects terminal-envelope projections and accepts record-only JSON
     const contextual = [_][]const u8{ "ix-zig", "matches", "lit:needle", "src", "--context", "2" };
     try std.testing.expectError(ParseError.UnsupportedFlag, parseInvocation(std.testing.allocator, &contextual));
 
+    const stats = [_][]const u8{ "ix-zig", "matches", "lit:needle", "src", "--stats-only" };
+    try std.testing.expectError(ParseError.UnsupportedFlag, parseInvocation(std.testing.allocator, &stats));
+
     const json = [_][]const u8{ "ix-zig", "matches", "lit:needle", "src", "--json" };
     const request = (try parseInvocation(std.testing.allocator, &json)).command.matches;
     try std.testing.expectEqual(OutputFormat.json, request.output_format);
+}
+
+test "path arguments normalize equivalent Windows relative spellings" {
+    const forward = [_][]const u8{ "ix-zig", "search", "lit:needle", "./src" };
+    const backward = [_][]const u8{ "ix-zig", "search", "lit:needle", ".\\src" };
+    const plain = [_][]const u8{ "ix-zig", "search", "lit:needle", "src" };
+    const forward_request = (try parseInvocation(std.testing.allocator, &forward)).command.search;
+    const backward_request = (try parseInvocation(std.testing.allocator, &backward)).command.search;
+    const plain_request = (try parseInvocation(std.testing.allocator, &plain)).command.search;
+    try std.testing.expectEqualStrings(plain_request.paths[0], forward_request.paths[0]);
+    try std.testing.expectEqualStrings(plain_request.paths[0], backward_request.paths[0]);
 }
 
 test "search context upgrades compatible legacy projections to exact v3" {

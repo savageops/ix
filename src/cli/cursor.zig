@@ -9,7 +9,7 @@ pub const Cursor = struct {
     column: usize,
 };
 
-pub const CursorError = error{
+pub const CursorError = std.mem.Allocator.Error || error{
     InvalidCursor,
 };
 
@@ -40,7 +40,7 @@ pub fn decode(allocator: std.mem.Allocator, raw: []const u8) CursorError!Cursor 
     const column = std.fmt.parseInt(usize, fields.next() orelse return error.InvalidCursor, 10) catch return error.InvalidCursor;
     const path_hex = fields.next() orelse return error.InvalidCursor;
     if (fields.next() != null or path_hex.len == 0 or path_hex.len % 2 != 0 or line == 0 or column == 0) return error.InvalidCursor;
-    const path = allocator.alloc(u8, path_hex.len / 2) catch return error.InvalidCursor;
+    const path = try allocator.alloc(u8, path_hex.len / 2);
     errdefer allocator.free(path);
     for (path, 0..) |*byte, index| {
         const high = hexValue(path_hex[index * 2]) orelse return error.InvalidCursor;
@@ -59,23 +59,29 @@ pub fn decode(allocator: std.mem.Allocator, raw: []const u8) CursorError!Cursor 
 /// Fingerprints every request dimension that can change membership or canonical ordering.
 pub fn requestFingerprint(request: cli.SearchRequest) u64 {
     var hasher = std.hash.Wyhash.init(0x4958_4355_5253_4f52);
-    hasher.update(request.expression);
-    for (request.paths[0..request.path_count]) |path| hasher.update(path);
-    hashBool(&hasher, request.hidden);
-    hashBool(&hasher, request.follow_symlinks);
-    hashBool(&hasher, request.no_ignore);
-    hashBool(&hasher, request.case_insensitive);
-    hashBool(&hasher, request.fixed_strings);
-    for (request.ignore_files[0..request.ignore_file_count]) |path| hasher.update(path);
+    hashField(&hasher, "schema", "ix.search.cursor.v2");
+    hashField(&hasher, "expression", request.expression);
+    hashUsize(&hasher, "path_count", request.path_count);
+    for (request.paths[0..request.path_count]) |path| hashField(&hasher, "path", path);
+    hashBool(&hasher, "hidden", request.hidden);
+    hashBool(&hasher, "follow_symlinks", request.follow_symlinks);
+    hashBool(&hasher, "no_ignore", request.no_ignore);
+    hashBool(&hasher, "case_insensitive", request.case_insensitive);
+    hashBool(&hasher, "fixed_strings", request.fixed_strings);
+    hashUsize(&hasher, "ignore_file_count", request.ignore_file_count);
+    for (request.ignore_files[0..request.ignore_file_count]) |path| hashField(&hasher, "ignore_file", path);
     return hasher.final();
 }
 
 /// Fingerprints semantic membership and frontier ordering independently from presentation.
 pub fn similarRequestFingerprint(request: cli.SimilarRequest) u64 {
     var hasher = std.hash.Wyhash.init(0x4958_5349_4d49_4c41);
-    if (request.query) |query| hasher.update(query);
-    for (request.paths[0..request.path_count]) |path| hasher.update(path);
-    hasher.update(std.mem.asBytes(&request.candidate_budget));
+    hashField(&hasher, "schema", "ix.similar.cursor.v2");
+    hashField(&hasher, "query", request.query orelse "");
+    hashUsize(&hasher, "path_count", request.path_count);
+    for (request.paths[0..request.path_count]) |path| hashField(&hasher, "path", path);
+    hashUsize(&hasher, "candidate_budget", request.candidate_budget);
+    hashBool(&hasher, "anti", request.anti);
     return hasher.final();
 }
 
@@ -88,9 +94,33 @@ pub fn keyAfter(path: []const u8, line: usize, column: usize, after: Cursor) boo
     return column > after.column;
 }
 
-/// Feeds one boolean into a stable request fingerprint.
-fn hashBool(hasher: *std.hash.Wyhash, value: bool) void {
-    hasher.update(if (value) &[_]u8{1} else &[_]u8{0});
+/// Frames one request field so adjacent variable-length values cannot alias.
+fn hashField(hasher: *std.hash.Wyhash, tag: []const u8, value: []const u8) void {
+    hashRawUsize(hasher, tag.len);
+    hasher.update(tag);
+    hashRawUsize(hasher, value.len);
+    hasher.update(value);
+}
+
+/// Feeds one boolean into a named stable request-fingerprint field.
+fn hashBool(hasher: *std.hash.Wyhash, tag: []const u8, value: bool) void {
+    hashField(hasher, tag, if (value) &[_]u8{1} else &[_]u8{0});
+}
+
+/// Encodes integer identity in a platform-independent little-endian field.
+fn hashUsize(hasher: *std.hash.Wyhash, tag: []const u8, value: usize) void {
+    hashRawUsize(hasher, tag.len);
+    hasher.update(tag);
+    hashRawUsize(hasher, @sizeOf(u64));
+    hashRawUsize(hasher, value);
+}
+
+/// Writes an unframed fixed-width integer for the framing helpers above.
+fn hashRawUsize(hasher: *std.hash.Wyhash, value: usize) void {
+    var bytes: [8]u8 = undefined;
+    const wide: u64 = @intCast(value);
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(wide >> @intCast(index * 8));
+    hasher.update(&bytes);
 }
 
 /// Maps one nibble to the lowercase cursor alphabet.
@@ -128,4 +158,18 @@ test "cursor rejects malformed and zero-coordinate input" {
     try std.testing.expectError(error.InvalidCursor, decode(std.testing.allocator, "ixc1.1.2.0.1.aa"));
     try std.testing.expectError(error.InvalidCursor, decode(std.testing.allocator, "ixc1.1.2.1.1.zz"));
     try std.testing.expectError(error.InvalidCursor, decode(std.testing.allocator, "ixc2.1.2.1.1.aa"));
+}
+
+test "request fingerprints frame variable fields and semantic ordering" {
+    const left_argv = [_][]const u8{ "ix-zig", "search", "lit:ab", "c" };
+    const right_argv = [_][]const u8{ "ix-zig", "search", "lit:a", "bc" };
+    const left = (try cli.parseInvocation(std.testing.allocator, &left_argv)).command.search;
+    const right = (try cli.parseInvocation(std.testing.allocator, &right_argv)).command.search;
+    try std.testing.expect(requestFingerprint(left) != requestFingerprint(right));
+
+    const normal_argv = [_][]const u8{ "ix-zig", "similar", "cache", "src", "--format", "agent-v3" };
+    const anti_argv = [_][]const u8{ "ix-zig", "similar", "cache", "src", "--format", "agent-v3", "--anti" };
+    const normal = (try cli.parseInvocation(std.testing.allocator, &normal_argv)).command.similar;
+    const anti = (try cli.parseInvocation(std.testing.allocator, &anti_argv)).command.similar;
+    try std.testing.expect(similarRequestFingerprint(normal) != similarRequestFingerprint(anti));
 }

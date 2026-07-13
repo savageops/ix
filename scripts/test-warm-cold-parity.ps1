@@ -8,6 +8,7 @@ $Ix = (Resolve-Path $Ix).Path
 $tempBase = [System.IO.Path]::GetTempPath()
 $root = Join-Path $tempBase ("ix-warm-cold-parity-" + [guid]::NewGuid().ToString("N"))
 [void][System.IO.Directory]::CreateDirectory($root)
+$indexd = $null
 
 function Assert-True([bool]$Condition, [string]$Message) {
   if (-not $Condition) { throw $Message }
@@ -28,7 +29,10 @@ function Search([string]$Expression, [bool]$Warm) {
 function Hit-Keys($Envelope) {
   $keys = [System.Collections.Generic.List[string]]::new()
   foreach ($property in $Envelope.hits.PSObject.Properties) {
-    foreach ($hit in $property.Value) { $keys.Add("$($property.Name):$($hit.l):$($hit.c):$($hit.n)") }
+    foreach ($hit in $property.Value) {
+      $hitIdentity = $hit | Select-Object l, c, n, p, w | ConvertTo-Json -Compress -Depth 4
+      $keys.Add("$($property.Name)|$hitIdentity")
+    }
   }
   return @($keys | Sort-Object)
 }
@@ -38,14 +42,25 @@ function Median([double[]]$Values) {
   return $sorted[[int][math]::Floor($sorted.Count / 2)]
 }
 
+function Wait-Warm([string]$Expression, [int]$TimeoutSeconds = 30) {
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  do {
+    if ($null -ne $indexd -and $indexd.HasExited) { throw "indexd exited before the warm lane became ready" }
+    $result = Search $Expression $true
+    if ($result.route.lane -eq "warm") { return $result }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $deadline)
+  throw "warm lane did not become ready within $TimeoutSeconds seconds"
+}
+
 try {
   for ($index = 1; $index -le 1000; $index++) {
     $body = if ($index % 10 -eq 0) { "alpha needle-$index`nsecond needle-$index`n" } else { "alpha filler-$index`n" }
     [System.IO.File]::WriteAllText((Join-Path $root ("f$index.txt")), $body, [System.Text.UTF8Encoding]::new($false))
   }
 
-  & $Ix __ix_indexd $root --foreground --once | Out-Null
-  Assert-True ($LASTEXITCODE -eq 0) "warm index build failed"
+  $indexd = Start-Process -FilePath $Ix -ArgumentList @("__ix_indexd", $root, "--foreground") -WindowStyle Hidden -PassThru
+  $null = Wait-Warm "lit:needle-"
 
   foreach ($expression in @("lit:needle-", "lit:not-present-anywhere")) {
     $cold = Search $expression $false
@@ -54,6 +69,9 @@ try {
     $coldKeys = @(Hit-Keys $cold)
     $warmKeys = @(Hit-Keys $warm)
     Assert-True ((Compare-Object $coldKeys $warmKeys).Count -eq 0) "retained evidence diverged for $expression"
+    Assert-True ($cold.scan.state -eq $warm.scan.state) "scan completion diverged for $expression"
+    Assert-True ($cold.scan.access_errors -eq $warm.scan.access_errors) "access-error truth diverged for $expression"
+    Assert-True ($cold.projection.eligible -eq $warm.projection.eligible) "eligible projection count diverged for $expression"
     Assert-True ($warm.route.lane -eq "warm") "eligible query did not use the warm lane for $expression ($($warm.route.fallback_reason))"
     Assert-True ($warm.scan.files_scanned -le $cold.scan.files_scanned) "warm lane verified more files than cold for $expression"
   }
@@ -73,6 +91,17 @@ try {
     if ($null -eq $previousIndex) { Remove-Item Env:IX_INDEX -ErrorAction SilentlyContinue } else { $env:IX_INDEX = $previousIndex }
   }
 
+  [System.IO.File]::AppendAllText((Join-Path $root "f1.txt"), "mutated needle-1`n", [System.Text.UTF8Encoding]::new($false))
+  $mutatedCold = Search "lit:needle-" $false
+  $mutationDeadline = [DateTime]::UtcNow.AddSeconds(30)
+  do {
+    $mutatedWarm = Wait-Warm "lit:needle-"
+    $mutationConverged = $mutatedCold.stats.matches_found -eq $mutatedWarm.stats.matches_found -and
+      (Compare-Object @(Hit-Keys $mutatedCold) @(Hit-Keys $mutatedWarm)).Count -eq 0
+    if (-not $mutationConverged) { Start-Sleep -Milliseconds 100 }
+  } while (-not $mutationConverged -and [DateTime]::UtcNow -lt $mutationDeadline)
+  Assert-True $mutationConverged "warm lane did not converge after mutation"
+
   $coldTimes = [System.Collections.Generic.List[double]]::new()
   $warmTimes = [System.Collections.Generic.List[double]]::new()
   for ($round = 0; $round -lt $Rounds; $round++) {
@@ -90,6 +119,10 @@ try {
     $coldMedian,
     $warmMedian)
 } finally {
+  if ($null -ne $indexd -and -not $indexd.HasExited) {
+    Stop-Process -Id $indexd.Id -Force -ErrorAction SilentlyContinue
+    $indexd.WaitForExit()
+  }
   $resolvedRoot = [System.IO.Path]::GetFullPath($root)
   $resolvedTemp = [System.IO.Path]::GetFullPath($tempBase)
   if ($resolvedRoot.StartsWith($resolvedTemp) -and [System.IO.Path]::GetFileName($resolvedRoot).StartsWith("ix-warm-cold-parity-")) {

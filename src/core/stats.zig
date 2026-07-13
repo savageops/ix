@@ -76,20 +76,6 @@ pub const RegexDecompositionStats = struct {
     candidate_lines_matched: usize = 0,
 };
 
-pub const UnicodeCaseFoldPrefilterStats = struct {
-    full_scan_calls: usize = 0,
-    range_scan_calls: usize = 0,
-    candidate_prefix_hits: usize = 0,
-    candidate_windows_verified: usize = 0,
-    confirmed_matches: usize = 0,
-    rejected_candidates: usize = 0,
-    candidate_gap_bytes_total: usize = 0,
-    candidate_gap_samples: usize = 0,
-    max_prefix_variant_count: usize = 0,
-    max_prefix_len: usize = 0,
-    max_match_len: usize = 0,
-};
-
 pub const FastCountDensityStats = struct {
     literal_reject_fast_calls: usize = 0,
     literal_reject_fast_bytes: usize = 0,
@@ -335,27 +321,6 @@ pub const AdmissionStats = struct {
     }
 };
 
-pub const FallbackLineScanStats = struct {
-    enabled: bool = false,
-    files_profiled: usize = 0,
-    line_count: usize = 0,
-    candidate_lines: usize = 0,
-    matched_lines: usize = 0,
-    scanned_line_bytes: usize = 0,
-    max_line_bytes: usize = 0,
-    newline_elapsed_ns_total: u64 = 0,
-    regex_elapsed_ns_total: u64 = 0,
-    max_file_elapsed_ns: u64 = 0,
-    max_file_bytes: usize = 0,
-    max_file_lines: usize = 0,
-    max_file_matches: usize = 0,
-    max_file_path: []const u8 = "",
-
-    pub fn isInactive(self: FallbackLineScanStats) bool {
-        return !self.enabled;
-    }
-};
-
 pub const SearchStats = struct {
     input_roots: usize = 0,
     effective_roots: usize = 0,
@@ -371,7 +336,6 @@ pub const SearchStats = struct {
     linux_strategy: LinuxStrategyStats = .{},
     linux_dominant_file: LinuxDominantFileStats = .{},
     regex_decomposition: RegexDecompositionStats = .{},
-    unicode_casefold_prefilter: UnicodeCaseFoldPrefilterStats = .{},
     fast_count_density: FastCountDensityStats = .{},
     byte_shard_kernel: ByteShardKernelStats = .{},
     trigram_acceleration: TrigramAccelerationStats = .{},
@@ -380,7 +344,6 @@ pub const SearchStats = struct {
     generation_refresh: GenerationRefreshStats = .{},
     access_errors: AccessErrorStats = .{},
     admission: AdmissionStats = .{},
-    fallback_line_scan: ?FallbackLineScanStats = null,
     timings: PhaseTimings = .{},
     process_memory: ProcessMemoryStats = .{},
     concurrency: ConcurrencyStats = .{},

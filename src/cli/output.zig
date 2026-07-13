@@ -38,9 +38,12 @@ fn writeTopHelp(writer: anytype) !void {
         \\  --agent        Compact grouped format (ix.result.v2, token-minimal)
         \\  --json         Full structured JSON with telemetry
         \\  --stats-only   Suppress hit records, emit sentinel only
+        \\  --format NAME  Select text, agent, agent-v3, json, json-compact, files, count, or stats
         \\  -l             Files with matches only
         \\  -c             Count per file
         \\  --context N    Exact coalesced source lines in the versioned result
+        \\  --max-bytes N  Bound one complete v3 envelope
+        \\  --cursor VALUE Continue a versioned result
         \\
         \\Search:
         \\  --max-hits N   Limit hit records
@@ -161,7 +164,7 @@ fn writeSearchHelp(writer: anytype, summary: []const u8, command: []const u8) !v
         try writer.writeAll("    ");
         try command_spec.writeFormatNames(writer);
     } else {
-        try writer.writeAll("  formats: text, json, files, count, stats\n");
+        try writer.writeAll("  formats: text, json, json-compact, files, count\n");
     }
     try writer.writeAll("\n");
 }
@@ -281,7 +284,11 @@ fn writeProcessHelp(writer: anytype) !void {
 }
 
 pub fn writeError(writer: anytype, code: []const u8, message: []const u8) !void {
-    try writer.print("-- ix.error.v1 {{\"code\":\"{s}\",\"message\":\"{s}\"}} --\n", .{ code, message });
+    try writer.writeAll("-- ix.error.v1 {\"schema\":\"ix.error.v1\",\"status\":\"error\",\"code\":");
+    try writeJsonString(writer, code);
+    try writer.writeAll(",\"message\":");
+    try writeJsonString(writer, message);
+    try writer.writeAll("} --\n");
 }
 
 pub fn writeCompatUnsupportedFlag(writer: anytype, flag: []const u8) !void {
@@ -439,10 +446,12 @@ pub fn writeSearchReportAgent(writer: anytype, report: search.SearchReport) !voi
         // Count distinct paths.
         var distinct_files: usize = 0;
         var prev_path: []const u8 = "";
+        var has_prev_path = false;
         for (indices[0..report.hit_count]) |i| {
-            if (prev_path.len == 0 or !std.mem.eql(u8, prev_path, report.hits[i].path)) {
+            if (!has_prev_path or !std.mem.eql(u8, prev_path, report.hits[i].path)) {
                 distinct_files += 1;
                 prev_path = report.hits[i].path;
+                has_prev_path = true;
             }
         }
 
@@ -524,7 +533,7 @@ pub fn writeSearchJsonReport(writer: anytype, report: search.SearchReport) !void
 /// Serializes telemetry through one visibility policy owner.
 pub fn writeStats(writer: anytype, stats: core_stats.SearchStats, visibility: output_contract.StatsVisibility) !void {
     switch (visibility) {
-        .agent => try writer.print("{{\"files_discovered\":{},\"files_scanned\":{},\"matches_found\":{},\"bytes_scanned\":{},\"access_errors\":{},\"total_ms\":{d}}}", .{ stats.files_discovered, stats.files_scanned, stats.matches_found, stats.bytes_scanned, stats.access_errors.total, stats.timings.total_ms }),
+        .agent => try writer.print("{{\"matches_found\":{},\"bytes_scanned\":{},\"total_ms\":{d}}}", .{ stats.matches_found, stats.bytes_scanned, stats.timings.total_ms }),
         .standard => try writer.print("{{\"files_discovered\":{},\"files_scanned\":{},\"files_skipped\":{},\"matches_found\":{},\"bytes_scanned\":{},\"access_errors\":{},\"discover_ms\":{d},\"scan_ms\":{d},\"total_ms\":{d}}}", .{ stats.files_discovered, stats.files_scanned, stats.files_skipped, stats.matches_found, stats.bytes_scanned, stats.access_errors.total, stats.timings.discover_ms, stats.timings.scan_ms, stats.timings.total_ms }),
         .debug => {
             try writer.print(
@@ -534,7 +543,6 @@ pub fn writeStats(writer: anytype, stats: core_stats.SearchStats, visibility: ou
             try writer.print("\"linux_strategy\":{{\"selector_eligible\":{s},\"current_strategy\":\"{s}\",\"matcher_strategy_supported\":{s},\"effective_roots\":{},\"directory_roots\":{},\"root_entry_count\":{},\"files_discovered\":{},\"collect_hits\":{s},\"outer_parallel_shard_safe\":{s}}},", .{ boolText(stats.linux_strategy.selector_eligible), stats.linux_strategy.current_strategy, boolText(stats.linux_strategy.matcher_strategy_supported), stats.linux_strategy.effective_roots, stats.linux_strategy.directory_roots, stats.linux_strategy.root_entry_count, stats.linux_strategy.files_discovered, boolText(stats.linux_strategy.collect_hits), boolText(stats.linux_strategy.outer_parallel_shard_safe) });
             try writer.print("\"linux_dominant_file\":{{\"target_class\":\"{s}\",\"min_bytes\":{},\"targeted_files_scanned\":{},\"targeted_bytes_scanned\":{},\"targeted_slowest_files\":{},\"targeted_slowest_bytes\":{},\"eligible_files\":{},\"activated_files\":{},\"bailout_files\":{},\"max_shard_threads\":{},\"max_range_count\":{},\"max_chunk_bytes\":{}}},", .{ stats.linux_dominant_file.target_class, stats.linux_dominant_file.min_bytes, stats.linux_dominant_file.targeted_files_scanned, stats.linux_dominant_file.targeted_bytes_scanned, stats.linux_dominant_file.targeted_slowest_files, stats.linux_dominant_file.targeted_slowest_bytes, stats.linux_dominant_file.eligible_files, stats.linux_dominant_file.activated_files, stats.linux_dominant_file.bailout_files, stats.linux_dominant_file.max_shard_threads, stats.linux_dominant_file.max_range_count, stats.linux_dominant_file.max_chunk_bytes });
             try writer.print("\"regex_decomposition\":{{\"eligible_files\":{},\"counted_files\":{},\"bailout_files\":{},\"candidate_lines_checked\":{},\"duplicate_candidate_hits_skipped\":{},\"candidate_lines_matched\":{}}},", .{ stats.regex_decomposition.eligible_files, stats.regex_decomposition.counted_files, stats.regex_decomposition.bailout_files, stats.regex_decomposition.candidate_lines_checked, stats.regex_decomposition.duplicate_candidate_hits_skipped, stats.regex_decomposition.candidate_lines_matched });
-            try writer.writeAll("\"unicode_casefold_prefilter\":{\"full_scan_calls\":0,\"range_scan_calls\":0,\"candidate_prefix_hits\":0,\"candidate_windows_verified\":0,\"confirmed_matches\":0,\"rejected_candidates\":0,\"candidate_gap_bytes_total\":0,\"candidate_gap_samples\":0,\"max_prefix_variant_count\":0,\"max_prefix_len\":0,\"max_match_len\":0},");
             try writeFastCountDensityJson(writer, stats.fast_count_density);
             try writer.writeAll(",");
             try writer.print("\"byte_shard_kernel\":{{\"enabled\":{s},\"strategy\":\"{s}\",\"files_profiled\":{},\"range_calls\":{},\"line_aligned_ranges\":{},\"logical_range_bytes\":{},\"widened_range_bytes\":{},\"overlap_bytes\":{},\"boundary_verified_candidates\":{},\"boundary_rejected_candidates\":{},\"range_elapsed_ns_total\":{},\"max_range_elapsed_ns\":{},\"reduce_elapsed_ns_total\":{},\"max_reduce_elapsed_ns\":{},\"matches\":{}}},", .{ boolText(stats.byte_shard_kernel.enabled), stats.byte_shard_kernel.strategy, stats.byte_shard_kernel.files_profiled, stats.byte_shard_kernel.range_calls, stats.byte_shard_kernel.line_aligned_ranges, stats.byte_shard_kernel.logical_range_bytes, stats.byte_shard_kernel.widened_range_bytes, stats.byte_shard_kernel.overlap_bytes, stats.byte_shard_kernel.boundary_verified_candidates, stats.byte_shard_kernel.boundary_rejected_candidates, stats.byte_shard_kernel.range_elapsed_ns_total, stats.byte_shard_kernel.max_range_elapsed_ns, stats.byte_shard_kernel.reduce_elapsed_ns_total, stats.byte_shard_kernel.max_reduce_elapsed_ns, stats.byte_shard_kernel.matches });
@@ -759,9 +767,8 @@ pub fn writeFilesWithMatches(writer: anytype, report: search.SearchReport) !void
 
 /// Count output (spec point 29): per-file match cardinality.
 /// Mirrors ripgrep -c / --count. Groups hits by path (path-sorted) and
-/// emits "path:count" per file. When hits are truncated, the count
-/// reflects only retained hits — the sentinel reports the true total
-/// via matches_found.
+/// emits "path:count" per file. The command boundary rejects incomplete
+/// retention before this pure record writer runs.
 pub fn writeCountPerFile(writer: anytype, report: search.SearchReport) !void {
     if (report.hit_count == 0) return;
     var indices: [search.MAX_RETAINED_HITS]usize = undefined;
@@ -982,22 +989,58 @@ fn boolText(value: bool) []const u8 {
     return if (value) "true" else "false";
 }
 
-fn writeJsonString(writer: anytype, value: []const u8) !void {
+/// Emits valid JSON for arbitrary filesystem and source bytes while preserving valid UTF-8 verbatim.
+pub fn writeJsonString(writer: anytype, value: []const u8) !void {
     try writer.writeByte('"');
     try writeJsonStringContents(writer, value);
     try writer.writeByte('"');
 }
 
 fn writeJsonStringContents(writer: anytype, value: []const u8) !void {
-    for (value) |byte| {
+    var index: usize = 0;
+    while (index < value.len) {
+        const byte = value[index];
         switch (byte) {
             '\\' => try writer.writeAll("\\\\"),
             '"' => try writer.writeAll("\\\""),
+            0x08 => try writer.writeAll("\\b"),
+            0x0c => try writer.writeAll("\\f"),
             '\n' => try writer.writeAll("\\n"),
             '\r' => try writer.writeAll("\\r"),
             '\t' => try writer.writeAll("\\t"),
-            else => try writer.writeByte(byte),
+            else => {
+                if (byte < 0x20) {
+                    try writer.print("\\u00{x:0>2}", .{byte});
+                    index += 1;
+                    continue;
+                }
+                if (byte < 0x80) {
+                    try writer.writeByte(byte);
+                    index += 1;
+                    continue;
+                }
+                const sequence_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+                    try writer.print("\\u00{x:0>2}", .{byte});
+                    index += 1;
+                    continue;
+                };
+                if (index + sequence_len > value.len) {
+                    try writer.print("\\u00{x:0>2}", .{byte});
+                    index += 1;
+                    continue;
+                }
+                const sequence = value[index .. index + sequence_len];
+                _ = std.unicode.utf8Decode(sequence) catch {
+                    try writer.print("\\u00{x:0>2}", .{byte});
+                    index += 1;
+                    continue;
+                };
+                try writer.writeAll(sequence);
+                index += sequence_len;
+                continue;
+            },
         }
+        index += 1;
     }
 }
 
@@ -1006,6 +1049,15 @@ test "error sentinel is versioned" {
     var writer = std.Io.Writer.fixed(&buffer);
     try writeError(&writer, "invalid_arguments", "MissingCommand");
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ix.error.v1") != null);
+}
+
+test "json strings escape controls and invalid utf8" {
+    var buffer: [128]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeJsonString(&writer, "a\x0cb\xffc");
+    try std.testing.expectEqualStrings("\"a\\fb\\u00ffc\"", writer.buffered());
+    const parsed = try std.json.parseFromSlice([]const u8, std.testing.allocator, writer.buffered(), .{});
+    defer parsed.deinit();
 }
 
 test "matches json emits hit records only" {
@@ -1116,6 +1168,7 @@ test "search result sentinel includes agent-safe absolute hit paths" {
 }
 
 test "inspect next sentinel json escapes path argv" {
+    var lines: [2]inspect.InspectLine = undefined;
     var window = inspect.InspectWindow{
         .path = "C:\\repo\\quote\"dir\\file.zig",
         .request_label = "range",
@@ -1128,7 +1181,7 @@ test "inspect next sentinel json escapes path argv" {
         .has_more = true,
         .eof = false,
         .total_lines = null,
-        .lines = undefined,
+        .lines = &lines,
         .line_count = 2,
     };
     window.lines[0] = .{ .number = 1, .text = "one" };

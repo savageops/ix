@@ -148,13 +148,15 @@ fn write(
 fn truncationReason(request: cli.SearchRequest, report: search.SearchReport, visible_count: usize, byte_truncated: bool) ?output_contract.TruncationReason {
     if (report.matches_after_cursor <= visible_count) return null;
     if (byte_truncated) return .byte_budget;
-    if (request.max_hits != null) return .max_hits;
+    if (request.max_hits) |max_hits| {
+        if (max_hits <= search.MAX_RETAINED_HITS) return .max_hits;
+    }
     return .retention_limit;
 }
 
-/// Emits a JSON string through Zig's canonical escaping implementation.
+/// Routes every output generation through the single arbitrary-byte-safe JSON owner.
 fn writeJsonString(writer: anytype, value: []const u8) !void {
-    try std.json.Stringify.value(value, .{}, writer);
+    try legacy_output.writeJsonString(writer, value);
 }
 
 /// Serializes booleans without format-policy duplication.

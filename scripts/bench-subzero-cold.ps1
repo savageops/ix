@@ -17,6 +17,32 @@ function Median([double[]]$Values) {
   return $sorted[[int][math]::Floor($sorted.Count / 2)]
 }
 
+function Get-TextSha256([string]$Text) {
+  $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  try { $hash = $sha.ComputeHash($bytes) } finally { $sha.Dispose() }
+  return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+function Get-EvidenceIdentity($Json) {
+  $ordered = @($Json.hits | ForEach-Object {
+    [pscustomobject]@{
+      path = ([string]$_.path).Replace('\\', '/')
+      line = [int64]$_.line
+      column = [int64]$_.column
+      match_len = [int64]$_.match_len
+    }
+  })
+  $records = @($ordered | Sort-Object path, line, column, match_len)
+  $files = @($records | ForEach-Object { $_.path } | Sort-Object -Unique)
+  return [pscustomobject]@{
+    schema = 'ix.bench.evidence.v2'
+    evidence_digest = Get-TextSha256 ($records | ConvertTo-Json -Compress -Depth 4)
+    ordered_evidence_digest = Get-TextSha256 ($ordered | ConvertTo-Json -Compress -Depth 4)
+    file_set_digest = Get-TextSha256 ($files | ConvertTo-Json -Compress)
+  }
+}
+
 function Invoke-IxSearch($Bin, $Engine, $Profile, [bool]$DisableNexus, [int]$Sample) {
   if ($DisableNexus) {
     $env:IX_NEXUS = "0"
@@ -46,11 +72,17 @@ function Invoke-IxSearch($Bin, $Engine, $Profile, [bool]$DisableNexus, [int]$Sam
   }
 
   $json = ($out -join "`n") | ConvertFrom-Json
+  $identity = Get-EvidenceIdentity $json
   return [pscustomobject]@{
     profile = $Profile.name
     engine = $Engine
     sample = $Sample
     ok = $true
+    binary_sha256 = (Get-FileHash -LiteralPath $Bin -Algorithm SHA256).Hash.ToLowerInvariant()
+    evidence_schema = $identity.schema
+    evidence_digest = $identity.evidence_digest
+    ordered_evidence_digest = $identity.ordered_evidence_digest
+    file_set_digest = $identity.file_set_digest
     wall_ms = [math]::Round($sw.Elapsed.TotalMilliseconds, 4)
     total_ms = [double]$json.stats.timings.total_ms
     discover_ms = [double]$json.stats.timings.discover_ms
@@ -154,6 +186,11 @@ function Compress-Row($Row) {
     skipped = $Row.skipped
     access_errors = $Row.access_errors
     access_errors_known = $Row.access_errors_known
+    binary_sha256 = $Row.binary_sha256
+    evidence_schema = $Row.evidence_schema
+    evidence_digest = $Row.evidence_digest
+    ordered_evidence_digest = $Row.ordered_evidence_digest
+    file_set_digest = $Row.file_set_digest
     comparison_valid = $Row.comparison_valid
     comparison_reason = $Row.comparison_reason
     pruned = $Row.pruned
@@ -198,6 +235,11 @@ $profiles = @(
   @{ name = "absent-literal"; expr = "lit:IX_ABSENT_NEEDLE_5E4C2D8F"; corpus = $LinuxCorpus }
 )
 
+$expectedBinaryHashes = @{
+  rust = (Get-FileHash -LiteralPath $RustBin -Algorithm SHA256).Hash.ToLowerInvariant()
+  zig = (Get-FileHash -LiteralPath $ZigBin -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
 $rows = New-Object System.Collections.Generic.List[object]
 foreach ($profile in $profiles) {
   for ($i = 1; $i -le $ColdRuns; $i++) {
@@ -233,16 +275,25 @@ foreach ($profile in $profiles) {
       continue
     }
     $match_ok = [int64]$row.matches -eq [int64]$baseline.matches
+    $expected_hash = if ($row.engine -eq 'rust') { $expectedBinaryHashes.rust } else { $expectedBinaryHashes.zig }
+    $binary_ok = $row.binary_sha256 -eq $expected_hash
+    $evidence_ok = $row.evidence_schema -eq $baseline.evidence_schema -and
+      $row.evidence_digest -eq $baseline.evidence_digest -and
+      $row.file_set_digest -eq $baseline.file_set_digest
     $route_ok = $row.access_errors_known -and $baseline.access_errors_known -and
       ([int64]$row.discovered -eq [int64]$baseline.discovered) -and
       ([int64]$row.scanned -eq [int64]$baseline.scanned) -and
       ([int64]$row.skipped -eq [int64]$baseline.skipped) -and
       ([int64]$row.access_errors -eq [int64]$baseline.access_errors)
-    $row.comparison_valid = $match_ok -and $route_ok
+    $row.comparison_valid = $binary_ok -and $match_ok -and $evidence_ok -and $route_ok
     if ($row.comparison_valid) {
-      $row.comparison_reason = "match_and_route_parity"
+      $row.comparison_reason = "evidence_and_route_parity"
+    } elseif (-not $binary_ok) {
+      $row.comparison_reason = "binary_identity_drift"
     } elseif (-not $match_ok) {
       $row.comparison_reason = "match_parity_mismatch"
+    } elseif (-not $evidence_ok) {
+      $row.comparison_reason = "evidence_parity_mismatch"
     } else {
       $row.comparison_reason = "route_parity_mismatch"
     }

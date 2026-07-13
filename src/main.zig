@@ -121,7 +121,11 @@ pub fn main(init: std.process.Init) !void {
             if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
             if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
             writeSearchResult(init.io, effective_request, report, stdout) catch |err| {
-                try output.writeError(stderr, "output_failed", @errorName(err));
+                switch (err) {
+                    error.ByteBudgetTooSmall => try output.writeError(stderr, "byte_budget_too_small", "increase --max-bytes; the budget cannot fit one complete result"),
+                    error.ProjectionIncomplete => try output.writeError(stderr, "projection_incomplete", "increase --max-hits or use a versioned result format"),
+                    else => try output.writeError(stderr, "output_failed", @errorName(err)),
+                }
                 try stderr.flush();
                 std.process.exit(1);
             };
@@ -147,13 +151,14 @@ pub fn main(init: std.process.Init) !void {
             };
             if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
             if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
-            switch (effective_request.output_format) {
-                .json, .json_compact => try output.writeMatchesJsonHits(stdout, report),
-                .files => try output.writeFilesWithMatches(stdout, report),
-                .count => try output.writeCountPerFile(stdout, report),
-                .stats => {},
-                else => try output.writeSearchHits(stdout, report),
-            }
+            writeMatchesResult(effective_request, report, stdout) catch |err| {
+                if (err == error.ProjectionIncomplete)
+                    try output.writeError(stderr, "projection_incomplete", "increase --max-hits or use a complete search result format")
+                else
+                    try output.writeError(stderr, "output_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
         },
         .inspect => |request| {
             if (request.expression) |expression| {
@@ -173,14 +178,12 @@ pub fn main(init: std.process.Init) !void {
                     try stderr.flush();
                     std.process.exit(1);
                 };
-                if (request.format == .json) {
-                    const context_expression = request.expression orelse plan.source;
-                    try output.writeInspectContextJsonReports(stdout, context_expression, reports);
-                } else if (request.format == .records) {
-                    for (reports) |report| try output.writeInspectContextRecords(stdout, report);
-                } else {
-                    for (reports) |report| try output.writeInspectContext(stdout, report);
-                }
+                const context_expression = request.expression orelse plan.source;
+                writeInspectContextResult(request.format, context_expression, reports, stdout) catch |err| {
+                    try output.writeError(stderr, "output_failed", @errorName(err));
+                    try stderr.flush();
+                    std.process.exit(1);
+                };
             } else {
                 const windows = try allocator.alloc(inspect.InspectWindow, request.path_count);
                 var window_count: usize = 0;
@@ -193,13 +196,11 @@ pub fn main(init: std.process.Init) !void {
                     };
                     window_count += 1;
                 }
-                if (request.format == .json) {
-                    try output.writeInspectWindowJsonReports(stdout, windows[0..window_count]);
-                } else if (request.format == .records) {
-                    for (windows[0..window_count]) |window| try output.writeInspectWindowRecords(stdout, window);
-                } else {
-                    for (windows[0..window_count]) |window| try output.writeInspectWindow(stdout, window);
-                }
+                writeInspectWindowResult(request.format, windows[0..window_count], stdout) catch |err| {
+                    try output.writeError(stderr, "output_failed", @errorName(err));
+                    try stderr.flush();
+                    std.process.exit(1);
+                };
             }
         },
         .explain => |request| {
@@ -208,7 +209,11 @@ pub fn main(init: std.process.Init) !void {
                 try stderr.flush();
                 std.process.exit(1);
             };
-            try output.writeExplain(stdout, plan);
+            output.writeExplain(stdout, plan) catch |err| {
+                try output.writeError(stderr, "output_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
         },
         .process => |request| {
             const report = process_tool.run(init.io, allocator, .{
@@ -224,7 +229,11 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             defer report.deinit(allocator);
-            try process_tool.writeReport(stdout, report, request.json);
+            process_tool.writeReport(stdout, report, request.json) catch |err| {
+                try output.writeError(stderr, "output_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
         },
         .similar => |request| {
             var effective_request = request;
@@ -318,12 +327,12 @@ fn writeSearchResult(io: std.Io, request: cli.SearchRequest, report: search.Sear
         .agent_v3, .json_compact => try writeVersionedSearchResult(io, request, report, writer),
         .json => try output.writeSearchJsonReport(writer, report),
         .files => {
+            try requireCompleteRecordProjection(report);
             try output.writeFilesWithMatches(writer, report);
-            if (report.hit_count > 0) try output.writeSearchReportCompact(writer, report) else try output.writeSearchReport(writer, report);
         },
         .count => {
+            try requireCompleteRecordProjection(report);
             try output.writeCountPerFile(writer, report);
-            if (report.hit_count > 0) try output.writeSearchReportCompact(writer, report) else try output.writeSearchReport(writer, report);
         },
         .stats => try output.writeSearchReport(writer, report),
         .text => {
@@ -337,22 +346,69 @@ fn writeSearchResult(io: std.Io, request: cli.SearchRequest, report: search.Sear
     }
 }
 
+/// Keeps the record-only command's format matrix in one writer owner.
+fn writeMatchesResult(request: cli.SearchRequest, report: search.SearchReport, writer: anytype) !void {
+    switch (request.output_format) {
+        .json, .json_compact => try output.writeMatchesJsonHits(writer, report),
+        .files => {
+            try requireCompleteRecordProjection(report);
+            try output.writeFilesWithMatches(writer, report);
+        },
+        .count => {
+            try requireCompleteRecordProjection(report);
+            try output.writeCountPerFile(writer, report);
+        },
+        .stats, .agent_v2, .agent_v3 => return error.UnsupportedOutputFormat,
+        .text => try output.writeSearchHits(writer, report),
+    }
+}
+
+/// Prevents a pure record stream from silently presenting retained evidence as the complete result.
+fn requireCompleteRecordProjection(report: search.SearchReport) !void {
+    if (report.matches_after_cursor != report.hit_count) return error.ProjectionIncomplete;
+}
+
+/// Writes exact expression context without changing its grouped, record, or JSON semantics.
+fn writeInspectContextResult(format: cli.InspectFormat, expression: []const u8, reports: []const inspect.ContextReport, writer: anytype) !void {
+    switch (format) {
+        .json => try output.writeInspectContextJsonReports(writer, expression, reports),
+        .records => for (reports) |report| try output.writeInspectContextRecords(writer, report),
+        .grouped => for (reports) |report| try output.writeInspectContext(writer, report),
+    }
+}
+
+/// Writes exact file windows through one failure boundary shared by every inspect format.
+fn writeInspectWindowResult(format: cli.InspectFormat, windows: []const inspect.InspectWindow, writer: anytype) !void {
+    switch (format) {
+        .json => try output.writeInspectWindowJsonReports(writer, windows),
+        .records => for (windows) |window| try output.writeInspectWindowRecords(writer, window),
+        .grouped => for (windows) |window| try output.writeInspectWindow(writer, window),
+    }
+}
+
 /// Finds the largest whole-record v3 page that fits the explicit aggregate byte budget.
 fn writeVersionedSearchResult(io: std.Io, request: cli.SearchRequest, report: search.SearchReport, writer: anytype) !void {
+    var context_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer context_arena.deinit();
+    var context_cache_storage: inspect.ContextCache = undefined;
+    const context_cache: ?*const inspect.ContextCache = if (request.context != null and report.hit_count > 0) blk: {
+        context_cache_storage = try inspect.cacheContextForSearchReport(io, context_arena.allocator(), searchContextRequest(request), report);
+        break :blk &context_cache_storage;
+    } else null;
     const budget = request.max_bytes;
     if (budget == null) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const bytes = try renderVersionedSearchResult(io, arena.allocator(), request, report, report.hit_count, false);
+        const bytes = try renderVersionedSearchResult(arena.allocator(), request, report, context_cache, report.hit_count, false);
         try writer.writeAll(bytes);
         return;
     }
 
-    const full_len = try versionedSearchResultLength(io, request, report, report.hit_count, false);
+    const full_len = try versionedSearchResultLength(request, report, context_cache, report.hit_count, false);
     if (full_len <= budget.?) {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const bytes = try renderVersionedSearchResult(io, arena.allocator(), request, report, report.hit_count, false);
+        const bytes = try renderVersionedSearchResult(arena.allocator(), request, report, context_cache, report.hit_count, false);
         try writer.writeAll(bytes);
         return;
     }
@@ -361,40 +417,106 @@ fn writeVersionedSearchResult(io: std.Io, request: cli.SearchRequest, report: se
     var high: usize = report.hit_count;
     while (low < high) {
         const middle = low + (high - low + 1) / 2;
-        const length = try versionedSearchResultLength(io, request, report, middle, true);
+        const length = try versionedSearchResultLength(request, report, context_cache, middle, middle < report.hit_count);
         if (length <= budget.?) low = middle else high = middle - 1;
     }
-    if (low == 0 and report.matches_after_cursor > 0) return error.ByteBudgetTooSmall;
-    const final_len = try versionedSearchResultLength(io, request, report, low, low < report.hit_count);
-    if (final_len > budget.?) return error.ByteBudgetTooSmall;
+
+    var visible_count = low;
+    var candidate = low + 1;
+    while (candidate <= report.hit_count) : (candidate += 1) {
+        const length = try versionedSearchResultLength(request, report, context_cache, candidate, candidate < report.hit_count);
+        if (length <= budget.?) visible_count = candidate;
+    }
+    if (visible_count == 0 and report.matches_after_cursor > 0) return error.ByteBudgetTooSmall;
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const bytes = try renderVersionedSearchResult(io, arena.allocator(), request, report, low, low < report.hit_count);
+    const bytes = try renderVersionedSearchResult(arena.allocator(), request, report, context_cache, visible_count, visible_count < report.hit_count);
     try writer.writeAll(bytes);
 }
 
+test "byte budget selects the maximal fitting prefix when cursor size is non-monotonic" {
+    var long_path: [420]u8 = @splat('x');
+    long_path[0] = 'a';
+    var report = std.mem.zeroes(search.SearchReport);
+    report.expression = "lit:x";
+    report.cwd = ".";
+    report.collect_hits = true;
+    report.corpus_signature = 0x1234;
+    report.request_fingerprint = 0x5678;
+    report.matches_found = 4;
+    report.matches_after_cursor = 4;
+    report.hit_count = 4;
+    report.hits[0] = .{ .path = "a", .line = 1, .column = 1, .preview = "x", .match_len = 1, .preview_end = 1 };
+    report.hits[1] = .{ .path = &long_path, .line = 1, .column = 1, .preview = "x", .match_len = 1, .preview_end = 1 };
+    report.hits[2] = .{ .path = "z", .line = 1, .column = 1, .preview = "x", .match_len = 1, .preview_end = 1 };
+    report.hits[3] = .{ .path = "zz", .line = 1, .column = 1, .preview = "x", .match_len = 1, .preview_end = 1 };
+
+    const argv = [_][]const u8{ "ix-zig", "search", "lit:x", "src", "--format", "agent-v3", "--max-hits", "4" };
+    var request = (try cli.parseInvocation(std.testing.allocator, &argv)).command.search;
+    request.max_bytes = try versionedSearchResultLength(request, report, null, 3, true);
+    const len_two = try versionedSearchResultLength(request, report, null, 2, true);
+    const len_three = try versionedSearchResultLength(request, report, null, 3, true);
+    const len_four = try versionedSearchResultLength(request, report, null, 4, false);
+    try std.testing.expect(len_three < len_two);
+    try std.testing.expect(len_three < len_four);
+    request.max_bytes = len_three;
+    var expected_visible: usize = 0;
+    for (1..report.hit_count + 1) |candidate| {
+        const length = try versionedSearchResultLength(request, report, null, candidate, candidate < report.hit_count);
+        if (length <= request.max_bytes.?) expected_visible = candidate;
+    }
+    try std.testing.expectEqual(@as(usize, 3), expected_visible);
+
+    var rendered: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer rendered.deinit();
+    try writeVersionedSearchResult(std.testing.io, request, report, &rendered.writer);
+    try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "\"returned\":3") != null);
+    try std.testing.expect(rendered.written().len <= len_three);
+}
+
+test "files and count formats remain pure record projections" {
+    var report = std.mem.zeroes(search.SearchReport);
+    report.expression = "lit:x";
+    report.cwd = ".";
+    report.collect_hits = true;
+    report.matches_found = 1;
+    report.matches_after_cursor = 1;
+    report.hit_count = 1;
+    report.hits[0] = .{ .path = "src/a.zig", .line = 2, .column = 3, .preview = "x" };
+
+    inline for (.{ "files", "count" }) |format| {
+        const argv = [_][]const u8{ "ix-zig", "search", "lit:x", "src", "--format", format };
+        const request = (try cli.parseInvocation(std.testing.allocator, &argv)).command.search;
+        var rendered: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer rendered.deinit();
+        try writeSearchResult(std.testing.io, request, report, &rendered.writer);
+        try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "ix.result") == null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered.written(), "src/a.zig") != null);
+    }
+}
+
 /// Measures a complete candidate envelope in an isolated arena so budget trials do not accumulate memory.
-fn versionedSearchResultLength(io: std.Io, request: cli.SearchRequest, report: search.SearchReport, visible_count: usize, byte_truncated: bool) !usize {
+fn versionedSearchResultLength(request: cli.SearchRequest, report: search.SearchReport, context_cache: ?*const inspect.ContextCache, visible_count: usize, byte_truncated: bool) !usize {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const bytes = try renderVersionedSearchResult(io, arena.allocator(), request, report, visible_count, byte_truncated);
+    const bytes = try renderVersionedSearchResult(arena.allocator(), request, report, context_cache, visible_count, byte_truncated);
     return bytes.len;
 }
 
 /// Builds context only for the selected page, then renders one internally consistent envelope.
 fn renderVersionedSearchResult(
-    io: std.Io,
     allocator: std.mem.Allocator,
     request: cli.SearchRequest,
     report: search.SearchReport,
+    context_cache: ?*const inspect.ContextCache,
     visible_count: usize,
     byte_truncated: bool,
 ) ![]u8 {
     var visible_report = report;
     visible_report.hit_count = @min(visible_count, report.hit_count);
-    const context_reports: []const inspect.ContextReport = if (request.context != null and visible_report.hit_count > 0)
-        try inspect.contextReportsFromSearchReport(io, allocator, searchContextRequest(request), visible_report)
+    const context_reports: []const inspect.ContextReport = if (context_cache) |cache|
+        try inspect.contextReportsFromCache(allocator, cache.*, visible_report.hit_count)
     else
         &.{};
     return agent_output.render(allocator, request, report, context_reports, .{

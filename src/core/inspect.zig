@@ -28,7 +28,7 @@ pub const InspectWindow = struct {
     has_more: bool,
     eof: bool,
     total_lines: ?usize,
-    lines: [MAX_WINDOW_LINES]InspectLine,
+    lines: []InspectLine,
     line_count: usize,
 };
 
@@ -43,8 +43,25 @@ pub const ContextLine = struct {
 pub const ContextReport = struct {
     path: []const u8,
     expression: []const u8,
-    lines: [MAX_CONTEXT_LINES]ContextLine,
+    lines: []ContextLine,
     line_count: usize,
+};
+
+pub const CachedContextLine = struct {
+    number: usize,
+    text: []const u8,
+    first_cover_hit: usize,
+    first_match_hit: ?usize,
+};
+
+pub const CachedContextFile = struct {
+    path: []const u8,
+    lines: []const CachedContextLine,
+};
+
+pub const ContextCache = struct {
+    expression: []const u8,
+    files: []const CachedContextFile,
 };
 
 pub fn window(io: std.Io, allocator: std.mem.Allocator, request: cli.InspectRequest) !InspectWindow {
@@ -54,6 +71,7 @@ pub fn window(io: std.Io, allocator: std.mem.Allocator, request: cli.InspectRequ
 
 pub fn windowForPath(io: std.Io, allocator: std.mem.Allocator, request: cli.InspectRequest, path: []const u8) !InspectWindow {
     const bounds = try resolveBounds(request);
+    const output_lines = try allocator.alloc(InspectLine, MAX_WINDOW_LINES);
     var output = InspectWindow{
         .path = try normalizeDisplayPath(allocator, path),
         .request_label = try requestLabel(allocator, bounds),
@@ -66,7 +84,7 @@ pub fn windowForPath(io: std.Io, allocator: std.mem.Allocator, request: cli.Insp
         .has_more = false,
         .eof = true,
         .total_lines = null,
-        .lines = undefined,
+        .lines = output_lines,
         .line_count = 0,
     };
 
@@ -74,15 +92,11 @@ pub fn windowForPath(io: std.Io, allocator: std.mem.Allocator, request: cli.Insp
     defer file.close(io);
     var read_buffer: [8192]u8 = undefined;
     var reader = file.reader(io, &read_buffer);
-    const bytes = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024 * 1024));
+    var line_buffer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer line_buffer.deinit();
 
     var line_number: usize = 1;
-    var cursor: usize = 0;
-    while (cursor < bytes.len) : (line_number += 1) {
-        const newline_offset = std.mem.indexOfScalar(u8, bytes[cursor..], '\n');
-        const end = if (newline_offset) |offset| cursor + offset else bytes.len;
-        const raw_line = bytes[cursor..end];
-        cursor = if (newline_offset != null) end + 1 else bytes.len;
+    while (try nextLine(&reader.interface, &line_buffer)) |raw_line| : (line_number += 1) {
         const line = std.mem.trimEnd(u8, raw_line, "\r");
         if (line_number < bounds.start_line) continue;
         if (bounds.end_line) |end_line| {
@@ -104,11 +118,11 @@ pub fn windowForPath(io: std.Io, allocator: std.mem.Allocator, request: cli.Insp
             output.eof = false;
             break;
         }
-        output.lines[output.line_count] = .{ .number = line_number, .text = line };
+        output.lines[output.line_count] = .{ .number = line_number, .text = try allocator.dupe(u8, line) };
         output.line_count += 1;
         output.end_line = line_number;
     }
-    if (output.eof) output.total_lines = if (bytes.len == 0) 0 else line_number - 1;
+    if (output.eof) output.total_lines = line_number - 1;
     if (output.line_count == 0) output.end_line = bounds.end_line orelse bounds.start_line;
     return output;
 }
@@ -142,11 +156,133 @@ pub fn contextReportsFromSearchReport(io: std.Io, allocator: std.mem.Allocator, 
     return reports.toOwnedSlice(allocator);
 }
 
+/// Reads each represented source file once so byte-budget probes only reshape cached context.
+pub fn cacheContextForSearchReport(io: std.Io, allocator: std.mem.Allocator, request: cli.InspectRequest, search_report: search.SearchReport) !ContextCache {
+    if (!hasCanonicalHitOrder(search_report.hits[0..search_report.hit_count])) return error.NonCanonicalHitOrder;
+    var files = std.ArrayList(CachedContextFile).empty;
+    errdefer files.deinit(allocator);
+    const before = request.before_context orelse request.context orelse 0;
+    const after = request.after_context orelse request.context orelse 0;
+
+    var hit_index: usize = 0;
+    while (hit_index < search_report.hit_count) {
+        const path = search_report.hits[hit_index].path;
+        const start = hit_index;
+        hit_index += 1;
+        while (hit_index < search_report.hit_count and std.mem.eql(u8, search_report.hits[hit_index].path, path)) : (hit_index += 1) {}
+        try files.append(allocator, try cacheContextFile(
+            io,
+            allocator,
+            path,
+            search_report.hits[start..hit_index],
+            start,
+            before,
+            after,
+        ));
+    }
+    return .{ .expression = search_report.expression, .files = try files.toOwnedSlice(allocator) };
+}
+
+/// Protects prefix-to-context ownership from interleaved files or descending source coordinates.
+fn hasCanonicalHitOrder(hits: []const search.SearchHit) bool {
+    if (hits.len < 2) return true;
+    for (hits[1..], 1..) |hit, index| {
+        const previous = hits[index - 1];
+        switch (std.mem.order(u8, previous.path, hit.path)) {
+            .gt => return false,
+            .lt => continue,
+            .eq => {},
+        }
+        if (hit.line < previous.line) return false;
+        if (hit.line == previous.line and hit.column < previous.column) return false;
+    }
+    return true;
+}
+
+/// Materializes the exact coalesced windows for a hit prefix without touching the filesystem.
+pub fn contextReportsFromCache(allocator: std.mem.Allocator, cache: ContextCache, visible_count: usize) ![]ContextReport {
+    var reports = std.ArrayList(ContextReport).empty;
+    errdefer reports.deinit(allocator);
+    for (cache.files) |file| {
+        var eligible_count: usize = 0;
+        for (file.lines) |line| {
+            if (line.first_cover_hit < visible_count) eligible_count += 1;
+            if (eligible_count >= MAX_CONTEXT_LINES) break;
+        }
+        if (eligible_count == 0) continue;
+        const lines = try allocator.alloc(ContextLine, eligible_count);
+        var line_count: usize = 0;
+        for (file.lines) |line| {
+            if (line.first_cover_hit >= visible_count) continue;
+            if (line_count >= eligible_count) break;
+            lines[line_count] = .{
+                .number = line.number,
+                .role = if (line.first_match_hit != null and line.first_match_hit.? < visible_count) "match" else "context",
+                .text = line.text,
+            };
+            line_count += 1;
+        }
+        try reports.append(allocator, .{
+            .path = file.path,
+            .expression = cache.expression,
+            .lines = lines,
+            .line_count = line_count,
+        });
+    }
+    return reports.toOwnedSlice(allocator);
+}
+
+/// Captures only lines covered by a search-hit window and tags the earliest hit that owns each line.
+fn cacheContextFile(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    hits: []const search.SearchHit,
+    global_hit_start: usize,
+    before: usize,
+    after: usize,
+) !CachedContextFile {
+    var lines = std.ArrayList(CachedContextLine).empty;
+    errdefer lines.deinit(allocator);
+    if (hits.len == 0) return .{ .path = path, .lines = &.{} };
+
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false });
+    defer file.close(io);
+    var read_buffer: [8192]u8 = undefined;
+    var reader = file.reader(io, &read_buffer);
+    var line_buffer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer line_buffer.deinit();
+
+    const last_needed = hits[hits.len - 1].line +| after;
+    var line_number: usize = 1;
+    var active_start: usize = 0;
+    while (line_number <= last_needed) : (line_number += 1) {
+        const raw_line = (try nextLine(&reader.interface, &line_buffer)) orelse break;
+        while (active_start < hits.len and hits[active_start].line +| after < line_number) : (active_start += 1) {}
+        if (active_start >= hits.len) break;
+
+        var probe = active_start;
+        var first_match_hit: ?usize = null;
+        while (probe < hits.len and hits[probe].line -| before <= line_number) : (probe += 1) {
+            if (hits[probe].line == line_number and first_match_hit == null) first_match_hit = global_hit_start + probe;
+        }
+        if (probe == active_start) continue;
+        try lines.append(allocator, .{
+            .number = line_number,
+            .text = try allocator.dupe(u8, std.mem.trimEnd(u8, raw_line, "\r")),
+            .first_cover_hit = global_hit_start + active_start,
+            .first_match_hit = first_match_hit,
+        });
+    }
+    return .{ .path = try normalizeDisplayPath(allocator, path), .lines = try lines.toOwnedSlice(allocator) };
+}
+
 pub fn contextForPath(io: std.Io, allocator: std.mem.Allocator, request: cli.InspectRequest, path: []const u8, plan: expr.ExpressionPlan) !ContextReport {
+    const report_lines = try allocator.alloc(ContextLine, MAX_CONTEXT_LINES);
     var report = ContextReport{
         .path = try normalizeDisplayPath(allocator, path),
         .expression = request.expression orelse plan.source,
-        .lines = undefined,
+        .lines = report_lines,
         .line_count = 0,
     };
 
@@ -154,17 +290,17 @@ pub fn contextForPath(io: std.Io, allocator: std.mem.Allocator, request: cli.Ins
     defer file.close(io);
     var read_buffer: [8192]u8 = undefined;
     var reader = file.reader(io, &read_buffer);
-    const bytes = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024 * 1024));
+    var line_buffer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer line_buffer.deinit();
 
-    var source_lines: [MAX_CONTEXT_LINES][]const u8 = undefined;
-    var match_lines: [MAX_CONTEXT_LINES]bool = undefined;
-    var emitted_lines: [MAX_CONTEXT_LINES]bool = undefined;
+    const source_lines = try allocator.alloc([]const u8, MAX_CONTEXT_LINES);
+    const match_lines = try allocator.alloc(bool, MAX_CONTEXT_LINES);
+    const emitted_lines = try allocator.alloc(bool, MAX_CONTEXT_LINES);
     var source_count: usize = 0;
-    var split = std.mem.splitScalar(u8, bytes, '\n');
-    while (split.next()) |raw_line| {
+    while (try nextLine(&reader.interface, &line_buffer)) |raw_line| {
         if (source_count >= MAX_CONTEXT_LINES) break;
         const line = std.mem.trimEnd(u8, raw_line, "\r");
-        source_lines[source_count] = line;
+        source_lines[source_count] = try allocator.dupe(u8, line);
         match_lines[source_count] = search.matchesLine(line, plan);
         emitted_lines[source_count] = false;
         source_count += 1;
@@ -201,10 +337,11 @@ fn contextForSearchHitsPath(
     path: []const u8,
     hits: []const search.SearchHit,
 ) !ContextReport {
+    const report_lines = try allocator.alloc(ContextLine, MAX_CONTEXT_LINES);
     var report = ContextReport{
         .path = try normalizeDisplayPath(allocator, path),
         .expression = request.expression orelse expression,
-        .lines = undefined,
+        .lines = report_lines,
         .line_count = 0,
     };
     if (hits.len == 0) return report;
@@ -217,17 +354,14 @@ fn contextForSearchHitsPath(
     defer file.close(io);
     var read_buffer: [8192]u8 = undefined;
     var reader = file.reader(io, &read_buffer);
-    const bytes = try reader.interface.allocRemaining(allocator, .limited(1024 * 1024 * 1024));
+    var line_buffer: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
+    defer line_buffer.deinit();
 
-    var cursor: usize = 0;
     var line_number: usize = 1;
     var next_hit_index: usize = 0;
     var last_emitted: usize = 0;
-    while (cursor < bytes.len and line_number <= last_needed) : (line_number += 1) {
-        const newline_offset = std.mem.indexOfScalar(u8, bytes[cursor..], '\n');
-        const end = if (newline_offset) |offset| cursor + offset else bytes.len;
-        const raw_line = bytes[cursor..end];
-        cursor = if (newline_offset != null) end + 1 else bytes.len;
+    while (line_number <= last_needed) : (line_number += 1) {
+        const raw_line = (try nextLine(&reader.interface, &line_buffer)) orelse break;
 
         while (next_hit_index < hits.len and hits[next_hit_index].line + after < line_number) : (next_hit_index += 1) {}
         if (next_hit_index >= hits.len) break;
@@ -250,13 +384,23 @@ fn contextForSearchHitsPath(
         report.lines[report.line_count] = .{
             .number = line_number,
             .role = if (is_match) "match" else "context",
-            .text = std.mem.trimEnd(u8, raw_line, "\r"),
+            .text = try allocator.dupe(u8, std.mem.trimEnd(u8, raw_line, "\r")),
         };
         report.line_count += 1;
         last_emitted = line_number;
         if (report.line_count >= MAX_CONTEXT_LINES) return report;
     }
     return report;
+}
+
+/// Streams one arbitrary-length line through a reusable buffer and consumes its delimiter.
+fn nextLine(reader: *std.Io.Reader, line_buffer: *std.Io.Writer.Allocating) !?[]const u8 {
+    line_buffer.clearRetainingCapacity();
+    _ = try reader.streamDelimiterEnding(&line_buffer.writer, '\n');
+    const has_delimiter = reader.seek < reader.end and reader.buffer[reader.seek] == '\n';
+    if (has_delimiter) reader.toss(1);
+    if (line_buffer.written().len == 0 and !has_delimiter) return null;
+    return line_buffer.written();
 }
 
 fn normalizeDisplayPath(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -402,4 +546,19 @@ test "inspect context materializes from search hits across roots" {
     try std.testing.expectEqual(@as(usize, 3), reports[1].line_count);
     try std.testing.expectEqualStrings("match", reports[0].lines[1].role);
     try std.testing.expectEqualStrings("match", reports[1].lines[1].role);
+
+    const cache = try cacheContextForSearchReport(io, allocator, request, report);
+    const first_page = try contextReportsFromCache(allocator, cache, 1);
+    try std.testing.expectEqual(@as(usize, 1), first_page.len);
+    try std.testing.expectEqual(@as(usize, 3), first_page[0].line_count);
+    const full_page = try contextReportsFromCache(allocator, cache, 2);
+    try std.testing.expectEqual(@as(usize, 2), full_page.len);
+}
+
+test "context cache rejects non-canonical hit order" {
+    const hits = [_]search.SearchHit{
+        .{ .path = "b.zig", .line = 1, .column = 1, .preview = "b" },
+        .{ .path = "a.zig", .line = 1, .column = 1, .preview = "a" },
+    };
+    try std.testing.expect(!hasCanonicalHitOrder(&hits));
 }

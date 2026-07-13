@@ -57,6 +57,7 @@ const Coverage = struct {
     skipped_binary: usize,
     skipped_empty: usize,
     skipped_oversize: usize,
+    discovery_errors: usize,
     read_errors: usize,
 };
 
@@ -97,8 +98,9 @@ pub fn run(
 
     var candidate_list = std.ArrayList(Candidate).empty;
     var skipped_oversize: usize = 0;
+    var discovery_errors: usize = 0;
     for (request.paths[0..request.path_count]) |path| {
-        try collectCandidatePath(io, allocator, &candidate_list, path, query_is_file, query, &skipped_oversize);
+        try collectCandidatePath(io, allocator, &candidate_list, path, query_is_file, query, &skipped_oversize, &discovery_errors);
     }
     canonicalizeCandidates(&candidate_list);
     const candidates = candidate_list.items;
@@ -128,10 +130,12 @@ pub fn run(
         .skipped_binary = 0,
         .skipped_empty = 0,
         .skipped_oversize = skipped_oversize,
+        .discovery_errors = discovery_errors,
         .read_errors = 0,
     };
 
     var document_list = std.ArrayList(Document).empty;
+    defer document_list.deinit(allocator);
     if (query_is_file) {
         const anchor = try readAnchorDocument(io, allocator, query);
         try document_list.append(allocator, anchor);
@@ -283,18 +287,28 @@ fn collectCandidatePath(
     exclude_anchor: bool,
     anchor: []const u8,
     skipped_oversize: *usize,
+    discovery_errors: *usize,
 ) !void {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return;
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch {
+        discovery_errors.* += 1;
+        return;
+    };
     if (stat.kind == .directory) {
-        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
+        var dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch {
+            discovery_errors.* += 1;
+            return;
+        };
         defer dir.close(io);
         var iterator = dir.iterate();
-        while (try iterator.next(io)) |entry| {
+        while (iterator.next(io) catch {
+            discovery_errors.* += 1;
+            return;
+        }) |entry| {
             if (entry.kind == .directory and entry.name.len > 0 and entry.name[0] == '.') continue;
             if (entry.kind != .file and entry.kind != .directory) continue;
             const child_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name });
             defer allocator.free(child_path);
-            try collectCandidatePath(io, allocator, list, child_path, exclude_anchor, anchor, skipped_oversize);
+            try collectCandidatePath(io, allocator, list, child_path, exclude_anchor, anchor, skipped_oversize, discovery_errors);
         }
         return;
     }
@@ -329,12 +343,28 @@ fn canonicalizeCandidates(list: *std.ArrayList(Candidate)) void {
 /// Binds continuation to the exact deterministic candidate corpus.
 fn candidateCorpusSignature(candidates: []const Candidate) u64 {
     var hasher = std.hash.Wyhash.init(0x4958_5345_4d43_4f52);
+    hashSignatureU64(&hasher, candidates.len);
     for (candidates) |candidate| {
+        hashSignatureU64(&hasher, candidate.path.len);
         hasher.update(candidate.path);
-        hasher.update(std.mem.asBytes(&candidate.size));
-        hasher.update(std.mem.asBytes(&candidate.mtime_ns));
+        hashSignatureU64(&hasher, candidate.size);
+        hashSignatureU128(&hasher, @bitCast(candidate.mtime_ns));
     }
     return hasher.final();
+}
+
+/// Writes one stable fixed-width corpus-signature word independent of host endianness.
+fn hashSignatureU64(hasher: *std.hash.Wyhash, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(value >> @intCast(index * 8));
+    hasher.update(&bytes);
+}
+
+/// Preserves signed nanosecond identity as its exact two's-complement bit pattern.
+fn hashSignatureU128(hasher: *std.hash.Wyhash, value: u128) void {
+    var bytes: [16]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(value >> @intCast(index * 8));
+    hasher.update(&bytes);
 }
 
 const RankedCandidate = struct { index: usize, lexical_score: usize };
@@ -521,10 +551,10 @@ fn writeVersionedResult(
         corpus_signature,
         request_fingerprint,
     });
-    const coverage_partial = coverage.candidates_omitted != 0 or coverage.read_errors != 0;
+    const coverage_partial = coverage.candidates_omitted != 0 or coverage.discovery_errors != 0 or coverage.read_errors != 0;
     try writer.writeAll(",\"coverage\":{\"state\":");
     try writeJsonString(writer, if (coverage_partial) "partial" else "complete");
-    try writer.print(",\"files_eligible\":{},\"frontier_start\":{},\"candidates_evaluated\":{},\"files_read\":{},\"chunks_embedded\":{},\"bytes_submitted\":{},\"candidates_omitted\":{},\"skipped_binary\":{},\"skipped_empty\":{},\"skipped_oversize\":{},\"read_errors\":{}", .{
+    try writer.print(",\"files_eligible\":{},\"frontier_start\":{},\"candidates_evaluated\":{},\"files_read\":{},\"chunks_embedded\":{},\"bytes_submitted\":{},\"candidates_omitted\":{},\"skipped_binary\":{},\"skipped_empty\":{},\"skipped_oversize\":{},\"discovery_errors\":{},\"read_errors\":{}", .{
         coverage.files_eligible,
         coverage.frontier_start,
         coverage.candidates_evaluated,
@@ -535,6 +565,7 @@ fn writeVersionedResult(
         coverage.skipped_binary,
         coverage.skipped_empty,
         coverage.skipped_oversize,
+        coverage.discovery_errors,
         coverage.read_errors,
     });
     if (coverage.candidates_omitted != 0) {
@@ -592,6 +623,26 @@ fn reportSemanticFailure(
 /// Uses the canonical JSON stringifier for every public semantic string.
 fn writeJsonString(writer: anytype, value: []const u8) !void {
     try std.json.Stringify.value(value, .{}, writer);
+}
+
+test "semantic discovery records inaccessible scope instead of claiming completeness" {
+    const io = std.testing.io;
+    var candidates = std.ArrayList(Candidate).empty;
+    defer candidates.deinit(std.testing.allocator);
+    var skipped_oversize: usize = 0;
+    var discovery_errors: usize = 0;
+    try collectCandidatePath(
+        io,
+        std.testing.allocator,
+        &candidates,
+        ".ix-missing-semantic-candidate-root",
+        false,
+        "",
+        &skipped_oversize,
+        &discovery_errors,
+    );
+    try std.testing.expectEqual(@as(usize, 0), candidates.items.len);
+    try std.testing.expectEqual(@as(usize, 1), discovery_errors);
 }
 
 fn jsonPayload(allocator: std.mem.Allocator, value: anytype) ![]u8 {

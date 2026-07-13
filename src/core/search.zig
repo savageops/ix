@@ -355,10 +355,20 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     if (discovered.len == 0) {
         // No files discovered -- nothing to scan.
     } else if (thread_count <= 1 or discovered.len < 4) {
-        // Serial path: single thread or too few files to justify workers.
-        for (discovered) |entry| {
-            try scanDiscoveredFile(io, allocator, entry.path, request, plan, trigram_admission, &trigram_program, &report);
-            if (report.truncated) break;
+        if (evidence_prepared.runtime.enabled) {
+            // Reuse the shard evidence owner without paying worker startup on
+            // small corpora; the ordinary serial hot path stays flat below.
+            const shards = try allocator.alloc(ShardReport, 1);
+            shards[0] = initShardReport(report, evidence_prepared.runtime, allocator);
+            shardWorker(io, allocator, discovered, request, plan, trigram_admission, &trigram_program, &shards[0]);
+            mergeShardsIntoReport(shards, request, &report);
+            writeEvidenceFrontierCacheFromShards(io, allocator, evidence_prepared.runtime, shards);
+        } else {
+            // Serial path: single thread or too few files to justify workers.
+            for (discovered) |entry| {
+                try scanDiscoveredFile(io, allocator, entry.path, request, plan, trigram_admission, &trigram_program, &report);
+                if (report.truncated) break;
+            }
         }
     } else {
         try parallelScanFiles(io, allocator, discovered, request, plan, trigram_admission, &trigram_program, thread_count, evidence_prepared.runtime, &report);
@@ -1070,11 +1080,9 @@ fn warmIndexFallback(report: *SearchReport, reason: []const u8) ?WarmIndexFronti
 }
 
 fn validateWarmIndexLiveMarker(bytes: []const u8, expected_root: []const u8) bool {
-    // First pass: validate format and root without checking PID liveness.
-    // This allows foreground_once (static index) to work even when the
-    // indexer process has exited — the index is still valid.
-    if (!validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, false)) return false;
-    return true;
+    // A generation without a live refresh owner is only a snapshot. Serving
+    // it as current can miss files created or changed after publication.
+    return validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, true);
 }
 
 fn validateWarmIndexLiveMarkerWithOwnerCheck(bytes: []const u8, expected_root: []const u8, check_owner: bool) bool {
@@ -1750,9 +1758,6 @@ fn prepareEvidenceFrontier(
     if (!evidenceFrontierEligible(request, plan, admission)) return .{};
     const key = evidenceFrontierKey(request, plan);
     const cache_path = state_dir.evidenceCachePath(allocator, key) catch return .{};
-    if (!request.nexus_build) {
-        std.Io.Dir.cwd().access(io, cache_path, .{}) catch return .{};
-    }
     const signature = computeDiscoveredSignature(io, files) catch return .{};
     if (loadEvidenceFrontierCache(io, allocator, cache_path, key, signature, files)) |cache| {
         var evidence_files: std.ArrayList(DiscoveredFile) = .empty;
@@ -3927,14 +3932,12 @@ fn recordLineIntoShardImpl(
         const under_request_limit = if (request.max_hits) |max_hits| shard.hit_count < max_hits else true;
         if (under_request_limit and shard.hit_count < MAX_RETAINED_HITS) {
             const span = exactMatchSpan(line, plan, request.case_insensitive, col);
-            shard.hits[shard.hit_count] = makeSearchHit(allocator, display_path, line_number, col, line, span) catch .{
-                .path = display_path,
-                .line = line_number,
-                .column = col,
-                .preview = allocator.dupe(u8, line) catch line,
-                .match_len = span.end - span.start,
-                .preview_end = line.len,
+            const hit = makeSearchHit(allocator, display_path, line_number, col, line, span) catch {
+                // A preview allocation failure must never retain a borrowed scan-buffer slice.
+                shard.truncated = true;
+                return;
             };
+            shard.hits[shard.hit_count] = hit;
             shard.hit_count += 1;
         }
     }
@@ -4141,17 +4144,7 @@ fn parallelScanFiles(
 
     // Allocate shard reports -- one per thread (including main).
     const shards = try allocator.alloc(ShardReport, actual_threads);
-    for (shards) |*s| {
-        s.* = ShardReport.empty;
-        s.capture_scan_open_timing = report.capture_scan_open_timing;
-        s.capture_linux_dominant_attribution = report.capture_linux_dominant_attribution;
-        s.scan_input_policy = report.scan_input_policy;
-        s.resource_profile = report.resource_profile;
-        if (evidence_runtime.enabled) {
-            s.evidence_capture = true;
-            s.evidence_allocator = allocator;
-        }
-    }
+    for (shards) |*shard| shard.* = initShardReport(report.*, evidence_runtime, allocator);
 
     if (!request.stable_output and shouldUseDynamicWorkClaim(plan, files.len)) {
         var next_file: usize = 0;
@@ -4196,6 +4189,20 @@ fn parallelScanFiles(
 
     mergeShardsIntoReport(shards, request, report);
     writeEvidenceFrontierCacheFromShards(io, allocator, evidence_runtime, shards);
+}
+
+/// Applies the main-report instrumentation and optional evidence capture to one isolated shard.
+fn initShardReport(report: SearchReport, evidence_runtime: EvidenceFrontierRuntime, allocator: std.mem.Allocator) ShardReport {
+    var shard = ShardReport.empty;
+    shard.capture_scan_open_timing = report.capture_scan_open_timing;
+    shard.capture_linux_dominant_attribution = report.capture_linux_dominant_attribution;
+    shard.scan_input_policy = report.scan_input_policy;
+    shard.resource_profile = report.resource_profile;
+    if (evidence_runtime.enabled) {
+        shard.evidence_capture = true;
+        shard.evidence_allocator = allocator;
+    }
+    return shard;
 }
 
 fn mergeShardsIntoReport(shards: []const ShardReport, request: cli.SearchRequest, report: *SearchReport) void {
@@ -6048,7 +6055,7 @@ test "warm foreground marker validation is generation-pin gated" {
     try std.testing.expect(!validateWarmIndexLiveMarker(marker, "D:/repo"));
 }
 
-test "warm index trusts foreground_once marker without live PID check" {
+test "warm index rejects foreground_once marker after its owner exits" {
     if (builtin.os.tag != .windows) return error.SkipZigTest;
 
     const io = std.testing.io;
@@ -6065,7 +6072,7 @@ test "warm index trusts foreground_once marker without live PID check" {
     try std.Io.Dir.cwd().createDirPath(io, index_dir);
     const live_path = try std.fs.path.join(allocator, &.{ index_dir, WARM_INDEX_LIVE_MARKER_NAME });
     defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
-    // foreground_once marker: PID may be dead, but format + root must be valid.
+    // A dead once-owner leaves a durable snapshot, not a live search index.
     const live_marker = try std.fmt.allocPrint(allocator, "IXINDEX_LIVE1\npid=999999\nprocess_start_ns=55\ncreated_ns=99\nroot={s}\n", .{root_path});
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = live_path, .data = live_marker });
 
@@ -6074,10 +6081,9 @@ test "warm index trusts foreground_once marker without live PID check" {
     request.nexus_disabled = true;
     const plan = try expr.parse(request.expression);
     const report = try run(io, allocator, request, plan);
-
-    // foreground_once markers are trusted without PID liveness check.
-    try std.testing.expect(report.stats.catalog_index.available);
-    try std.testing.expect(report.stats.postings_index.available);
+    try std.testing.expect(!report.stats.catalog_index.available);
+    try std.testing.expect(!report.stats.postings_index.available);
+    try std.testing.expectEqualStrings("invalid_live_owner", report.stats.generation_refresh.fallback_reason);
 }
 
 test "warm index reports corrupt generation payload before falling back" {
@@ -6622,7 +6628,7 @@ test "evidence frontier rejects stale content signature before foreground admiss
     try std.testing.expect(loadEvidenceFrontierCache(io, allocator, cache_path, 0x44, signature, &files) == null);
 }
 
-test "search run consumes evidence frontier and scans only retained candidates" {
+test "search run builds then consumes the evidence frontier through the owner path" {
     const io = std.testing.io;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -6633,7 +6639,8 @@ test "search run consumes evidence frontier and scans only retained candidates" 
     try tmp.dir.writeFile(io, .{ .sub_path = "candidate.txt", .data = "needle\n" });
     try tmp.dir.writeFile(io, .{ .sub_path = "pruned.txt", .data = "absent\n" });
     const root_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
-    const request = testSearchRequest("lit:needle", root_path);
+    var request = testSearchRequest("lit:needle", root_path);
+    request.nexus_build = true;
     const plan = try expr.parse(request.expression);
     const key = evidenceFrontierKey(request, plan);
     const cache_path = try state_dir.evidenceCachePath(allocator, key);
@@ -6641,33 +6648,18 @@ test "search run consumes evidence frontier and scans only retained candidates" 
     const live_path = try evidenceFrontierLivePath(allocator, cache_path);
     defer std.Io.Dir.cwd().deleteFile(io, live_path) catch {};
 
-    var discovery_report = testSearchReport(request.expression, plan);
-    var discovered = try FileList.initWithCapacity(allocator, 4);
-    var admission_engine = path_admission.Engine.init(allocator, !request.no_ignore);
-    const prepared_roots = try prepareRoots(io, allocator, request);
-    try std.testing.expectEqual(@as(usize, 1), prepared_roots.count);
-    try discoverFiles(io, allocator, prepared_roots.items[0].original, request, &admission_engine, &discovered, &discovery_report);
-    const files = discovered.mutableItems();
-    try std.testing.expectEqual(@as(usize, 2), files.len);
-    nt_open.initCwdPrefix(io);
-    const signature = try computeDiscoveredSignature(io, files);
+    const build_report = try run(io, allocator, request, plan);
+    try std.testing.expectEqual(@as(usize, 1), build_report.matches_found);
+    // A second owner-path pass lets Windows metadata settle and refreshes the
+    // cache if the initial temporary-file identity changed after creation.
+    _ = try run(io, allocator, request, plan);
 
-    var retained = [_]DiscoveredFile{candidateFromDiscovered(files) orelse return error.TestExpectedCacheHit};
-    const content_signature = try computeContentSignature(io, files);
-    writeEvidenceFrontierCache(io, cache_path, key, signature, content_signature, files.len, .{
-        .pruned_files = 1,
-        .pruned_bytes = 64,
-        .skipped_files = 0,
-        .candidates = &retained,
-    });
-    writeEvidenceFrontierLive(io, cache_path, key);
-    try std.testing.expect(loadEvidenceFrontierCache(io, allocator, cache_path, key, signature, files) != null);
-
+    request.nexus_build = false;
     const report = try run(io, allocator, request, plan);
     try std.testing.expectEqual(@as(usize, 2), report.files_discovered);
     try std.testing.expectEqual(@as(usize, 1), report.matches_found);
     try std.testing.expectEqual(@as(usize, 1), report.hit_count);
-    try std.testing.expectEqualStrings(retained[0].path, report.hits[0].path);
+    try std.testing.expect(std.mem.endsWith(u8, report.hits[0].path, "candidate.txt"));
     try std.testing.expectEqual(@as(usize, 1), report.stats.trigram_acceleration.pruned_files);
     try std.testing.expectEqual(@as(usize, 2), report.files_scanned);
 }
