@@ -147,17 +147,10 @@ fn writeSearchHelp(writer: anytype, summary: []const u8, command: []const u8) !v
         \\  [PATH]...  Files or directories to scan [default: .]
         \\
         \\Options:
-        \\      --hidden                     Include hidden files and directories
-        \\      --no-ignore                  Disable explicit ignore-file admission
-        \\  -u, --unrestricted              Include hidden and ignored paths
-        \\      --ignore-file <PATH>         Add an explicit ignore source
-        \\      --follow-symlinks            
-        \\      --json
-        \\      --stats-only
-        \\      --max-hits <MAX_HITS>
-        \\  -t, --threads <THREADS>
-        \\      --emit-report <EMIT_REPORT>
-        \\  -h, --help                       Print help
+        \\
+    , .{ summary, command });
+    try command_spec.writeSearchOptions(writer, is_search);
+    try writer.writeAll(
         \\
         \\EXPRESSION CONTRACT
         \\  ix search EXPR and ix matches EXPR use the canonical native IX expression surface
@@ -173,7 +166,7 @@ fn writeSearchHelp(writer: anytype, summary: []const u8, command: []const u8) !v
         \\  --json emits the structured SearchReport contract
         \\  agent shorthand: -n N means line numbers plus max N hits
         \\
-    , .{ summary, command });
+    );
     if (is_search) {
         try writer.writeAll(
             \\  --agent emits ix.result.v2: file-grouped hits, short field names, minimal telemetry
@@ -307,10 +300,22 @@ fn writeProcessHelp(writer: anytype) !void {
 }
 
 pub fn writeError(writer: anytype, code: []const u8, message: []const u8) !void {
+    return writeErrorDetail(writer, code, message, null, null);
+}
+
+pub fn writeErrorDetail(writer: anytype, code: []const u8, message: []const u8, argument: ?[]const u8, hint: ?[]const u8) !void {
     try writer.writeAll("-- ix.error.v1 {\"schema\":\"ix.error.v1\",\"status\":\"error\",\"code\":");
     try writeJsonString(writer, code);
     try writer.writeAll(",\"message\":");
     try writeJsonString(writer, message);
+    if (argument) |value| {
+        try writer.writeAll(",\"argument\":");
+        try writeJsonString(writer, value);
+    }
+    if (hint) |value| {
+        try writer.writeAll(",\"hint\":");
+        try writeJsonString(writer, value);
+    }
     try writer.writeAll("} --\n");
 }
 

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, buildAlternatesComparisonScore, buildAlternatesRoundLedger, buildAlternatesScorecard, identityControlFailures, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, pairOrderSummaryIsBalanced } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, buildAlternatesComparisonScore, buildAlternatesRoundLedger, buildAlternatesScorecard, identityControlFailures, IX_STATS_JSON_FLAGS, measureSameBinaryIdentityControl, pairedEngineStats, pairOrderSummary, pairOrderSummaryIsBalanced } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "alternates-decision");
@@ -990,7 +990,7 @@ function summarizeLane(binaryPath, label, branchCount, expression, runs) {
 
 function measure(binaryPath, label, branchCount) {
   const expression = expressionFor(branchCount);
-  const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)];
+  const ixArgs = ["search", expression, corpus, ...IX_STATS_JSON_FLAGS, "--threads", String(threads)];
   const runs = [];
   for (let sample = 1; sample <= samples; sample += 1) {
     runs.push(measureSample(binaryPath, ixArgs, expression, sample));
@@ -1000,7 +1000,7 @@ function measure(binaryPath, label, branchCount) {
 
 function measurePaired(candidateBinaryPath, baselineBinaryPath, branchCount) {
   const expression = expressionFor(branchCount);
-  const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)];
+  const ixArgs = ["search", expression, corpus, ...IX_STATS_JSON_FLAGS, "--threads", String(threads)];
   const candidateRuns = [];
   const baselineRuns = [];
   const pairOrder = [];
@@ -1060,7 +1060,7 @@ const baselineLanes = [];
 const identityControls = {};
 for (const branchCount of branchCounts) {
   const expression = expressionFor(branchCount);
-  const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)];
+  const ixArgs = ["search", expression, corpus, ...IX_STATS_JSON_FLAGS, "--threads", String(threads)];
   identityControls[String(branchCount)] = measureSameBinaryIdentityControl({
     binaryPath: ixBinary,
     ixArgs,

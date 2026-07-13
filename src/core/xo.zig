@@ -29,6 +29,7 @@ const Coverage = struct {
 const QueryTerm = struct {
     text: []const u8,
     document_frequency: usize = 0,
+    weight: f64 = 1.0,
 };
 
 const SourceLine = struct {
@@ -65,6 +66,12 @@ const Span = struct {
     focus_column: usize = 0,
 };
 
+const Projection = struct {
+    eligible_spans: usize,
+    reason: ?[]const u8 = null,
+    selection_limit_reached: bool = false,
+};
+
 /// Builds one deterministic, bounded context projection without entering the search hot path.
 ///
 /// Exact search remains the truth owner. XO reads a bounded corpus, scores source lines with
@@ -95,15 +102,22 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.XoRequest, wri
 
     scoreCandidates(files.items, terms, candidates.items, coverage.lines_read);
     std.mem.sort(Candidate, candidates.items, files.items, candidateLessThan);
-    var spans = try selectSpans(allocator, files.items, candidates.items, request.max_spans);
+    const ranked_spans = try selectSpans(allocator, files.items, candidates.items, MAX_OUTPUT_SPANS);
+    var spans = ranked_spans[0..@min(ranked_spans.len, request.max_spans)];
+    var projection = Projection{
+        .eligible_spans = ranked_spans.len,
+        .reason = if (spans.len < ranked_spans.len) "max_spans" else null,
+        .selection_limit_reached = ranked_spans.len == MAX_OUTPUT_SPANS and candidates.items.len > ranked_spans.len,
+    };
 
-    while (spans.len > 0 and try renderedLength(request, files.items, spans, coverage) > request.max_bytes) {
+    if (spans.len > 0 and try renderedLength(request, files.items, spans, coverage, projection) > request.max_bytes) projection.reason = "byte_budget";
+    while (spans.len > 0 and try renderedLength(request, files.items, spans, coverage, projection) > request.max_bytes) {
         spans.len -= 1;
     }
     if (spans.len == 0 and candidates.items.len != 0) return error.ByteBudgetTooSmall;
 
-    try expandWithinBudget(request, files.items, spans, coverage);
-    const bytes = try render(allocator, request, files.items, spans, coverage);
+    try expandWithinBudget(request, files.items, spans, coverage, projection);
+    const bytes = try render(allocator, request, files.items, spans, coverage, projection);
     if (bytes.len > request.max_bytes) return error.ByteBudgetTooSmall;
     try writer.writeAll(bytes);
 }
@@ -119,9 +133,30 @@ fn tokenizeQuery(allocator: std.mem.Allocator, query: []const u8) ![]QueryTerm {
         if (index - start < 2) continue;
         const term = query[start..index];
         if (isStopWord(term) or containsTerm(terms.items, term)) continue;
-        try terms.append(allocator, .{ .text = try allocator.dupe(u8, term) });
+        try appendQueryTerm(allocator, &terms, term, 1.0);
+        try appendConceptAliases(allocator, &terms, term);
     }
     return terms.toOwnedSlice(allocator);
+}
+
+fn appendQueryTerm(allocator: std.mem.Allocator, terms: *std.ArrayList(QueryTerm), text: []const u8, weight: f64) !void {
+    if (terms.items.len >= MAX_QUERY_TERMS or containsTerm(terms.items, text)) return;
+    try terms.append(allocator, .{ .text = try allocator.dupe(u8, text), .weight = weight });
+}
+
+/// Bridges common intent words to code vocabulary without claiming semantic retrieval.
+fn appendConceptAliases(allocator: std.mem.Allocator, terms: *std.ArrayList(QueryTerm), term: []const u8) !void {
+    if (std.ascii.eqlIgnoreCase(term, "wait") or std.ascii.eqlIgnoreCase(term, "waits") or std.ascii.eqlIgnoreCase(term, "waiting"))
+        try appendQueryTerm(allocator, terms, "sleep", 0.72)
+    else if (std.ascii.eqlIgnoreCase(term, "change") or std.ascii.eqlIgnoreCase(term, "changes") or std.ascii.eqlIgnoreCase(term, "changed")) {
+        try appendQueryTerm(allocator, terms, "notify", 0.68);
+        try appendQueryTerm(allocator, terms, "watch", 0.68);
+    } else if (std.ascii.eqlIgnoreCase(term, "unix")) {
+        try appendQueryTerm(allocator, terms, "linux", 0.64);
+        try appendQueryTerm(allocator, terms, "posix", 0.64);
+    } else if (std.ascii.eqlIgnoreCase(term, "file")) {
+        try appendQueryTerm(allocator, terms, "directory", 0.58);
+    }
 }
 
 /// Keeps query boundaries locale-independent and aligned with common code identifiers.
@@ -131,7 +166,7 @@ fn isTermByte(byte: u8) bool {
 
 /// Removes natural-language glue whose frequency would drown the identifying code terms.
 fn isStopWord(term: []const u8) bool {
-    const words = [_][]const u8{ "a", "an", "and", "are", "as", "at", "be", "by", "code", "for", "from", "how", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "with" };
+    const words = [_][]const u8{ "a", "an", "and", "are", "as", "at", "be", "by", "code", "different", "differently", "for", "from", "how", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "versus", "where", "which", "with" };
     for (words) |word| if (std.ascii.eqlIgnoreCase(term, word)) return true;
     return false;
 }
@@ -359,11 +394,31 @@ fn scoreCandidates(files: []const SourceFile, terms: []const QueryTerm, candidat
             const df = @as(f64, @floatFromInt(term.document_frequency));
             const idf = @log(1.0 + (document_count - df + 0.5) / (df + 0.5));
             const denominator = frequency + 1.2 * (1.0 - 0.75 + 0.75 * line_length / average_length);
-            value += idf * (frequency * 2.2) / denominator;
+            value += term.weight * idf * (frequency * 2.2) / denominator;
         }
+        value += neighborhoodPrior(file.lines, candidate.line_index, terms, candidate.frequencies, document_count);
         const path_matches: u16 = @popCount(file.path_term_hits);
         candidate.score = value + @as(f64, @floatFromInt(path_matches)) * 0.08 + structuralPrior(line.text);
     }
+}
+
+/// Rewards distinct query evidence that converges within one readable code neighborhood.
+fn neighborhoodPrior(lines: []const SourceLine, focus: usize, terms: []const QueryTerm, frequencies: [MAX_QUERY_TERMS]u8, document_count: f64) f64 {
+    var value: f64 = 0;
+    for (terms, 0..) |term, term_index| {
+        if (frequencies[term_index] != 0) continue;
+        var distance: usize = 1;
+        while (distance <= 4) : (distance += 1) {
+            const before_hit = focus >= distance and containsFold(lines[focus - distance].text, term.text);
+            const after_hit = focus + distance < lines.len and containsFold(lines[focus + distance].text, term.text);
+            if (!before_hit and !after_hit) continue;
+            const df = @as(f64, @floatFromInt(@max(term.document_frequency, 1)));
+            const idf = @log(1.0 + (document_count - df + 0.5) / (df + 0.5));
+            value += term.weight * idf * 0.42 / @as(f64, @floatFromInt(distance));
+            break;
+        }
+    }
+    return value;
 }
 
 /// Gives declarations and rationale comments a small tie-breaker, never lexical eligibility.
@@ -372,9 +427,11 @@ fn scoreCandidates(files: []const SourceFile, terms: []const QueryTerm, candidat
 /// keywords inside string literals.
 fn structuralPrior(line: []const u8) f64 {
     const trimmed = std.mem.trimStart(u8, line, " \t");
-    if (std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "#")) return 0.08;
+    if (std.mem.startsWith(u8, trimmed, "//") or std.mem.startsWith(u8, trimmed, "#")) return 0.06;
+    const control = [_][]const u8{ "if ", "if (", "switch ", "switch (", "return ", "try ", "await " };
+    for (control) |marker| if (std.mem.startsWith(u8, trimmed, marker)) return 0.20;
     const markers = [_][]const u8{ "fn ", "function ", "class ", "struct ", "const ", "pub ", "export ", "impl ", "interface " };
-    for (markers) |marker| if (std.mem.startsWith(u8, trimmed, marker)) return 0.18;
+    for (markers) |marker| if (std.mem.startsWith(u8, trimmed, marker)) return 0.08;
     return 0;
 }
 
@@ -394,6 +451,12 @@ fn selectSpans(allocator: std.mem.Allocator, files: []const SourceFile, candidat
         if (spans.items.len >= max_spans) break;
         var too_close = false;
         for (spans.items) |span| {
+            const selected_focus = std.mem.trim(u8, files[span.file_index].lines[span.focus_line_index].text, " \t");
+            const candidate_focus = std.mem.trim(u8, files[candidate.file_index].lines[candidate.line_index].text, " \t");
+            if (selected_focus.len != 0 and std.ascii.eqlIgnoreCase(selected_focus, candidate_focus)) {
+                too_close = true;
+                break;
+            }
             if (span.file_index != candidate.file_index) continue;
             const distance = if (span.focus_line_index > candidate.line_index) span.focus_line_index - candidate.line_index else candidate.line_index - span.focus_line_index;
             if (distance <= MAX_RADIUS * 2 + 1) {
@@ -417,7 +480,7 @@ fn selectSpans(allocator: std.mem.Allocator, files: []const SourceFile, candidat
 }
 
 /// Expands highest-value focus points geometrically and accepts a line only when the full envelope still fits.
-fn expandWithinBudget(request: cli.XoRequest, files: []const SourceFile, spans: []Span, coverage: Coverage) !void {
+fn expandWithinBudget(request: cli.XoRequest, files: []const SourceFile, spans: []Span, coverage: Coverage, projection: Projection) !void {
     var distance: usize = 1;
     while (distance <= MAX_RADIUS) : (distance += 1) {
         var changed = false;
@@ -426,12 +489,12 @@ fn expandWithinBudget(request: cli.XoRequest, files: []const SourceFile, spans: 
             if (span.focus_line_index >= distance) {
                 const previous = span.start_line_index;
                 span.start_line_index = span.focus_line_index - distance;
-                if (try renderedLength(request, files, spans, coverage) <= request.max_bytes) changed = true else span.start_line_index = previous;
+                if (try renderedLength(request, files, spans, coverage, projection) <= request.max_bytes) changed = true else span.start_line_index = previous;
             }
             if (span.focus_line_index + distance < files[span.file_index].lines.len) {
                 const previous = span.end_line_index;
                 span.end_line_index = span.focus_line_index + distance;
-                if (try renderedLength(request, files, spans, coverage) <= request.max_bytes) changed = true else span.end_line_index = previous;
+                if (try renderedLength(request, files, spans, coverage, projection) <= request.max_bytes) changed = true else span.end_line_index = previous;
             }
         }
         if (!changed) break;
@@ -439,37 +502,40 @@ fn expandWithinBudget(request: cli.XoRequest, files: []const SourceFile, spans: 
 }
 
 /// Measures the real serializer through a discard writer so budget trials allocate nothing.
-fn renderedLength(request: cli.XoRequest, files: []const SourceFile, spans: []const Span, coverage: Coverage) !usize {
+fn renderedLength(request: cli.XoRequest, files: []const SourceFile, spans: []const Span, coverage: Coverage, projection: Projection) !usize {
     var buffer: [256]u8 = undefined;
     var discarding: std.Io.Writer.Discarding = .init(&buffer);
-    try writeProjection(&discarding.writer, request, files, spans, coverage);
+    try writeProjection(&discarding.writer, request, files, spans, coverage, projection);
     return @intCast(discarding.fullCount());
 }
 
 /// Allocates only the final envelope after all candidate shapes pass measurement.
-fn render(allocator: std.mem.Allocator, request: cli.XoRequest, files: []const SourceFile, spans: []const Span, coverage: Coverage) ![]u8 {
+fn render(allocator: std.mem.Allocator, request: cli.XoRequest, files: []const SourceFile, spans: []const Span, coverage: Coverage, projection: Projection) ![]u8 {
     var rendered: std.Io.Writer.Allocating = .init(allocator);
-    try writeProjection(&rendered.writer, request, files, spans, coverage);
+    try writeProjection(&rendered.writer, request, files, spans, coverage, projection);
     return rendered.toOwnedSlice();
 }
 
 /// Routes both projections through identical span selection and budget accounting.
-fn writeProjection(writer: anytype, request: cli.XoRequest, files: []const SourceFile, spans: []const Span, coverage: Coverage) !void {
+fn writeProjection(writer: anytype, request: cli.XoRequest, files: []const SourceFile, spans: []const Span, coverage: Coverage, projection: Projection) !void {
     if (request.format == .json)
-        try writeJson(writer, request, files, spans, coverage)
+        try writeJson(writer, request, files, spans, coverage, projection)
     else
-        try writeGrouped(writer, request, files, spans, coverage);
+        try writeGrouped(writer, request, files, spans, coverage, projection);
 }
 
 /// Groups each path once while preserving source order and making every discontinuity visible.
-fn writeGrouped(writer: anytype, request: cli.XoRequest, files: []const SourceFile, spans: []const Span, coverage: Coverage) !void {
+fn writeGrouped(writer: anytype, request: cli.XoRequest, files: []const SourceFile, spans: []const Span, coverage: Coverage, projection: Projection) !void {
     try writer.writeAll("-- ix.xo.v1 query=");
     try output.writeJsonString(writer, request.query);
-    try writer.print(" retrieval=bm25_line assembly=degree_of_interest files_read={} bytes_read={} candidates={} returned={} coverage={s} --\n", .{
+    try writer.print(" retrieval=bm25_line assembly=degree_of_interest files_read={} bytes_read={} candidates={} returned={} eligible={} remaining={} projection={s} coverage={s} --\n", .{
         coverage.files_read,
         coverage.bytes_read,
         coverage.candidate_lines,
         spans.len,
+        projection.eligible_spans,
+        projection.eligible_spans -| spans.len,
+        projection.reason orelse "complete",
         coverageState(coverage),
     });
     var emitted: [MAX_OUTPUT_SPANS]usize = undefined;
@@ -537,7 +603,7 @@ fn nextSpanInFile(spans: []const Span, file_index: usize, previous_end: ?usize) 
 }
 
 /// Emits a versioned machine contract whose retrieval labels name only stages that actually ran.
-fn writeJson(writer: anytype, request: cli.XoRequest, files: []const SourceFile, spans: []const Span, coverage: Coverage) !void {
+fn writeJson(writer: anytype, request: cli.XoRequest, files: []const SourceFile, spans: []const Span, coverage: Coverage, projection: Projection) !void {
     try writer.writeAll("{\"schema\":\"ix.xo.v1\",\"query\":");
     try output.writeJsonString(writer, request.query);
     try writer.writeAll(",\"retrieval\":{\"candidate\":\"bm25_line\",\"structural_prior\":true,\"semantic\":false,\"assembly\":\"degree_of_interest\"},\"coverage\":{");
@@ -547,7 +613,19 @@ fn writeJson(writer: anytype, request: cli.XoRequest, files: []const SourceFile,
         boolText(coverage.candidate_limit_reached),
     });
     try writer.writeAll("},\"projection\":{");
-    try writer.print("\"max_bytes\":{},\"max_spans\":{},\"returned_spans\":{}", .{ request.max_bytes, request.max_spans, spans.len });
+    try writer.print("\"state\":\"{s}\",\"max_bytes\":{},\"max_spans\":{},\"returned_spans\":{},\"eligible_spans\":{},\"remaining_spans\":{},\"selection_limit_reached\":{s}", .{
+        if (projection.reason == null) "complete" else "truncated",
+        request.max_bytes,
+        request.max_spans,
+        spans.len,
+        projection.eligible_spans,
+        projection.eligible_spans -| spans.len,
+        boolText(projection.selection_limit_reached),
+    });
+    if (projection.reason) |reason| {
+        try writer.writeAll(",\"reason\":");
+        try output.writeJsonString(writer, reason);
+    }
     try writer.writeAll("},\"files\":[");
     var emitted: [MAX_OUTPUT_SPANS]usize = undefined;
     var emitted_count: usize = 0;
@@ -592,7 +670,7 @@ fn writeJson(writer: anytype, request: cli.XoRequest, files: []const SourceFile,
         // Emit trailing omission count so agents can see if the file continues past the last span.
         const total_lines_in_file = files[next_file].lines.len;
         const omitted_after: usize = if (previous_end) |last_line| total_lines_in_file -| last_line else total_lines_in_file;
-        try writer.print(",\"omitted_after\":{}}}", .{omitted_after});
+        try writer.print("],\"omitted_after\":{}}}", .{omitted_after});
     }
     try writer.writeAll("]}\n");
 }
@@ -633,6 +711,52 @@ test "xo BM25 ranks multi-term declaration over incidental mention" {
     try std.testing.expect(candidates[1].score > candidates[0].score);
 }
 
+test "xo normalizes platform wait intent and rewards converging branch evidence" {
+    const terms = try tokenizeQuery(std.testing.allocator, "waits for file changes differently on Windows versus Unix");
+    defer {
+        for (terms) |term| std.testing.allocator.free(term.text);
+        std.testing.allocator.free(terms);
+    }
+    try std.testing.expect(containsTerm(terms, "sleep"));
+    try std.testing.expect(containsTerm(terms, "linux"));
+
+    const lines = [_]SourceLine{
+        .{ .number = 1, .text = "if (builtin.os.tag == .windows) {", .token_count = 5 },
+        .{ .number = 2, .text = "watchForFileChanges();", .token_count = 2 },
+        .{ .number = 3, .text = "} else {", .token_count = 2 },
+        .{ .number = 4, .text = "io.sleep(.fromMilliseconds(50), .awake);", .token_count = 4 },
+        .{ .number = 5, .text = "}", .token_count = 1 },
+        .{ .number = 6, .text = "fn fileTimeToUnixNs(value: u64) u64 {", .token_count = 6 },
+    };
+    const files = [_]SourceFile{.{ .path = "watch.zig", .lines = &lines, .path_term_hits = 0 }};
+    var candidates = [_]Candidate{
+        .{ .file_index = 0, .line_index = 0, .frequencies = .{0} ** MAX_QUERY_TERMS },
+        .{ .file_index = 0, .line_index = 5, .frequencies = .{0} ** MAX_QUERY_TERMS },
+    };
+    for (terms, 0..) |*term, term_index| for (lines, 0..) |line, line_index| {
+        candidates[if (line_index == 5) 1 else 0].frequencies[term_index] +|= @intCast(@min(countFold(line.text, term.text), 255));
+        if (containsFold(line.text, term.text)) term.document_frequency += 1;
+    };
+    scoreCandidates(&files, terms, &candidates, lines.len);
+    try std.testing.expect(candidates[0].score > candidates[1].score);
+}
+
+test "xo selection removes duplicate helper shapes across files" {
+    const lines_a = [_]SourceLine{.{ .number = 1, .text = "fn fileTimeToUnixNs(value: u64) u64 {", .token_count = 6 }};
+    const lines_b = [_]SourceLine{.{ .number = 1, .text = "fn fileTimeToUnixNs(value: u64) u64 {", .token_count = 6 }};
+    const files = [_]SourceFile{
+        .{ .path = "a.zig", .lines = &lines_a, .path_term_hits = 0 },
+        .{ .path = "b.zig", .lines = &lines_b, .path_term_hits = 0 },
+    };
+    const candidates = [_]Candidate{
+        .{ .file_index = 0, .line_index = 0, .frequencies = .{0} ** MAX_QUERY_TERMS, .score = 2 },
+        .{ .file_index = 1, .line_index = 0, .frequencies = .{0} ** MAX_QUERY_TERMS, .score = 1 },
+    };
+    const spans = try selectSpans(std.testing.allocator, &files, &candidates, 2);
+    defer std.testing.allocator.free(spans);
+    try std.testing.expectEqual(@as(usize, 1), spans.len);
+}
+
 test "xo rendering groups a path once and honors byte measurement" {
     const lines = [_]SourceLine{
         .{ .number = 1, .text = "alpha", .token_count = 1 },
@@ -642,9 +766,21 @@ test "xo rendering groups a path once and honors byte measurement" {
     const files = [_]SourceFile{.{ .path = "src/a.zig", .lines = &lines, .path_term_hits = 0 }};
     const spans = [_]Span{.{ .file_index = 0, .focus_line_index = 1, .start_line_index = 0, .end_line_index = 2, .score = 2 }};
     const request = cli.XoRequest{ .query = "worker \"events\"\nnext", .paths = undefined, .path_count = 0, .max_bytes = 4096 };
-    const bytes = try render(std.testing.allocator, request, &files, &spans, .{ .files_read = 1, .lines_read = 3, .bytes_read = 25, .candidate_lines = 1 });
+    const bytes = try render(std.testing.allocator, request, &files, &spans, .{ .files_read = 1, .lines_read = 3, .bytes_read = 25, .candidate_lines = 1 }, .{
+        .eligible_spans = spans.len,
+    });
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(std.mem.count(u8, bytes, "src/a.zig") == 1);
     try std.testing.expect(std.mem.indexOf(u8, bytes, "query=\"worker \\\"events\\\"\\nnext\"") != null);
     try std.testing.expect(bytes.len <= request.max_bytes);
+
+    var json_request = request;
+    json_request.format = .json;
+    const json_bytes = try render(std.testing.allocator, json_request, &files, &spans, .{ .files_read = 1, .lines_read = 3, .bytes_read = 25, .candidate_lines = 1 }, .{
+        .eligible_spans = spans.len,
+    });
+    defer std.testing.allocator.free(json_bytes);
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json_bytes, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("ix.xo.v1", parsed.value.object.get("schema").?.string);
 }

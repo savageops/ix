@@ -86,7 +86,8 @@ pub fn main(init: std.process.Init) !void {
         if (err == cli.ParseError.UnsupportedFlag and argv.len > 1 and std.mem.startsWith(u8, argv[1], "-")) {
             try output.writeCompatUnsupportedFlag(stderr, argv[1]);
         } else {
-            try output.writeError(stderr, "invalid_arguments", @errorName(err));
+            const detail = cli.diagnoseParseFailure(argv, err);
+            try output.writeErrorDetail(stderr, "invalid_arguments", @errorName(err), detail.argument, detail.hint);
         }
         try stderr.flush();
         std.process.exit(1);
@@ -194,7 +195,10 @@ pub fn main(init: std.process.Init) !void {
                 var path_index: usize = 0;
                 while (path_index < request.path_count) : (path_index += 1) {
                     windows[window_count] = inspect.windowForPath(init.io, allocator, request, request.paths[path_index]) catch |err| {
-                        try output.writeError(stderr, "inspect_failed", @errorName(err));
+                        if (err == error.IncompatibleBounds)
+                            try output.writeErrorDetail(stderr, "inspect_incompatible_bounds", "range and count selectors cannot be combined", "--range", "use one of --range START:END, --total-count N, or --limit N")
+                        else
+                            try output.writeError(stderr, "inspect_failed", @errorName(err));
                         try stderr.flush();
                         std.process.exit(1);
                     };

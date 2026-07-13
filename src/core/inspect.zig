@@ -135,22 +135,26 @@ pub fn context(io: std.Io, allocator: std.mem.Allocator, request: cli.InspectReq
 pub fn contextReportsFromSearchReport(io: std.Io, allocator: std.mem.Allocator, request: cli.InspectRequest, search_report: search.SearchReport) ![]ContextReport {
     var reports = std.ArrayList(ContextReport).empty;
     errdefer reports.deinit(allocator);
+    var remaining_lines = request.total_count orelse MAX_CONTEXT_LINES;
 
     var hit_index: usize = 0;
-    while (hit_index < search_report.hit_count) {
+    while (hit_index < search_report.hit_count and remaining_lines > 0) {
         const path = search_report.hits[hit_index].path;
         const start = hit_index;
         hit_index += 1;
         while (hit_index < search_report.hit_count and std.mem.eql(u8, search_report.hits[hit_index].path, path)) : (hit_index += 1) {}
 
-        try reports.append(allocator, try contextForSearchHitsPath(
+        const report = try contextForSearchHitsPath(
             io,
             allocator,
             request,
             search_report.expression,
             path,
             search_report.hits[start..hit_index],
-        ));
+            remaining_lines,
+        );
+        remaining_lines -= report.line_count;
+        if (report.line_count != 0) try reports.append(allocator, report);
     }
 
     return reports.toOwnedSlice(allocator);
@@ -308,6 +312,7 @@ pub fn contextForPath(io: std.Io, allocator: std.mem.Allocator, request: cli.Ins
 
     const before = request.before_context orelse request.context orelse 0;
     const after = request.after_context orelse request.context orelse 0;
+    const output_limit = @min(request.total_count orelse MAX_CONTEXT_LINES, MAX_CONTEXT_LINES);
     var index: usize = 0;
     while (index < source_count) : (index += 1) {
         if (!match_lines[index]) continue;
@@ -323,7 +328,7 @@ pub fn contextForPath(io: std.Io, allocator: std.mem.Allocator, request: cli.Ins
             };
             emitted_lines[line_index] = true;
             report.line_count += 1;
-            if (report.line_count >= MAX_CONTEXT_LINES) return report;
+            if (report.line_count >= output_limit) return report;
         }
     }
     return report;
@@ -336,6 +341,7 @@ fn contextForSearchHitsPath(
     expression: []const u8,
     path: []const u8,
     hits: []const search.SearchHit,
+    output_limit: usize,
 ) !ContextReport {
     const report_lines = try allocator.alloc(ContextLine, MAX_CONTEXT_LINES);
     var report = ContextReport{
@@ -388,7 +394,7 @@ fn contextForSearchHitsPath(
         };
         report.line_count += 1;
         last_emitted = line_number;
-        if (report.line_count >= MAX_CONTEXT_LINES) return report;
+        if (report.line_count >= @min(output_limit, MAX_CONTEXT_LINES)) return report;
     }
     return report;
 }
@@ -546,6 +552,12 @@ test "inspect context materializes from search hits across roots" {
     try std.testing.expectEqual(@as(usize, 3), reports[1].line_count);
     try std.testing.expectEqualStrings("match", reports[0].lines[1].role);
     try std.testing.expectEqualStrings("match", reports[1].lines[1].role);
+
+    request.total_count = 4;
+    const bounded = try contextReportsFromSearchReport(io, allocator, request, report);
+    var bounded_lines: usize = 0;
+    for (bounded) |context_report| bounded_lines += context_report.line_count;
+    try std.testing.expectEqual(@as(usize, 4), bounded_lines);
 
     const cache = try cacheContextForSearchReport(io, allocator, request, report);
     const first_page = try contextReportsFromCache(allocator, cache, 1);

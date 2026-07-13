@@ -5,7 +5,7 @@ import { baseBenchEnv, defaultRepoIxPath, DEFAULT_ALTERNATES_EXPRESSION, DEFAULT
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkDecisionGrade, benchmarkEvidenceFailures, benchmarkHostWarningFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, hardestComparableHistoricalLabel, preferHistoricalSelectionSeed, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, assertRepoBinaryFresh, benchmarkEnvSnapshot, binarySnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, interPairSettleMs, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, sleepMs, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, assertRepoBinaryFresh, benchmarkEnvSnapshot, binarySnapshot, buildHistoricalComparisonScore, buildHistoricalGateDiagnostic, buildHistoricalRoundLedger, buildHistoricalScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, interPairSettleMs, IX_STATS_JSON_FLAGS, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, phaseLeakSummaryFromRounds, requireOk, routeParityEvaluation, run, scanIxProcesses, sleepMs, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "historical-speed");
@@ -469,7 +469,7 @@ if (buildFirst) {
 if (!existsSync(repoIx)) throw new Error(`repo IX not found: ${repoIx}`);
 const repoBinaryFreshness = assertRepoBinaryFresh({ root: ROOT, repoIx, label: "repo IX" });
 
-const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)];
+const ixArgs = ["search", expression, corpus, ...IX_STATS_JSON_FLAGS, "--threads", String(threads)];
 const hostBefore = hostSnapshot();
 const hostPreflightFailures = requireStrict ? benchmarkHostWarningFailures({ before: hostBefore }) : [];
 const processBefore = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV, cleanupOwned: true });

@@ -179,6 +179,40 @@ pub const ParseError = error{
     AmbiguousBooleanRegex,
 };
 
+pub const ParseFailureDetail = struct {
+    argument: ?[]const u8 = null,
+    hint: ?[]const u8 = null,
+};
+
+/// Recovers the exact rejected token from the canonical command specification.
+pub fn diagnoseParseFailure(argv: []const []const u8, err: anyerror) ParseFailureDetail {
+    if (err == ParseError.ConflictingOutputFormat) return .{
+        .hint = "choose one output format; --json may combine only with --stats-only",
+    };
+    if (err != ParseError.UnsupportedFlag or argv.len < 2) return .{};
+    const is_search = std.mem.eql(u8, argv[1], "search");
+    const is_matches = std.mem.eql(u8, argv[1], "matches");
+    if (!is_search and !is_matches) return .{ .hint = "run ix help <command> to list accepted options" };
+    var index: usize = 2;
+    while (index < argv.len) : (index += 1) {
+        const argument = argv[index];
+        if (!std.mem.startsWith(u8, argument, "-")) continue;
+        const spec = command_spec.findSearchOption(argument, is_search) orelse return .{
+            .argument = argument,
+            .hint = if (is_search) "run ix help search to list accepted options" else "run ix help matches to list accepted options",
+        };
+        if (std.mem.eql(u8, argument, "--format") and index + 1 < argv.len) {
+            const value = argv[index + 1];
+            if (command_spec.parseFormat(value) == null) return .{
+                .argument = value,
+                .hint = "use --format with a value listed by ix help search",
+            };
+        }
+        if (spec.takes_value and index + 1 < argv.len) index += 1;
+    }
+    return .{ .hint = "run ix help <command> to review accepted option combinations" };
+}
+
 pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !Invocation {
     if (argv.len <= 1) {
         return .{ .command = .{ .help = .top } };
@@ -1062,6 +1096,18 @@ test "search accepts the shared records and total-count vocabulary" {
     const request = (try parseInvocation(std.testing.allocator, &argv)).command.search;
     try std.testing.expectEqual(OutputFormat.text, request.output_format);
     try std.testing.expectEqual(@as(?usize, 300), request.max_hits);
+}
+
+test "search parse diagnostics identify rejected flags and format values" {
+    const unknown = [_][]const u8{ "ix-zig", "search", "lit:needle", "src", "--invented" };
+    const unknown_detail = diagnoseParseFailure(&unknown, ParseError.UnsupportedFlag);
+    try std.testing.expectEqualStrings("--invented", unknown_detail.argument.?);
+    try std.testing.expect(std.mem.indexOf(u8, unknown_detail.hint.?, "help search") != null);
+
+    const invalid_format = [_][]const u8{ "ix-zig", "search", "lit:needle", "src", "--format", "nonsense" };
+    const format_detail = diagnoseParseFailure(&invalid_format, ParseError.UnsupportedFlag);
+    try std.testing.expectEqualStrings("nonsense", format_detail.argument.?);
+    try std.testing.expect(std.mem.indexOf(u8, format_detail.hint.?, "--format") != null);
 }
 
 test "legacy json stats composition preserves raw telemetry without hit collection" {

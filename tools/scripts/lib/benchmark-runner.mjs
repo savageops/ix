@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { classifyHotspot, computeRatio, computeSpeedupPct, summarizeSeries } from "./metrics.mjs";
-import { interPairSettleMs, pairOrderSummary, sleepMs } from "./speed-compare-utils.mjs";
+import { interPairSettleMs, IX_STATS_JSON_FLAGS, pairOrderSummary, sleepMs } from "./speed-compare-utils.mjs";
 import { benchmarkHostNoiseConfig } from "./benchmark-config.mjs";
 import { benchmarkIsolationPlan, defaultBenchmarkIsolationResult, mergedEnv, runWithWindowsBenchmarkIsolation } from "./benchmark-isolation.mjs";
 
@@ -188,8 +188,7 @@ function buildIxSearchArgs({ expression, corpus, threads }) {
     "search",
     expression,
     corpus,
-    "--json",
-    "--stats-only",
+    ...IX_STATS_JSON_FLAGS,
   ];
 
   if (typeof threads === "number" && Number.isFinite(threads) && threads > 0) {

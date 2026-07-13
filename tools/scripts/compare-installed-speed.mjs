@@ -5,7 +5,7 @@ import { baseBenchEnv, defaultInstalledIxPath, defaultRepoIxPath, DEFAULT_ALTERN
 import { hostSnapshot } from "./lib/benchmark-runner.mjs";
 import { benchmarkDecisionGrade, benchmarkEvidenceFailures, benchmarkHostWarningFailures, evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
-import { acquireBenchmarkLock, assertRepoBinaryFresh, benchmarkEnvSnapshot, binarySnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, interPairSettleMs, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, sleepMs, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
+import { acquireBenchmarkLock, assertRepoBinaryFresh, benchmarkEnvSnapshot, binarySnapshot, buildInstalledComparisonScore, buildInstalledRoundLedger, buildInstalledScorecard, buildRoundLedgerSummary, dependencyTreeSnapshot, effectiveImprovementTargetPct, identityControlFailures, interPairSettleMs, IX_STATS_JSON_FLAGS, measureIxOnce, measureRipgrepBracketed, measureRipgrepMmapComparison, measureSameBinaryIdentityControl, orderStratifiedEngineStats, pairedEngineStats, pairOrderSummary, requireOk, routeParityEvaluation, run, scanIxProcesses, sleepMs, summarizeIxRuns } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const REPORT_DIR = path.join(ROOT, "tools", "reports", "manual-speed-compare");
@@ -98,7 +98,7 @@ function nativeInstalledBaselinePath(filePath) {
 }
 
 function measurePairedIx() {
-  const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)];
+  const ixArgs = ["search", expression, corpus, ...IX_STATS_JSON_FLAGS, "--threads", String(threads)];
   const lanes = { installed: [], repo: [] };
   const pairOrder = [];
   for (let pair = 0; pair < samples; pair += 1) {
@@ -325,7 +325,7 @@ const repoBinaryFreshness = assertRepoBinaryFresh({ root: ROOT, repoIx, label: "
 const hostBefore = hostSnapshot();
 const hostPreflightFailures = requireStrict ? benchmarkHostWarningFailures({ before: hostBefore }) : [];
 const processBefore = scanIxProcesses({ ixBinary: repoIx, env: BENCH_ENV, cleanupOwned: true });
-const ixArgs = ["search", expression, corpus, "--json", "--stats-only", "--threads", String(threads)];
+const ixArgs = ["search", expression, corpus, ...IX_STATS_JSON_FLAGS, "--threads", String(threads)];
 let strictIdentityPreflight = null;
 if (requireStrict && identityControlEnabled && identityControlSamples > 0) {
   strictIdentityPreflight = measureSameBinaryIdentityControl({

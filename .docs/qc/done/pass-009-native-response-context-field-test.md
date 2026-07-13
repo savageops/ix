@@ -71,7 +71,7 @@ Promote commit `9e62dbe1`, preserve the displaced native binary, then test the i
 - [x] Warm/cold mutation parity passes against installed `ix` (1,000 -> 101 files, identical evidence).
 - [x] Cross-platform compile matrix was green before promotion (Linux/Darwin, x86_64/AArch64).
 - [x] Context usefulness was judged from native-install, resource-policy, CLI-owner, and platform-watcher retrieval tasks.
-- [ ] Limits remain exact: search and `xo` pass; inspect expression context overshot `total-count 30` by one.
+- [x] Limits remain exact: inspect now shares one remaining-line budget across every context report; the original expression/context probe emits exactly 30 lines.
 - [x] Strong points, weak points, defaults, and removal candidates have transcript evidence.
 
 ## Priority Actions
@@ -92,10 +92,22 @@ Promote commit `9e62dbe1`, preserve the displaced native binary, then test the i
 - Formerly failing records/total-count command: pass after final promotion.
 - Full Debug suite: pass after parser repair.
 - Targeted ReleaseSmall JSON/stats regression: pass.
-- Full ReleaseSmall suite: inconclusive in the final round; two attempts exceeded 120/180 seconds without emitting a failure, while the same suite passed before the parser-only repair. This is recorded as a test-runner/process-lifecycle stability debt, not represented as green.
+- Full ReleaseSmall suite: pass; 522/522 tests completed in 214.9 seconds. The former 120/180-second timeouts were compile-duration assumptions, not test-runner failure.
 - Native/source SHA-256 identity: pass.
 - Old rollback executable remains untouched and independently hash-addressable.
 
 ## Disposition
 
-Pass 009 remains active. Native promotion and the critical benchmark-script compatibility repair are complete. Closure is blocked by the inspect hard-cap ambiguity, generic argument diagnostics, natural-language `xo` ranking misses, and the final full ReleaseSmall timeout. These belong to this response/context owner; creating another QC file would split the evidence.
+Pass 009 is complete. Exact inspect limits, argument provenance, parser-owned help, `xo` intent normalization/proximity/deduplication, explicit projection termination, format guidance, benchmark serialization ownership, and transaction-like native promotion now have direct tests or live proof.
+
+## Remediation Receipt
+
+- Inspect applies one hard `total-count` budget across files and fragmented context windows; unit and native probes both prove the ceiling.
+- Error v1 retains its stable envelope while adding `argument` and `hint`; incompatible inspect bounds use a specific code and recovery syntax.
+- Search help is generated from the parser-owned option table. `text` is explicitly an alias of `records`; v3 and JSON-compact remain the recommended agent/program surfaces.
+- `xo` adds weighted intent aliases, neighborhood convergence, branch/body preference, duplicate-helper rejection, and `eligible/remaining/reason/selection_limit_reached` projection truth.
+- Benchmark scripts import one `IX_STATS_JSON_FLAGS` owner rather than independently reconstructing the raw-JSON/no-hit-retention wire contract.
+- Native sync verifies source freshness, the full ReleaseSmall gate when building, v3 serialization, warm/cold evidence parity, staged hash identity, `.old.ddmmyy[.N].exe` rollback rotation, installed smoke, and rollback-on-failure.
+- Debug suite passes. Full ReleaseSmall passes 522/522. A real isolated install transaction preserved exact hashes on both aliases.
+- A final tight-budget native probe caught and repaired a missing `spans` array closure in `xo` JSON. The serializer now has a real JSON parser regression, and the 2,000-byte installed response parses with 1 byte to spare.
+- Final native promotion installed SHA-256 `8A65178047A679F6A051BC9FE342BC9D04F42EE710AE5DD168EEE3180C18FD48` to `ix.exe` and `iex.exe`; displaced binaries remain independently hash-addressable under `.old.130726[.N].exe` names.

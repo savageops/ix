@@ -10,6 +10,9 @@ export { pairedAttributionLedgerFields, pairedEngineStats, phaseLeakSummaryFromR
 export { identityNoiseDiagnostics } from "./benchmark-noise-diagnostics.mjs";
 
 export const DEFAULT_ALTERNATES_EXPR = "re:(?i)(ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT)";
+// One owner preserves the benchmark telemetry wire contract: raw JSON serialization
+// with hit retention disabled. Historical binaries may still require a capability probe.
+export const IX_STATS_JSON_FLAGS = Object.freeze(["--json", "--stats-only"]);
 const DEFAULT_BENCHMARK_LOCK_DIR = path.join(os.tmpdir(), "ix-zig-benchmark.lock");
 const DEFAULT_STALE_BENCHMARK_LOCK_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_PENDING_BENCHMARK_LOCK_OWNER_GRACE_MS = 5 * 1000;
