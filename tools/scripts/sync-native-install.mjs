@@ -8,10 +8,12 @@ import { assertRepoBinaryFresh } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const DEFAULT_REPO_IX = path.join(ROOT, "zig-out", "bin", "ix-zig.exe");
-const DEFAULT_INSTALL_DIR = path.join(os.homedir(), "AppData", "ix");
-const LEGACY_INSTALL_DIR = path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin");
+const DEFAULT_INSTALL_DIR = path.join(os.homedir(), "AppData", "Local", "ix");
+const LEGACY_INSTALL_DIRS = [
+  path.join(os.homedir(), "AppData", "ix"),
+  path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin"),
+];
 const DEFAULT_STATE_DIR = path.join(os.homedir(), ".ix");
-const LEGACY_STATE_DIR = path.join(os.homedir(), "AppData", "Local", "ix");
 
 const args = process.argv.slice(2);
 if (args.includes("--help") || args.includes("-h")) {
@@ -24,7 +26,7 @@ Options:
   --build                 Run tests and build repo IX ReleaseSmall before syncing.
   --repo-ix <path>        Repo IX binary. Default: zig-out/bin/ix-zig.exe.
   --install-dir <path>    Native install directory.
-                          Default: ~/AppData/ix.
+                          Default: ~/AppData/Local/ix.
   --dry-run               Print planned actions without copying files.
   --help, -h              Print this help.
 `);

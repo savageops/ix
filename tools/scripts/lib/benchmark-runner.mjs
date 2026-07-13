@@ -20,9 +20,9 @@ const DEFAULT_EXPR = "lit:ERROR && lit:timeout";
 /// sub-millisecond cache-HIT path. Used by the --clear-warm-cache benchmark
 /// mode to measure warm-MISS optimizations.
 function clearWarmQueryCache() {
-  const localAppData = process.env.LOCALAPPDATA || process.env.HOME || "";
-  if (!localAppData) return;
-  const ixStateDir = process.env.IX_STATE_DIR || path.join(localAppData, "ix");
+  const home = process.env.USERPROFILE || process.env.HOME || "";
+  if (!home) return;
+  const ixStateDir = process.env.IX_STATE_DIR || path.join(home, ".ix");
   const rootsDir = path.join(ixStateDir, "index", "roots");
   if (!existsSync(rootsDir)) return;
   for (const entry of readdirSync(rootsDir)) {
