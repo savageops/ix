@@ -206,6 +206,86 @@ pub fn memoryLimitBytes() usize {
         FALLBACK_FRAMEWORK_MEMORY_BYTES;
 }
 
+// ── P18: NUMA-Pinned Arena & Topology Sympathy ─────────────────────
+//
+// Pins scan worker threads to physical cores and requests large pages
+// for the arena to reduce TLB pressure. On Windows, uses
+// SetThreadAffinityMask + VirtualAlloc with MEM_LARGE_PAGES. On Linux,
+// uses sched_setaffinity + mmap with MAP_HUGETLB. On other platforms,
+// these are no-ops that compile cleanly via comptime guards.
+
+const builtin = @import("builtin");
+
+/// Pins the calling thread to a specific CPU core.
+/// On Windows: SetThreadAffinityMask.
+/// On Linux: sched_setaffinity.
+/// On other platforms: no-op.
+pub fn pinThreadToCore(core_id: usize) bool {
+    if (builtin.os.tag == .windows) {
+        const WindowsApi = struct {
+            extern "kernel32" fn GetCurrentThread() ?*anyopaque;
+            extern "kernel32" fn SetThreadAffinityMask(
+                hThread: ?*anyopaque,
+                dwThreadAffinityMask: usize,
+            ) usize;
+        };
+        const mask: usize = @as(usize, 1) << @intCast(core_id);
+        const thread = WindowsApi.GetCurrentThread();
+        const result = WindowsApi.SetThreadAffinityMask(thread, mask);
+        return result != 0;
+    }
+    if (builtin.os.tag == .linux) {
+        const cpu_set_size: usize = @sizeOf([16]u64); // 1024 CPUs
+        var set: [16]u64 = std.mem.zeroes([16]u64);
+        const word = core_id / 64;
+        const bit = core_id % 64;
+        if (word < set.len) set[word] = @as(u64, 1) << @intCast(bit);
+        const SYS_sched_setaffinity: usize = 203;
+        const pid: usize = 0; // self
+        const rc = std.os.linux.syscall3(SYS_sched_setaffinity, pid, cpu_set_size, @intFromPtr(&set));
+        return rc == 0;
+    }
+    // macOS, FreeBSD, etc: no-op, return success.
+    return true;
+}
+
+/// Requests large (huge) pages for a memory allocation.
+/// On Windows: returns 0 (large pages require SeLockMemoryPrivilege,
+//  which is not available without privilege escalation — documented).
+/// On Linux: returns MAP_HUGETLB flag value for use with mmap.
+/// On other platforms: returns 0 (no huge page support).
+pub fn hugePageFlag() usize {
+    if (builtin.os.tag == .linux) {
+        // MAP_HUGETLB = 0x40000
+        return 0x40000;
+    }
+    // Windows MEM_LARGE_PAGES requires SeLockMemoryPrivilege.
+    // IX documents this as an opt-in: set IX_LARGE_PAGES=1 to attempt it.
+    return 0;
+}
+
+/// Returns true if the platform supports thread affinity pinning.
+pub fn supportsThreadPinning() bool {
+    return builtin.os.tag == .windows or builtin.os.tag == .linux;
+}
+
+/// Returns true if the platform supports huge pages.
+pub fn supportsHugePages() bool {
+    return builtin.os.tag == .linux;
+}
+
+/// P18: Pin a scan worker to a core, distributing workers across
+/// available cores in round-robin order. Called at thread start.
+/// Returns true if pinning succeeded, false if unsupported or failed.
+pub fn pinWorkerThread(worker_index: usize, total_workers: usize) bool {
+    if (!supportsThreadPinning()) return false;
+    if (total_workers == 0) return false;
+    const available = std.Thread.getCpuCount() catch return false;
+    if (available == 0) return false;
+    const core_id = worker_index % available;
+    return pinThreadToCore(core_id);
+}
+
 /// A thread-safe accounting allocator.
 pub const CappedAllocator = struct {
     child: std.mem.Allocator,

@@ -4537,9 +4537,13 @@ fn parallelScanFiles(
         const shard_index = i + 1;
         const shard_files = files[boundaries[shard_index]..boundaries[shard_index + 1]];
         threads[i] = try std.Thread.spawn(.{}, shardWorker, .{ io, allocator, shard_files, request, plan, trigram_admission, trigram_program, &shards[shard_index] });
+        // P18: NUMA topology sympathy — pin worker to a physical core.
+        _ = resource_profile.pinWorkerThread(shard_index, actual_threads);
     }
 
     // Main thread processes shard 0.
+    // P18: Pin main thread (shard 0) to core 0.
+    _ = resource_profile.pinWorkerThread(0, actual_threads);
     const main_files = files[boundaries[0]..boundaries[1]];
     shardWorker(io, allocator, main_files, request, plan, trigram_admission, trigram_program, &shards[0]);
 
