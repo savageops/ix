@@ -242,6 +242,8 @@ pub const ScopeTracker = struct {
     name_len: usize = 0,
     decl_line: usize = 0,
     brace_depth: usize = 0,
+    last_line_was_blank: bool = false,
+    paragraph_start: usize = 0,
 
     pub fn currentScope(self: *const ScopeTracker) struct { name: []const u8, line: usize } {
         return .{ .name = self.name[0..self.name_len], .line = self.decl_line };
@@ -249,6 +251,14 @@ pub const ScopeTracker = struct {
 
     /// Process one line: update brace depth and detect scope entry/exit.
     pub fn processLine(self: *ScopeTracker, line: []const u8, line_number: usize) void {
+        // P22: Paragraph boundary detection — a blank line starts a new paragraph.
+        const is_blank = std.mem.trim(u8, line, " \t\r\n").len == 0;
+        if (is_blank and !self.last_line_was_blank) {
+            // First blank line after content — new paragraph starts at next line.
+            self.paragraph_start = line_number;
+        }
+        self.last_line_was_blank = is_blank;
+
         // Detect function/type/test declarations at brace_depth 0 or 1.
         if (self.brace_depth <= 1) {
             if (detectScopeName(line)) |name| {
@@ -335,6 +345,7 @@ fn shouldDedupByRecord(request: cli.SearchRequest, last_scope_line: *const usize
     return switch (request.record) {
         .line => false,
         .block, .section => scope_line > 0 and scope_line == last_scope_line.*,
+        .paragraph => scope_line > 0 and scope_line == last_scope_line.*,
     };
 }
 

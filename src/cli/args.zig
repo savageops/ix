@@ -78,6 +78,7 @@ pub const RecordGranularity = enum {
     line,
     block,
     section,
+    paragraph,
 };
 
 /// Adjacent Operations Vector output modes (spec point 29).
@@ -555,6 +556,8 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
                 request.record = .block;
             } else if (std.mem.eql(u8, args[index], "section")) {
                 request.record = .section;
+            } else if (std.mem.eql(u8, args[index], "paragraph")) {
+                request.record = .paragraph;
             } else return ParseError.UnsupportedFlag;
         } else return ParseError.UnsupportedFlag;
     }

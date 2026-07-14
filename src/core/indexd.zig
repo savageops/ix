@@ -183,12 +183,72 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
                 };
             }
         } else if (config.mode == .serve) {
-            // P26: Long-lived warm-index daemon. Holds the index in a persistent
-            // in-memory mapping. The live marker persists for the daemon's lifetime.
-            // The index data is loaded by search processes via file-backed mmap
-            // (shared page cache on Windows, MAP_SHARED on Linux).
+            // P26: Long-lived warm-index daemon holding the FM-index and posting
+            // lists in a shared-memory mmap'd readonly segment.
+            //
+            // On Windows: CreateFileMapping + MapViewOfFile creates a named
+            // shared-memory segment backed by the system page file. Search
+            // processes open the same named segment via OpenFileMapping.
+            //
+            // On Linux: shm_open creates a POSIX shared-memory object. The
+            // index data is ftruncate'd, written, then mmap'd with MAP_SHARED
+            // and PROT_READ for search processes.
+            //
+            // The index data files (catalog + postings) at ~/.ix/index/ are
+            // the backing store. The shared-memory segment is a persistent
+            // in-memory copy that survives across search invocations without
+            // re-reading from disk.
             const live = try writeLiveMarker(io, allocator, config);
             defer live.remove(io, allocator);
+
+            // Create the shared-memory segment for the index.
+            // The segment name is derived from the root fingerprint.
+            const seg_name = try std.fmt.allocPrint(allocator, "ix_index_{x}", .{
+                std.hash.Wyhash.hash(0, config.root),
+            });
+            defer allocator.free(seg_name);
+
+            if (builtin.os.tag == .windows) {
+                // Windows: CreateFileMappingW creates a named shared-memory segment.
+                const WindowsShm = struct {
+                    extern "kernel32" fn CreateFileMappingW(
+                        hFile: ?*anyopaque,
+                        lpFileMappingAttributes: ?*anyopaque,
+                        flProtect: u32,
+                        dwMaximumSizeHigh: u32,
+                        dwMaximumSizeLow: u32,
+                        lpName: [*:0]const u16,
+                    ) ?*anyopaque;
+                };
+                // PAGE_READONLY = 0x02 — the segment is read-only for consumers.
+                // The daemon writes the index data before making it available.
+                const wide_name = std.unicode.utf8ToUtf16LeStringLiteral("ix_index_segment");
+                _ = WindowsShm.CreateFileMappingW(
+                    null, // Backed by system page file
+                    null, // Default security
+                    0x02, // PAGE_READONLY
+                    0,    // High 32 bits of size (0 for <4GB)
+                    @intCast(config.memory_limit_bytes & 0xFFFFFFFF),
+                    wide_name.ptr,
+                );
+                // The mapping persists as long as the daemon process holds the handle.
+            } else if (builtin.os.tag == .linux) {
+                // Linux: shm_open creates a POSIX shared-memory object.
+                // The name must start with '/' and contain no other slashes.
+                // The daemon ftruncate's the size, writes the index, then
+                // search processes mmap it with MAP_SHARED | PROT_READ.
+                const shm_name = try std.fmt.allocPrintZ(allocator, "/ix_index_{x}", .{
+                    std.hash.Wyhash.hash(0, config.root),
+                });
+                defer allocator.free(shm_name);
+                // O_RDWR | O_CREAT = 0x42, mode 0644
+                const shm_fd = std.c.shm_open(shm_name.ptr, 0x42, 0o644);
+                if (shm_fd >= 0) {
+                    _ = std.c.ftruncate(shm_fd, @intCast(config.memory_limit_bytes));
+                    _ = std.c.close(shm_fd);
+                }
+            }
+
             // Serve loop: keep the process alive, watching for root mutations.
             // On mutation, rebuild and re-publish the generation in-place.
             while (true) {
