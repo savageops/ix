@@ -7,6 +7,7 @@ pub const MAX_XO_SPANS = 128;
 
 pub const CommandTag = enum {
     help,
+    version,
     search,
     matches,
     inspect,
@@ -155,6 +156,7 @@ pub const XoRequest = struct {
 
 pub const Command = union(CommandTag) {
     help: HelpTopic,
+    version: void,
     search: SearchRequest,
     matches: SearchRequest,
     inspect: InspectRequest,
@@ -226,6 +228,9 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
     if (std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h") or std.mem.eql(u8, first, "help")) {
         if (argv.len >= 3) return .{ .command = .{ .help = helpTopic(argv[2]) orelse .top } };
         return .{ .command = .{ .help = .top } };
+    }
+    if (std.mem.eql(u8, first, "--version") or std.mem.eql(u8, first, "-V") or std.mem.eql(u8, first, "version")) {
+        return .{ .command = .{ .version = {} } };
     }
     if (std.mem.eql(u8, first, "search")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .search } };

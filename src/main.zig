@@ -95,6 +95,10 @@ pub fn main(init: std.process.Init) !void {
 
     switch (invocation.command) {
         .help => |topic| try output.writeHelp(stdout, topic),
+        .version => {
+            try stdout.writeAll("ix 2.0.0\n");
+            try stdout.flush();
+        },
         .search => |request| {
             var effective_request = request;
             effective_request.nexus_disabled = nexusDisabled(init);
