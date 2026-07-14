@@ -15,6 +15,7 @@ pub const CommandTag = enum {
     process,
     similar,
     xo,
+    mcp,
     nexus,
     indexd,
 };
@@ -164,8 +165,17 @@ pub const Command = union(CommandTag) {
     process: ProcessRequest,
     similar: SimilarRequest,
     xo: XoRequest,
+    mcp: McpRequest,
     nexus: SearchRequest,
     indexd: IndexdRequest,
+};
+
+pub const McpRequest = struct {
+    transport: McpTransport = .stdio,
+};
+
+pub const McpTransport = enum {
+    stdio,
 };
 
 pub const Invocation = struct {
@@ -260,6 +270,9 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
     if (std.mem.eql(u8, first, "xo")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .xo } };
         return .{ .command = .{ .xo = try parseXo(argv[2..]) } };
+    }
+    if (std.mem.eql(u8, first, "mcp")) {
+        return .{ .command = .{ .mcp = .{} } };
     }
     if (std.mem.eql(u8, first, "__ix_nexus")) {
         var request = try parseSearch(argv[2..]);

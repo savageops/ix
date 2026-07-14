@@ -7,6 +7,7 @@ const output = @import("cli/output.zig");
 const expr = @import("core/expr.zig");
 const indexd = @import("core/indexd.zig");
 const inspect = @import("core/inspect.zig");
+const mcp = @import("core/mcp.zig");
 const process_tool = @import("core/process_tool.zig");
 const pcre_regex = @import("core/pcre_regex.zig");
 const search = @import("core/search.zig");
@@ -98,6 +99,9 @@ pub fn main(init: std.process.Init) !void {
         .version => {
             try stdout.writeAll("ix 2.0.0\n");
             try stdout.flush();
+        },
+        .mcp => {
+            try mcp.run(init.io, allocator);
         },
         .search => |request| {
             var effective_request = request;
