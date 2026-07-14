@@ -149,14 +149,15 @@ const IoUringImpl = struct {
         const entries: u32 = 32;
 
         // io_uring_setup syscall (number 425 on x86_64)
-        const fd_raw = std.os.linux.syscall2(425, entries, @intFromPtr(&params));
+        const SYS_io_uring_setup: usize = 425;
+        const fd_raw = std.os.linux.syscall2(SYS_io_uring_setup, entries, @intFromPtr(&params));
         const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
         var self = IoUringImpl{ .fd = fd, .sqpoll_enabled = true };
 
         if (fd < 0) {
             // SQPOLL requires CAP_SYS_NICE — fall back without it
             params = std.mem.zeroes(io_uring_params);
-            const fd2_raw = std.os.linux.syscall2(425, entries, @intFromPtr(&params));
+            const fd2_raw = std.os.linux.syscall2(SYS_io_uring_setup, entries, @intFromPtr(&params));
             const fd2: i32 = @intCast(@as(isize, @bitCast(fd2_raw)));
             if (fd2 < 0) return error.IoUringSetupFailed;
             self.fd = fd2;
@@ -287,7 +288,7 @@ const IoUringImpl = struct {
         // io_uring_register(fd, IORING_REGISTER_BUFFERS, iovecs, nr_bufs)
         // Syscall number 427 on x86_64
         const ret = std.os.linux.syscall4(
-            427, // __NR_io_uring_register
+            @as(usize, 427), // __NR_io_uring_register
             @intCast(self.fd),
             IORING_REGISTER_BUFFERS,
             @intFromPtr(&iovecs),
@@ -355,7 +356,7 @@ const IoUringImpl = struct {
         // If SQPOLL is not enabled, we need to call io_uring_enter
         if (!self.sqpoll_enabled) {
             const enter_fd: usize = @intCast(self.fd);
-            _ = std.os.linux.syscall4(426, enter_fd, 0, 0, 0);
+            _ = std.os.linux.syscall4(@as(usize, 426), enter_fd, 0, 0, 0);
         }
 
         return sqe_index;
@@ -395,7 +396,7 @@ const IoUringImpl = struct {
             // If not SQPOLL, we should call io_uring_enter with GETEVENTS.
             if (!self.sqpoll_enabled) {
                 const enter_fd: usize = @intCast(self.fd);
-                _ = std.os.linux.syscall4(426, enter_fd, 1, IORING_ENTER_GETEVENTS, 0);
+                _ = std.os.linux.syscall4(@as(usize, 426), enter_fd, 1, IORING_ENTER_GETEVENTS, 0);
             }
         }
     }

@@ -168,6 +168,9 @@ fn createIxModule(
             "-std=c11",
             "-O2",
             "-DNDEBUG",
+            "-D_POSIX_C_SOURCE=200809L",
+            "-Wno-implicit-function-declaration",
+            "-Wno-int-conversion",
         },
     });
     root_module.addIncludePath(b.path(".refs/tree-sitter/lib"));
