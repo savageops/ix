@@ -34,6 +34,24 @@ jobs:
         with:
           version: 0.16.0
 
+      - name: Download vendored dependencies
+        shell: bash
+        run: |
+          # StringZilla
+          mkdir -p .refs/stringzilla/include
+          curl -sL https://raw.githubusercontent.com/ashvardanian/StringZilla/v4.6.0/include/stringzilla/stringzilla.h -o .refs/stringzilla/include/stringzilla.h
+          curl -sL https://raw.githubusercontent.com/ashvardanian/StringZilla/v4.6.0/include/stringzilla/stringzilla.hpp -o .refs/stringzilla/include/stringzilla.hpp || true
+          # PCRE2 10.44
+          mkdir -p .refs/pcre2/src
+          for f in pcre2_auto_possess pcre2_chartables pcre2_chkdint pcre2_compile pcre2_config pcre2_context pcre2_convert pcre2_dfa_match pcre2_error pcre2_extuni pcre2_find_bracket pcre2_jit_compile pcre2_maketables pcre2_match pcre2_match_data pcre2_newline pcre2_ord2utf pcre2_pattern_info pcre2_script_run pcre2_serialize pcre2_string_utils pcre2_study pcre2_substitute pcre2_substring pcre2_tables pcre2_ucd pcre2_valid_utf pcre2_xclass sljit sljitConfigCCallback sljitConfigInternal sljitLir sljitNativeARM_32 sljitNativeARM_64 sljitNativeX86_32 sljitNativeX86_64; do
+            curl -sL "https://raw.githubusercontent.com/PCRE2Project/pcre2/pcre2-10.44/src/${f}.c" -o ".refs/pcre2/src/${f}.c" 2>/dev/null
+            curl -sL "https://raw.githubusercontent.com/PCRE2Project/pcre2/pcre2-10.44/src/${f}.h" -o ".refs/pcre2/src/${f}.h" 2>/dev/null
+          done
+          curl -sL "https://raw.githubusercontent.com/PCRE2Project/pcre2/pcre2-10.44/src/pcre2.h" -o ".refs/pcre2/src/pcre2.h"
+          curl -sL "https://raw.githubusercontent.com/PCRE2Project/pcre2/pcre2-10.44/src/pcre2_internal.h" -o ".refs/pcre2/src/pcre2_internal.h"
+          curl -sL "https://raw.githubusercontent.com/PCRE2Project/pcre2/pcre2-10.44/src/config.h" -o ".refs/pcre2/src/config.h"
+          echo "Downloaded PCRE2 + StringZilla dependencies"
+
       - name: Build
         run: zig build -Doptimize=ReleaseFast
 
