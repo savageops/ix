@@ -2,7 +2,7 @@
 
 # IX
 
-**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Warm-index foreground admission. BM25-ranked agent context. Fisheye-focused output. Thread-sharded execution. Exact-verified output.**
+**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Warm-index foreground admission. BM25 degree-of-interest context. Furnas fisheye match lens. Thread-sharded execution. Exact-verified output.**
 
 *AVX2 SIMD literal scan · Boolean predicate algebra · Generation-pinned warm index · Arena-allocated pipeline · Vendored C kernels compiled into one binary*
 
@@ -165,7 +165,7 @@ IX_INDEX=1 ix.exe "lit:search_term" "/path/to/corpus" --json
 
 Set `IX_INDEX=1` (or `true`/`on`) to enable foreground warm-index admission. The index lives at `~/.ix/index/` and persists across invocations. `~/.ix/` is the single owner for mutable IX state, including future `config.json` and `auth.json` contracts; the replaceable executable never owns user state. Rebuild after large corpus changes.
 
-Warm postings are not a flat list. Validated segments carry block metadata and a max-postings proof so whole blocks that cannot contain a surviving FileId are discarded before decompression. Generation pins, tombstones, and reader protection keep that pruning safe while compaction happens around active searches.
+Warm postings are not a flat list. Validated segments carry block metadata and a max-postings proof; blocks that cannot contain a surviving FileId are discarded before decompression. Generation pins, tombstones, and reader protection keep the negative proof safe while compaction moves around active readers.
 
 > The index rejects candidates. It never creates matches. The exact verifier confirms every emitted result.
 
@@ -175,25 +175,25 @@ Warm postings are not a flat list. Validated segments carry block metadata and a
 
 ## Agent Context Lane
 
-Search tells you where a term exists. `xo` answers the harder question: **which small pieces of a codebase are worth reading next?** It reads a bounded corpus, removes natural-language glue, adds a few code-vocabulary aliases, and scores source lines with BM25. A small path and structural prior breaks lexical ties without pretending to be semantic retrieval.
+`xo` is the context-selection lane. It does not pretend that a phrase search is understanding; it compiles a bounded degree-of-interest field over source lines. Natural-language glue is removed, code-vocabulary aliases are admitted, and standard BM25 ranks the surviving lines. Path and structural priors break lexical ties; they never masquerade as semantic retrieval.
 
-The winning lines become degree-of-interest focus points. `xo` expands exact neighboring source around those points until the byte budget or span cap is reached, then emits the same bounded grouped narrative or JSON projection every time. It skips hidden, generated, binary, and oversize material with visible coverage counters, so a compact answer never disguises what was not read.
+The highest-scoring lines become focus points. `xo` expands exact neighboring source around them until the byte budget or span cap closes, then emits a bounded grouped narrative or JSON projection with coverage and omission state intact. Hidden, generated, binary, and oversize material is skipped explicitly; compactness never becomes a completion costume.
 
 ```sh
-# Let the context lane choose useful spans; no fixed line range required
+# Let the context lane choose the highest-interest source spans; no guessed range required
 ix xo "agentSimulation code with system administration ENV_VAR and a function for worker events" src --max-bytes 8000
 
-# Stable machine projection for a follow-up tool
+# Stable machine projection for a follow-up verifier
 ix xo "worker event lifecycle" src --format json --max-spans 8
 ```
 
-This is intentionally separate from exact search. `xo` is a bounded reading lens, not a match oracle; use `ix search` when every hit must be verified.
+`xo` is a bounded reading lens, not a match oracle. Use `ix search` when every hit must be exact-verified. The Furnas fisheye lens belongs to lossy search previews (`--agent`, v1/v2/v3); `xo` and `search --context` preserve exact source evidence.
 
 ## Framework Resource Ceiling
 
-IX applies one framework-wide accounting allocator and worker ceiling across search, warm-index maintenance, semantic ranking, and context assembly. The default is **5% of detected physical memory and 5% of available threads**, not 5% per feature. `~/.ix/config.json` owns persistent overrides; `IX_MEMORY_PERCENT` and `IX_THREAD_PERCENT` override them for a run.
+IX applies one framework-wide accounting allocator and worker ceiling across search, warm-index maintenance, semantic ranking, and context assembly. The default is **5% of detected physical memory and 5% of available threads** — not 5% per lane. `~/.ix/config.json` owns persistent overrides; `IX_MEMORY_PERCENT` and `IX_THREAD_PERCENT` override them for a run.
 
-The limit is part of the product contract: if a bounded lane cannot fit a complete result, IX reports the exact refusal instead of quietly exceeding the budget or returning a pretend-complete answer.
+The ceiling is part of the product contract. If a bounded lane cannot fit a complete result, IX reports the exact refusal; it does not quietly exceed the owner budget or return a pretend-complete projection.
 
 ---
 
