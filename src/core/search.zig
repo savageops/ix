@@ -96,6 +96,104 @@ const FM_INDEX_ADMISSION_MAX_BYTES: usize = 16 * 1024; // Max file size for in-m
 /// takes the PEB lock. Checked once per thread, cached forever.
 threadlocal var fm_index_admission_cached: bool = false;
 threadlocal var fm_index_admission_checked: bool = false;
+
+/// Maximum scope name length (function/symbol name stored inline).
+const SCOPE_NAME_MAX: usize = 128;
+
+/// Lightweight per-file scope tracker. Maintains brace depth and the enclosing
+/// function/test/type name by scanning for declaration keywords. Zero allocation
+/// — the scope name is stored in a stack buffer. Does not require a parser;
+/// uses keyword detection + brace counting, which is reliable for C-family
+/// languages (C, C++, Zig, Rust, Java, Go, JavaScript, TypeScript).
+pub const ScopeTracker = struct {
+    name: [SCOPE_NAME_MAX]u8 = undefined,
+    name_len: usize = 0,
+    decl_line: usize = 0,
+    brace_depth: usize = 0,
+
+    pub fn currentScope(self: *const ScopeTracker) struct { name: []const u8, line: usize } {
+        return .{ .name = self.name[0..self.name_len], .line = self.decl_line };
+    }
+
+    /// Process one line: update brace depth and detect scope entry/exit.
+    pub fn processLine(self: *ScopeTracker, line: []const u8, line_number: usize) void {
+        // Detect function/type/test declarations at brace_depth 0 or 1.
+        if (self.brace_depth <= 1) {
+            if (detectScopeName(line)) |name| {
+                if (name.len > 0 and name.len <= SCOPE_NAME_MAX) {
+                    @memcpy(self.name[0..name.len], name);
+                    self.name_len = name.len;
+                    self.decl_line = line_number;
+                }
+            }
+        }
+        // Update brace depth from this line.
+        for (line) |byte| {
+            if (byte == '{') self.brace_depth +|= 1;
+            if (byte == '}') self.brace_depth -|= 1;
+        }
+    }
+};
+
+/// Detects a function/type/test declaration name from a source line.
+/// Returns the extracted name (e.g. "renderCatalogJson" from "pub fn renderCatalogJson(...)").
+/// Returns null if the line is not a declaration.
+fn detectScopeName(line: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimStart(u8, line, " \t");
+    if (trimmed.len == 0) return null;
+
+    // Skip comments
+    if (std.mem.startsWith(u8, trimmed, "//") or
+        std.mem.startsWith(u8, trimmed, "/*") or
+        std.mem.startsWith(u8, trimmed, "*") or
+        std.mem.startsWith(u8, trimmed, "#")) return null;
+
+    // Pattern: [pub] [export] [extern] fn NAME or func NAME or function NAME
+    // Also: [pub] const NAME = struct, test "NAME", [pub] struct NAME
+    return extractNameAfterKeyword(trimmed);
+}
+
+fn extractNameAfterKeyword(line: []const u8) ?[]const u8 {
+    // Strip common leading qualifiers: pub, export, extern, inline, async, pub
+    var rest = line;
+    const qualifiers = [_][]const u8{ "pub ", "export ", "extern ", "inline ", "async ", "virtual ", "static ", "override " };
+    var changed = true;
+    while (changed) {
+        changed = false;
+        for (qualifiers) |qual| {
+            if (rest.len > qual.len and std.ascii.eqlIgnoreCase(rest[0..qual.len], qual)) {
+                rest = std.mem.trimStart(u8, rest[qual.len..], " \t");
+                changed = true;
+            }
+        }
+    }
+
+    // Check for declaration keywords
+    const decl_keywords = [_][]const u8{ "fn ", "func ", "function ", "def ", "test ", "struct ", "class ", "enum ", "union ", "interface ", "impl " };
+    for (decl_keywords) |kw| {
+        if (rest.len > kw.len and std.ascii.eqlIgnoreCase(rest[0..kw.len], kw)) {
+            return extractIdentifier(rest[kw.len..]);
+        }
+    }
+
+    // Check for: const NAME = struct/enum (Zig style)
+    if (rest.len > 6 and std.ascii.eqlIgnoreCase(rest[0..6], "const ")) {
+        const after_const = std.mem.trimStart(u8, rest[6..], " \t");
+        return extractIdentifier(after_const);
+    }
+
+    return null;
+}
+
+fn extractIdentifier(text: []const u8) ?[]const u8 {
+    var end: usize = 0;
+    while (end < text.len) : (end += 1) {
+        const c = text[end];
+        if (!(std.ascii.isAlphanumeric(c) or c == '_')) break;
+    }
+    if (end == 0) return null;
+    return text[0..end];
+}
 const BYTE_SHARD_MIN_FILE_BYTES: usize = 8 * 1024 * 1024;
 const BYTE_SHARD_MIN_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const BYTE_SHARD_WORD_BOUNDARY_MIN_FILE_BYTES: usize = 1 * 1024 * 1024;
@@ -140,6 +238,8 @@ pub const SearchHit = struct {
     preview_end: usize = 0,
     preview_elided_left: bool = false,
     preview_elided_right: bool = false,
+    scope: []const u8 = "",
+    scope_line: usize = 0,
 };
 
 pub const SearchReport = struct {
@@ -184,6 +284,7 @@ pub const SearchReport = struct {
     available_threads: usize,
     outer_scan_threads: usize,
     scan_buffer: []u8 = &.{},
+    scope_tracker: ScopeTracker = .{},
     hits: [MAX_RETAINED_HITS]SearchHit,
     hit_count: usize,
 };
@@ -2764,6 +2865,7 @@ const ShardReport = struct {
     evidence_had_error: bool,
     access_errors: core_stats.AccessErrorStats,
     scan_buffer: []u8,
+    scope_tracker: ScopeTracker = .{},
 
     const empty: ShardReport = .{
         .bytes_scanned = 0,
@@ -3059,6 +3161,7 @@ fn scanFileMmap(
 
     shard.files_scanned += 1;
     shard.bytes_scanned += file_bytes;
+    shard.scope_tracker = .{};
     const linux_dominant_target = recordLinuxDominantFileScan(shard, display_path, file_bytes);
     if (file_bytes >= shard.slowest_bytes) {
         shard.slowest_path = display_path;
@@ -3686,6 +3789,7 @@ fn scanOpenFileIntoShardImpl(
 
     shard.files_scanned += 1;
     shard.bytes_scanned += file_bytes;
+    shard.scope_tracker = .{};
     const linux_dominant_target = recordLinuxDominantFileScan(shard, display_path, file_bytes);
     if (file_bytes >= shard.slowest_bytes) {
         shard.slowest_path = display_path;
@@ -3932,6 +4036,7 @@ fn recordLineIntoShardImpl(
     chunk_casefolded: bool,
 ) void {
     const line = trimCR(raw_line);
+    shard.scope_tracker.processLine(line, line_number);
     if (request.stats_only) {
         const ci = if (chunk_casefolded) false else request.case_insensitive;
         const count = if (mono) |m|
@@ -3960,7 +4065,10 @@ fn recordLineIntoShardImpl(
                 shard.truncated = true;
                 return;
             };
+            const sc = shard.scope_tracker.currentScope();
             shard.hits[shard.hit_count] = hit;
+            shard.hits[shard.hit_count].scope = if (sc.name.len > 0) allocator.dupe(u8, sc.name) catch "" else "";
+            shard.hits[shard.hit_count].scope_line = sc.line;
             shard.hit_count += 1;
         }
     }
@@ -4940,6 +5048,7 @@ fn recordLine(
     chunk_casefolded: bool,
 ) !void {
     const line = trimCR(raw_line);
+    report.scope_tracker.processLine(line, line_number);
     if (request.stats_only) {
         const ci = if (chunk_casefolded) false else request.case_insensitive;
         const count = statsOnlyMatchCount(line, plan, ci, chunk_casefolded);
@@ -4954,7 +5063,12 @@ fn recordLine(
         if (!request.stats_only and under_request_limit and report.hit_count < MAX_RETAINED_HITS) {
             const span = exactMatchSpan(line, plan, request.case_insensitive, column);
             report.hits[report.hit_count] = try makeSearchHit(allocator, display_path, line_number, column, line, span);
+            const sc = report.scope_tracker.currentScope();
+            report.hits[report.hit_count].scope = if (sc.name.len > 0) try allocator.dupe(u8, sc.name) else "";
+            report.hits[report.hit_count].scope_line = sc.line;
             report.hit_count += 1;
+        } else {
+            report.truncated = true;
         }
     }
 }

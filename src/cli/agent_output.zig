@@ -111,12 +111,18 @@ fn write(
         }
         try writer.print("{{\"l\":{},\"c\":{},\"n\":{},\"p\":", .{ hit.line, hit.column, hit.match_len });
         try writeJsonString(writer, hit.preview);
-        try writer.print(",\"w\":{{\"s\":{},\"e\":{},\"l\":{s},\"r\":{s}}}}}", .{
+        try writer.print(",\"w\":{{\"s\":{},\"e\":{},\"l\":{s},\"r\":{s}}}", .{
             hit.preview_start,
             hit.preview_end,
             boolText(hit.preview_elided_left),
             boolText(hit.preview_elided_right),
         });
+        if (hit.scope.len > 0) {
+            try writer.print(",\"fn\":\"", .{});
+            try writeJsonString(writer, hit.scope);
+            try writer.print("\",\"fnl\":{}", .{hit.scope_line});
+        }
+        try writer.writeByte('}');
     }
     if (current_path != null) try writer.writeByte(']');
     try writer.writeByte('}');

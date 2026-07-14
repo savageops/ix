@@ -525,6 +525,11 @@ pub fn writeSearchReportAgent(writer: anytype, report: search.SearchReport) !voi
             }
             try writer.print("{{\"l\":{},\"c\":{},\"p\":", .{ hit.line, hit.column });
             try writeJsonString(writer, hit.preview);
+            if (hit.scope.len > 0) {
+                try writer.writeAll(",\"fn\":");
+                try writeJsonString(writer, hit.scope);
+                try writer.print(",\"fnl\":{}", .{hit.scope_line});
+            }
             try writer.writeAll("}");
             first_hit_in_file = false;
         }
