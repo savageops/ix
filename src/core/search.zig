@@ -272,6 +272,18 @@ fn extractIdentifier(text: []const u8) ?[]const u8 {
     if (end == 0) return null;
     return text[0..end];
 }
+
+/// P22: Determines whether a hit should be deduplicated based on --record granularity.
+/// - line: never dedup (one hit per matching line)
+/// - block: dedup if the enclosing brace-block scope already has a hit
+/// - section: dedup if the enclosing function/section already has a hit
+fn shouldDedupByRecord(request: cli.SearchRequest, last_scope_line: *const usize, _: []const u8, scope_line: usize) bool {
+    return switch (request.record) {
+        .line => false,
+        .block, .section => scope_line > 0 and scope_line == last_scope_line.*,
+    };
+}
+
 const BYTE_SHARD_MIN_FILE_BYTES: usize = 8 * 1024 * 1024;
 const BYTE_SHARD_MIN_RANGE_BYTES: usize = 4 * 1024 * 1024;
 const BYTE_SHARD_WORD_BOUNDARY_MIN_FILE_BYTES: usize = 1 * 1024 * 1024;
@@ -363,6 +375,7 @@ pub const SearchReport = struct {
     outer_scan_threads: usize,
     scan_buffer: []u8 = &.{},
     scope_tracker: ScopeTracker = .{},
+    last_record_scope_line: usize = 0,
     hits: [MAX_RETAINED_HITS]SearchHit,
     hit_count: usize,
 };
@@ -3077,6 +3090,7 @@ const ShardReport = struct {
     access_errors: core_stats.AccessErrorStats,
     scan_buffer: []u8,
     scope_tracker: ScopeTracker = .{},
+    last_record_scope_line: usize = 0,
 
     const empty: ShardReport = .{
         .bytes_scanned = 0,
@@ -3373,6 +3387,7 @@ fn scanFileMmap(
     shard.files_scanned += 1;
     shard.bytes_scanned += file_bytes;
     shard.scope_tracker = .{};
+    shard.last_record_scope_line = 0;
     const linux_dominant_target = recordLinuxDominantFileScan(shard, display_path, file_bytes);
     if (file_bytes >= shard.slowest_bytes) {
         shard.slowest_path = display_path;
@@ -4001,6 +4016,7 @@ fn scanOpenFileIntoShardImpl(
     shard.files_scanned += 1;
     shard.bytes_scanned += file_bytes;
     shard.scope_tracker = .{};
+    shard.last_record_scope_line = 0;
     const linux_dominant_target = recordLinuxDominantFileScan(shard, display_path, file_bytes);
     if (file_bytes >= shard.slowest_bytes) {
         shard.slowest_path = display_path;
@@ -4272,18 +4288,23 @@ fn recordLineIntoShardImpl(
         shard.matches_after_cursor += 1;
         const under_request_limit = if (request.max_hits) |max_hits| shard.hit_count < max_hits else true;
         if (under_request_limit and shard.hit_count < MAX_RETAINED_HITS) {
+            const sc = shard.scope_tracker.currentScope();
+            // P22: --record block/section deduplication.
+            // block: one hit per brace-depth-0 block (deduplicate by scope+brace_depth).
+            // section: one hit per function/section (deduplicate by scope name).
+            if (shouldDedupByRecord(request, &shard.last_record_scope_line, sc.name, sc.line)) return;
             const span = exactMatchSpan(line, plan, request.case_insensitive, col);
             const hit = makeSearchHit(allocator, display_path, line_number, col, line, span) catch {
                 // A preview allocation failure must never retain a borrowed scan-buffer slice.
                 shard.truncated = true;
                 return;
             };
-            const sc = shard.scope_tracker.currentScope();
             // P17: Non-temporal hint — result buffer writes should not evict hot scan data.
             streamStoreHint(@ptrCast(&shard.hits[shard.hit_count]));
             shard.hits[shard.hit_count] = hit;
             shard.hits[shard.hit_count].scope = if (sc.name.len > 0) allocator.dupe(u8, sc.name) catch "" else "";
             shard.hits[shard.hit_count].scope_line = sc.line;
+            shard.last_record_scope_line = sc.line;
             shard.hit_count += 1;
         }
     }
@@ -5280,11 +5301,13 @@ fn recordLine(
         report.matches_after_cursor += 1;
         const under_request_limit = if (request.max_hits) |max_hits| report.hit_count < max_hits else true;
         if (!request.stats_only and under_request_limit and report.hit_count < MAX_RETAINED_HITS) {
+            const sc = report.scope_tracker.currentScope();
+            if (shouldDedupByRecord(request, &report.last_record_scope_line, sc.name, sc.line)) return;
             const span = exactMatchSpan(line, plan, request.case_insensitive, column);
             report.hits[report.hit_count] = try makeSearchHit(allocator, display_path, line_number, column, line, span);
-            const sc = report.scope_tracker.currentScope();
             report.hits[report.hit_count].scope = if (sc.name.len > 0) try allocator.dupe(u8, sc.name) else "";
             report.hits[report.hit_count].scope_line = sc.line;
+            report.last_record_scope_line = sc.line;
             report.hit_count += 1;
         } else {
             report.truncated = true;

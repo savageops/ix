@@ -52,6 +52,7 @@ pub const SearchRequest = struct {
     max_hits: ?usize,
     threads: ?usize,
     emit_report: ?[]const u8,
+    record: RecordGranularity = .line,
     nexus_build: bool,
     nexus_disabled: bool,
     index_enabled: bool,
@@ -66,6 +67,17 @@ pub const SearchRequest = struct {
     cursor_column: usize = 0,
     cursor_corpus_signature: ?u64 = null,
     cursor_request_fingerprint: ?u64 = null,
+};
+
+/// P22: Structural record granularity for the --record flag.
+/// Controls how matches are grouped and presented.
+/// line: one hit per matching line (default, ripgrep-compatible)
+/// block: one hit per enclosing brace-block (function body, struct body, etc.)
+/// section: one hit per enclosing section (markdown heading, function, class)
+pub const RecordGranularity = enum {
+    line,
+    block,
+    section,
 };
 
 /// Adjacent Operations Vector output modes (spec point 29).
@@ -533,6 +545,16 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
             index += 1;
             if (index >= args.len or args[index].len == 0) return ParseError.MissingValue;
             request.cursor = args[index];
+        } else if (std.mem.eql(u8, arg, "--record")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            if (std.mem.eql(u8, args[index], "line")) {
+                request.record = .line;
+            } else if (std.mem.eql(u8, args[index], "block")) {
+                request.record = .block;
+            } else if (std.mem.eql(u8, args[index], "section")) {
+                request.record = .section;
+            } else return ParseError.UnsupportedFlag;
         } else return ParseError.UnsupportedFlag;
     }
     request.expression = expression orelse return ParseError.MissingExpression;
