@@ -29,6 +29,10 @@ pub const HelpTopic = enum {
     process,
     similar,
     xo,
+    completions_bash,
+    completions_zsh,
+    completions_fish,
+    completions_powershell,
 };
 
 pub const SearchRequest = struct {
@@ -238,6 +242,14 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
     if (std.mem.eql(u8, first, "--help") or std.mem.eql(u8, first, "-h") or std.mem.eql(u8, first, "help")) {
         if (argv.len >= 3) return .{ .command = .{ .help = helpTopic(argv[2]) orelse .top } };
         return .{ .command = .{ .help = .top } };
+    }
+    if (std.mem.eql(u8, first, "--completions")) {
+        const shell = if (argv.len >= 3) argv[2] else "bash";
+        if (std.mem.eql(u8, shell, "bash")) return .{ .command = .{ .help = .completions_bash } };
+        if (std.mem.eql(u8, shell, "zsh")) return .{ .command = .{ .help = .completions_zsh } };
+        if (std.mem.eql(u8, shell, "fish")) return .{ .command = .{ .help = .completions_fish } };
+        if (std.mem.eql(u8, shell, "powershell") or std.mem.eql(u8, shell, "pwsh")) return .{ .command = .{ .help = .completions_powershell } };
+        return .{ .command = .{ .help = .completions_bash } };
     }
     if (std.mem.eql(u8, first, "--version") or std.mem.eql(u8, first, "-V") or std.mem.eql(u8, first, "version")) {
         return .{ .command = .{ .version = {} } };

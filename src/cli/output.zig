@@ -18,6 +18,10 @@ pub fn writeHelp(writer: anytype, topic: cli.HelpTopic) !void {
         .process => writeProcessHelp(writer),
         .similar => writeSimilarHelp(writer),
         .xo => writeXoHelp(writer),
+        .completions_bash => command_spec.writeBashCompletion(writer),
+        .completions_zsh => command_spec.writeZshCompletion(writer),
+        .completions_fish => command_spec.writeFishCompletion(writer),
+        .completions_powershell => command_spec.writePowerShellCompletion(writer),
     };
 }
 

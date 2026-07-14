@@ -105,3 +105,156 @@ test "search help metadata covers every bounded agent control" {
         try std.testing.expect(findSearchOption(name, true) != null);
     }
 }
+
+// ── Shell Completions (P30) ─────────────────────────────────────────
+//
+// Generated from the same command_spec tables that own the parser and
+// help text. Four shells: bash, zsh, fish, PowerShell. Each uses the
+// canonical command list and option list — single source of truth.
+
+pub const commands = [_][]const u8{
+    "search", "matches", "inspect", "explain", "process", "similar", "xo", "mcp", "help",
+};
+
+/// Writes bash completion to the given writer.
+pub fn writeBashCompletion(writer: anytype) !void {
+    try writer.writeAll("# bash completion for ix\n");
+    try writer.writeAll("_ix() {\n");
+    try writer.writeAll("    local cur prev cmds\n");
+    try writer.writeAll("    cur=${COMP_WORDS[COMP_CWORD]}\n");
+    try writer.writeAll("    prev=${COMP_WORDS[COMP_CWORD-1]}\n");
+    try writer.writeAll("    cmds=\"");
+    for (commands, 0..) |cmd, i| {
+        if (i > 0) try writer.writeByte(' ');
+        try writer.writeAll(cmd);
+    }
+    try writer.writeAll("\"\n");
+    try writer.writeAll("    if [ $COMP_CWORD -eq 1 ]; then\n");
+    try writer.writeAll("        COMPREPLY=( $(compgen -W \"$cmds\" -- \"$cur\") )\n");
+    try writer.writeAll("        return 0\n");
+    try writer.writeAll("    fi\n");
+    // Format values for --format
+    try writer.writeAll("    case \"$prev\" in\n");
+    try writer.writeAll("        --format)\n");
+    try writer.writeAll("            COMPREPLY=( $(compgen -W \"");
+    for (formats, 0..) |spec, i| {
+        if (i > 0) try writer.writeByte(' ');
+        try writer.writeAll(spec.name);
+    }
+    try writer.writeAll("\" -- \"$cur\") )\n");
+    try writer.writeAll("            return 0 ;;\n");
+    try writer.writeAll("    esac\n");
+    // Options
+    try writer.writeAll("    case \"${COMP_WORDS[1]}\" in\n");
+    try writer.writeAll("        search|matches)\n");
+    try writer.writeAll("            COMPREPLY=( $(compgen -W \"");
+    for (search_options) |spec| {
+        for (spec.names) |name| {
+            try writer.writeAll(name);
+            try writer.writeByte(' ');
+        }
+    }
+    try writer.writeAll("--version\" -- \"$cur\") )\n");
+    try writer.writeAll("            ;;\n");
+    try writer.writeAll("    esac\n");
+    try writer.writeAll("    COMPREPLY=( $(compgen -f -- \"$cur\") )\n");
+    try writer.writeAll("    return 0\n");
+    try writer.writeAll("}\n");
+    try writer.writeAll("complete -F _ix ix ix-zig\n");
+}
+
+/// Writes zsh completion to the given writer.
+pub fn writeZshCompletion(writer: anytype) !void {
+    try writer.writeAll("#compdef ix ix-zig\n");
+    try writer.writeAll("_ix() {\n");
+    try writer.writeAll("    local -a commands formats options\n");
+    try writer.writeAll("    commands=( ");
+    for (commands) |cmd| {
+        try writer.print("{s} ", .{cmd});
+    }
+    try writer.writeAll(")\n");
+    try writer.writeAll("    formats=( ");
+    for (formats) |spec| {
+        try writer.print("{s} ", .{spec.name});
+    }
+    try writer.writeAll(")\n");
+    try writer.writeAll("    options=( ");
+    for (search_options) |spec| {
+        for (spec.names) |name| {
+            try writer.print("{s} ", .{name});
+        }
+    }
+    try writer.writeAll(")\n");
+    try writer.writeAll("    _arguments -C \\\n");
+    try writer.writeAll("        '1:command:->cmds' \\\n");
+    try writer.writeAll("        '*::arg:->args'\n");
+    try writer.writeAll("    case \"$state\" in\n");
+    try writer.writeAll("        cmds) _describe 'command' commands ;;\n");
+    try writer.writeAll("        args)\n");
+    try writer.writeAll("            case \"${words[1]}\" in\n");
+    try writer.writeAll("                search|matches)\n");
+    try writer.writeAll("                    _arguments \"--format[Output projection]:format:->fmts\" ");
+    for (search_options) |spec| {
+        for (spec.names) |name| {
+            try writer.print("\"{s}\" ", .{name});
+        }
+    }
+    try writer.writeAll("\n");
+    try writer.writeAll("                    ;;\n");
+    try writer.writeAll("            esac\n");
+    try writer.writeAll("            case \"$state\" in\n");
+    try writer.writeAll("                fmts) _describe 'format' formats ;;\n");
+    try writer.writeAll("            esac\n");
+    try writer.writeAll("            ;;\n");
+    try writer.writeAll("    esac\n");
+    try writer.writeAll("}\n");
+    try writer.writeAll("_ix \"$@\"\n");
+}
+
+/// Writes fish completion to the given writer.
+pub fn writeFishCompletion(writer: anytype) !void {
+    for (commands) |cmd| {
+        try writer.print("complete -c ix -n \"__fish_use_subcommand\" -a \"{s}\"\n", .{cmd});
+    }
+    for (formats) |spec| {
+        try writer.print("complete -c ix -n \"__fish_seen_subcommand_from search; and __fish_seen_argument --format\" -a \"{s}\"\n", .{spec.name});
+    }
+    for (search_options) |spec| {
+        for (spec.names) |name| {
+            try writer.print("complete -c ix -n \"__fish_seen_subcommand_from search matches\" -l \"{s}\"", .{name[2..]});
+            try writer.writeAll("\n");
+        }
+    }
+}
+
+/// Writes PowerShell completion to the given writer.
+pub fn writePowerShellCompletion(writer: anytype) !void {
+    try writer.writeAll("Register-ArgumentCompleter -Native -CommandName ix -ScriptBlock {\n");
+    try writer.writeAll("    param($wordToComplete, $commandAst, $cursorPosition)\n");
+    try writer.writeAll("    $commands = @(");
+    for (commands, 0..) |cmd, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.print("'{s}'", .{cmd});
+    }
+    try writer.writeAll(")\n");
+    try writer.writeAll("    $formats = @(");
+    for (formats, 0..) |spec, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.print("'{s}'", .{spec.name});
+    }
+    try writer.writeAll(")\n");
+    try writer.writeAll("    $options = @(");
+    for (search_options, 0..) |spec, i| {
+        if (i > 0) try writer.writeAll(", ");
+        try writer.print("'{s}'", .{spec.names[0]});
+    }
+    try writer.writeAll(")\n");
+    try writer.writeAll("    if ($wordToComplete.StartsWith('-')) {\n");
+    try writer.writeAll("        $options | Where-Object { $_ -like \"$wordToComplete*\" } |\n");
+    try writer.writeAll("            ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }\n");
+    try writer.writeAll("    } else {\n");
+    try writer.writeAll("        $commands | Where-Object { $_ -like \"$wordToComplete*\" } |\n");
+    try writer.writeAll("            ForEach-Object { [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_) }\n");
+    try writer.writeAll("    }\n");
+    try writer.writeAll("}\n");
+}
