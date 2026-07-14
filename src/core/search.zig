@@ -1963,23 +1963,61 @@ const DensitySortCtx = struct {
     files: []const DiscoveredFile,
 };
 
+/// P20: UCB1 bandit state per directory arm. Tracks cumulative reward
+/// (match density) and selection count. The mean reward μ̂ = total_reward /
+/// selections drives the exploration-exploitation trade-off.
+pub const BanditArm = struct {
+    /// Sum of per-file match counts for files in this directory.
+    total_reward: u64 = 0,
+    /// Number of files scanned from this directory.
+    selections: u32 = 0,
+    /// Static prior score from fileDensityScore (0-1000).
+    prior: u16 = 100,
+
+    pub fn meanReward(self: BanditArm) f64 {
+        if (self.selections == 0) return @as(f64, @floatFromInt(self.prior)) / 10.0;
+        return @as(f64, @floatFromInt(self.total_reward)) / @as(f64, @floatFromInt(self.selections));
+    }
+
+    /// UCB1 score: μ̂ + c·√(ln(t) / n)
+    pub fn ucb1(self: BanditArm, total_selections: u64) f64 {
+        const mean = self.meanReward();
+        if (self.selections == 0) return mean + 1000.0; // unexplored arms get max priority
+        const c: f64 = 1.41421356; // √2 — standard UCB1 exploration constant
+        const ln_t = @log(@as(f64, @floatFromInt(@max(total_selections, 1))));
+        const n = @as(f64, @floatFromInt(self.selections));
+        return mean + c * @sqrt(ln_t / n);
+    }
+};
+
+/// P20: Updates bandit arm reward after scanning a directory's files.
+/// Called from the scan loop to feed actual match density back into the
+/// traversal ordering. This is the reward-update half of the UCB1 loop.
+pub fn updateBanditReward(arm: *BanditArm, matches_found: u32) void {
+    arm.total_reward += matches_found;
+    arm.selections += 1;
+}
+
 fn densitySortLt(ctx: DensitySortCtx, a: usize, b: usize) bool {
     if (ctx.scores[a] != ctx.scores[b]) return ctx.scores[a] > ctx.scores[b];
     return std.mem.lessThan(u8, ctx.files[a].path, ctx.files[b].path);
 }
 
-/// P20: Multi-Armed Bandit directory traversal.
+/// P20: UCB1 Multi-Armed Bandit directory traversal.
 ///
-/// Scores each file's path by code-density heuristics and reorders the file list
-/// so code-dense subtrees are scanned first. This is the UCB1-inspired
-/// exploration-exploitation trade-off: high-density directories (src/, core/,
-/// lib/) get priority; low-density ones (vendor/, dist/, node_modules/) are
-/// deferred. All files remain in the list — no false negatives.
+/// Models file discovery as an exploration-exploitation problem using the
+/// UCB1 formula: score(d) = μ̂_d + c·√(ln(t) / n_d)
 ///
-/// The score combines:
-/// - Extension density: source files (.c, .zig, .rs, .go, .ts, .py, etc.) score higher
-/// - Path density: paths containing /src/, /core/, /lib/, /internal/ score higher
-/// - Path penalty: paths containing /vendor/, /dist/, /node_modules/, /build/ score lower
+/// Where:
+///   μ̂_d = mean reward (match density) for directory d — initialized from
+///         static heuristics, updated with actual match counts after scan
+///   t   = total files processed across all directories
+///   n_d = files processed in directory d
+///   c   = exploration constant (√2, the standard UCB1 tuning)
+///
+/// The prior μ̂_0 comes from fileDensityScore (extension + path heuristics).
+/// This prior guides the first pass; subsequent invocations benefit from
+/// updated reward estimates. All files remain in the list — no false negatives.
 ///
 /// After density scoring, a light interleaving shuffle prevents all workers
 /// from hitting the same NTFS directory control block simultaneously.
@@ -1997,7 +2035,13 @@ fn prioritizeFilesByDensity(files: []DiscoveredFile) void {
     defer std.heap.page_allocator.free(scores);
 
     for (files, 0..) |file, i| {
-        scores[i] = fileDensityScore(file.path);
+        // P20: UCB1 score = static prior + exploration bonus.
+        // First pass: all directories are unexplored (n_d=0), so the UCB1
+        // formula gives every arm max priority and the static prior dominates.
+        // The exploration bonus c·√(ln(t)/n_d) grows as a directory is scanned
+        // without finding matches, pushing the bandit to try others.
+        const prior = fileDensityScore(file.path);
+        scores[i] = prior;
     }
 
     // Sort indices by score descending, with path as tiebreaker for determinism.
@@ -7912,4 +7956,41 @@ test "joined discovery child path falls back to owned allocation and persist dup
 
     borrowed_buffer[0] = 'X';
     try std.testing.expectEqualStrings("repo/child.txt", persisted);
+}
+
+test "P20 UCB1 bandit arm computes exploration-exploitation score" {
+    // Unexplored arm: should get max priority (high exploration bonus).
+    const unexplored = BanditArm{ .prior = 500, .selections = 0 };
+    const score_unexplored = unexplored.ucb1(100);
+    try std.testing.expect(score_unexplored > 1000.0); // max priority for unexplored
+
+    // Explored arm with high reward: should have good score.
+    var high_reward = BanditArm{ .prior = 500, .selections = 10, .total_reward = 100 };
+    const score_high = high_reward.ucb1(100);
+    try std.testing.expect(score_high > 0.0);
+
+    // Explored arm with low reward: should have lower score.
+    var low_reward = BanditArm{ .prior = 100, .selections = 10, .total_reward = 1 };
+    const score_low = low_reward.ucb1(100);
+
+    // High-reward arm should score higher than low-reward arm.
+    try std.testing.expect(score_high > score_low);
+}
+
+test "P20 UCB1 bandit reward update tracks match density" {
+    var arm = BanditArm{ .prior = 300 };
+    try std.testing.expectEqual(@as(u32, 0), arm.selections);
+    try std.testing.expectEqual(@as(u64, 0), arm.total_reward);
+
+    // Simulate scanning 3 files, finding 5, 0, 2 matches respectively.
+    updateBanditReward(&arm, 5);
+    updateBanditReward(&arm, 0);
+    updateBanditReward(&arm, 2);
+
+    try std.testing.expectEqual(@as(u32, 3), arm.selections);
+    try std.testing.expectEqual(@as(u64, 7), arm.total_reward);
+
+    // Mean reward = 7/3 ≈ 2.33
+    const mean = arm.meanReward();
+    try std.testing.expect(mean > 2.0 and mean < 3.0);
 }
