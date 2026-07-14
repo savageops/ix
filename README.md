@@ -2,7 +2,7 @@
 
 # IX
 
-**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Warm-index foreground admission. Casefold-buffer admission probe. Thread-sharded execution. Exact-verified output.**
+**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Warm-index foreground admission. BM25-ranked agent context. Fisheye-focused output. Thread-sharded execution. Exact-verified output.**
 
 *AVX2 SIMD literal scan · Boolean predicate algebra · Generation-pinned warm index · Arena-allocated pipeline · Vendored C kernels compiled into one binary*
 
@@ -82,6 +82,7 @@ ix explain 'lit:auth && re:token_\d+'
 | `search --format agent-v3` | Bounded `ix.result.v3` with typed coverage, exact spans, and cursors |
 | `search --context N` | Exact coalesced source lines embedded in the versioned result |
 | `similar` | Semantic similarity ranking (requires `IX_AI_API_KEY`) |
+| `xo` | Deterministic BM25-ranked context spans for agent reading |
 | `matches` | Hit records only — same engine, no sentinel |
 | `inspect` | Read-only file windows and match context |
 | `explain` | Expression plan JSON with strategy annotation |
@@ -117,7 +118,7 @@ Configuration via environment variables:
 
 When unconfigured, `ix similar` fails clean: `set IX_AI_API_KEY to use ix similar`.
 
-`ix.similar.v2` builds each first page from a deterministic union of lexical path signal and corpus-wide coverage. Lexical evidence prioritizes work but never defines semantic eligibility. The envelope reports eligible/read files, embedded whole-file ranges, provider bytes, omissions, policy skips, and a corpus-bound cursor. Whole-file ranges remain the default until a labeled recall/latency/cost benchmark proves a chunk policy; every result carries `start_line` and `end_line` for exact inspection.
+`ix.similar.v2` builds each first page from a deterministic union of lexical path signal and corpus-wide coverage. Lexical evidence prioritizes work but never defines semantic eligibility; zero lexical overlap never excludes a file. Embeddings provide recall, the reranker supplies final ordering, and `--anti` turns the same ranking into a parity-drift lens. The envelope reports eligible/read files, embedded whole-file ranges, provider bytes, omissions, policy skips, and a corpus-bound cursor. Whole-file ranges remain the default until a labeled recall/latency/cost benchmark proves a chunk policy; every result carries `start_line` and `end_line` for exact inspection.
 
 </details>
 
@@ -164,9 +165,35 @@ IX_INDEX=1 ix.exe "lit:search_term" "/path/to/corpus" --json
 
 Set `IX_INDEX=1` (or `true`/`on`) to enable foreground warm-index admission. The index lives at `~/.ix/index/` and persists across invocations. `~/.ix/` is the single owner for mutable IX state, including future `config.json` and `auth.json` contracts; the replaceable executable never owns user state. Rebuild after large corpus changes.
 
+Warm postings are not a flat list. Validated segments carry block metadata and a max-postings proof so whole blocks that cannot contain a surviving FileId are discarded before decompression. Generation pins, tombstones, and reader protection keep that pruning safe while compaction happens around active searches.
+
 > The index rejects candidates. It never creates matches. The exact verifier confirms every emitted result.
 
 </details>
+
+---
+
+## Agent Context Lane
+
+Search tells you where a term exists. `xo` answers the harder question: **which small pieces of a codebase are worth reading next?** It reads a bounded corpus, removes natural-language glue, adds a few code-vocabulary aliases, and scores source lines with BM25. A small path and structural prior breaks lexical ties without pretending to be semantic retrieval.
+
+The winning lines become degree-of-interest focus points. `xo` expands exact neighboring source around those points until the byte budget or span cap is reached, then emits the same bounded grouped narrative or JSON projection every time. It skips hidden, generated, binary, and oversize material with visible coverage counters, so a compact answer never disguises what was not read.
+
+```sh
+# Let the context lane choose useful spans; no fixed line range required
+ix xo "agentSimulation code with system administration ENV_VAR and a function for worker events" src --max-bytes 8000
+
+# Stable machine projection for a follow-up tool
+ix xo "worker event lifecycle" src --format json --max-spans 8
+```
+
+This is intentionally separate from exact search. `xo` is a bounded reading lens, not a match oracle; use `ix search` when every hit must be verified.
+
+## Framework Resource Ceiling
+
+IX applies one framework-wide accounting allocator and worker ceiling across search, warm-index maintenance, semantic ranking, and context assembly. The default is **5% of detected physical memory and 5% of available threads**, not 5% per feature. `~/.ix/config.json` owns persistent overrides; `IX_MEMORY_PERCENT` and `IX_THREAD_PERCENT` override them for a run.
+
+The limit is part of the product contract: if a bounded lane cannot fit a complete result, IX reports the exact refusal instead of quietly exceeding the budget or returning a pretend-complete answer.
 
 ---
 
@@ -283,6 +310,7 @@ Fisheye applies to lossy search previews in v1, v2, and v3. It does not contract
 | Protected cold path | Protected Windows roots now reject volatile stores and non-text protected-root extensions before open, route recoverable open/read failures through structured `access_errors`, and account open latency in `scan_work_ms_total` plus slow-file telemetry. This protects cold searches from blocking on system database/log handles while still returning structured partial status when the OS refuses a file. |
 | Byte kernels | Current hot kernels are Zig `@Vector(32, u8)` and StringZilla AVX2. Planned narrow C shim additions are limited to primitives Zig cannot emit cleanly: `ix_count_byte_avx2`, `ix_ascii_ci_memmem_avx2`, and `ix_trigram_admit_scalar_or_avx2`. |
 | Inspect | Bounded read-only windows, match-context mode, `ix.inspect.*` sentinels, `ix.next.v1` continuation hints for agent pagination |
+| XO context ranking | Deterministic BM25 line scoring with document-frequency weighting, path/structural tie-breakers, concept aliases, degree-of-interest span expansion, and explicit byte/file/span coverage |
 | Fisheye preview | Match-centered adaptive context window (Furnas 1986). Geometrically contracting half-width at dyadic line-length tiers: T0 ≤300 bytes (full line), T1 ≤600 (150-byte half-width), T2 ≤1200 (75), T3 >1200 (37). Match substring always fully visible; elision marked with `…`. Up to 143× output reduction on minified/generated content. |
 | Agent format | `--agent` emits `ix.result.v2`: file-grouped hits (path once per file), short field names (`l`/`c`/`p`), zero-elided telemetry, `cwd` at top level. 4-9× token reduction vs `--json` for multi-hit results. Designed for LLM agent consumption. |
 | Explain | Structured plan JSON, strategy annotation, proof-program lowering — queries classified as `conjunctive_literal_evidence`, `conjunctive_regex_with_mandatory_evidence`, `disjunctive_byte_evidence`, or `verifier_only` with trigram terms and verifier type |
