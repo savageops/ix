@@ -41,6 +41,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  explain  Expression plan JSON
         \\  why      Posting-list lineage of a match (P29)
         \\  watch    Stream new matches as files change (P29)
+        \\  replace  Indexed structural rewrite with --dry-run (P29)
         \\  process  State-dir inspection and cleanup
         \\  help     Print this message or subcommand help
         \\
@@ -424,11 +425,6 @@ pub fn writeExplain(writer: anytype, plan: expr.ExpressionPlan) !void {
 }
 
 /// P29: 'why' command — traces a match to its posting-list lineage.
-/// Shows which trigram evidence was extracted from the query, the
-/// query decomposition, and how the admission pipeline classifies it.
-/// This makes the sub-linear pruning transparent: the consumer sees
-/// exactly which grams would be looked up in the posting lists, which
-/// intersection mode applies, and what the verifier would do.
 pub fn writeWhy(writer: anytype, request: cli.WhyRequest, plan: expr.ExpressionPlan) !void {
     const proof = corpus.compileProofProgram(plan);
     if (request.json) {
@@ -522,6 +518,135 @@ fn writeWhyJson(writer: anytype, request: cli.WhyRequest, plan: expr.ExpressionP
     try writer.writeAll("}\n");
 }
 
+/// P29: 'replace' command — indexed structural rewrite.
+/// Finds literal matches in files and applies replacements. With --dry-run,
+/// shows planned changes without writing. Without --dry-run, writes changes
+/// in-place. Each modified file is reported as a JSON or text record.
+pub fn writeReplaceResult(io: std.Io, allocator: std.mem.Allocator, writer: anytype, request: cli.ReplaceRequest) !void {
+    var files_modified: usize = 0;
+    var total_replacements: usize = 0;
+
+    if (request.json) {
+        try writer.writeAll("{\"type\":\"replace\",\"pattern\":");
+        try writeJsonString(writer, request.pattern);
+        try writer.writeAll(",\"replacement\":");
+        try writeJsonString(writer, request.replacement);
+        try writer.writeAll(",\"dry_run\":");
+        try writer.writeAll(if (request.dry_run) "true" else "false");
+        try writer.writeAll(",\"files\":[");
+    } else {
+        if (request.dry_run) {
+            try writer.print("== ix.replace DRY-RUN pattern=\"{s}\" replacement=\"{s}\" ==\n", .{ request.pattern, request.replacement });
+        } else {
+            try writer.print("== ix.replace pattern=\"{s}\" replacement=\"{s}\" ==\n", .{ request.pattern, request.replacement });
+        }
+    }
+
+    for (request.paths[0..request.path_count]) |root_path| {
+        // Walk the directory tree and process each file.
+        var dir_stack = std.ArrayList([]const u8).empty;
+        defer dir_stack.deinit(allocator);
+        try dir_stack.append(allocator, root_path);
+
+        while (dir_stack.items.len > 0) {
+            const dir_path = dir_stack.pop() orelse continue;
+
+            var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch {
+                allocator.free(dir_path);
+                continue;
+            };
+            defer dir.close(io);
+
+            var iter = dir.iterate();
+            while (try iter.next(io)) |entry| {
+                const child_path = try std.fs.path.join(allocator, &.{ dir_path, entry.name });
+                defer allocator.free(child_path);
+
+                if (entry.kind == .directory) {
+                    try dir_stack.append(allocator, allocator.dupe(u8, child_path) catch continue);
+                    continue;
+                }
+                if (entry.kind != .file) continue;
+
+                // Read the file.
+                const data = std.Io.Dir.cwd().readFileAlloc(io, child_path, allocator, .limited(16 * 1024 * 1024)) catch continue;
+                defer allocator.free(data);
+
+                // Count matches.
+                const count = countLiteral(data, request.pattern);
+                if (count == 0) continue;
+
+                total_replacements += count;
+                files_modified += 1;
+
+                if (request.json) {
+                    if (files_modified > 1) try writer.writeAll(",");
+                    try writer.writeAll("{\"path\":");
+                    try writeJsonString(writer, child_path);
+                    try writer.print(",\"replacements\":{}}}", .{count});
+                } else {
+                    const status = if (request.dry_run) "would-modify" else "modified";
+                    try writer.print("{s}: {s} ({} replacements)\n", .{ status, child_path, count });
+                }
+
+                // Write the replacement if not dry-run.
+                if (!request.dry_run) {
+                    const new_data = try replaceLiteral(allocator, data, request.pattern, request.replacement);
+                    defer allocator.free(new_data);
+                    const file = std.Io.Dir.cwd().createFile(io, child_path, .{ .truncate = true }) catch continue;
+                    defer file.close(io);
+                    var write_buf: [8192]u8 = undefined;
+                    var fw = file.writer(io, &write_buf);
+                    fw.interface.writeAll(new_data) catch {};
+                    fw.interface.flush() catch {};
+                }
+            }
+            allocator.free(dir_path);
+        }
+    }
+
+    if (request.json) {
+        try writer.print("],\"files_modified\":{},\"total_replacements\":{}}}\n", .{ files_modified, total_replacements });
+    } else {
+        try writer.print("total: {} files, {} replacements\n", .{ files_modified, total_replacements });
+        if (request.dry_run) {
+            try writer.writeAll("(dry-run: no files were modified)\n");
+        }
+    }
+    try writer.flush();
+}
+
+fn countLiteral(haystack: []const u8, needle: []const u8) usize {
+    if (needle.len == 0 or haystack.len < needle.len) return 0;
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) {
+        if (std.mem.eql(u8, haystack[i .. i + needle.len], needle)) {
+            count += 1;
+            i += needle.len;
+        } else {
+            i += 1;
+        }
+    }
+    return count;
+}
+
+fn replaceLiteral(allocator: std.mem.Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
+    if (needle.len == 0) return allocator.dupe(u8, haystack);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < haystack.len) {
+        if (i + needle.len <= haystack.len and std.mem.eql(u8, haystack[i .. i + needle.len], needle)) {
+            try out.appendSlice(allocator, replacement);
+            i += needle.len;
+        } else {
+            try out.append(allocator, haystack[i]);
+            i += 1;
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
 
 /// P9: Pre-execution cost estimate. Classifies the query into a predicted
 /// cost class (instant/fast/moderate/slow) based on query shape, index

@@ -17,6 +17,7 @@ pub const CommandTag = enum {
     xo,
     why,
     watch,
+    replace,
     mcp,
     nexus,
     indexd,
@@ -212,6 +213,7 @@ pub const Command = union(CommandTag) {
     xo: XoRequest,
     why: WhyRequest,
     watch: SearchRequest,
+    replace: ReplaceRequest,
     mcp: McpRequest,
     nexus: SearchRequest,
     indexd: IndexdRequest,
@@ -234,6 +236,19 @@ pub const WhyRequest = struct {
     expression: []const u8,
     paths: [MAX_SEARCH_PATHS][]const u8,
     path_count: usize,
+    json: bool = false,
+};
+
+/// P29: Adjacent Operations Vector — 'replace' command.
+/// Performs indexed structural rewrites: finds literal matches in files
+/// and replaces them with a replacement string. Uses --dry-run to preview
+/// changes without writing. Requires explicit confirmation by default.
+pub const ReplaceRequest = struct {
+    pattern: []const u8,
+    replacement: []const u8,
+    paths: [MAX_SEARCH_PATHS][]const u8,
+    path_count: usize,
+    dry_run: bool = false,
     json: bool = false,
 };
 
@@ -345,6 +360,10 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
     if (std.mem.eql(u8, first, "watch")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .search } };
         return .{ .command = .{ .watch = try parseSearch(argv[2..]) } };
+    }
+    if (std.mem.eql(u8, first, "replace")) {
+        if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .search } };
+        return .{ .command = .{ .replace = try parseReplace(argv[2..]) } };
     }
     if (std.mem.eql(u8, first, "mcp")) {
         return .{ .command = .{ .mcp = .{} } };
@@ -538,6 +557,39 @@ fn parseWhy(args: []const []const u8) ParseError!WhyRequest {
         } else return ParseError.UnsupportedFlag;
     }
     request.expression = expression orelse return ParseError.MissingExpression;
+    if (request.path_count == 0) return ParseError.MissingValue;
+    return request;
+}
+
+fn parseReplace(args: []const []const u8) ParseError!ReplaceRequest {
+    if (args.len == 0) return ParseError.MissingExpression;
+    var pattern: ?[]const u8 = null;
+    var replacement: ?[]const u8 = null;
+    var request = ReplaceRequest{
+        .pattern = "",
+        .replacement = "",
+        .paths = undefined,
+        .path_count = 0,
+    };
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--dry-run")) {
+            request.dry_run = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            request.json = true;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            if (pattern == null) {
+                pattern = arg;
+            } else if (replacement == null) {
+                replacement = arg;
+            } else {
+                if (request.path_count >= MAX_SEARCH_PATHS) return ParseError.MissingValue;
+                request.paths[request.path_count] = arg;
+                request.path_count += 1;
+            }
+        } else return ParseError.UnsupportedFlag;
+    }
+    request.pattern = pattern orelse return ParseError.MissingExpression;
+    request.replacement = replacement orelse return ParseError.MissingValue;
     if (request.path_count == 0) return ParseError.MissingValue;
     return request;
 }

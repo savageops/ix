@@ -120,7 +120,7 @@ test "search help metadata covers every bounded agent control" {
 // canonical command list and option list — single source of truth.
 
 pub const commands = [_][]const u8{
-    "search", "matches", "inspect", "explain", "process", "similar", "xo", "why", "watch", "mcp", "help",
+    "search", "matches", "inspect", "explain", "process", "similar", "xo", "why", "watch", "replace", "mcp", "help",
 };
 
 /// Writes bash completion to the given writer.

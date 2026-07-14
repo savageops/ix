@@ -267,6 +267,15 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
         },
+        .replace => |request| {
+            // P29: Indexed structural rewrite. Finds literal matches and
+            // applies replacements. --dry-run shows changes without writing.
+            output.writeReplaceResult(init.io, allocator, stdout, request) catch |err| {
+                try output.writeError(stderr, "replace_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
+        },
         .process => |request| {
             const report = process_tool.run(init.io, allocator, .{
                 .action = switch (request.action) {
