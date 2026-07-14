@@ -16,7 +16,7 @@
 [![Hot Path](https://img.shields.io/badge/Hot%20Path-Zero%20Mutex-06b6d4)](#execution-model)
 [![License: MIT](https://img.shields.io/badge/License-MIT-0f766e)](LICENSE)
 
-[Origin](#origin) · [What It Is](#what-it-is) · [Use It](#use-it) · [How It Works](#how-it-works) · [What Is Inside](#what-is-inside) · [Fisheye Preview](#fisheye-preview) · [Trigram Acceleration](#exact-trigram-acceleration) · [Admission Bytecode](#admission-bytecode-lane) · [Roadmap](#roadmap)
+[Origin](#origin) · [What It Is](#what-it-is) · [Use It](#use-it) · [Agent Context](#agent-context-lane) · [Resource Ceiling](#framework-resource-ceiling) · [How It Works](#how-it-works) · [What Is Inside](#what-is-inside) · [Fisheye Preview](#fisheye-preview) · [Trigram Acceleration](#exact-trigram-acceleration) · [Admission Bytecode](#admission-bytecode-lane) · [Roadmap](#roadmap)
 
 </div>
 
@@ -44,11 +44,13 @@ The first executable admission slice now compiles trigram evidence once per quer
 
 The second architecture lane is the warm index: a corpus-global `FileCatalog`, generation-pinned trigram postings, live `__ix_indexd` ownership, USN/delta freshness substrate, and query-frontier reuse. When the live marker and current generation are valid, IX can skip discovery, skip full-corpus trigram scans, load the retained candidate frontier, and invoke the canonical verifier only on the surviving files. The verifier still owns correctness; the index only removes impossible work.
 
+The third lane is agent-native output. Every result carries typed truth: canonical verification (the exact matcher confirmed every hit), scan coverage (were access errors present?), and projection completeness (are there more eligible hits?). Cursor pagination binds continuation to the request fingerprint and corpus signature — change the query or touch a file, and the cursor is rejected. Byte budgets fit the largest whole-record page without cutting a hit in half. BM25 degree-of-interest context assembly (`xo`) ranks source lines by lexical evidence and expands around focus points until the byte budget closes. The Furnas fisheye lens contracts previews geometrically — 143× reduction on minified content, zero overhead on normal source code.
+
 > [!NOTE]
 > Acceleration rejects candidates. It never creates matches.
 > The exact verifier confirms every emitted result.
 
-The binary is 2 MB. It vendors everything — StringZilla, PCRE2 with JIT — compiled from source into a single static binary. No package manager. No network fetch. No runtime dependencies. `zig build` and it ships.
+The binary vendors everything — StringZilla, PCRE2 with JIT — compiled from source into a single static binary. No package manager. No network fetch. No runtime dependencies. `zig build` and it ships. It runs on 5% of your machine by default — independently tunable for memory and threads — and matches ripgrep's wall time on a 1.34 GB Linux kernel corpus using 1/16th the cores. The per-thread throughput is the engine's advantage. The cap is a product choice.
 
 ---
 
@@ -177,9 +179,9 @@ Warm postings are not a flat list. Validated segments carry block metadata and a
 
 ## Agent Context Lane
 
-`xo` is the context-selection lane. It does not pretend that a phrase search is understanding; it compiles a bounded degree-of-interest field over source lines. Natural-language glue is removed, code-vocabulary aliases are admitted, and standard BM25 ranks the surviving lines. Path and structural priors break lexical ties; they never masquerade as semantic retrieval.
+`xo` is the context-selection lane. It does not pretend that a phrase search is understanding. Natural-language glue is stripped, code-vocabulary tokens are extracted, and standard BM25 ranks the surviving lines as documents — IDF weighting, term-frequency saturation (k1=1.2, b=0.75), document-length normalization. Path and structural priors (function declarations, type keywords, imports) break lexical ties at 0.18 weight, capped below BM25 values >1.0 — they never masquerade as semantic retrieval.
 
-The highest-scoring lines become focus points. `xo` expands exact neighboring source around them until the byte budget or span cap closes, then emits a bounded grouped narrative or JSON projection with coverage and omission state intact. Hidden, generated, binary, and oversize material is skipped explicitly; compactness never becomes a completion costume.
+The highest-scoring lines become focus points. `xo` expands exact neighboring source around them — geometrically, distance 1 through 8, with a score-relative decay floor — until the byte budget or span cap closes. Anti-clustering span selection prevents one dense region from consuming the projection. Every span carries a score, every omission carries a count, and the coverage envelope reports whether the result is complete or partial.
 
 ```sh
 # Let the context lane choose the highest-interest source spans; no guessed range required
@@ -377,6 +379,13 @@ Fisheye applies to lossy search previews in v1, v2, and v3. It does not contract
 - Warm-index query reuse can collapse repeated searches to a generation-pinned candidate frontier with `discover_ms=0`.
 - `inspect` is agent-native: bounded, read-only, structured, continuable via `ix.next.v1`.
 - Thread-local shard reports eliminate mutex contention. Each thread accumulates its own counters and hit buffers; results merge after join.
+- Every result carries typed truth: canonical verification independent of scan coverage independent of projection completeness. An agent can branch on three failure modes without parsing prose.
+- Cursor pagination is corpus-bound. The cursor encodes the request fingerprint and a content signature over every discovered file. Change the expression, paths, or touch a file — the cursor is rejected with a typed error.
+- Byte budgets fit the largest whole-record page via binary search. No hit is ever cut in half to fit. If the budget cannot fit one complete record, IX says so.
+- BM25 degree-of-interest context (`xo`) runs its own discovery and scoring pipeline — it never enters the search hot path. Only `search` needs to be fast; insight lanes optimize for evidence density.
+- The Furnas fisheye lens contracts match previews geometrically by line length, with UTF-8-safe boundary correction. Minified content gets 75-byte windows; normal source code passes through unchanged.
+- Memory and thread ceilings are independently configurable at 5% defaults. The engine matches ripgrep's wall time at 1/16th the cores because the per-thread scan kernel is 15× more productive per cycle.
+- One binary, vendored everything, zero dependencies. Cross-platform: x86 AVX2 on Windows/Linux, stdlib I/O fallback on ARM. State lives in `~/.ix/`; the executable is replaceable.
 
 ---
 
@@ -714,6 +723,10 @@ Every emitted result is exact-verified. Acceleration structures (trigram gates, 
 | File set | Identical file discovery and processing |
 | Result envelope | `ix.result.v1` digest consistency |
 | Phase timing | `discover_ms`, `scan_ms`, `aggregate_ms` tracked per-run |
+| Cursor integrity | Request fingerprint + corpus signature bound to every continuation token |
+| Projection truth | `verification: canonical` independent of `scan: complete` independent of `projection: complete` |
+| Fisheye invariant | Match substring always fully contained in preview window; UTF-8 boundaries never split |
+| Byte budget | Binary search guarantees no partial-record emission; `ByteBudgetTooSmall` refuses explicitly |
 
 ---
 
