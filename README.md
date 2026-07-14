@@ -181,6 +181,8 @@ Warm postings are not a flat list. Validated segments carry block metadata and a
 
 ## Agent Context Lane
 
+A search engine finds matches. An agent needs to understand them — without reading the whole file.
+
 `xo` is the context-selection lane. It does not pretend that a phrase search is understanding. Natural-language glue is stripped, code-vocabulary tokens are extracted, and standard BM25 ranks the surviving lines as documents — IDF weighting, term-frequency saturation (k1=1.2, b=0.75), document-length normalization. Path and structural priors (function declarations, type keywords, imports) break lexical ties at 0.18 weight, capped below BM25 values >1.0 — they never masquerade as semantic retrieval.
 
 The highest-scoring lines become focus points. `xo` expands exact neighboring source around them — geometrically, distance 1 through 8, with a score-relative decay floor — until the byte budget or span cap closes. Anti-clustering span selection prevents one dense region from consuming the projection. Every span carries a score, every omission carries a count, and the coverage envelope reports whether the result is complete or partial.
@@ -197,7 +199,9 @@ ix xo "worker event lifecycle" src --format json --max-spans 8
 
 ## Framework Resource Ceiling
 
-IX applies one framework-wide accounting allocator and worker ceiling across search, warm-index maintenance, semantic ranking, and context assembly. The default is **5% of detected physical memory and 5% of available threads** — not 5% per lane. Memory and threads are **independently** configurable: crank threads to 50% while keeping memory at 5%, or vice versa.
+Most search tools take whatever the OS gives them. IX takes 5% — and makes it enough.
+
+One framework-wide `CappedAllocator` enforces a memory ceiling at allocation time, not after RSS grows. One atomic thread ceiling bounds worker count. The default is **5% of detected physical memory and 5% of available threads** — not 5% per lane, 5% total. Memory and threads are **independently** configurable: crank threads to 50% while keeping memory at 5%, or vice versa.
 
 Three override layers, in priority order:
 
@@ -368,7 +372,6 @@ Fisheye applies to lossy search previews in v1, v2, and v3. It does not contract
 - **Single-shot streaming read** — first chunk uses `readStreaming` (one syscall, up to 1 MiB). Most source files are < 1 MiB and fit in a single read. File length lookup deferred until the first chunk proves the file exceeds the buffer.
 - **Binary sniff** — first 1024 bytes of the read buffer checked for null byte via `simd.indexOfByte`. Binary files skipped before any line processing.
 - **1 MiB chunk sizing** — chosen to fit in L2/L3 cache so StringZilla SIMD newline scan operates on warm cache lines. Larger buffers risk cache thrashing; smaller ones increase syscall frequency.
-- **Binary sniff** — first 1024 bytes checked for null byte via `sz.indexOfByte`. Binary files skipped before any line processing.
 - **Protected-root admission** — Windows system roots skip volatile database/log stores and non-text protected extensions before open. Recoverable `FileBusy` / access failures become bounded `access_errors` samples and partial status instead of aborting the scan.
 - **Batch-claim work scheduling** — scan workers claim 64 files per atomic `LOCK XADD` instead of one, reducing shared-counter contention by 64× on large corpora. Inner loop processes the batch without any atomics.
 - **Fisheye preview** — match-centered adaptive context window with geometrically contracting half-width at dyadic line-length tiers (see [Fisheye Preview](#fisheye-preview)).
@@ -386,14 +389,14 @@ Fisheye applies to lossy search previews in v1, v2, and v3. It does not contract
 - Byte budgets fit the largest whole-record page via binary search. No hit is ever cut in half to fit. If the budget cannot fit one complete record, IX says so.
 - BM25 degree-of-interest context (`xo`) runs its own discovery and scoring pipeline — it never enters the search hot path. Only `search` needs to be fast; insight lanes optimize for evidence density.
 - The Furnas fisheye lens contracts match previews geometrically by line length, with UTF-8-safe boundary correction. Minified content gets 75-byte windows; normal source code passes through unchanged.
-- Memory and thread ceilings are independently configurable at 5% defaults. The engine matches ripgrep's wall time at 1/16th the cores because the per-thread scan kernel is 15× more productive per cycle.
-- One binary, vendored everything, zero dependencies. Cross-platform: x86 AVX2 on Windows/Linux, stdlib I/O fallback on ARM. State lives in `~/.ix/`; the executable is replaceable.
+- Memory and thread ceilings are independently configurable at 5% defaults. IX matches ripgrep's wall time on a 1.34 GB corpus at 1/16th the cores because the per-thread scan kernel is 15× more productive per cycle.
+- One binary, vendored everything, zero dependencies. Cross-platform: x86 AVX2 on Windows/Linux, stdlib I/O on ARM. State lives in `~/.ix/`; the executable is replaceable. The machine is yours; IX borrows 5%.
 
 ---
 
 ## Fisheye Preview
 
-Match hits carry a preview — the line content around the match. For normal source code (lines ≤ 300 bytes), the full line is emitted. For generated, minified, or machine-produced content where lines run into thousands of bytes, emitting the full line wastes memory and bandwidth on context the user cannot scan.
+A 10,000-byte minified line contains one match. Emitting the full line costs 10 KB of context window for 50 bytes of signal. IX solves this with a lens adapted from Furnas 1986 (*Generalized Fisheye Views*): the match is the focus point, the context window contracts geometrically as line length grows, and the match substring is always fully visible.
 
 IX applies a **fisheye lens** to match previews: the match is the focus point, and the context window contracts geometrically as line length grows. The mechanism is adapted from Furnas 1986 (*Generalized Fisheye Views*), where the degree of interest at each point is a function of its distance from the focus and its *a priori* importance. Here, line length acts as the importance prior — longer lines skew toward minified or generated content with lower marginal information density per byte.
 
@@ -716,7 +719,7 @@ Design constraints:
 
 ## Correctness
 
-Every emitted result is exact-verified. Acceleration structures (trigram gates, literal prefilters, strategy classification) only reject — they never create matches. The verifier confirms every hit.
+Every optimization in this document — every SIMD path, every trigram gate, every warm index — can only reject. None of them can create a match. The canonical verifier confirms every emitted result. This is not a performance claim; it is a correctness invariant the architecture cannot violate.
 
 | Invariant | Coverage |
 |:----------|:---------|
