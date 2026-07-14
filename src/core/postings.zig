@@ -2,6 +2,7 @@ const std = @import("std");
 const catalog = @import("catalog.zig");
 const expr = @import("expr.zig");
 const trigram = @import("trigram.zig");
+const roaring = @import("roaring.zig");
 
 pub const MAGIC: [8]u8 = .{ 'I', 'X', 'P', 'O', 'S', 'T', '0', '1' };
 pub const FORMAT_VERSION: u16 = 2;
@@ -1132,6 +1133,40 @@ fn readExactAt(io: std.Io, file: *std.Io.File, buffer: []u8, offset: u64) !void 
 }
 
 fn intersectFileIds(allocator: std.mem.Allocator, lhs: []const FileId, rhs: []const FileId) ![]FileId {
+    // P10: Use Roaring Bitmap for SIMD-vectorized set intersection.
+    // For small lists (<256 elements each), sequential merge is faster
+    // due to allocation overhead. For larger lists, Roaring Bitmap's
+    // per-chunk @Vector(1024, u64) AND outperforms scalar merge.
+    if (lhs.len < 256 or rhs.len < 256) {
+        return intersectFileIdsScalar(allocator, lhs, rhs);
+    }
+
+    // Build roaring bitmaps from sorted FileId arrays.
+    var bm_lhs = roaring.RoaringBitmap.init(allocator);
+    defer bm_lhs.deinit();
+    var bm_rhs = roaring.RoaringBitmap.init(allocator);
+    defer bm_rhs.deinit();
+
+    for (lhs) |id| try bm_lhs.add(@intCast(id));
+    for (rhs) |id| try bm_rhs.add(@intCast(id));
+
+    // Intersect using Roaring Bitmap's per-chunk optimal algorithm.
+    var result_bm = try bm_lhs.intersect(&bm_rhs, allocator);
+    defer result_bm.deinit();
+
+    // Materialize the result as a sorted FileId array.
+    var out = std.ArrayList(FileId).empty;
+    errdefer out.deinit(allocator);
+    var it = result_bm.iterator();
+    while (it.next()) |id| {
+        try out.append(allocator, @intCast(id));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Scalar merge intersection — used for small lists where Roaring Bitmap
+/// allocation overhead exceeds the merge savings.
+fn intersectFileIdsScalar(allocator: std.mem.Allocator, lhs: []const FileId, rhs: []const FileId) ![]FileId {
     var out = std.ArrayList(FileId).empty;
     errdefer out.deinit(allocator);
 
