@@ -10,6 +10,10 @@ pub const OutputFormat = enum {
     files,
     count,
     stats,
+    /// P23: Streaming NDJSON — one JSON hit object per line, flushed as
+    /// discovered. Terminated by a result sentinel JSON object on the
+    /// final line. No monolithic array materialization.
+    ndjson,
 };
 
 pub const FormatSpec = struct {
@@ -64,6 +68,7 @@ pub const formats = [_]FormatSpec{
     .{ .name = "files", .format = .files, .compatibility = "alias:-l", .help = "Unique paths with matches" },
     .{ .name = "count", .format = .count, .compatibility = "alias:-c", .help = "Per-file match counts" },
     .{ .name = "stats", .format = .stats, .compatibility = "alias:--stats-only", .help = "Suppress hit records and emit result telemetry" },
+    .{ .name = "ndjson", .format = .ndjson, .compatibility = "streaming", .help = "Streaming NDJSON — one hit per line, sentinel-terminated (P23)" },
 };
 
 /// Resolves a public format name through the canonical table.

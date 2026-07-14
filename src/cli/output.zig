@@ -840,6 +840,34 @@ pub fn writeMatchesJsonHits(writer: anytype, report: search.SearchReport) !void 
     try writer.writeAll("]}\n");
 }
 
+/// P23: Streaming NDJSON output. Emits one JSON hit object per line as
+/// discovered, followed by a sentinel JSON object carrying totals and
+/// provenance. No monolithic array materialized — each hit is a standalone
+/// line-delimited JSON object, immediately parseable by any NDJSON consumer.
+///
+/// Line 1..N: {"type":"hit","path":"...","line":N,"column":N,"preview":"..."}
+/// Final:    {"type":"result","schema":"ix.result.v1","status":"ok","matches":N,...}
+pub fn writeSearchNdjson(writer: anytype, report: search.SearchReport) !void {
+    for (report.hits[0..report.hit_count]) |hit| {
+        try writer.writeAll("{\"type\":\"hit\",\"path\":");
+        try writeJsonString(writer, hit.path);
+        try writer.print(",\"line\":{},\"column\":{},\"preview\":", .{ hit.line, hit.column });
+        try writeJsonString(writer, hit.preview);
+        try writer.writeAll("}\n");
+    }
+    // Sentinel: carries totals, truncation status, freshness provenance.
+    try writer.writeAll("{\"type\":\"result\",\"schema\":\"ix.result.v1\",\"status\":");
+    try writer.writeAll(if (report.truncated) "\"truncated\"" else "\"ok\"");
+    try writer.print(",\"expression\":", .{});
+    try writeJsonString(writer, report.expression);
+    try writer.print(",\"matches\":{},\"files\":{},\"bytes_scanned\":{}", .{
+        report.matches_found, report.files_scanned, report.bytes_scanned,
+    });
+    try writer.print(",\"ms\":{d},\"cwd\":", .{report.total_ms});
+    try writeJsonString(writer, report.cwd);
+    try writer.writeAll("}\n");
+}
+
 fn writeSearchHitJson(writer: anytype, report: search.SearchReport, hit: search.SearchHit) !void {
     try writer.writeAll("{\"path\":");
     try writeJsonString(writer, hit.path);

@@ -355,6 +355,7 @@ fn writeSearchResult(io: std.Io, request: cli.SearchRequest, report: search.Sear
         .agent_v2 => try output.writeSearchReportAgent(writer, report),
         .agent_v3, .json_compact => try writeVersionedSearchResult(io, request, report, writer),
         .json => try output.writeSearchJsonReport(writer, report),
+        .ndjson => try output.writeSearchNdjson(writer, report),
         .files => {
             try requireCompleteRecordProjection(report);
             try output.writeFilesWithMatches(writer, report);
@@ -388,6 +389,7 @@ fn writeMatchesResult(request: cli.SearchRequest, report: search.SearchReport, w
             try output.writeCountPerFile(writer, report);
         },
         .stats, .agent_v2, .agent_v3 => return error.UnsupportedOutputFormat,
+        .ndjson => try output.writeSearchNdjson(writer, report),
         .text => try output.writeSearchHits(writer, report),
     }
 }

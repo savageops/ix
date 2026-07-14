@@ -16,7 +16,7 @@ ProjectionCompletion = Literal["complete", "truncated"]
 TruncationReason = Literal["max_hits", "byte_budget", "retention_limit", "similar_candidate_budget"]
 StatsVisibility = Literal["agent", "standard", "debug"]
 RecordGranularity = Literal["line", "block", "section", "paragraph", "ast"]
-OutputFormat = Literal["text", "agent", "agent-v3", "json", "json-compact", "files", "count", "stats"]
+OutputFormat = Literal["text", "agent", "agent-v3", "json", "json-compact", "files", "count", "stats", "ndjson"]
 RouteLane = Literal["cold", "warm"]
 
 # ── ix.result.v3 ─────────────────────────────────────────────────────

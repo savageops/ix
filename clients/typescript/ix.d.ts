@@ -33,7 +33,8 @@ export type OutputFormat =
   | "json-compact"
   | "files"
   | "count"
-  | "stats";
+  | "stats"
+  | "ndjson";
 
 /** Warm index route lane. */
 export type RouteLane = "cold" | "warm";
