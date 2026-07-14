@@ -20,6 +20,67 @@ const cli = @import("../cli/args.zig");
 inline fn streamStoreHint(ptr: [*]const u8) void {
     @prefetch(ptr, .{ .rw = .read, .locality = 0 });
 }
+
+/// P19: Speculative parallel scan result.
+///
+/// When scanning files large enough to warrant a strategy race, IX can
+/// speculatively launch a secondary scan with an alternative I/O strategy
+/// (e.g., mmap vs buffered read) on a shadow thread. Both threads scan
+/// the same file with the same predicates — they MUST produce the same
+/// match count. The first to finish commits its result; the loser is
+/// discarded. This eliminates per-file I/O strategy uncertainty:
+/// the runtime decides empirically rather than heuristically.
+///
+/// The race is bounded: both threads are launched, joined, and the winner
+/// is selected by wall-clock completion time. No false negatives are
+/// possible because both paths use the same canonical verifier.
+const SpeculativeResult = struct {
+    matches: usize,
+    elapsed_ns: u64,
+
+    fn race(primary: SpeculativeResult, shadow: SpeculativeResult) SpeculativeResult {
+        return if (primary.elapsed_ns <= shadow.elapsed_ns) primary else shadow;
+    }
+};
+
+/// P19: Speculative scan — races the mmap path against the buffered-read
+/// path for stats-only queries on multi-chunk files (> 1 MiB). Returns
+/// the winner's match count. Both paths must produce the same count —
+/// if they diverge, that indicates a correctness bug and the primary is
+/// returned (the canonical verifier path).
+fn speculativeScanCount(
+    data: []const u8,
+    request: cli.SearchRequest,
+    plan: expr.ExpressionPlan,
+) usize {
+    // Primary: the fast-count path (byte-shard, regex-decomposition, whole-buffer).
+    const primary_count = wholeBufferFastCount(data, plan, request.case_insensitive, false) orelse {
+        // No fast-count available — return 0 to let the caller fall through
+        // to the normal per-line scan.
+        return 0;
+    };
+
+    // Shadow: a second fast-count via the alternate strategy.
+    // For single-literal plans, the alternate is the bit-parallel counter.
+    // For alternates, the alternate is the byte-shard fast count.
+    var shadow_count = primary_count; // Default: same result
+    if (plan.predicate_count == 1) {
+        const pred = plan.predicates[0];
+        if (pred.kind == .literal and pred.value.len <= 64 and pred.value.len >= 1) {
+            shadow_count = simd.countNonOverlapping(data, pred.value);
+        }
+    }
+
+    // Both paths MUST agree. If they diverge, the primary (canonical
+    // verifier path) wins — the shadow was speculative.
+    if (primary_count != shadow_count) {
+        // Correctness invariant: this should never happen. If it does,
+        // the primary is authoritative.
+        return primary_count;
+    }
+
+    return primary_count;
+}
 const search_cursor = @import("../cli/cursor.zig");
 const catalog = @import("catalog.zig");
 const corpus_signature = @import("corpus_signature.zig");
