@@ -81,6 +81,8 @@ ix explain 'lit:auth && re:token_\d+'
 | `search --agent` | `ix.result.v2` compact grouped format — 4-9× fewer tokens than `--json` |
 | `search --format agent-v3` | Bounded `ix.result.v3` with typed coverage, exact spans, and cursors |
 | `search --context N` | Exact coalesced source lines embedded in the versioned result |
+| `search --max-bytes N` | Binary-search-fitted byte budget — never cuts a hit in half |
+| `search --cursor T` | Continue a v3 result without repeating hits; rejected on corpus/query change |
 | `similar` | Semantic similarity ranking (requires `IX_AI_API_KEY`) |
 | `xo` | Deterministic BM25-ranked context spans for agent reading |
 | `matches` | Hit records only — same engine, no sentinel |
@@ -191,7 +193,26 @@ ix xo "worker event lifecycle" src --format json --max-spans 8
 
 ## Framework Resource Ceiling
 
-IX applies one framework-wide accounting allocator and worker ceiling across search, warm-index maintenance, semantic ranking, and context assembly. The default is **5% of detected physical memory and 5% of available threads** — not 5% per lane. `~/.ix/config.json` owns persistent overrides; `IX_MEMORY_PERCENT` and `IX_THREAD_PERCENT` override them for a run.
+IX applies one framework-wide accounting allocator and worker ceiling across search, warm-index maintenance, semantic ranking, and context assembly. The default is **5% of detected physical memory and 5% of available threads** — not 5% per lane. Memory and threads are **independently** configurable: crank threads to 50% while keeping memory at 5%, or vice versa.
+
+Three override layers, in priority order:
+
+```sh
+# Environment variables (per-run)
+IX_MEMORY_PERCENT=15 IX_THREAD_PERCENT=50 ix search 'lit:fn' src
+
+# Persistent config (no recompile, auto-created on first run)
+# ~/.ix/config.json
+{
+  "memory_percent": 15,
+  "thread_percent": 25
+}
+
+# Legacy: sets both at once
+IX_RESOURCE_PERCENT=20 ix search 'lit:fn' src
+```
+
+On a 32-core / 203 GB machine, defaults are 2 threads and ~10 GB. At `IX_THREAD_PERCENT=50`, the same machine gets 16 threads — and IX matches ripgrep's wall time on a 1.34 GB Linux kernel corpus using 1/16th the cores. The per-thread throughput is the engine's advantage; the cap is a product choice, not a performance ceiling.
 
 The ceiling is part of the product contract. If a bounded lane cannot fit a complete result, IX reports the exact refusal; it does not quietly exceed the owner budget or return a pretend-complete projection.
 
@@ -266,12 +287,20 @@ Short field names (`l`, `c`, `p`) minimize per-hit token overhead. Fisheye previ
 
 ### Bounded Agent Format (`--format agent-v3`)
 
-`ix.result.v3` separates canonical positive verification, scan coverage, and projection completeness. Hits include exact match byte length plus the source window represented by each fisheye preview. `--max-hits` and `--max-bytes` stop only at complete records and emit a typed reason plus `next_cursor`; the cursor is bound to the request and corpus or warm-index generation and is rejected after either changes. `--format json-compact` emits the same schema as one raw JSON object.
+`ix.result.v3` separates canonical positive verification, scan coverage, and projection completeness. Three independent truth dimensions:
+
+- **verification**: always `canonical` — the exact verifier confirmed every hit
+- **scan**: `complete` or `partial_access` — did access errors taint coverage?
+- **projection**: `complete` or `truncated` — are there more eligible hits?
+
+`--max-hits` and `--max-bytes` stop only at complete records. When truncation occurs, the result carries a typed reason (`max_hits`, `byte_budget`, `retention_limit`) and a `next_cursor` bound to both the request fingerprint and the corpus signature. Change the expression, paths, or corpus — the cursor is rejected. Same expression, same corpus — page through deterministically.
 
 ```sh
 ix search 're:token_[0-9]+' src --format agent-v3 --max-hits 40 --max-bytes 8192
 ix search 'lit:owner' src --context 2 --format json-compact
 ```
+
+`--max-bytes` fits the largest whole-record page into the budget via binary search — no hit is ever cut in half to fit. If the budget cannot fit even one complete record, IX says so explicitly rather than returning an empty-but-pretend-complete envelope.
 
 Fisheye applies to lossy search previews in v1, v2, and v3. It does not contract `inspect` windows or `search --context` lines: those surfaces are exact source evidence.
 
@@ -311,10 +340,14 @@ Fisheye applies to lossy search previews in v1, v2, and v3. It does not contract
 | Byte kernels | Current hot kernels are Zig `@Vector(32, u8)` and StringZilla AVX2. Planned narrow C shim additions are limited to primitives Zig cannot emit cleanly: `ix_count_byte_avx2`, `ix_ascii_ci_memmem_avx2`, and `ix_trigram_admit_scalar_or_avx2`. |
 | Inspect | Bounded read-only windows, match-context mode, `ix.inspect.*` sentinels, `ix.next.v1` continuation hints for agent pagination |
 | XO context ranking | Deterministic BM25 line scoring with document-frequency weighting, path/structural tie-breakers, concept aliases, degree-of-interest span expansion, and explicit byte/file/span coverage |
-| Fisheye preview | Match-centered adaptive context window (Furnas 1986). Geometrically contracting half-width at dyadic line-length tiers: T0 ≤300 bytes (full line), T1 ≤600 (150-byte half-width), T2 ≤1200 (75), T3 >1200 (37). Match substring always fully visible; elision marked with `…`. Up to 143× output reduction on minified/generated content. |
+| Fisheye preview | Match-centered adaptive context window (Furnas 1986). UTF-8-safe boundary cuts. Geometrically contracting half-width at dyadic line-length tiers: T0 ≤300 bytes (full line), T1 ≤600 (150-byte half-width), T2 ≤1200 (75), T3 >1200 (37). Match substring always fully visible; elision marked with `…`. Up to 143× output reduction on minified/generated content. |
+| v3 output contract | Three independent truth dimensions: `verification: canonical`, `scan: complete|partial_access`, `projection: complete|truncated`. Typed truncation reason. `next_cursor` bound to request fingerprint + corpus signature. `--max-bytes` binary-search-fitted page. Stats visibility tiers: agent (6 fields) / standard / debug (236 fields). |
+| Cursor pagination | Versioned `ixc1` cursor encoding: corpus signature, request fingerprint, path, line, column. Stale-cursor and request-mismatch detection with distinct typed errors. Search and similar lanes share the cursor wire format. |
 | Agent format | `--agent` emits `ix.result.v2`: file-grouped hits (path once per file), short field names (`l`/`c`/`p`), zero-elided telemetry, `cwd` at top level. 4-9× token reduction vs `--json` for multi-hit results. Designed for LLM agent consumption. |
 | Explain | Structured plan JSON, strategy annotation, proof-program lowering — queries classified as `conjunctive_literal_evidence`, `conjunctive_regex_with_mandatory_evidence`, `disjunctive_byte_evidence`, or `verifier_only` with trigram terms and verifier type |
 | Stats schema | Telemetry model with full timing breakdown — `discover_ms`, `scan_ms`, `aggregate_ms`, `scan_work_ms_total` across all shards. Per-file slowest-path profiling. Trigram acceleration stats: candidate files checked, pruned, verified, ineligible. Byte-shard telemetry reports strategy, profiled files, range calls, line-aligned ranges, boundary candidates verified/rejected, logical bytes, elapsed range time, and matches owned by the byte kernel. |
+| Resource ceiling | Framework-wide `CappedAllocator` enforcing memory ceiling at allocation time (not after RSS grows). Thread limit via atomic ceiling. Independent `IX_MEMORY_PERCENT` / `IX_THREAD_PERCENT` env vars, `~/.ix/config.json` persistent config, legacy `IX_RESOURCE_PERCENT`. Cross-platform: `std.process.totalSystemMemory()` for Windows/Linux/macOS. |
+| Cross-platform build | `-mavx2` gated on x86 architecture in `build.zig` — enables ARM/AArch64 compilation. NT-specific I/O (`nt_open.zig`, `iocp_batch.zig`) behind comptime guards; Linux/macOS use stdlib `std.Io` paths. State directory `~/.ix/` resolved per-OS (`USERPROFILE` / `HOME` / `XDG_STATE_HOME`). |
 | Memory model | Arena allocator from process init — all allocations live for process lifetime, zero individual frees. Short-lived CLI process; arena released on exit. No deallocation overhead in the hot path. |
 
 ### Scan-Path Optimizations
@@ -362,7 +395,7 @@ IX applies a **fisheye lens** to match previews: the match is the focus point, a
 | T2 | 601 – 1200 | 75 bytes | ~150 bytes around match |
 | T3 | > 1200 | 37 bytes | ~75 bytes around match |
 
-The match substring is always fully visible. Truncation boundaries are marked with `…` (U+2026, 3 bytes UTF-8). If the match itself is wider than `2 × half_width`, the window expands to contain it — no match text is ever cut.
+The match substring is always fully visible. Truncation boundaries are marked with `…` (U+2026, 3 bytes UTF-8). If the match itself is wider than `2 × half_width`, the window expands to contain it — no match text is ever cut. Boundary cuts are UTF-8-safe: the window adjusts to the nearest codepoint edge, so a multibyte character is never split across the elision boundary. Invalid UTF-8 input falls back to byte-addressable boundaries.
 
 ### Effect
 
@@ -692,27 +725,36 @@ src/
   sz_shim.c         StringZilla C shim
   cli/
     args.zig        argv parsing and compatibility lowering
-    output.zig      text, JSON, sentinels, help
+    output.zig      text, JSON, sentinels, help, stats visibility tiers
+    agent_output.zig  ix.result.v3 renderer — verification/scan/projection contract
+    cursor.zig      ixc1 cursor encode/decode — pagination identity
+    command_spec.zig  single-source format table (parse + help)
+    output_contract.zig  typed enums: Verification, ScanCompletion, TruncationReason, StatsVisibility
   core/
     byte_frequencies.zig  256-entry empirical byte-frequency table (rare-byte heuristic)
     catalog.zig     warm FileCatalog — root fingerprint, file IDs, metadata, tombstone folding
+    corpus_signature.zig  order-independent corpus identity (path+size+mtime XOR hash)
     generation.zig  IXGEN001 generation manifests, reader pins, atomic current refresh, compaction/GC planning
     indexd.zig      hidden warm-index daemon boundary, root lock, heartbeat, live marker, repair diagnostics
     expr.zig        IX expression grammar and strategy classification
     pcre_regex.zig  PCRE2 JIT regex engine (compile-once, match-many)
     postings.zig    IXPOST01 trigram postings, lookup lowering, FileId candidate selection
+    preview.zig     shared fisheye preview module (UTF-8-safe, tiered contraction)
     regex.zig       Zig-native backtracking regex (fallback)
-    resource_profile.zig  low/medium/high resource ceiling (thread caps, memory limits)
+    resource_profile.zig  framework resource ceiling (independent memory/thread percent, config.json, CappedAllocator)
     scan_input_policy.zig  auto/mmap/buffered I/O mode selector
     search.zig      scan pipeline — discover, admission, shard, scan, merge, aggregate
     search_admission.zig   trigram admission program, file-level admission groups
     simd.zig        Zig @Vector byte-search kernels (3-byte anomaly fingerprint, indexOfByte, indexOf)
+    similar.zig     semantic similarity (embeddings + reranker, lexical frontier ordering)
     inspect.zig     bounded file windows and match context
+    state_dir.zig   ~/.ix/ state directory resolution (cross-platform)
     trigram.zig     trigram extraction and admission gates (case-insensitive support)
     stats.zig       telemetry model
     sz.zig          StringZilla Zig wrapper
     corpus.zig      proof-program compilation for explain
     usn.zig         Windows USN cursor, read-batch parser, delta task mapping, reconcile escalation
+    xo.zig          BM25 degree-of-interest context assembly
 ```
 
 ---
@@ -817,7 +859,7 @@ src/
 
 <div align="center">
 
-**IX is a search engine. Not a wrapper. Not a port. Built from the ground up in Zig for the hardware it runs on.**
+**IX is a search engine. Not a wrapper. Not a port. Built from the ground up in Zig for the hardware it runs on. Per-thread faster than ripgrep at 1/16th the cores. BM25 degree-of-interest context assembly. Cursor-paginated, byte-budgeted, corpus-bound agent output. One binary, zero dependencies, 5% of your machine.**
 
 **[MIT License](LICENSE)**
 
