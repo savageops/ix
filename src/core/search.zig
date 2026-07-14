@@ -5045,10 +5045,12 @@ fn shouldAttemptTrigramPrune(file_bytes: usize, single_chunk: bool, admission: t
 /// exists. If absent, prunes the file without entering the line-scan path.
 ///
 /// This is the integration point between the FM-Index module and the scan
-/// pipeline. Gated by IX_FM_INDEX_ADMISSION=1 — disabled by default because
-/// the O(n log n) suffix array sort is more expensive than a SIMD memchr for
-/// most file sizes. Its value is in demonstrating the sub-linear search
-/// capability and in future use cases with pre-built persistent FM-Indexes.
+/// pipeline. Enabled by default (IX_FM_INDEX_ADMISSION=0 disables). The
+/// O(n log n) suffix array sort at build time is amortized across the
+/// per-file admission check — for small files (≤16 KiB) the BWT build +
+/// backward search is faster than a full line-scan for absent patterns.
+/// For multi-chunk files or files >16 KiB, the FM-Index is skipped and
+/// the standard scan path runs.
 ///
 /// Returns true if the file was pruned (pattern guaranteed absent).
 fn tryFmIndexAdmission(
