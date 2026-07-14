@@ -176,6 +176,7 @@ pub const ParseError = error{
     MissingValue,
     UnsupportedFlag,
     ConflictingOutputFormat,
+    StatsOnlyOutputCapConflict,
     AmbiguousBooleanRegex,
 };
 
@@ -188,6 +189,9 @@ pub const ParseFailureDetail = struct {
 pub fn diagnoseParseFailure(argv: []const []const u8, err: anyerror) ParseFailureDetail {
     if (err == ParseError.ConflictingOutputFormat) return .{
         .hint = "choose one output format; --json may combine only with --stats-only",
+    };
+    if (err == ParseError.StatsOnlyOutputCapConflict) return .{
+        .hint = "remove --total-count/--max-hits for a complete stats-only scan, or remove --stats-only for a bounded projection",
     };
     if (err != ParseError.UnsupportedFlag or argv.len < 2) return .{};
     const is_search = std.mem.eql(u8, argv[1], "search");
@@ -513,6 +517,9 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
         if (request.output_format == .text) request.output_format = .agent_v3;
         if (request.output_format != .agent_v3 and request.output_format != .json_compact) return ParseError.ConflictingOutputFormat;
     }
+    // Stats-only is a complete-count projection. A hit cap would stop the
+    // scanner early and turn an exact count into an unlabeled lower bound.
+    if (request.stats_only and request.max_hits != null) return ParseError.StatsOnlyOutputCapConflict;
     request.stable_output = request.output_format == .agent_v3 or request.output_format == .json_compact;
     return request;
 }
@@ -1119,6 +1126,11 @@ test "legacy json stats composition preserves raw telemetry without hit collecti
         try std.testing.expect(request.stats_only);
         try std.testing.expect(request.json);
     }
+}
+
+test "stats-only rejects a hit cap instead of reporting a partial count as complete" {
+    const argv = [_][]const u8{ "ix-zig", "search", "lit:needle", "src", "--stats-only", "--total-count", "10" };
+    try std.testing.expectError(ParseError.StatsOnlyOutputCapConflict, parseInvocation(std.testing.allocator, &argv));
 }
 
 test "matches rejects terminal-envelope projections and accepts record-only JSON" {

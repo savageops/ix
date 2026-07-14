@@ -8,9 +8,9 @@ import { assertRepoBinaryFresh } from "./lib/speed-compare-utils.mjs";
 
 const ROOT = process.cwd();
 const DEFAULT_REPO_IX = path.join(ROOT, "zig-out", "bin", "ix-zig.exe");
-const DEFAULT_INSTALL_DIR = path.join(os.homedir(), "AppData", "Local", "ix");
+const DEFAULT_INSTALL_DIR = path.join(os.homedir(), "AppData", "ix");
 const LEGACY_INSTALL_DIRS = [
-  path.join(os.homedir(), "AppData", "ix"),
+  path.join(os.homedir(), "AppData", "Local", "ix"),
   path.join(os.homedir(), "AppData", "Local", "Programs", "iEx", "bin"),
 ];
 const DEFAULT_STATE_DIR = path.join(os.homedir(), ".ix");
@@ -23,10 +23,10 @@ Proves the repo IX candidate, stages the single native executable, archives ever
 predecessor under ix/backups, atomically promotes, and verifies the owner path.
 
 Options:
-  --build                 Run tests and build repo IX ReleaseSmall before syncing.
+  --build                 Run tests and build repo IX ReleaseFast before syncing.
   --repo-ix <path>        Repo IX binary. Default: zig-out/bin/ix-zig.exe.
   --install-dir <path>    Native install directory.
-                          Default: ~/AppData/Local/ix.
+                           Default: ~/AppData/ix.
   --dry-run               Print planned actions without copying files.
   --help, -h              Print this help.
 `);
@@ -58,8 +58,8 @@ function run(command, commandArgs, { quiet = false } = {}) {
     stdio: quiet ? "pipe" : "inherit",
     windowsHide: true,
   });
-  if ((result.status ?? 0) !== 0) {
-    throw new Error(`${command} ${commandArgs.join(" ")} failed with exit code ${result.status}`);
+  if (result.status == null || result.status !== 0) {
+    throw new Error(`${command} ${commandArgs.join(" ")} failed with exit code ${result.status ?? "not-started"}`);
   }
 }
 
@@ -131,23 +131,23 @@ function migrateBackupDirectory(sourceDir) {
   return moves;
 }
 
-/// Retires the previous Programs/iEx/bin layout after its state and backups are safe.
+/// Retires every pre-canonical install layout after its state and backups are safe.
 function migrateLegacyInstall() {
-  const moves = migrateBackupDirectory(path.join(LEGACY_INSTALL_DIR, "ix", "backups"));
-  if (!existsSync(LEGACY_INSTALL_DIR)) return moves;
-  for (const entry of readdirSync(LEGACY_INSTALL_DIR, { withFileTypes: true })) {
-    const source = path.join(LEGACY_INSTALL_DIR, entry.name);
-    if (entry.isDirectory()) continue;
-    const lower = entry.name.toLowerCase();
-    if (!lower.startsWith("ix") && !lower.startsWith("iex")) continue;
-    const destination = uniqueBackupPath(entry.name);
-    if (!dryRun) renameSync(source, destination);
-    moves.push({ source, destination });
-  }
-  if (!dryRun) {
-    const ixDir = path.join(LEGACY_INSTALL_DIR, "ix");
-    if (existsSync(ixDir) && readdirSync(ixDir).length === 0) rmSync(ixDir, { recursive: true, force: true });
-    if (readdirSync(LEGACY_INSTALL_DIR).length === 0) rmSync(LEGACY_INSTALL_DIR, { recursive: true, force: true });
+  const moves = [];
+  for (const legacyDir of LEGACY_INSTALL_DIRS) {
+    moves.push(...migrateBackupDirectory(path.join(legacyDir, "backups")));
+    moves.push(...migrateBackupDirectory(path.join(legacyDir, "ix", "backups")));
+    if (!existsSync(legacyDir)) continue;
+    for (const entry of readdirSync(legacyDir, { withFileTypes: true })) {
+      const source = path.join(legacyDir, entry.name);
+      if (entry.isDirectory()) continue;
+      const lower = entry.name.toLowerCase();
+      if (!lower.startsWith("ix") && !lower.startsWith("iex")) continue;
+      const destination = uniqueBackupPath(entry.name);
+      if (!dryRun) renameSync(source, destination);
+      moves.push({ source, destination });
+    }
+    if (!dryRun && readdirSync(legacyDir).length === 0) rmSync(legacyDir, { recursive: true, force: true });
   }
   return moves;
 }
@@ -158,19 +158,19 @@ function updateUserPath() {
   if (dryRun || !isDefaultInstall) return { changed: false, reason: dryRun ? "dry_run" : "custom_install_dir" };
   const script = [
     "$parts = @([Environment]::GetEnvironmentVariable('Path','User') -split ';' | Where-Object { $_ })",
-    "$legacy = $env:IX_LEGACY_INSTALL",
+    "$legacy = @(" + LEGACY_INSTALL_DIRS.map((entry) => `'${entry.replaceAll("'", "''")}'`).join(",") + ")",
     "$current = $env:IX_CURRENT_INSTALL",
-    "$next = @($parts | Where-Object { -not [string]::Equals($_.TrimEnd('\\'), $legacy.TrimEnd('\\'), [StringComparison]::OrdinalIgnoreCase) })",
+    "$next = @($parts | Where-Object { $item = $_.TrimEnd('\\'); -not ($legacy | Where-Object { [string]::Equals($item, $_.TrimEnd('\\'), [StringComparison]::OrdinalIgnoreCase) }) })",
     "if (-not ($next | Where-Object { [string]::Equals($_.TrimEnd('\\'), $current.TrimEnd('\\'), [StringComparison]::OrdinalIgnoreCase) })) { $next += $current }",
     "[Environment]::SetEnvironmentVariable('Path', ($next -join ';'), 'User')",
   ].join("; ");
   const result = spawnSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
     encoding: "utf8",
     windowsHide: true,
-    env: { ...process.env, IX_LEGACY_INSTALL: LEGACY_INSTALL_DIR, IX_CURRENT_INSTALL: installDir },
+    env: { ...process.env, IX_CURRENT_INSTALL: installDir },
   });
   if (result.status !== 0) throw new Error(`user PATH migration failed: ${result.stderr.trim()}`);
-  return { changed: true, removed: LEGACY_INSTALL_DIR, added: installDir };
+  return { changed: true, removed: LEGACY_INSTALL_DIRS, added: installDir };
 }
 
 function verifyCandidate(binaryPath) {
@@ -239,8 +239,8 @@ if (process.platform !== "win32") {
 }
 
 if (buildFirst) {
-  run(resolveZigExe(), ["build", "test", "-j1", "-Doptimize=ReleaseSmall"]);
-  run(resolveZigExe(), ["build", "-j1", "-Doptimize=ReleaseSmall", "--summary", "all"]);
+  run(resolveZigExe(), ["build", "test", "-j1", "-Doptimize=ReleaseFast"]);
+  run(resolveZigExe(), ["build", "-j1", "-Doptimize=ReleaseFast", "--summary", "all"]);
 }
 if (!existsSync(repoIx)) {
   throw new Error(`repo IX binary missing: ${repoIx}`);
@@ -269,8 +269,7 @@ try {
 }
 const archived = archiveLegacySiblings();
 const stateMigrations = isDefaultInstall ? [
-  migrateStateRoot(LEGACY_STATE_DIR, DEFAULT_STATE_DIR, "localappdata-ix"),
-  migrateStateRoot(path.join(LEGACY_INSTALL_DIR, ".ix"), DEFAULT_STATE_DIR, "install-dot-ix"),
+  ...LEGACY_INSTALL_DIRS.map((legacyDir) => migrateStateRoot(path.join(legacyDir, ".ix"), DEFAULT_STATE_DIR, "install-dot-ix")),
 ].filter(Boolean) : [];
 const legacyInstallMoves = isDefaultInstall ? migrateLegacyInstall() : [];
 const pathMigration = updateUserPath();

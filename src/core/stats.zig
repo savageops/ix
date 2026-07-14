@@ -33,7 +33,7 @@ pub const ConcurrencyStats = struct {
     thread_limit: usize = 1,
     outer_scan_threads: usize = 1,
     execution_mode: []const u8 = "materialized",
-    resource_policy: []const u8 = "hardware_5_percent",
+    resource_policy: []const u8 = "hardware_percent",
     scan_input_policy: []const u8 = "auto",
     sharding_enabled: bool = false,
     sharded_files: usize = 0,
@@ -437,7 +437,7 @@ test "search stats owns rust-compatible top-level schema defaults" {
     snapshot.recordSlowFile("fast.txt", 0.5, 21, false);
     try std.testing.expectEqual(@as(usize, 1), snapshot.concurrency.available_threads);
     try std.testing.expectEqualStrings("materialized", snapshot.concurrency.execution_mode);
-    try std.testing.expectEqualStrings("hardware_5_percent", snapshot.concurrency.resource_policy);
+    try std.testing.expectEqualStrings("hardware_percent", snapshot.concurrency.resource_policy);
     try std.testing.expectEqualStrings("linux_amd_asic_reg_giant_header", snapshot.linux_dominant_file.target_class);
     try std.testing.expect(!snapshot.catalog_index.enabled);
     try std.testing.expectEqualStrings("not_wired", snapshot.catalog_index.fallback_reason);

@@ -323,9 +323,9 @@ export function runWithWindowsBenchmarkIsolation(command, args, options, isolati
   });
   const ended = process.hrtime.bigint();
   const wrapperDurationMs = Number(ended - started) / 1_000_000;
-  const wrapperStatus = result.status ?? 0;
-  if (wrapperStatus !== 0) {
-    throw new Error(`isolation wrapper failed (${command} ${args.join(" ")}): code=${wrapperStatus}\n${result.stderr?.toString() ?? ""}`);
+  const wrapperStatus = result.status;
+  if (result.error || wrapperStatus == null || wrapperStatus !== 0) {
+    throw new Error(`isolation wrapper failed (${command} ${args.join(" ")}): code=${wrapperStatus ?? "not-started"}\n${result.stderr?.toString() ?? result.error?.message ?? ""}`);
   }
   let payload = null;
   try {
@@ -333,7 +333,10 @@ export function runWithWindowsBenchmarkIsolation(command, args, options, isolati
   } catch {
     throw new Error(`isolation wrapper returned invalid JSON for ${command}`);
   }
-  const status = Number(payload?.status ?? 0);
+  if (payload?.status == null) {
+    throw new Error(`isolated command did not start (${command} ${args.join(" ")}): ${String(payload?.startError ?? payload?.stderr ?? "unknown start failure")}`);
+  }
+  const status = Number(payload.status);
   if (!allowedCodes.includes(status)) {
     const stderr = String(payload?.stderr ?? "");
     throw new Error(`command failed (${command} ${args.join(" ")}): code=${status}\n${stderr}`);

@@ -2421,7 +2421,13 @@ fn skippedFileBytes(io: std.Io, path: []const u8) usize {
 }
 
 fn shouldUseParallelDiscovery(request: cli.SearchRequest, roots: PreparedRoots) bool {
-    if (request.max_hits != null and !request.stats_only and !request.stable_output) return false;
+    // Versioned output binds cursors to the discovered corpus. Parallel
+    // top-level walks share the request arena across workers, so path
+    // allocation can produce a different identity for the same tree.
+    // Deterministic projections use the serial discovery owner; the search
+    // lane keeps parallel discovery.
+    if (request.stable_output) return false;
+    if (request.max_hits != null and !request.stats_only) return false;
     const requested_threads = boundedRequestedThreads(request.threads, defaultParallelDiscoveryThreadBudget(request));
     if (requested_threads <= 1) return false;
     if (roots.count == 0) return false;
@@ -7324,7 +7330,7 @@ test "protected Windows stats-only roots allow parallel discovery under default 
         request.stats_only = false;
         try std.testing.expect(!shouldUseParallelDiscovery(request, roots));
         request.stable_output = true;
-        try std.testing.expect(shouldUseParallelDiscovery(request, roots));
+        try std.testing.expect(!shouldUseParallelDiscovery(request, roots));
     }
 }
 

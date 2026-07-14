@@ -17,6 +17,7 @@ const DEFAULT_BENCHMARK_LOCK_DIR = path.join(os.tmpdir(), "ix-zig-benchmark.lock
 const DEFAULT_STALE_BENCHMARK_LOCK_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_PENDING_BENCHMARK_LOCK_OWNER_GRACE_MS = 5 * 1000;
 const RUNTIME_FRESHNESS_EXTENSIONS = new Set([".zig", ".c", ".h"]);
+let cachedRipgrepPath = null;
 const BENCHMARK_ENV_SNAPSHOT_KEYS = [
   "IX_INDEX",
   "IX_NEXUS",
@@ -182,7 +183,7 @@ export function run(command, commandArgs, options = {}) {
     }, isolationPlan, { allowedCodes: [0] });
     return {
       command: [command, ...commandArgs].join(" "),
-      exitCode: isolated.status,
+      exitCode: isolated.status == null ? null : isolated.status,
       stdout: isolated.stdout,
       stderr: isolated.stderr,
       durationMs: isolated.durationMs,
@@ -199,7 +200,7 @@ export function run(command, commandArgs, options = {}) {
   });
   return {
     command: [command, ...commandArgs].join(" "),
-    exitCode: result.status ?? 0,
+    exitCode: result.status == null ? null : result.status,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
     durationMs: Number(process.hrtime.bigint() - started) / 1_000_000,
@@ -209,10 +210,34 @@ export function run(command, commandArgs, options = {}) {
 }
 
 export function requireOk(result, label) {
-  if (result.exitCode !== 0) {
-    throw new Error(`${label} failed (${result.exitCode}): ${result.stderr || result.stdout}`);
+  if (result.exitCode == null || result.exitCode !== 0) {
+    throw new Error(`${label} failed (${result.exitCode ?? "not-started"}): ${result.stderr || result.stdout}`);
   }
   return result;
+}
+
+/**
+ * Resolves ripgrep to an executable path before Windows ProcessStartInfo sees it.
+ * A bare `rg` may work through a shell but is not a reliable FileName for the
+ * isolated helper; accepting that miss as exit code 0 corrupts timing evidence.
+ */
+export function resolveRipgrepPath() {
+  if (cachedRipgrepPath != null) return cachedRipgrepPath;
+  const configured = process.env.IX_RG_PATH?.trim();
+  if (configured) {
+    if (!existsSync(configured)) throw new Error(`IX_RG_PATH does not exist: ${configured}`);
+    cachedRipgrepPath = configured;
+    return cachedRipgrepPath;
+  }
+  const resolver = process.platform === "win32" ? "where.exe" : "which";
+  const result = spawnSync(resolver, ["rg"], { encoding: "utf8", windowsHide: true });
+  if (result.error || result.status !== 0) {
+    throw new Error(`ripgrep executable not found; set IX_RG_PATH${result.stderr ? `: ${result.stderr.trim()}` : ""}`);
+  }
+  const candidate = String(result.stdout ?? "").split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  if (!candidate || !existsSync(candidate)) throw new Error(`ripgrep resolver returned no executable path: ${candidate ?? "empty"}`);
+  cachedRipgrepPath = candidate;
+  return cachedRipgrepPath;
 }
 
 function processIsAlive(pid) {
@@ -2186,13 +2211,14 @@ export function inferRipgrepArgs({ expression, defaultExpression = DEFAULT_ALTER
 
 export function measureRipgrep({ expression, defaultExpression = DEFAULT_ALTERNATES_EXPR, corpus, threads, samples, env, mmapMode = "force", label = "ripgrep" }) {
   const args = inferRipgrepArgs({ expression, defaultExpression, corpus, threads, mmapMode });
+  const command = resolveRipgrepPath();
   const runs = [];
   for (let sample = 1; sample <= samples; sample += 1) {
-    const result = run("rg", args, { env });
+    const result = run(command, args, { env });
     if (result.exitCode !== 0 && result.exitCode !== 1) requireOk(result, `ripgrep sample ${sample}`);
-    runs.push({ sample, durationMs: result.durationMs, exitCode: result.exitCode });
+    runs.push({ sample, durationMs: result.durationMs, exitCode: result.exitCode, command });
   }
-  return { command: "rg", label, mmapMode, args, samples: runs, summary: summary(runs.map((entry) => entry.durationMs)) };
+  return { command, label, mmapMode, args, samples: runs, summary: summary(runs.map((entry) => entry.durationMs)) };
 }
 
 export function measureRipgrepBracketed({
@@ -2232,7 +2258,7 @@ export function measureRipgrepBracketed({
         label: `${label}-after`,
       })
     : {
-        command: "rg",
+        command: before.command,
         label: `${label}-after`,
         mmapMode,
         args: before.args,

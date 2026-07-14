@@ -1317,7 +1317,7 @@ test "search json emits bounded slowest file attribution list" {
     try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_file_mmap_ms_total\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_file_buffered_ms_total\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"scan_input_policy\":\"auto\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "\"resource_policy\":\"hardware_5_percent\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"resource_policy\":\"hardware_percent\"") != null);
     const slow_index = std.mem.indexOf(u8, out, "\"path\":\"slow.h\"") orelse return error.MissingSlowFile;
     const fast_index = std.mem.indexOf(u8, out, "\"path\":\"fast.h\"") orelse return error.MissingFastFile;
 

@@ -43,7 +43,7 @@ pub const search_options = [_]OptionSpec{
     .{ .syntax = "-l, --files-with-matches", .names = &.{ "-l", "--files-with-matches" }, .help = "Emit unique matching paths" },
     .{ .syntax = "-c, --count", .names = &.{ "-c", "--count" }, .help = "Emit per-file match counts" },
     .{ .syntax = "--max-hits <N>", .names = &.{"--max-hits"}, .help = "Limit retained hit records", .takes_value = true },
-    .{ .syntax = "--total-count <N>", .names = &.{"--total-count"}, .help = "Alias of --max-hits for bounded readers", .takes_value = true },
+    .{ .syntax = "--total-count <N>", .names = &.{"--total-count"}, .help = "Output cap; scanning may continue (alias of --max-hits)", .takes_value = true },
     .{ .syntax = "-t, --threads <N>", .names = &.{ "-t", "--threads" }, .help = "Request workers below the framework ceiling", .takes_value = true },
     .{ .syntax = "--emit-report <PATH>", .names = &.{"--emit-report"}, .help = "Write the full JSON report to a file", .takes_value = true },
     .{ .syntax = "--context <N>", .names = &.{"--context"}, .help = "Include exact coalesced context in v3", .search_only = true, .takes_value = true },

@@ -247,10 +247,14 @@ function latestHistoricalSelectionSeed() {
 function backupCandidates() {
   const current = path.join(installDir, "ix.exe");
   const candidates = [];
-  for (const name of readdirSync(installDir)) {
-    if (!/^ix\.exe\.backup-/.test(name)) continue;
-    const fullPath = path.join(installDir, name);
-    candidates.push({ label: name.replace(/^ix\.exe\./, ""), path: fullPath, mtimeMs: statSync(fullPath).mtimeMs, source: "backup" });
+  const canonicalBackupDir = path.join(installDir, "backups");
+  const backupRoots = existsSync(canonicalBackupDir) ? [canonicalBackupDir] : [installDir];
+  for (const backupRoot of backupRoots) {
+    for (const name of readdirSync(backupRoot)) {
+      if (!/^ix\.exe\.backup-/.test(name)) continue;
+      const fullPath = path.join(backupRoot, name);
+      candidates.push({ label: name.replace(/^ix\.exe\./, ""), path: fullPath, mtimeMs: statSync(fullPath).mtimeMs, source: "backup" });
+    }
   }
   if (includeCurrentInstall && existsSync(current)) {
     candidates.push({ label: "installed-current", path: current, mtimeMs: statSync(current).mtimeMs, source: "current_install" });

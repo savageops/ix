@@ -34,7 +34,19 @@ foreach ($entry in $envMap.GetEnumerator()) {
 $proc = [System.Diagnostics.Process]::new()
 $proc.StartInfo = $psi
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-$null = $proc.Start()
+try {
+  $null = $proc.Start()
+} catch {
+  $sw.Stop()
+  [pscustomobject]@{
+    status = $null
+    durationMs = [Math]::Round($sw.Elapsed.TotalMilliseconds, 6)
+    stdout = ""
+    stderr = ""
+    startError = $_.Exception.Message
+  } | ConvertTo-Json -Compress -Depth 6
+  exit 0
+}
 
 $priorityError = $null
 $appliedPriorityClass = $null
