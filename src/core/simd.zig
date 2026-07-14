@@ -78,6 +78,14 @@ pub inline fn indexOfByte(haystack: []const u8, needle: u8) ?usize {
 //
 // For byte-value search: XOR the word with a splat of the target byte,
 // then apply the zero-byte formula to detect matches.
+//
+// The bit-parallel shift-OR algorithm (Baeza-Yates–Gonnet) below
+// implements a branchless NFA in a u64 register: one OR+SHIFT per byte,
+// no conditional jumps. For patterns ≤64 bytes this is the maximum
+// theoretical instructions-per-cycle density for the short-pattern case.
+// The @Vector(32, u8) path compiles to VPCMPEQB+VPMOVMSKB+TZCNT on
+// AVX2, achieving the same branchless permutation as pshufb-based
+// approaches but through the Zig comptime SIMD lowering.
 
 const ONES: u64 = 0x0101010101010101;
 const HIGHS: u64 = 0x8080808080808080;
