@@ -5,7 +5,7 @@ Scope: shipped CLI projections, bounded inspection, semantic/lexical insight lan
 
 ## Review provenance
 
-Three independent subagents received the exact same review prompt at x2 effort. None edited files. Their consensus was merged with direct source probes and installed-binary probes. A fourth focused review was opened for the reproduced multi-file v3 cursor failure; its result must close before this pass is considered complete.
+Three independent subagents received the exact same review prompt at x2 effort. None edited files. Their consensus was merged with direct source probes and installed-binary probes. A fourth focused review isolated the reproduced multi-file v3 cursor failure to parallel discovery sharing the request arena; the repair and installed-binary continuation probe closed that finding.
 
 ## Response structures
 
@@ -13,7 +13,7 @@ Three independent subagents received the exact same review prompt at x2 effort. 
 |---|---|---|---|---|---|
 | `records` / text | Exact query returned readable path:line:column records plus one terminal sentinel. | Pipe-safe, familiar, exact. | Keep terminal state compact and stable. | Keep for human/read-through compatibility. | Do not group paths; repetition is intentional statelessness. |
 | `--agent` (`ix.result.v2`) | `lit:fn src --agent --max-hits 3` returned one path-grouped object with short `l/c/p` fields and explicit truncation. | Highest context density for ordinary agents. | Add only proven fields; preserve path-once grouping. | Agent-facing default when explicitly requested. | `--format agent-v2` is not a supported spelling; remove from docs/examples. |
-| `--format agent-v3` | Returned canonical verification, scan completion, projection budget, cursor, compact stats, route, and grouped hits. | Strong machine contract and bounded envelope. | Fix the reproduced multi-file cursor false-stale path; consider renaming ambiguous `returned` only in a versioned contract. | Default for cursor/budget workflows. | Do not duplicate v2 as a second implementation. |
+| `--format agent-v3` | Returned canonical verification, scan completion, projection budget, cursor, compact stats, route, and grouped hits. | Strong machine contract and bounded envelope; multi-file continuation now passes. | Preserve serial discovery for stable projections; consider renaming ambiguous `returned` only in a versioned contract. | Default for cursor/budget workflows. | Do not duplicate v2 as a second implementation. |
 | `--json` | Full telemetry is valid and useful for diagnostics and benchmarks. | Complete provenance. | Keep opt-in; label count units. | Diagnostics/benchmark only. | Do not make it the agent default; repeated paths and zero-heavy telemetry waste context. |
 | `--stats-only` | Full corpus scan is complete only without a hit cap. | Fast count path and no hit allocation. | Distinguish occurrence counts from matching-line counts. | Use for benchmark telemetry. | Reject `--stats-only` plus `--max-hits`/`--total-count`; a capped count is a lower bound and previously looked complete. |
 | `inspect --range` | `1:32` returned literal lines. | Exact, deterministic evidence. | Add an explicit lens only if exact bytes remain recoverable. | Exact range. | Do not silently apply fisheye or accept undocumented `390:410...` syntax. |
