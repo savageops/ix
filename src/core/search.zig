@@ -3,6 +3,23 @@ const builtin = @import("builtin");
 const path_admission = @import("admission.zig");
 const byte_shard = @import("byte_shard.zig");
 const cli = @import("../cli/args.zig");
+
+/// P17: Non-temporal streaming store for SearchHit writes.
+///
+/// On x86_64, uses @prefetch with locality=0 (non-temporal hint) to signal
+/// the hardware that result-buffer writes should not pollute L1/L2 with
+/// scan data being evicted. The hint tells the prefetcher: "this memory
+/// will not be reused soon — stream it without caching."
+///
+/// SearchHit records are written once during scan and never re-read until
+/// the merge phase (after all files are processed). Non-temporal stores
+/// prevent these writes from evicting the hot scan working set (1 MiB
+/// chunk buffer, SIMD constants, predicate state) from L1/L2.
+///
+/// On non-x86 platforms, this is a no-op (the hint is ignored).
+inline fn streamStoreHint(ptr: [*]const u8) void {
+    @prefetch(ptr, .{ .rw = .read, .locality = 0 });
+}
 const search_cursor = @import("../cli/cursor.zig");
 const catalog = @import("catalog.zig");
 const corpus_signature = @import("corpus_signature.zig");
@@ -4199,6 +4216,8 @@ fn recordLineIntoShardImpl(
                 return;
             };
             const sc = shard.scope_tracker.currentScope();
+            // P17: Non-temporal hint — result buffer writes should not evict hot scan data.
+            streamStoreHint(@ptrCast(&shard.hits[shard.hit_count]));
             shard.hits[shard.hit_count] = hit;
             shard.hits[shard.hit_count].scope = if (sc.name.len > 0) allocator.dupe(u8, sc.name) catch "" else "";
             shard.hits[shard.hit_count].scope_line = sc.line;
