@@ -199,7 +199,7 @@ fn watchPolling(
     // Simple polling fallback: re-scan every POLL_INTERVAL_MS.
     // This is the portable path for non-Windows platforms.
     while (true) {
-        std.Thread.sleep(POLL_INTERVAL_MS * std.time.ns_per_ms);
+        io.sleep(std.Io.Duration.fromMilliseconds(POLL_INTERVAL_MS), .awake) catch {};
         // Re-run the search and emit only NEW hits (simplified: emit all).
         var report = search.run(io, allocator, request, plan) catch continue;
         for (report.hits[0..report.hit_count]) |hit| {

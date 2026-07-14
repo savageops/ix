@@ -240,7 +240,7 @@ pub fn pinThreadToCore(core_id: usize) bool {
         const word = core_id / 64;
         const bit = core_id % 64;
         if (word < set.len) set[word] = @as(u64, 1) << @intCast(bit);
-        const SYS_sched_setaffinity: usize = 203;
+        const SYS_sched_setaffinity = std.os.linux.SYS.sched_setaffinity;
         const pid: usize = 0; // self
         const rc = std.os.linux.syscall3(SYS_sched_setaffinity, pid, cpu_set_size, @intFromPtr(&set));
         return rc == 0;
@@ -280,7 +280,7 @@ pub fn allocateHugePages(size: usize) ?[*]u8 {
     const PROT_READ: u32 = 0x1;
     const PROT_WRITE: u32 = 0x2;
     const MAP_PRIVATE: u32 = 0x02;
-    const MAP_ANON: u32 = 0x20;
+    const MAP_ANONYMOUS: u32 = 0x20;
     const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 
     // Round up to huge page boundary.
@@ -290,7 +290,7 @@ pub fn allocateHugePages(size: usize) ?[*]u8 {
         null,
         rounded_size,
         PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANON | @as(u32, @intCast(hugePageFlag())),
+        MAP_PRIVATE | MAP_ANONYMOUS | @as(u32, @intCast(hugePageFlag())),
         -1,
         0,
     );
