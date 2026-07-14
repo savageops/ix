@@ -52,6 +52,29 @@ jobs:
           curl -sL "https://raw.githubusercontent.com/PCRE2Project/pcre2/pcre2-10.44/src/config.h" -o ".refs/pcre2/src/config.h"
           echo "Downloaded PCRE2 + StringZilla dependencies"
 
+      - name: Download tree-sitter dependencies
+        shell: bash
+        run: |
+          # Tree-sitter runtime
+          mkdir -p .refs/tree-sitter/lib/unicode .refs/tree-sitter/lib/portable
+          mkdir -p .refs/tree-sitter/include/tree_sitter
+          TS_VER=v0.25.3
+          curl -sL "https://raw.githubusercontent.com/tree-sitter/tree-sitter/${TS_VER}/lib/include/tree_sitter/api.h" -o .refs/tree-sitter/include/tree_sitter/api.h
+          for f in alloc bits clock error_costs get_changed_ranges language lexer length node parser query reduce_action reusable_node stack subtree tree tree_cursor unicode ts_assert host wasm_store wasm_host point; do
+            curl -sL "https://raw.githubusercontent.com/tree-sitter/tree-sitter/${TS_VER}/lib/src/${f}.c" -o ".refs/tree-sitter/lib/${f}.c" 2>/dev/null
+            curl -sL "https://raw.githubusercontent.com/tree-sitter/tree-sitter/${TS_VER}/lib/src/${f}.h" -o ".refs/tree-sitter/lib/${f}.h" 2>/dev/null
+          done
+          # Minimal unicode.h (no ICU dependency)
+          printf '#ifndef TREE_SITTER_UNICODE_H_\n#define TREE_SITTER_UNICODE_H_\n#include <stdint.h>\n#define TS_DECODE_ERROR ((uint32_t)-1)\nstatic inline uint32_t ts_decode_utf8(const uint8_t *i, uint32_t l, uint32_t *cp) {\n  if(!l){*cp=0;return 0;}\n  uint8_t f=*i;\n  if(f<0x80){*cp=f;return 1;}\n  if((f&0xE0)==0xC0&&l>=2){*cp=((f&0x1F)<<6)|(i[1]&0x3F);return 2;}\n  if((f&0xF0)==0xE0&&l>=3){*cp=((f&0x0F)<<12)|((i[1]&0x3F)<<6)|(i[2]&0x3F);return 3;}\n  if((f&0xF8)==0xF0&&l>=4){*cp=((f&0x07)<<18)|((i[1]&0x3F)<<12)|((i[2]&0x3F)<<6)|(i[3]&0x3F);return 4;}\n  *cp=f;return 1;\n}\nstatic inline uint32_t ts_decode_utf16_le(const uint8_t *i, uint32_t l, uint32_t *cp){if(l<2){*cp=TS_DECODE_ERROR;return 0;}*cp=i[0]|(i[1]<<8);return 2;}\nstatic inline uint32_t ts_decode_utf16_be(const uint8_t *i, uint32_t l, uint32_t *cp){if(l<2){*cp=TS_DECODE_ERROR;return 0;}*cp=(i[0]<<8)|i[1];return 2;}\n#endif\n' > .refs/tree-sitter/lib/unicode.h
+          printf '#ifndef PORTABLE_ENDIAN_H\n#define PORTABLE_ENDIAN_H\n#include <stdint.h>\n#endif\n' > .refs/tree-sitter/lib/portable/endian.h
+          # WASM stubs
+          printf '#include <stdint.h>\n#include <stdbool.h>\n#include "tree_sitter/api.h"\nbool ts_language_is_wasm(const TSLanguage*s){return false;}\nvoid ts_wasm_language_retain(const TSLanguage*s){}\nvoid ts_wasm_language_release(const TSLanguage*s){}\nvoid ts_wasm_store_delete(TSWasmStore*s){}\nbool ts_wasm_store_start(TSWasmStore*s,TSLexer*l,const TSLanguage*g){return false;}\nvoid ts_wasm_store_reset(TSWasmStore*s){}\nbool ts_wasm_store_has_error(const TSWasmStore*s){return false;}\nbool ts_wasm_store_call_lex_main(TSWasmStore*s,uint16_t st){return false;}\nbool ts_wasm_store_call_lex_keyword(TSWasmStore*s,uint16_t st){return false;}\nuint32_t ts_wasm_store_call_scanner_create(TSWasmStore*s){return 0;}\nvoid ts_wasm_store_call_scanner_destroy(TSWasmStore*s,uint32_t a){}\nbool ts_wasm_store_call_scanner_scan(TSWasmStore*s,uint32_t a,uint32_t v){return false;}\nuint32_t ts_wasm_store_call_scanner_serialize(TSWasmStore*s,uint32_t a,char*b){return 0;}\nvoid ts_wasm_store_call_scanner_deserialize(TSWasmStore*s,uint32_t sc,const char*b,unsigned l){}\n' > .refs/tree-sitter/lib/wasm_stubs.c
+          # Zig grammar
+          mkdir -p .refs/tree-sitter-zig/src/tree_sitter
+          curl -sL "https://raw.githubusercontent.com/maxxnino/tree-sitter-zig/main/src/parser.c" -o .refs/tree-sitter-zig/src/parser.c
+          curl -sL "https://raw.githubusercontent.com/tree-sitter-grammars/tree-sitter-zig/v1.1.2/src/tree_sitter/parser.h" -o .refs/tree-sitter-zig/src/tree_sitter/parser.h
+          echo "Downloaded tree-sitter + Zig grammar"
+
       - name: Build
         run: zig build -Doptimize=ReleaseFast
 
