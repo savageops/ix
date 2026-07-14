@@ -18,6 +18,7 @@ pub const CommandTag = enum {
     why,
     watch,
     replace,
+    diff_matches,
     mcp,
     nexus,
     indexd,
@@ -214,6 +215,7 @@ pub const Command = union(CommandTag) {
     why: WhyRequest,
     watch: SearchRequest,
     replace: ReplaceRequest,
+    diff_matches: DiffMatchesRequest,
     mcp: McpRequest,
     nexus: SearchRequest,
     indexd: IndexdRequest,
@@ -249,6 +251,19 @@ pub const ReplaceRequest = struct {
     paths: [MAX_SEARCH_PATHS][]const u8,
     path_count: usize,
     dry_run: bool = false,
+    json: bool = false,
+};
+
+/// P29: Adjacent Operations Vector — 'diff-matches' command.
+/// Compares search results between two git commits, showing which matches
+/// were added, removed, or changed. Uses git show to extract file content
+/// at each commit, then diffs the match sets.
+pub const DiffMatchesRequest = struct {
+    expression: []const u8,
+    base_commit: []const u8,
+    head_commit: []const u8,
+    paths: [MAX_SEARCH_PATHS][]const u8,
+    path_count: usize,
     json: bool = false,
 };
 
@@ -364,6 +379,10 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
     if (std.mem.eql(u8, first, "replace")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .search } };
         return .{ .command = .{ .replace = try parseReplace(argv[2..]) } };
+    }
+    if (std.mem.eql(u8, first, "diff-matches")) {
+        if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .search } };
+        return .{ .command = .{ .diff_matches = try parseDiffMatches(argv[2..]) } };
     }
     if (std.mem.eql(u8, first, "mcp")) {
         return .{ .command = .{ .mcp = .{} } };
@@ -590,6 +609,42 @@ fn parseReplace(args: []const []const u8) ParseError!ReplaceRequest {
     }
     request.pattern = pattern orelse return ParseError.MissingExpression;
     request.replacement = replacement orelse return ParseError.MissingValue;
+    if (request.path_count == 0) return ParseError.MissingValue;
+    return request;
+}
+
+fn parseDiffMatches(args: []const []const u8) ParseError!DiffMatchesRequest {
+    if (args.len == 0) return ParseError.MissingExpression;
+    var expression: ?[]const u8 = null;
+    var base_commit: ?[]const u8 = null;
+    var head_commit: ?[]const u8 = null;
+    var request = DiffMatchesRequest{
+        .expression = "",
+        .base_commit = "",
+        .head_commit = "",
+        .paths = undefined,
+        .path_count = 0,
+    };
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            request.json = true;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            if (expression == null) {
+                expression = arg;
+            } else if (base_commit == null) {
+                base_commit = arg;
+            } else if (head_commit == null) {
+                head_commit = arg;
+            } else {
+                if (request.path_count >= MAX_SEARCH_PATHS) return ParseError.MissingValue;
+                request.paths[request.path_count] = arg;
+                request.path_count += 1;
+            }
+        } else return ParseError.UnsupportedFlag;
+    }
+    request.expression = expression orelse return ParseError.MissingExpression;
+    request.base_commit = base_commit orelse return ParseError.MissingValue;
+    request.head_commit = head_commit orelse return ParseError.MissingValue;
     if (request.path_count == 0) return ParseError.MissingValue;
     return request;
 }

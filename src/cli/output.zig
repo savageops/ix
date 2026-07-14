@@ -42,6 +42,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  why      Posting-list lineage of a match (P29)
         \\  watch    Stream new matches as files change (P29)
         \\  replace  Indexed structural rewrite with --dry-run (P29)
+        \\  diff-matches  Compare results between two git commits (P29)
         \\  process  State-dir inspection and cleanup
         \\  help     Print this message or subcommand help
         \\
@@ -646,6 +647,106 @@ fn replaceLiteral(allocator: std.mem.Allocator, haystack: []const u8, needle: []
         }
     }
     return out.toOwnedSlice(allocator);
+}
+
+/// P29: 'diff-matches' command — compares search results between two git commits.
+/// Shows which matches were added (in head, not in base) or removed (in base,
+/// not in head). Uses git to extract file content at each commit.
+pub fn writeDiffMatchesResult(io: std.Io, allocator: std.mem.Allocator, writer: anytype, request: cli.DiffMatchesRequest) !void {
+    var files_added: usize = 0;
+    var files_removed: usize = 0;
+    var total_added: usize = 0;
+    var total_removed: usize = 0;
+
+    // Extract the literal needle from the expression (strip lit: prefix if present).
+    const needle = if (std.mem.startsWith(u8, request.expression, "lit:"))
+        request.expression["lit:".len..]
+    else
+        request.expression;
+
+    if (request.json) {
+        try writer.writeAll("{\"type\":\"diff-matches\",\"expression\":");
+        try writeJsonString(writer, request.expression);
+        try writer.print(",\"base\":\"{s}\",\"head\":\"{s}\",\"files\":[", .{ request.base_commit, request.head_commit });
+    } else {
+        try writer.print("== ix.diff-matches expression=\"{s}\" base={s} head={s} ==\n", .{
+            request.expression, request.base_commit, request.head_commit,
+        });
+    }
+
+    for (request.paths[0..request.path_count]) |root_path| {
+        // Get list of changed files via git diff --name-only.
+        const diff_args = [_][]const u8{ "git", "-C", root_path, "diff", "--name-only", request.base_commit, request.head_commit };
+        const changed_files = runGitCommand(io, allocator, &diff_args) catch continue;
+        defer allocator.free(changed_files);
+
+        var lines = std.mem.splitScalar(u8, changed_files, '\n');
+        var first_file = true;
+        while (lines.next()) |file_path| {
+            if (file_path.len == 0) continue;
+
+            // Get file content at base commit.
+            const base_args = [_][]const u8{ "git", "-C", root_path, "show", request.base_commit, file_path };
+            const base_content = runGitCommand(io, allocator, &base_args) catch "";
+            defer if (base_content.len > 0) allocator.free(base_content);
+
+            // Get file content at head commit.
+            const head_args = [_][]const u8{ "git", "-C", root_path, "show", request.head_commit, file_path };
+            const head_content = runGitCommand(io, allocator, &head_args) catch "";
+            defer if (head_content.len > 0) allocator.free(head_content);
+
+            const base_count = countLiteral(base_content, needle);
+            const head_count = countLiteral(head_content, needle);
+
+            if (base_count == head_count) continue; // no change in match count
+
+            const added = if (head_count > base_count) head_count - base_count else 0;
+            const removed = if (base_count > head_count) base_count - head_count else 0;
+            total_added += added;
+            total_removed += removed;
+            if (added > 0) files_added += 1;
+            if (removed > 0) files_removed += 1;
+
+            if (request.json) {
+                if (!first_file) try writer.writeAll(",");
+                first_file = false;
+                try writer.writeAll("{\"path\":");
+                try writeJsonString(writer, file_path);
+                try writer.print(",\"base_matches\":{},\"head_matches\":{},\"added\":{},\"removed\":{}}}", .{
+                    base_count, head_count, added, removed,
+                });
+            } else {
+                if (added > 0) {
+                    try writer.print("added:   {s} (+{} matches, {} -> {})\n", .{ file_path, added, base_count, head_count });
+                }
+                if (removed > 0) {
+                    try writer.print("removed: {s} (-{} matches, {} -> {})\n", .{ file_path, removed, base_count, head_count });
+                }
+            }
+        }
+    }
+
+    if (request.json) {
+        try writer.print("],\"total_added\":{},\"total_removed\":{},\"files_added\":{},\"files_removed\":{}}}\n", .{
+            total_added, total_removed, files_added, files_removed,
+        });
+    } else {
+        try writer.print("summary: +{} added, -{} removed across {} files\n", .{ total_added, total_removed, files_added + files_removed });
+    }
+    try writer.flush();
+}
+
+/// Runs a git command and returns its stdout output. Returns empty string on failure.
+fn runGitCommand(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) ![]u8 {
+    const result = std.process.run(allocator, io, .{
+        .argv = args,
+    }) catch return error.GitFailed;
+    defer allocator.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        allocator.free(result.stdout);
+        return error.GitFailed;
+    }
+    return result.stdout;
 }
 
 /// P9: Pre-execution cost estimate. Classifies the query into a predicted

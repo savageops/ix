@@ -268,10 +268,15 @@ pub fn main(init: std.process.Init) !void {
             };
         },
         .replace => |request| {
-            // P29: Indexed structural rewrite. Finds literal matches and
-            // applies replacements. --dry-run shows changes without writing.
             output.writeReplaceResult(init.io, allocator, stdout, request) catch |err| {
                 try output.writeError(stderr, "replace_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
+        },
+        .diff_matches => |request| {
+            output.writeDiffMatchesResult(init.io, allocator, stdout, request) catch |err| {
+                try output.writeError(stderr, "diff_matches_failed", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
             };
