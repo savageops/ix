@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const path_admission = @import("admission.zig");
 const byte_shard = @import("byte_shard.zig");
 const cli = @import("../cli/args.zig");
+const io_uring = @import("io_uring.zig");
 
 /// P17: Non-temporal streaming store for SearchHit writes.
 ///
@@ -4270,7 +4271,19 @@ fn scanOpenFileIntoShardImpl(
         // Read next chunk -- only for files > 1 MiB.
         const remaining = file_bytes - @as(usize, @intCast(offset));
         const target_len: usize = @intCast(@min(read_buffer.len, remaining));
-        const read_len = try file.readPositionalAll(io, read_buffer[0..target_len], offset);
+
+        // P16: On Linux, use io_uring kernel-bypass I/O for multi-chunk reads.
+        // io_uring.submitRead + pollCompletion eliminates the readPositionalAll
+        // syscall — the kernel reads directly into the pre-registered buffer
+        // via IORING_OP_READ_FIXED with zero context switches (SQPOLL mode).
+        const read_len: usize = if (io_uring.supported) blk: {
+            // io_uring is Linux-only; on other platforms, this path is unreachable.
+            var ring = io_uring.createWorkerRing(allocator) orelse break :blk file.readPositionalAll(io, read_buffer[0..target_len], offset) catch break :blk 0;
+            defer ring.deinit();
+            const result = ring.readBlocking(file, read_buffer[0..target_len], offset) catch break :blk file.readPositionalAll(io, read_buffer[0..target_len], offset) catch break :blk 0;
+            break :blk @intCast(@max(result, 0));
+        } else try file.readPositionalAll(io, read_buffer[0..target_len], offset);
+
         if (read_len == 0) break;
         offset += read_len;
         chunk = read_buffer[0..read_len];

@@ -349,7 +349,7 @@ const IoUringImpl = struct {
         sq_array[sqe_index] = sqe_index;
 
         // Memory barrier before updating tail
-        @fence(.release);
+        asm volatile("" ::: "memory");
         self.writeSqU32(self.sq_tail_off, next_tail);
 
         // If SQPOLL is not enabled, we need to call io_uring_enter
@@ -373,7 +373,7 @@ const IoUringImpl = struct {
         const cqe = cqes[cq_index];
 
         // Advance the CQ head
-        @fence(.release);
+        asm volatile("" ::: "memory");
         self.writeCqU32(self.cq_head_off, (head + 1) & self.cq_mask);
 
         return Completion{
