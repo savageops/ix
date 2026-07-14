@@ -44,11 +44,22 @@ const IORING_OFF_SQES: u64 = 0x10000000;
 
 const IORING_ENTER_GETEVENTS: u32 = 1;
 
-const IORING_OP_READV: u8 = 1;
 const IORING_OP_READ_FIXED: u8 = 5;
+
+// io_uring_register opcodes
+const IORING_REGISTER_BUFFERS: u32 = 0;
+
+// Maximum pre-registered buffers per ring instance.
+const MAX_FIXED_BUFFERS: usize = 4;
 
 const SQE_SIZE: usize = 64;
 const CQE_SIZE: usize = 16;
+
+// iovec struct for io_uring_register
+const iovec = extern struct {
+    iov_base: *anyopaque,
+    iov_len: usize,
+};
 
 // io_uring_params struct (kernel ABI)
 const io_uring_params = extern struct {
@@ -124,6 +135,9 @@ const IoUringImpl = struct {
     sq_mask: u32 = 0,
     cq_mask: u32 = 0,
     sqpoll_enabled: bool = false,
+    // P16: Pre-registered fixed buffers for IORING_OP_READ_FIXED.
+    fixed_buffers: [MAX_FIXED_BUFFERS]?[]u8 = .{null} ** MAX_FIXED_BUFFERS,
+    fixed_buffer_count: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator) !IoUringImpl {
         _ = allocator;
@@ -250,9 +264,44 @@ const IoUringImpl = struct {
         ptr.* = val;
     }
 
-    /// Submit an IORING_OP_READ_FIXED request.
-    /// The kernel reads `buffer.len` bytes from `file` at `offset` into `buffer`.
-    /// Returns the SQE index used.
+    /// P16: Register a fixed buffer for IORING_OP_READ_FIXED.
+    /// Pre-registers the buffer with the kernel via io_uring_register,
+    /// eliminating per-I/O buffer allocation. Returns the buffer index
+    /// to use in submitRead's buf_index field.
+    pub fn registerFixedBuffer(self: *IoUringImpl, buffer: []u8) !u16 {
+        if (self.fixed_buffer_count >= MAX_FIXED_BUFFERS) return error.TooManyFixedBuffers;
+
+        const buf_index = self.fixed_buffer_count;
+        self.fixed_buffers[buf_index] = buffer;
+
+        // Build iovec array for all registered buffers (must include all up to count)
+        var iovecs: [MAX_FIXED_BUFFERS]iovec = undefined;
+        for (0..self.fixed_buffer_count + 1) |i| {
+            const buf = self.fixed_buffers[i] orelse break;
+            iovecs[i] = .{
+                .iov_base = @ptrCast(@constCast(buf.ptr)),
+                .iov_len = buf.len,
+            };
+        }
+
+        // io_uring_register(fd, IORING_REGISTER_BUFFERS, iovecs, nr_bufs)
+        // Syscall number 427 on x86_64
+        const ret = std.os.linux.syscall4(
+            427, // __NR_io_uring_register
+            @intCast(self.fd),
+            IORING_REGISTER_BUFFERS,
+            @intFromPtr(&iovecs),
+            self.fixed_buffer_count + 1,
+        );
+        if (@as(isize, @bitCast(ret)) < 0) return error.RegisterBuffersFailed;
+
+        self.fixed_buffer_count += 1;
+        return @intCast(buf_index);
+    }
+
+    /// Submit an IORING_OP_READ_FIXED request using a pre-registered buffer.
+    /// The kernel reads directly into the pre-registered buffer at `buf_index`,
+    /// eliminating per-I/O buffer allocation. This is the zero-copy path.
     pub fn submitRead(self: *IoUringImpl, file: std.Io.File, buffer: []u8, offset: u64) !u32 {
         const tail = self.readSqU32(self.sq_tail_off);
         const next_tail = (tail + 1) & self.sq_mask;
@@ -264,13 +313,35 @@ const IoUringImpl = struct {
         const sqe_index = tail & self.sq_mask;
         const sqe: *volatile io_uring_sqe = @ptrCast(@alignCast(self.sqes_ptr + sqe_index));
 
-        // Fill the SQE
+        // Determine buffer index: use pre-registered if available, else register on first use.
+        var buf_index: u16 = 0;
+        if (self.fixed_buffer_count == 0) {
+            buf_index = try self.registerFixedBuffer(buffer);
+        } else {
+            // Find the matching pre-registered buffer.
+            var found = false;
+            for (0..self.fixed_buffer_count) |i| {
+                if (self.fixed_buffers[i]) |fb| {
+                    if (fb.ptr == buffer.ptr and fb.len == buffer.len) {
+                        buf_index = @intCast(i);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if (!found) {
+                buf_index = try self.registerFixedBuffer(buffer);
+            }
+        }
+
+        // Fill the SQE with IORING_OP_READ_FIXED
         sqe.* = std.mem.zeroes(io_uring_sqe);
-        sqe.opcode = IORING_OP_READV;
+        sqe.opcode = IORING_OP_READ_FIXED;
         sqe.fd = @intCast(file.handle);
         sqe.off = offset;
         sqe.addr = @intFromPtr(buffer.ptr);
         sqe.len = @intCast(buffer.len);
+        sqe.buf_index = buf_index;
         sqe.user_data = sqe_index;
 
         // Update the SQ array to point to this SQE
