@@ -4,9 +4,7 @@
 
 **A search engine that knows what to ignore.**
 
-32 bytes per cycle through 256-bit SIMD lanes. PCRE2 patterns compiled to native machine code. Mandatory-trigram evidence gates that reject impossible files before a single line is scanned. BM25 degree-of-interest context assembly. Furnas fisheye match lenses. Cursor-paginated, byte-budgeted, corpus-bound agent output. One binary. Zero dependencies. 5% of your machine.
-
-*AVX2 SIMD literal scan · Boolean predicate algebra · Generation-pinned warm index · Arena-allocated pipeline · Vendored C kernels*
+*Every search engine scans files. IX also knows which files to skip — and which lines within those files actually matter.*
 
 ---
 
@@ -38,21 +36,23 @@ What ships today is not a port. The CLI contract and JSON output schema remain c
 
 ## What It Is
 
-Every search engine scans files. The fastest ones also know which files to skip.
+IX is a search engine built around one constraint: the fastest path to an exact result.
 
-IX classifies each query at parse time — `lit:`, `re:`, `prefix:`, `suffix:`, boolean `&&` / `||` — and routes it to the narrowest execution path before touching a byte of input. A literal hits 256-bit SIMD lanes at 32 bytes per cycle. A regex with an extractable literal bypasses the regex engine entirely — the literal is extracted, searched via SIMD, and the regex verifies only the survivors. A full regex compiles through PCRE2 10.44 with JIT: the pattern becomes native machine code, compiled once per thread, reused for every line. AND/OR queries extract mandatory trigram evidence and reject files that cannot match before scanning.
+Queries in the IX expression language — `lit:`, `re:`, `prefix:`, `suffix:`, boolean `&&` / `||` — are each classified into the narrowest execution strategy before touching a byte of input. A literal hits 256-bit SIMD lanes at 32 bytes per cycle. A regex with an extractable literal bypasses the regex engine entirely — the literal is searched via SIMD, the regex verifies only the survivors. A full regex compiles through PCRE2 10.44 with JIT: the pattern becomes native machine code, compiled once per thread, reused for every line.
 
-The admission pipeline is `PathAdmission → FileAdmissionBytecode → ByteKernel → LineVerifier`. Path predicates reject by location. File metadata rejects by size and binary prefix. PCRE2-proven byte facts reject by mandatory first-byte, last-code-unit, and minimum-length constraints. One-pass rolling trigram evidence — a compact membership program compiled once per query, zero heap allocation — rejects files missing mandatory 3-byte substrings. Each stage may prove a miss; none ever creates a match. The canonical verifier confirms every emitted result.
+Most queries are reduced to literal evidence before the regex engine runs. The verifier only confirms.
 
-The warm index extends admission across invocations. A corpus-global `FileCatalog` assigns deterministic file IDs to path metadata. Generation-pinned trigram postings map 3-byte evidence to file IDs. When the live marker and current generation are valid, IX skips discovery entirely, loads the retained candidate frontier, and verifies only the surviving files. On the Linux kernel source tree (79,402 files), this reduces scanned files from 79,402 to ~195.
+Before scanning a single file, IX runs an admission pipeline: `PathAdmission → FileAdmissionBytecode → ByteKernel → LineVerifier`. Path predicates reject by location. File metadata rejects by size and binary prefix. PCRE2-proven byte facts reject by mandatory first-byte, last-code-unit, and minimum-length constraints. One-pass rolling trigram evidence — a compact membership program compiled once per query, zero heap allocation — rejects files missing mandatory 3-byte substrings. On the Linux kernel source tree (79,402 files), the warm index reduces scanned files from 79,402 to ~195.
 
-The output contract is three independent truth dimensions. **Verification**: always `canonical` — the exact matcher confirmed every hit. **Scan**: `complete` or `partial_access` — were access errors present? **Projection**: `complete` or `truncated` — are there more eligible hits? Cursor pagination binds continuation to the request fingerprint and corpus signature. Byte budgets fit the largest whole-record page via binary search — no hit is ever cut in half. BM25 degree-of-interest context (`xo`) ranks source lines by lexical evidence and expands around focus points until the byte budget closes. The Furnas fisheye lens contracts previews geometrically — 143× reduction on minified content, zero overhead on normal source code.
+Each stage may prove a miss. None ever creates a match.
 
 > [!NOTE]
 > Acceleration rejects candidates. It never creates matches.
 > The exact verifier confirms every emitted result.
 
-The binary vendors everything — StringZilla, PCRE2 with JIT — compiled from source into one static binary. No package manager. No network fetch. No runtime dependencies. `zig build` and it ships. It runs on 5% of your machine by default — independently tunable for memory and threads — and matches ripgrep's wall time on a 1.34 GB Linux kernel corpus using 1/16th the cores. The per-thread throughput is the engine's advantage. The cap is a product choice.
+The output contract separates three independent truth dimensions: **verification** (always `canonical` — the exact matcher confirmed every hit), **scan** (`complete` or `partial_access`), and **projection** (`complete` or `truncated`). Cursor pagination binds continuation to the request fingerprint and corpus signature — change the query or touch a file, the cursor is rejected. Byte budgets fit the largest whole-record page via binary search — no hit is ever cut in half.
+
+The binary vendors everything — StringZilla, PCRE2 with JIT — compiled from source into one static binary. No package manager. No network fetch. No runtime dependencies. It runs on 5% of your machine by default and matches ripgrep's wall time on a 1.34 GB Linux kernel corpus using 1/16th the cores. The per-thread throughput is the engine's advantage. The cap is a product choice.
 
 ---
 
