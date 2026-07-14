@@ -22,8 +22,10 @@ pub fn writeHelp(writer: anytype, topic: cli.HelpTopic) !void {
 }
 
 fn writeTopHelp(writer: anytype) !void {
+    // Keep the front door task-shaped: agents need the lane, one safe default,
+    // and the next help command before they need the complete option matrix.
     try writer.writeAll(
-        \\IX v2 intelligent expression toolkit
+        \\IX — native search, inspection, and agent context
         \\
         \\Usage: ix.exe <COMMAND>
         \\
@@ -36,23 +38,19 @@ fn writeTopHelp(writer: anytype) !void {
         \\  process  State-dir inspection and cleanup
         \\  help     Print this message or subcommand help
         \\
-        \\Output:
-        \\  --agent        Compact grouped format (ix.result.v2, token-minimal)
-        \\  --json         Full structured JSON with telemetry
-        \\  --stats-only   Suppress hit records, emit sentinel only
-        \\  --format NAME  Select records, text, agent, agent-v3, json, json-compact, files, count, or stats
-        \\  -l             Files with matches only
-        \\  -c             Count per file
-        \\  --context N    Exact coalesced source lines in the versioned result
-        \\  --max-bytes N  Bound one complete v3 envelope
-        \\  --cursor VALUE Continue a versioned result
+        \\Agent quickstart:
+        \\  Search:  ix search 'lit:TERM' . --agent
+        \\  Inspect: ix inspect FILE --range START:END --format records
+        \\  Context: ix xo 'concept' ROOT --max-bytes 8000
+        \\  Explain: ix explain 'lit:TERM && re:OTHER'
+        \\  Help:    ix help <search|inspect|xo|similar|explain|process>
         \\
-        \\Search:
-        \\  --max-hits N   Limit hit records
-        \\  --total-count N  Limit hit records (shared bounded-read spelling)
-        \\  -t N           Thread count
-        \\  --hidden       Include hidden files
-        \\  --no-ignore    Disable ignore-file admission
+        \\Common controls (see lane help for exact scope):
+        \\  --format NAME  Choose a stable output projection
+        \\  --json         Machine-readable JSON (where supported)
+        \\  --agent        Compact agent output (search/similar)
+        \\  --max-hits N   Bound retained search hits
+        \\  --context N    Add exact coalesced source context to v3 search output
         \\
         \\Similar:
         \\  --anti         Rank least similar first (parity drift)
@@ -74,7 +72,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  ix search 're:TODO|FIXME' . --context 3
         \\  ix similar "cancellation pattern" apps/src --agent
         \\  ix similar "transport closure" apps/src --anti --max-results 10
-        \\  ix inspect src/main.zig --range 40:80
+        \\  ix inspect src/main.zig --range 40:80 --format records
         \\  ix xo "agentSimulation code with system administration ENV_VAR and a function for worker events" src
         \\  ix explain 'lit:auth && re:token_\d+'
         \\
@@ -186,6 +184,8 @@ fn writeSearchHelp(writer: anytype, summary: []const u8, command: []const u8) !v
 }
 
 fn writeInspectHelp(writer: anytype) !void {
+    // Inspect is frequently used as a follow-up to search; spell out the
+    // bounded-read and continuation contract so an agent can continue safely.
     try writer.writeAll(
         \\Read-only file windows and match context
         \\
@@ -222,13 +222,13 @@ fn writeInspectHelp(writer: anytype) !void {
         \\  -A, --after-context <AFTER_CONTEXT>
         \\          Lines after each match
         \\      --hidden
-        \\          
+        \\          Include hidden files and directories
         \\      --follow-symlinks
-        \\          
+        \\          Follow symbolic links
         \\  -t, --threads <THREADS>
-        \\          
+        \\          Request workers below the framework ceiling
         \\      --max-hits <MAX_HITS>
-        \\          
+        \\          Bound matches in match-context mode
         \\  -h, --help
         \\          Print help
         \\
@@ -245,6 +245,7 @@ fn writeInspectHelp(writer: anytype) !void {
         \\  limit-shaped reads continue with --start-line next --limit N
         \\  range-shaped reads continue with --range next:next+span-1
         \\  eof=true suppresses continuation and carries total_lines when the file horizon is known
+        \\  records is the simplest pipe form; grouped is the default agent-readable form
         \\SNIPS
         \\  ix inspect src/main.rs
         \\  ix inspect src/main.rs --total-count 40
