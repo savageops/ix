@@ -15,7 +15,7 @@ ScanCompletion = Literal["complete", "partial_access"]
 ProjectionCompletion = Literal["complete", "truncated"]
 TruncationReason = Literal["max_hits", "byte_budget", "retention_limit", "similar_candidate_budget"]
 StatsVisibility = Literal["agent", "standard", "debug"]
-RecordGranularity = Literal["line", "block", "section"]
+RecordGranularity = Literal["line", "block", "section", "paragraph", "ast"]
 OutputFormat = Literal["text", "agent", "agent-v3", "json", "json-compact", "files", "count", "stats"]
 RouteLane = Literal["cold", "warm"]
 

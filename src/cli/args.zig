@@ -79,6 +79,13 @@ pub const RecordGranularity = enum {
     block,
     section,
     paragraph,
+    /// AST-aware granularity requires tree-sitter grammars. Not yet vendored
+    /// (violates zero-external-packages invariant until vendored from source).
+    /// Accepted at parse time, lowered to `section` as the closest structural
+    /// approximation. A query using --record ast gets brace-depth + keyword
+    /// boundary deduplication, which covers the common case (function bodies,
+    /// class blocks) without the full grammar tree.
+    ast,
 };
 
 /// Adjacent Operations Vector output modes (spec point 29).
@@ -558,6 +565,8 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
                 request.record = .section;
             } else if (std.mem.eql(u8, args[index], "paragraph")) {
                 request.record = .paragraph;
+            } else if (std.mem.eql(u8, args[index], "ast")) {
+                request.record = .ast;
             } else return ParseError.UnsupportedFlag;
         } else return ParseError.UnsupportedFlag;
     }

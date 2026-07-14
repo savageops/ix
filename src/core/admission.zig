@@ -59,6 +59,12 @@ pub const Engine = struct {
         const ignore = try joinPath(self.allocator, directory, ".ignore");
         defer self.allocator.free(ignore);
         if (try self.loadOptionalIgnoreFile(io, ignore, directory)) loaded += 1;
+        // P21: .agignore is the silver-searcher convention. Same syntax as
+        // .gitignore. Loaded after .gitignore and .ignore so its patterns
+        // can override or extend the social contract users expect.
+        const agignore = try joinPath(self.allocator, directory, ".agignore");
+        defer self.allocator.free(agignore);
+        if (try self.loadOptionalIgnoreFile(io, agignore, directory)) loaded += 1;
         return loaded;
     }
 

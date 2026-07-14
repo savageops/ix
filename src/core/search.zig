@@ -344,7 +344,9 @@ fn extractIdentifier(text: []const u8) ?[]const u8 {
 fn shouldDedupByRecord(request: cli.SearchRequest, last_scope_line: *const usize, _: []const u8, scope_line: usize) bool {
     return switch (request.record) {
         .line => false,
-        .block, .section => scope_line > 0 and scope_line == last_scope_line.*,
+        // ast lowers to section semantics: brace-depth + keyword boundary dedup.
+        // Full tree-sitter grammars are deferred (P22).
+        .block, .section, .ast => scope_line > 0 and scope_line == last_scope_line.*,
         .paragraph => scope_line > 0 and scope_line == last_scope_line.*,
     };
 }

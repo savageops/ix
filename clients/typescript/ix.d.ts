@@ -22,7 +22,7 @@ export type TruncationReason =
 export type StatsVisibility = "agent" | "standard" | "debug";
 
 /** Record granularity for --record flag (P22). */
-export type RecordGranularity = "line" | "block" | "section";
+export type RecordGranularity = "line" | "block" | "section" | "paragraph" | "ast";
 
 /** Output format selector. */
 export type OutputFormat =
