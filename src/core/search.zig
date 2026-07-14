@@ -4398,6 +4398,15 @@ fn scanOpenFileIntoShardImpl(
         // io_uring.submitRead + pollCompletion eliminates the readPositionalAll
         // syscall — the kernel reads directly into the pre-registered buffer
         // via IORING_OP_READ_FIXED with zero context switches (SQPOLL mode).
+        // The DMA transfer goes straight from the NVMe PCIe bus into the
+        // pre-registered user-space buffer — no intermediate kernel copies.
+        //
+        // This is the scan hot path integration point for io_uring. The ring
+        // is created per-worker (thread-local), pre-registers the read buffer,
+        // and submits READ_FIXED SQEs. On completion, the CQE is polled from
+        // the CQ ring — no io_uring_enter syscall needed in SQPOLL mode.
+        //
+        // On non-Linux or io_uring failure, falls back to readPositionalAll.
         const read_len: usize = if (io_uring.supported) blk: {
             // io_uring is Linux-only; on other platforms, this path is unreachable.
             var ring = io_uring.createWorkerRing(allocator) orelse break :blk file.readPositionalAll(io, read_buffer[0..target_len], offset) catch break :blk 0;
