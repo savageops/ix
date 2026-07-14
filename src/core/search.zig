@@ -4060,11 +4060,13 @@ fn scanOpenFileIntoShardImpl(
 
     // FM-Index backward-search admission (spec point 11).
     // Env-gated: IX_FM_INDEX_ADMISSION=1 enables in-memory BWT construction
-    // and O(p) backward search for eligible files. Disabled by default.
-    // The env check is cached per-thread to avoid getenv() on every file.
+    // and O(p) backward search for eligible files. Enabled by default as
+    // the sub-linear admission path (P11). The env gate IX_FM_INDEX_ADMISSION=0
+    // can disable it if needed. The check is cached per-thread.
     if (!fm_index_admission_checked) {
         fm_index_admission_checked = true;
-        fm_index_admission_cached = std.c.getenv("IX_FM_INDEX_ADMISSION") != null;
+        const env_val = std.c.getenv("IX_FM_INDEX_ADMISSION\x00");
+        fm_index_admission_cached = !(env_val != null and std.mem.eql(u8, std.mem.span(env_val.?), "0"));
     }
     if (fm_index_admission_cached and single_chunk and file_bytes <= FM_INDEX_ADMISSION_MAX_BYTES) {
         if (tryFmIndexAdmission(allocator, read_buffer[0..first_read], plan)) {
