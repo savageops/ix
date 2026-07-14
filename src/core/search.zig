@@ -171,9 +171,10 @@ fn speculativeScanCount(
 }
 
 /// Shadow thread worker for P19 speculative parallel scan.
-/// Runs the bit-parallel counter, then sets the winner flag to terminate
-/// the race. The shadow checks the winner flag — if the primary already
-/// finished, the shadow sets its result and exits (cooperative cancellation).
+/// Runs the cancellable bit-parallel counter, checking the winner flag
+/// every 4096 bytes. If the primary thread has already finished (winner != 0),
+/// the shadow TERMINATES MID-SCAN — this is the cooperative execution-pointer
+/// swap. The partial result is discarded.
 fn racingShadowWorker(ctx: *anyopaque) void {
     const RaceCtx = struct {
         data: []const u8,
@@ -184,16 +185,25 @@ fn racingShadowWorker(ctx: *anyopaque) void {
     };
     const rc: *RaceCtx = @ptrCast(@alignCast(ctx));
     const shadow_start = std.Io.Timestamp.now(std.Io.universal, .awake);
-    const count = simd.countNonOverlapping(rc.data, rc.needle);
+
+    // P19: Use the cancellable counter that checks the winner flag between
+    // chunks. Returns null if cancelled mid-scan — the shadow thread bails
+    // without completing the full count.
+    const maybe_count = simd.countNonOverlappingCancellable(rc.data, rc.needle, rc.winner);
     const elapsed = @as(u64, @intCast(@max(
         std.Io.Timestamp.now(std.Io.universal, .awake).nanoseconds - shadow_start.nanoseconds,
         0,
     )));
 
-    // Commit result and claim victory (execution-pointer swap).
-    // If primary already won (winner != 0), our result is still recorded
-    // for correctness verification — we just didn't win the race.
-    rc.result.* = .{ .matches = count, .elapsed_ns = elapsed };
+    if (maybe_count) |count| {
+        // Shadow completed the full scan — commit result and claim victory.
+        rc.result.* = .{ .matches = count, .elapsed_ns = elapsed };
+    } else {
+        // Shadow was cancelled mid-scan — primary already won.
+        // Leave shadow_result at its initial value (maxInt(u64) elapsed, 0 matches).
+        // The primary's result is authoritative.
+        rc.result.* = .{ .matches = 0, .elapsed_ns = elapsed };
+    }
     _ = rc.winner.cmpxchgStrong(@as(u32, 0), rc.id, .release, .monotonic);
 }
 const search_cursor = @import("../cli/cursor.zig");

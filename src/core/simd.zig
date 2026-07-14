@@ -261,6 +261,77 @@ pub inline fn countNonOverlapping(haystack: []const u8, needle: []const u8) usiz
     return total;
 }
 
+/// P19: Cancellable variant of countNonOverlapping for speculative parallel
+/// scan. Checks the atomic cancellation flag every CANCEL_CHECK_INTERVAL bytes
+/// — if another thread has won the race, this function returns early with
+/// a partial count. The winner is selected by wall-clock time; the loser's
+/// partial result is discarded.
+///
+/// The cancellation check is a single atomic load per chunk — negligible
+/// overhead relative to the SIMD scan work.
+const CANCEL_CHECK_INTERVAL: usize = 4096;
+
+pub fn countNonOverlappingCancellable(
+    haystack: []const u8,
+    needle: []const u8,
+    cancel_flag: *const std.atomic.Value(u32),
+) ?usize {
+    if (needle.len == 0 or needle.len > haystack.len) return 0;
+    if (needle.len <= BITPARALLEL_NEEDLE_MAX) {
+        return countNonOverlappingBitParallelCancellable(haystack, needle, cancel_flag);
+    }
+
+    var total: usize = 0;
+    var start: usize = 0;
+    var chunk_pos: usize = 0;
+    while (start + needle.len <= haystack.len) {
+        // Check cancellation every CANCEL_CHECK_INTERVAL bytes.
+        if (chunk_pos >= CANCEL_CHECK_INTERVAL) {
+            if (cancel_flag.load(.monotonic) != 0) return null; // cancelled
+            chunk_pos = 0;
+        }
+        const index = indexOf(haystack[start..], needle) orelse break;
+        total += 1;
+        const advance = index + needle.len;
+        start += advance;
+        chunk_pos += advance;
+    }
+    return total;
+}
+
+inline fn countNonOverlappingBitParallelCancellable(
+    haystack: []const u8,
+    needle: []const u8,
+    cancel_flag: *const std.atomic.Value(u32),
+) ?usize {
+    var masks = [_]u64{0} ** 256;
+    for (needle, 0..) |byte, index| {
+        const bit: u6 = @intCast(index);
+        masks[byte] |= @as(u64, 1) << bit;
+    }
+
+    const match_bit: u64 = @as(u64, 1) << @as(u6, @intCast(needle.len - 1));
+    var state: u64 = 0;
+    var total: usize = 0;
+
+    var i: usize = 0;
+    while (i < haystack.len) {
+        // Check cancellation every CANCEL_CHECK_INTERVAL bytes.
+        if (i > 0 and (i % CANCEL_CHECK_INTERVAL) == 0) {
+            if (cancel_flag.load(.monotonic) != 0) return null; // cancelled
+        }
+        const byte = haystack[i];
+        state = ((state << 1) | 1) & masks[byte];
+        if ((state & match_bit) != 0) {
+            total += 1;
+            state = 0;
+        }
+        i += 1;
+    }
+
+    return total;
+}
+
 inline fn indexOfBitParallel(haystack: []const u8, needle: []const u8) ?usize {
     var masks = [_]u64{0} ** 256;
     for (needle, 0..) |byte, index| {
