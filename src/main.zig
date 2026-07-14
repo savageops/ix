@@ -37,6 +37,7 @@ test {
     _ = @import("core/shift_or.zig");
     _ = @import("core/fm_index.zig");
     _ = @import("core/preview.zig");
+    _ = @import("core/jit_forge.zig");
     _ = @import("cli/command_spec.zig");
     _ = @import("cli/cursor.zig");
 }
