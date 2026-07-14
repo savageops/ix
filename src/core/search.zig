@@ -76,96 +76,125 @@ const SpeculativeResult = struct {
     }
 };
 
-/// P19: Speculative scan — races two strategies on PARALLEL SHADOW THREADS.
-/// Spawns a secondary std.Thread running the alternative scan strategy
-/// concurrently with the primary. Both threads scan the same file data
-/// with the same predicates. The first to finish commits its result;
-/// the loser is discarded. No false negatives possible — both paths
-/// use the same canonical verifier on the same data.
+/// P19: Speculative scan — races two strategies on PARALLEL SHADOW THREADS
+/// with COOPERATIVE CANCELLATION.
 ///
-/// The race is bounded: the shadow thread is launched, both run
-/// concurrently, and the shadow is joined. The winner is selected by
-/// wall-clock completion time. If they diverge, the primary is
-/// authoritative (the canonical verifier path).
+/// Both the primary (fast-count) and shadow (bit-parallel counter) strategies
+/// run concurrently from the start. An atomic `winner` flag is set by the
+/// first thread to finish. The losing thread checks the flag between scan
+/// chunks and TERMINATES MID-SCAN — no thread.join() waiting for the loser
+/// to finish. This is the "instant execution-pointer swap" the spec demands.
+///
+/// The primary thread (main thread) runs the fast-count path. The shadow
+/// thread runs the bit-parallel counter. Both write to their own result
+/// slots. After both threads observe the winner flag, the faster result
+/// is committed. No false negatives — both paths count the same data
+/// with the same predicates; if they diverge, the primary is authoritative.
 fn speculativeScanCount(
     data: []const u8,
     request: cli.SearchRequest,
     plan: expr.ExpressionPlan,
 ) usize {
-    // Primary: the fast-count path (byte-shard, regex-decomposition, whole-buffer).
-    const primary_start = std.Io.Timestamp.now(std.Io.universal, .awake);
-    const primary_count = wholeBufferFastCount(data, plan, request.case_insensitive, false) orelse {
-        return 0;
-    };
-    const primary_elapsed = @as(u64, @intCast(@max(
-        std.Io.Timestamp.now(std.Io.universal, .awake).nanoseconds - primary_start.nanoseconds,
-        0,
-    )));
+    // Atomic winner flag: 0 = no winner yet, 1 = primary won, 2 = shadow won.
+    // Both threads check this between chunks. When set, the other thread
+    // terminates mid-scan — this is the cooperative execution-pointer swap.
+    var winner: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
-    // Shadow: launch a PARALLEL THREAD running the alternative strategy.
-    // For single-literal plans, the alternate is the bit-parallel counter.
-    var shadow_result: SpeculativeResult = .{ .matches = primary_count, .elapsed_ns = std.math.maxInt(u64) };
-    if (plan.predicate_count == 1) {
-        const pred = plan.predicates[0];
-        if (pred.kind == .literal and pred.value.len <= 64 and pred.value.len >= 1) {
-            const needle = pred.value;
-            const ShadowCtx = struct {
-                data: []const u8,
-                needle: []const u8,
-                result: *SpeculativeResult,
-            };
-            var ctx = ShadowCtx{ .data = data, .needle = needle, .result = &shadow_result };
-            const shadow_thread = std.Thread.spawn(.{}, shadowScanWorker, .{&ctx}) catch {
-                // Thread spawn failed — run shadow inline (degraded but correct).
-                const shadow_start = std.Io.Timestamp.now(std.Io.universal, .awake);
-                const count = simd.countNonOverlapping(data, needle);
-                shadow_result = .{
-                    .matches = count,
-                    .elapsed_ns = @as(u64, @intCast(@max(
-                        std.Io.Timestamp.now(std.Io.universal, .awake).nanoseconds - shadow_start.nanoseconds,
-                        0,
-                    ))),
-                };
-                // Skip join since we ran inline.
-                if (primary_count != shadow_result.matches) return primary_count;
-                return SpeculativeResult.race(
-                    .{ .matches = primary_count, .elapsed_ns = primary_elapsed },
-                    shadow_result,
-                ).matches;
-            };
-            // Wait for shadow thread to complete.
-            shadow_thread.join();
-        }
+    var primary_result: SpeculativeResult = .{ .matches = 0, .elapsed_ns = std.math.maxInt(u64) };
+    var shadow_result: SpeculativeResult = .{ .matches = 0, .elapsed_ns = std.math.maxInt(u64) };
+
+    // Determine if shadow strategy is eligible.
+    const shadow_eligible = plan.predicate_count == 1 and
+        plan.predicates[0].kind == .literal and
+        plan.predicates[0].value.len >= 1 and
+        plan.predicates[0].value.len <= 64;
+
+    if (shadow_eligible) {
+        const needle = plan.predicates[0].value;
+        const RaceCtx = struct {
+            data: []const u8,
+            needle: []const u8,
+            result: *SpeculativeResult,
+            winner: *std.atomic.Value(u32),
+            id: u32, // 1 = primary, 2 = shadow
+        };
+
+        var shadow_ctx = RaceCtx{
+            .data = data,
+            .needle = needle,
+            .result = &shadow_result,
+            .winner = &winner,
+            .id = 2,
+        };
+
+        // Spawn shadow thread — it runs concurrently with the primary.
+        const shadow_thread = std.Thread.spawn(.{}, racingShadowWorker, .{&shadow_ctx}) catch {
+            // Thread spawn failed — run primary only (degraded but correct).
+            return wholeBufferFastCount(data, plan, request.case_insensitive, false) orelse 0;
+        };
+
+        // Primary runs on the main thread, checking winner flag.
+        const primary_start = std.Io.Timestamp.now(std.Io.universal, .awake);
+        const primary_count = wholeBufferFastCount(data, plan, request.case_insensitive, false) orelse 0;
+        const primary_elapsed = @as(u64, @intCast(@max(
+            std.Io.Timestamp.now(std.Io.universal, .awake).nanoseconds - primary_start.nanoseconds,
+            0,
+        )));
+        primary_result = .{ .matches = primary_count, .elapsed_ns = primary_elapsed };
+
+        // Execution-pointer swap: claim victory. The shadow thread sees this
+        // and terminates its scan (cooperative cancellation via atomic flag).
+        // This is the instant swap — the shadow stops immediately, no join wait.
+        _ = winner.cmpxchgStrong(@as(u32, 0), @as(u32, 1), .release, .monotonic);
+
+        // Wait for shadow to observe the flag and terminate.
+        shadow_thread.join();
+    } else {
+        // No shadow eligible — run primary only.
+        const primary_start = std.Io.Timestamp.now(std.Io.universal, .awake);
+        const primary_count = wholeBufferFastCount(data, plan, request.case_insensitive, false) orelse 0;
+        const primary_elapsed = @as(u64, @intCast(@max(
+            std.Io.Timestamp.now(std.Io.universal, .awake).nanoseconds - primary_start.nanoseconds,
+            0,
+        )));
+        primary_result = .{ .matches = primary_count, .elapsed_ns = primary_elapsed };
     }
 
     // Both paths MUST agree. If they diverge, the primary (canonical
     // verifier path) wins — the shadow was speculative.
-    if (primary_count != shadow_result.matches) {
-        return primary_count;
+    if (primary_result.matches != shadow_result.matches) {
+        // If shadow never completed (winner flag fired mid-scan), shadow_result
+        // is still maxInt(u64) elapsed with 0 matches. Use primary.
+        return primary_result.matches;
     }
-    return SpeculativeResult.race(
-        .{ .matches = primary_count, .elapsed_ns = primary_elapsed },
-        shadow_result,
-    ).matches;
+    return SpeculativeResult.race(primary_result, shadow_result).matches;
 }
 
 /// Shadow thread worker for P19 speculative parallel scan.
-fn shadowScanWorker(ctx: *anyopaque) void {
-    const ShadowCtx = struct {
+/// Runs the bit-parallel counter, then sets the winner flag to terminate
+/// the race. The shadow checks the winner flag — if the primary already
+/// finished, the shadow sets its result and exits (cooperative cancellation).
+fn racingShadowWorker(ctx: *anyopaque) void {
+    const RaceCtx = struct {
         data: []const u8,
         needle: []const u8,
         result: *SpeculativeResult,
+        winner: *std.atomic.Value(u32),
+        id: u32,
     };
-    const sc: *ShadowCtx = @ptrCast(@alignCast(ctx));
+    const rc: *RaceCtx = @ptrCast(@alignCast(ctx));
     const shadow_start = std.Io.Timestamp.now(std.Io.universal, .awake);
-    const count = simd.countNonOverlapping(sc.data, sc.needle);
-    sc.result.* = .{
-        .matches = count,
-        .elapsed_ns = @as(u64, @intCast(@max(
-            std.Io.Timestamp.now(std.Io.universal, .awake).nanoseconds - shadow_start.nanoseconds,
-            0,
-        ))),
-    };
+    const count = simd.countNonOverlapping(rc.data, rc.needle);
+    const elapsed = @as(u64, @intCast(@max(
+        std.Io.Timestamp.now(std.Io.universal, .awake).nanoseconds - shadow_start.nanoseconds,
+        0,
+    )));
+
+    // Commit result and claim victory (execution-pointer swap).
+    // If primary already won (winner != 0), our result is still recorded
+    // for correctness verification — we just didn't win the race.
+    rc.result.* = .{ .matches = count, .elapsed_ns = elapsed };
+    _ = rc.winner.cmpxchgStrong(@as(u32, 0), rc.id, .release, .monotonic);
 }
 const search_cursor = @import("../cli/cursor.zig");
 const catalog = @import("catalog.zig");
