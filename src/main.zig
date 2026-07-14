@@ -60,7 +60,12 @@ test {
 /// physical memory. Long-lived and short-lived lanes therefore obey the same
 /// owner instead of maintaining command-specific ceilings.
 pub fn main(init: std.process.Init) !void {
-    var framework_budget = resource_profile.CappedAllocator.init(std.heap.page_allocator, resource_profile.memoryLimitBytes());
+    // P18: On Linux, back the arena with huge pages (2 MiB) to eliminate
+    // TLB pressure. The HugePageAllocator attempts MAP_HUGETLB for allocations
+    // ≥ 2 MiB, falling back to regular pages if huge pages are exhausted.
+    // On Windows/non-Linux, it passes through to the child allocator.
+    var hp_alloc = resource_profile.HugePageAllocator.init(std.heap.page_allocator);
+    var framework_budget = resource_profile.CappedAllocator.init(hp_alloc.allocator(), resource_profile.memoryLimitBytes());
     var framework_arena = std.heap.ArenaAllocator.init(framework_budget.allocator());
     defer framework_arena.deinit();
     const allocator = framework_arena.allocator();

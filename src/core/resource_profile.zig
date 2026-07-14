@@ -264,6 +264,123 @@ pub fn hugePageFlag() usize {
     return 0;
 }
 
+/// P18: Allocates a memory region backed by huge pages (2 MiB on Linux).
+/// Uses mmap with MAP_HUGETLB on Linux. Returns a pointer to the mapped
+/// region, or null if huge pages are unavailable or the allocation fails.
+///
+/// On Linux, the kernel transparently backs the region with 2 MiB huge
+/// pages, reducing TLB pressure by 512× (one TLB entry covers 2 MiB
+/// instead of 4 KiB). This eliminates page-walk overhead on arena regions.
+///
+/// The caller is responsible for munmap'ing the region.
+pub fn allocateHugePages(size: usize) ?[*]u8 {
+    if (builtin.os.tag != .linux) return null;
+    if (!supportsHugePages()) return null;
+
+    const PROT_READ: u32 = 0x1;
+    const PROT_WRITE: u32 = 0x2;
+    const MAP_PRIVATE: u32 = 0x02;
+    const MAP_ANON: u32 = 0x20;
+    const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
+
+    // Round up to huge page boundary.
+    const rounded_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
+
+    const result = std.c.mmap(
+        null,
+        rounded_size,
+        PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANON | @as(u32, @intCast(hugePageFlag())),
+        -1,
+        0,
+    );
+    if (@intFromPtr(result.addr) == std.math.maxInt(usize)) return null;
+    return result.addr;
+}
+
+/// P18: Frees a huge page-backed memory region.
+pub fn freeHugePages(ptr: [*]u8, size: usize) void {
+    if (builtin.os.tag != .linux) return;
+    const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024;
+    const rounded_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
+    _ = std.c.munmap(ptr, rounded_size);
+}
+
+/// P18: Checks if huge page allocation should be used for the arena.
+/// Enabled by default on Linux (MAP_HUGETLB). Disabled on Windows
+/// (requires SeLockMemoryPrivilege). Can be forced off with IX_NO_HUGE_PAGES=1.
+pub fn shouldUseHugePages() bool {
+    if (builtin.os.tag != .linux) return false;
+    if (std.c.getenv("IX_NO_HUGE_PAGES\x00")) |v| {
+        if (std.mem.eql(u8, std.mem.span(v), "1")) return false;
+    }
+    return true;
+}
+
+/// P18: Huge Page-backed Allocator.
+///
+/// Wraps the standard page allocator but attempts to back large allocations
+/// with MAP_HUGETLB on Linux. Small allocations pass through to the child
+/// allocator. Large allocations (≥ 2 MiB) attempt huge pages first, falling
+/// back to regular pages if huge pages are exhausted or unavailable.
+///
+/// This allocator is designed to sit beneath ArenaAllocator. The arena
+/// requests large backing regions; this allocator services them with
+/// huge pages, eliminating TLB misses on the arena's working set.
+pub const HugePageAllocator = struct {
+    child: std.mem.Allocator,
+    huge_page_allocs: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+
+    pub fn init(child: std.mem.Allocator) HugePageAllocator {
+        return .{ .child = child };
+    }
+
+    pub fn allocator(self: *HugePageAllocator) std.mem.Allocator {
+        return .{ .ptr = self, .vtable = &hp_vtable };
+    }
+
+    pub fn hugePageAllocs(self: *const HugePageAllocator) usize {
+        return self.huge_page_allocs.load(.monotonic);
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *HugePageAllocator = @ptrCast(@alignCast(ctx));
+
+        // Attempt huge pages for allocations ≥ 2 MiB on Linux.
+        if (shouldUseHugePages() and len >= 2 * 1024 * 1024) {
+            if (allocateHugePages(len)) |ptr| {
+                _ = self.huge_page_allocs.fetchAdd(1, .monotonic);
+                return ptr;
+            }
+            // Fall back to regular allocation if huge pages exhausted.
+        }
+
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *HugePageAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *HugePageAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *HugePageAllocator = @ptrCast(@alignCast(ctx));
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+
+    const hp_vtable: std.mem.Allocator.VTable = .{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+};
+
 /// Returns true if the platform supports thread affinity pinning.
 pub fn supportsThreadPinning() bool {
     return builtin.os.tag == .windows or builtin.os.tag == .linux;

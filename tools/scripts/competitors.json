@@ -1,0 +1,36 @@
+{
+  "competitors": [
+    {
+      "name": "ripgrep",
+      "command": "rg",
+      "probes": ["rg", "rg.exe", "C:/Users/Savage/.cache/opencode/bin/rg.exe"],
+      "args": ["--color=never", "{{regex}}", "{{corpus}}"],
+      "allowedCodes": [0, 1],
+      "suppressOutput": true
+    },
+    {
+      "name": "silver-searcher",
+      "command": "ag",
+      "probes": ["ag", "ag.exe"],
+      "args": ["--nocolor", "{{regex}}", "{{corpus}}"],
+      "allowedCodes": [0, 1],
+      "suppressOutput": true
+    },
+    {
+      "name": "ack",
+      "command": "ack",
+      "probes": ["ack", "ack.bat", "ack.exe"],
+      "args": ["--nocolor", "{{regex}}", "{{corpus}}"],
+      "allowedCodes": [0, 1],
+      "suppressOutput": true
+    },
+    {
+      "name": "grep",
+      "command": "grep",
+      "probes": ["grep", "grep.exe"],
+      "args": ["-rn", "--include=*", "{{regex}}", "{{corpus}}"],
+      "allowedCodes": [0, 1, 2],
+      "suppressOutput": true
+    }
+  ]
+}
