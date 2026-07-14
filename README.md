@@ -191,7 +191,7 @@ ix xo "agentSimulation code with system administration ENV_VAR and a function fo
 ix xo "worker event lifecycle" src --format json --max-spans 8
 ```
 
-`xo` is a bounded reading lens, not a match oracle. Use `ix search` when every hit must be exact-verified. The Furnas fisheye lens belongs to lossy search previews (`--agent`, v1/v2/v3); `xo` and `search --context` preserve exact source evidence.
+`xo` is a bounded reading lens, not a match oracle. Use `ix search` when every hit must be exact-verified. Lines exceeding 300 bytes in `xo` output are fisheye-contracted around the focus term — minified or generated content gets the same tiered contraction as search previews, preserving the focus substring while collapsing the surrounding noise.
 
 ## Framework Resource Ceiling
 
