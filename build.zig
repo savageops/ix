@@ -41,6 +41,30 @@ pub fn build(b: *std.Build) void {
     const delta_overlay_test_cmd = b.addRunArtifact(delta_overlay_tests);
     delta_overlay_test_cmd.setEnvironmentVariable("IX_STATE_DIR", b.pathFromRoot(".zig-cache/ix-test-state"));
     test_step.dependOn(&delta_overlay_test_cmd.step);
+
+    // P30: Binary signing step. Signs the installed binary using the
+    // platform-native code-signing tool when signing credentials are
+    // available via environment variables:
+    //
+    //   Windows: IX_SIGN_CERT (PFX path) + IX_SIGN_PASSWORD
+    //            → signtool sign /f <cert> /p <pass> /fd SHA256 /t <timestamp> <exe>
+    //   macOS:   IX_SIGN_IDENTITY (keychain identity name)
+    //            → codesign --sign <identity> --force <binary>
+    //   Linux:   IX_SIGN_KEY (GPG key ID)
+    //            → gpg --detach-sign --armor <binary>
+    //
+    // When credentials are absent, the step is a no-op (development builds
+    // remain unsigned). CI sets the env vars in the release workflow.
+    const sign_step = b.step("sign", "Sign the installed binary (P30)");
+    // Use python3 on POSIX, python on Windows (python3 is aliased on Windows).
+    const python_cmd = if (@import("builtin").os.tag == .windows) "python" else "python3";
+    const sign_cmd = b.addSystemCommand(&.{python_cmd});
+    sign_cmd.addFileArg(b.path("tools/scripts/sign_binary.py"));
+    sign_cmd.addFileArg(b.path("zig-out/bin/ix-zig.exe"));
+    sign_cmd.addFileArg(b.path("zig-out/bin/ix-zig"));
+    sign_step.dependOn(b.getInstallStep());
+    sign_step.dependOn(&sign_cmd.step);
+    b.getInstallStep().dependOn(&exe.step);
 }
 
 fn createIxModule(

@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-sign:
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: ix-zig.exe
+            archive: ix-windows-x86_64.zip
+          - os: ubuntu-latest
+            artifact: ix-zig
+            archive: ix-linux-x86_64.tar.gz
+          - os: macos-latest
+            artifact: ix-zig
+            archive: ix-macos-aarch64.tar.gz
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        run: |
+          curl -L https://ziglang.org/download/0.16.0/zig-linux-x86_64-0.16.0.tar.xz | tar xJ
+          echo "$PWD/zig-linux-x86_64-0.16.0" >> $GITHUB_PATH
+        if: matrix.os != 'windows-latest'
+
+      - name: Install Zig (Windows)
+        shell: pwsh
+        run: |
+          curl -L -o zig.zip https://ziglang.org/download/0.16.0/zig-windows-x86_64-0.16.0.zip
+          Expand-Archive zig.zip -DestinationPath .
+          echo "$PWD\zig-windows-x86_64-0.16.0" | Out-File -FilePath $env:GITHUB_PATH -Append
+        if: matrix.os == 'windows-latest'
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Sign binary (Windows)
+        shell: pwsh
+        env:
+          IX_SIGN_CERT: ${{ secrets.IX_SIGN_CERT }}
+          IX_SIGN_PASSWORD: ${{ secrets.IX_SIGN_PASSWORD }}
+        run: |
+          if ($env:IX_SIGN_CERT) {
+            [System.IO.File]::WriteAllBytes("cert.pfx", [System.Convert]::FromBase64String($env:IX_SIGN_CERT))
+            $env:IX_SIGN_CERT = "cert.pfx"
+            python3 tools/scripts/sign_binary.py zig-out/bin/ix-zig.exe
+          } else {
+            Write-Host "No signing certificate — skipping"
+          }
+        if: matrix.os == 'windows-latest'
+
+      - name: Sign binary (macOS)
+        env:
+          IX_SIGN_IDENTITY: ${{ secrets.IX_SIGN_IDENTITY }}
+        run: python3 tools/scripts/sign_binary.py zig-out/bin/ix-zig
+        if: matrix.os == 'macos-latest'
+
+      - name: Sign binary (Linux)
+        env:
+          IX_SIGN_KEY: ${{ secrets.IX_SIGN_KEY }}
+        run: python3 tools/scripts/sign_binary.py zig-out/bin/ix-zig
+        if: matrix.os == 'ubuntu-latest'
+
+      - name: Compute SHA256
+        shell: bash
+        run: |
+          sha256sum zig-out/bin/ix-zig* | tee checksums-${{ matrix.os }}.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ix-${{ matrix.os }}
+          path: |
+            zig-out/bin/
+            checksums-*.txt
+
+  release:
+    needs: build-and-sign
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*/zig-out/bin/*
+            artifacts/*/checksums-*.txt
