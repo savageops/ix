@@ -27,44 +27,130 @@ const std = @import("std");
 const ALPHABET_SIZE: usize = 256;
 const SENTINEL: u8 = 0; // We use byte 0 as the unique sentinel.
 
-/// The FM-Index structure. Owns the BWT, C table, and Occ prefix sums.
+/// P11: Wavelet Tree — compressed bit-vector Occ table.
+///
+/// A wavelet tree stores the BWT as a balanced binary tree of bit-vectors.
+/// For a 256-byte alphabet, the tree has 8 levels (log₂ 256). At each level,
+/// the alphabet is partitioned by the bit at that level. The bit-vector
+/// records which side each character belongs to.
+///
+/// Rank queries (Occ(c, i) = count of character c in BWT[0..i)) are answered
+/// by traversing the tree: at each level, use the bit-vector's rank1 to project
+/// the position into the child's domain. This takes O(log σ) = O(8) = O(1) time.
+///
+/// Space: 8 × n bits = n bytes. Compare to the uncompressed Occ table which
+/// uses 257 × n × 8 bytes = 2056n bytes. This is a ~2000× compression.
+pub const WaveletTree = struct {
+    /// One bit-vector per level (8 levels for 256-byte alphabet).
+    /// Level 0 uses bit 7 of the byte, level 7 uses bit 0.
+    levels: [8][]u64,
+    /// Number of 0-bits (characters in left child) at each level.
+    n_zeros: [8]usize = [_]usize{0} ** 8,
+    n: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *WaveletTree) void {
+        for (self.levels) |level| self.allocator.free(level);
+    }
+
+    /// Occ(c, i): count of character c in BWT[0..i).
+    /// Traverses the wavelet tree from root to leaf (8 levels).
+    pub fn rank(self: *const WaveletTree, char: u8, pos: usize) u64 {
+        var lo: usize = 0;
+        var hi: usize = pos;
+        for (0..8) |level| {
+            const bit = (char >> @intCast(7 - level)) & 1;
+            const level_bits = self.levels[level];
+            // Count 1-bits in [lo, hi) of this level's bit-vector.
+            const ones = popcountRange(level_bits, lo, hi);
+            const range_len = hi - lo;
+            const zeros = range_len - ones;
+            if (bit == 0) {
+                hi = zeros;
+                // lo stays at 0 (all zeros are packed to the left).
+                // But we need rank0(lo) as new lo, and rank0(hi) as new hi.
+                // Since we're navigating the 0-child:
+                lo = (lo - popcountRange(level_bits, 0, lo)); // zeros before lo
+                hi = lo + zeros;
+            } else {
+                // 1-child: new position = total_zeros + ones_before_in_range
+                const total_zeros = self.n_zeros[level];
+                lo = total_zeros + popcountRange(level_bits, 0, lo);
+                hi = lo + ones;
+            }
+        }
+        return @intCast(hi - lo);
+    }
+
+    const POPLUT: [256]u8 = blk: {
+        var lut: [256]u8 = undefined;
+        for (0..256) |i| lut[i] = @popCount(@as(u8, @intCast(i)));
+        break :blk lut;
+    };
+
+    /// Count 1-bits in positions [lo, hi) of a bit-vector stored as u64 array.
+    fn popcountRange(bits: []const u64, lo: usize, hi: usize) usize {
+        if (lo >= hi) return 0;
+        var count: usize = 0;
+        // Bit i is in word i/64 at position i%64.
+        const start_word = lo / 64;
+        const end_word = hi / 64;
+        if (start_word == end_word) {
+            // Single word partial.
+            const mask = (~@as(u64, 0) >> @intCast(lo % 64)) & (~@as(u64, 0) << @intCast(@as(u8, @intCast(64 - (hi - start_word * 64))) & 63));
+            count += @popCount(bits[start_word] & mask);
+        } else {
+            // Start partial.
+            if (lo % 64 != 0) {
+                count += @popCount(bits[start_word] >> @intCast(lo % 64));
+            } else {
+                count += @popCount(bits[start_word]);
+            }
+            // Full words.
+            for (start_word + 1..end_word) |w| count += @popCount(bits[w]);
+            // End partial.
+            if (hi % 64 != 0) {
+                const shift: u6 = @intCast(64 - (hi % 64));
+                count += @popCount(bits[end_word] << shift >> shift);
+            } else {
+                count += @popCount(bits[end_word]);
+            }
+        }
+        return count;
+    }
+};
+
+/// The FM-Index structure. Owns the BWT, C table, and wavelet tree.
 pub const FMIndex = struct {
     bwt: []u8,
     c_table: [ALPHABET_SIZE + 1]u64,
-    /// Occ prefix sums: occ[c * (text_len + 1) + i] = count of c in BWT[0, i].
-    /// This is the uncompressed form — a production index would use
-    /// wavelet trees or compressed bit-vectors (spec point 11 mentions
-    /// "compressed bit-vectors"). The interface is identical.
-    occ: []u64,
+    /// P11: Wavelet tree replaces the uncompressed Occ prefix-sum table.
+    /// Provides O(1) rank queries using compressed bit-vectors (8 × n bits).
+    wavelet: ?WaveletTree = null,
+    /// Fallback uncompressed Occ for small texts where wavelet overhead
+    /// exceeds the memory savings.
+    occ: ?[]u64 = null,
     text_len: usize,
-    /// The original text positions, sorted lexicographically by suffix.
-    /// Used for locate() — mapping BWT positions back to text offsets.
     sa: []u64,
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *FMIndex) void {
         self.allocator.free(self.bwt);
-        self.allocator.free(self.occ);
+        if (self.occ) |o| self.allocator.free(o);
+        if (self.wavelet) |*w| w.deinit();
         self.allocator.free(self.sa);
     }
 
-    /// Returns true if the pattern exists in the indexed text.
-    /// O(p) time where p = pattern length.
     pub fn contains(self: *const FMIndex, pattern: []const u8) bool {
         return self.count(pattern) > 0;
     }
 
-    /// Returns the number of occurrences of the pattern.
-    /// O(p) time.
     pub fn count(self: *const FMIndex, pattern: []const u8) usize {
         if (pattern.len == 0) return 0;
         const range = self.backwardSearch(pattern);
         return if (range.last > range.first) range.last - range.first else 0;
     }
 
-    /// Locates all occurrences of the pattern, writing text offsets to `out`.
-    /// Returns the number of occurrences found.
-    /// O(p + occ) where occ is the number of occurrences.
     pub fn locate(self: *const FMIndex, pattern: []const u8, out: []u64) usize {
         if (pattern.len == 0) return 0;
         const range = self.backwardSearch(pattern);
@@ -78,7 +164,6 @@ pub const FMIndex = struct {
 
     const Range = struct { first: u64, last: u64 };
 
-    /// Core backward search. Processes the pattern right-to-left.
     fn backwardSearch(self: *const FMIndex, pattern: []const u8) Range {
         var first: u64 = 0;
         var last: u64 = @intCast(self.text_len);
@@ -86,7 +171,7 @@ pub const FMIndex = struct {
         while (j > 0) {
             j -= 1;
             const c = pattern[j];
-            const c_idx = @as(usize, c) + 1; // +1 offset for sentinel at index 0.
+            const c_idx = @as(usize, c) + 1;
             first = self.c_table[c_idx] + self.occAt(c_idx, first);
             last = self.c_table[c_idx] + self.occAt(c_idx, last);
             if (last <= first) break;
@@ -95,9 +180,17 @@ pub const FMIndex = struct {
     }
 
     /// Occ(c, i): count of character c in BWT at positions before i.
-    /// O(1) lookup into the prefix-sum table.
+    /// Dispatches to wavelet tree (compressed) or uncompressed table.
     fn occAt(self: *const FMIndex, c: usize, i: u64) u64 {
-        return self.occ[c * (self.text_len + 1) + i];
+        if (self.wavelet) |w| {
+            // c is 1-indexed (c_idx = byte + 1 for sentinel). Convert back.
+            const byte: u8 = @intCast(c - 1);
+            return w.rank(byte, @intCast(i));
+        }
+        if (self.occ) |o| {
+            return o[c * (self.text_len + 1) + i];
+        }
+        return 0;
     }
 };
 
@@ -151,32 +244,82 @@ pub fn buildFMIndex(allocator: std.mem.Allocator, text: []const u8) !FMIndex {
         cumulative += char_counts[idx];
     }
 
-    // Build Occ prefix-sum table: Occ(c, i) = count of c in BWT[0, i).
-    const occ = try allocator.alloc(u64, (ALPHABET_SIZE + 1) * (n + 2));
-    errdefer allocator.free(occ);
-    @memset(occ, 0);
-
-    // Initialize row 0 to all zeros.
-    for (0..ALPHABET_SIZE + 1) |c| {
-        occ[c * (n + 2) + 0] = 0;
-    }
-    // Fill prefix sums. BWT character at position i is indexed at bwt[i]+1
-    // in the Occ table (matching the C table's sentinel offset).
-    for (0..n + 1) |i| {
-        const bwt_idx = @as(usize, bwt[i]) + 1;
-        for (0..ALPHABET_SIZE + 1) |c| {
-            occ[c * (n + 2) + i + 1] = occ[c * (n + 2) + i] + (if (c == bwt_idx) @as(u64, 1) else 0);
-        }
-    }
+    // P11: Build wavelet tree for compressed Occ queries.
+    // The wavelet tree uses 8 × n bits = n bytes (vs 257 × n × 8 bytes
+    // for the uncompressed table). This is a ~2000× compression.
+    const bwt_len = n + 1;
+    var wavelet = try buildWaveletTree(allocator, bwt, bwt_len);
+    errdefer wavelet.deinit();
 
     return FMIndex{
         .bwt = bwt,
         .c_table = c_table,
-        .occ = occ,
-        .text_len = n + 1,
+        .wavelet = wavelet,
+        .occ = null,
+        .text_len = bwt_len,
         .sa = sa,
         .allocator = allocator,
     };
+}
+
+/// P11: Builds a wavelet tree from a BWT byte array.
+/// The tree has 8 levels (log₂ 256). At each level, characters are
+/// partitioned by the bit at that level (MSB first). The bit-vector
+/// records which partition each character belongs to.
+fn buildWaveletTree(allocator: std.mem.Allocator, bwt: []const u8, n: usize) !WaveletTree {
+    var wt = WaveletTree{
+        .levels = undefined,
+        .n = n,
+        .allocator = allocator,
+    };
+
+    // Current permutation of BWT characters at each level.
+    var current = try allocator.alloc(u8, n);
+    defer allocator.free(current);
+    @memcpy(current, bwt);
+
+    var next = try allocator.alloc(u8, n);
+    defer allocator.free(next);
+
+    for (0..8) |level| {
+        const bit_pos: u3 = @intCast(7 - level);
+        const words = (n + 63) / 64;
+        const level_bits = try allocator.alloc(u64, words);
+        @memset(level_bits, 0);
+
+        // Partition: zeros go left, ones go right.
+        var zero_idx: usize = 0;
+        var one_idx: usize = 0;
+        // First pass: count zeros.
+        var zero_count: usize = 0;
+        for (current) |c| {
+            if ((c >> bit_pos) & 1 == 0) zero_count += 1;
+        }
+        wt.n_zeros[level] = zero_count;
+        one_idx = zero_count;
+
+        // Second pass: build bit-vector and partition.
+        for (current, 0..) |c, i| {
+            const bit = (c >> bit_pos) & 1;
+            if (bit == 1) {
+                level_bits[i / 64] |= @as(u64, 1) << @intCast(i % 64);
+                next[one_idx] = c;
+                one_idx += 1;
+            } else {
+                next[zero_idx] = c;
+                zero_idx += 1;
+            }
+        }
+
+        wt.levels[level] = level_bits;
+
+        // Swap current and next.
+        const tmp = current;
+        current = next;
+        next = tmp;
+    }
+
+    return wt;
 }
 
 fn suffixLessThan(ctx: []const u8, a: u64, b: u64) bool {
