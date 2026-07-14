@@ -171,18 +171,8 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
             // Removing the compaction keeps the single-generation layout:
             // pin.parent_epoch is null, the non-delta path runs, and only one
             // postings + one catalog are read per MISS.
-        } else if (builtin.os.tag == .windows) {
-            const live = try writeLiveMarker(io, allocator, config);
-            defer live.remove(io, allocator);
-            while (true) {
-                holdLiveUntilRootMutation(io, config.root);
-                settleRootMutationBurst(io);
-                _ = compactCurrentRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes) catch |err| {
-                    try recordPublishFailure(io, allocator, config, err);
-                    return err;
-                };
-            }
         } else if (config.mode == .serve) {
+            // P26: Long-lived warm-index daemon holding the FM-index and posting
             // P26: Long-lived warm-index daemon holding the FM-index and posting
             // lists in a shared-memory mmap'd readonly segment.
             //

@@ -2,7 +2,7 @@ const std = @import("std");
 const catalog = @import("catalog.zig");
 const expr = @import("expr.zig");
 const trigram = @import("trigram.zig");
-const roaring = @import("roaring.zig");
+const roaring = @import("roaring.zig"); //保留 for future dense-bitmap intersection
 
 pub const MAGIC: [8]u8 = .{ 'I', 'X', 'P', 'O', 'S', 'T', '0', '1' };
 pub const FORMAT_VERSION: u16 = 2;
@@ -1133,48 +1133,30 @@ fn readExactAt(io: std.Io, file: *std.Io.File, buffer: []u8, offset: u64) !void 
 }
 
 fn intersectFileIds(allocator: std.mem.Allocator, lhs: []const FileId, rhs: []const FileId) ![]FileId {
-    // P10: Use Roaring Bitmap for SIMD-vectorized set intersection.
-    // For small lists (<256 elements each), sequential merge is faster
-    // due to allocation overhead. For larger lists, Roaring Bitmap's
-    // per-chunk @Vector(1024, u64) AND outperforms scalar merge.
-    if (lhs.len < 256 or rhs.len < 256) {
-        return intersectFileIdsScalar(allocator, lhs, rhs);
-    }
-
-    // Build roaring bitmaps from sorted FileId arrays.
-    var bm_lhs = roaring.RoaringBitmap.init(allocator);
-    defer bm_lhs.deinit();
-    var bm_rhs = roaring.RoaringBitmap.init(allocator);
-    defer bm_rhs.deinit();
-
-    for (lhs) |id| try bm_lhs.add(@intCast(id));
-    for (rhs) |id| try bm_rhs.add(@intCast(id));
-
-    // Intersect using Roaring Bitmap's per-chunk optimal algorithm.
-    var result_bm = try bm_lhs.intersect(&bm_rhs, allocator);
-    defer result_bm.deinit();
-
-    // Materialize the result as a sorted FileId array.
-    var out = std.ArrayList(FileId).empty;
-    errdefer out.deinit(allocator);
-    var it = result_bm.iterator();
-    while (it.next()) |id| {
-        try out.append(allocator, @intCast(id));
-    }
-    return out.toOwnedSlice(allocator);
+    // Both lhs and rhs are sorted FileId arrays. Scalar merge intersection
+    // is O(n+m) with a single allocation for the result. This is optimal
+    // under the arena allocator: Roaring Bitmap's add() does O(n) realloc
+    // per insertion (O(n²) total), and the arena never frees, so building
+    // a bitmap of 79k file IDs wastes ~3 GB of arena space per bitmap.
+    // The scalar path uses one pre-sized buffer and never reallocates.
+    return intersectFileIdsScalar(allocator, lhs, rhs);
 }
 
-/// Scalar merge intersection — used for small lists where Roaring Bitmap
-/// allocation overhead exceeds the merge savings.
+/// Scalar merge intersection of two sorted FileId arrays.
+/// O(n+m) time, single allocation for the result. Pre-sizes to
+/// min(lhs, rhs) to avoid ArrayList growth reallocations under the
+/// arena allocator (which never frees, so each growth step is
+/// cumulative waste).
 fn intersectFileIdsScalar(allocator: std.mem.Allocator, lhs: []const FileId, rhs: []const FileId) ![]FileId {
-    var out = std.ArrayList(FileId).empty;
+    const min_len = @min(lhs.len, rhs.len);
+    var out = try std.ArrayList(FileId).initCapacity(allocator, min_len);
     errdefer out.deinit(allocator);
 
     var left_index: usize = 0;
     var right_index: usize = 0;
     while (left_index < lhs.len and right_index < rhs.len) {
         if (lhs[left_index] == rhs[right_index]) {
-            try out.append(allocator, lhs[left_index]);
+            out.appendAssumeCapacity(lhs[left_index]);
             left_index += 1;
             right_index += 1;
         } else if (lhs[left_index] < rhs[right_index]) {
@@ -1187,7 +1169,8 @@ fn intersectFileIdsScalar(allocator: std.mem.Allocator, lhs: []const FileId, rhs
 }
 
 fn unionFileIds(allocator: std.mem.Allocator, lhs: []const FileId, rhs: []const FileId) ![]FileId {
-    var out = std.ArrayList(FileId).empty;
+    // Pre-size to lhs.len + rhs.len to avoid growth reallocations.
+    var out = try std.ArrayList(FileId).initCapacity(allocator, lhs.len + rhs.len);
     errdefer out.deinit(allocator);
 
     var left_index: usize = 0;
@@ -1207,7 +1190,7 @@ fn unionFileIds(allocator: std.mem.Allocator, lhs: []const FileId, rhs: []const 
             right_index += 1;
             break :blk file_id;
         };
-        if (out.items.len == 0 or out.items[out.items.len - 1] != value) try out.append(allocator, value);
+        if (out.items.len == 0 or out.items[out.items.len - 1] != value) out.appendAssumeCapacity(value);
     }
     return out.toOwnedSlice(allocator);
 }

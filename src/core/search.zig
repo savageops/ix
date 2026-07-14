@@ -1403,7 +1403,13 @@ fn parseWarmIndexFreshness(bytes: []const u8, expected_root: []const u8) ?WarmIn
 }
 
 fn warmIndexRelativePath(root: []const u8, path: []const u8) []const u8 {
-    if (!std.mem.startsWith(u8, path, root)) return path;
+    // Case-insensitive prefix match: on Windows, the catalog stores paths
+    // with the canonical drive letter case (E:/) while the user may pass
+    // a lowercase root (e:/). A case-sensitive startsWith would fail to
+    // strip the prefix, leaving the full absolute path — which then trips
+    // isHiddenDirectoryPath on directories like .refs, .git, etc.
+    if (path.len < root.len) return path;
+    if (!std.ascii.startsWithIgnoreCase(path, root)) return path;
     var offset = root.len;
     while (offset < path.len and (path[offset] == '/' or path[offset] == '\\')) : (offset += 1) {}
     return path[offset..];

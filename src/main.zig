@@ -304,6 +304,7 @@ pub fn main(init: std.process.Init) !void {
                 .foreground = request.foreground,
                 .once = request.once,
                 .repair = request.repair,
+                .serve = request.serve,
             }) catch |err| {
                 try output.writeError(stderr, "indexd_failed", @errorName(err));
                 try stderr.flush();
