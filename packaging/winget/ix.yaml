@@ -1,0 +1,24 @@
+# P30: Package manager manifest — winget (Windows)
+PackageIdentifier: savageops.ix
+PackageName: IX
+PackageVersion: 2.0.0
+Publisher: savageops
+PublisherUrl: https://github.com/savageops/ix-zig
+License: MIT
+LicenseUrl: https://github.com/savageops/ix-zig/blob/master/LICENSE
+ShortDescription: A search engine that knows what to ignore. SIMD literal scan, trigram-gated file rejection, BM25 degree-of-interest context, cursor-paginated agent output.
+Tags:
+  - search
+  - code-search
+  - cli
+  - agent
+  - ripgrep
+Installers:
+  - Architecture: x64
+    InstallerType: zip
+    InstallerUrl: https://github.com/savageops/ix-zig/releases/latest/download/ix-x86_64-windows.zip
+    InstallerSha256: ""
+    Commands:
+      - ix
+ManifestType: singleton
+ManifestVersion: 1.0.0

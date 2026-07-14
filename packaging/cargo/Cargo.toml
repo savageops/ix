@@ -1,0 +1,14 @@
+# P30: Package manager manifest — Cargo (Rust ecosystem wrapper)
+# Not a real Rust crate — downloads and installs the prebuilt binary.
+[package]
+name = "ix-search"
+version = "2.0.0"
+edition = "2021"
+description = "A search engine that knows what to ignore"
+license = "MIT"
+homepage = "https://github.com/savageops/ix-zig"
+repository = "https://github.com/savageops/ix-zig"
+
+[[bin]]
+name = "ix"
+path = "src/main.rs"

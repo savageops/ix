@@ -1,0 +1,27 @@
+# P30: Package manager manifest — apt/dpkg (Debian/Ubuntu)
+Source: ix
+Section: utils
+Priority: optional
+Maintainer: savageops <noreply@savageops.com>
+Build-Depends: zig (>= 0.16.0)
+Standards-Version: 4.5.0
+
+Package: ix
+Architecture: amd64
+Depends: libc6
+Description: A search engine that knows what to ignore
+ IX classifies each query at parse time and routes it to the narrowest
+ execution path before touching a byte of input. Literal queries hit
+ 256-bit SIMD lanes at 32 bytes per cycle. Regex compiles through PCRE2
+ JIT. AND/OR queries extract mandatory trigram evidence and reject
+ ineligible files before scanning.
+ .
+ Features:
+  * AVX2 SIMD literal scan (32 bytes/cycle)
+  * Trigram-gated file rejection (sub-linear pruning)
+  * Warm index with persistent trigram postings
+  * BM25 degree-of-interest context assembly (xo)
+  * Cursor-paginated, byte-budgeted agent output
+  * MCP server for agent-native integration
+  * Shell completions for bash/zsh/fish/PowerShell
+  * Single static binary, zero runtime dependencies

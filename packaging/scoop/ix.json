@@ -1,0 +1,22 @@
+# P30: Package manager manifest — Scoop (Windows)
+{
+  "version": "2.0.0",
+  "description": "A search engine that knows what to ignore. SIMD literal scan, trigram-gated file rejection, BM25 degree-of-interest context.",
+  "homepage": "https://github.com/savageops/ix-zig",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/savageops/ix-zig/releases/latest/download/ix-x86_64-windows.zip",
+      "hash": ""
+    }
+  },
+  "bin": "ix.exe",
+  "checkver": "github",
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/savageops/ix-zig/releases/latest/download/ix-x86_64-windows.zip"
+      }
+    }
+  }
+}
