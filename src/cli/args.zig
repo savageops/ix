@@ -15,6 +15,7 @@ pub const CommandTag = enum {
     process,
     similar,
     xo,
+    why,
     mcp,
     nexus,
     indexd,
@@ -208,6 +209,7 @@ pub const Command = union(CommandTag) {
     process: ProcessRequest,
     similar: SimilarRequest,
     xo: XoRequest,
+    why: WhyRequest,
     mcp: McpRequest,
     nexus: SearchRequest,
     indexd: IndexdRequest,
@@ -219,6 +221,18 @@ pub const McpRequest = struct {
 
 pub const McpTransport = enum {
     stdio,
+};
+
+/// P29: Adjacent Operations Vector — 'why' command.
+/// Traces a match to its posting-list lineage: which trigram evidence caused
+/// a file to be admitted as a candidate, the per-gram file count, and the
+/// intersection result. This makes the sub-linear pruning pipeline
+/// transparent to the consumer.
+pub const WhyRequest = struct {
+    expression: []const u8,
+    paths: [MAX_SEARCH_PATHS][]const u8,
+    path_count: usize,
+    json: bool = false,
 };
 
 pub const Invocation = struct {
@@ -321,6 +335,10 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
     if (std.mem.eql(u8, first, "xo")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .xo } };
         return .{ .command = .{ .xo = try parseXo(argv[2..]) } };
+    }
+    if (std.mem.eql(u8, first, "why")) {
+        if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .explain } };
+        return .{ .command = .{ .why = try parseWhy(argv[2..]) } };
     }
     if (std.mem.eql(u8, first, "mcp")) {
         return .{ .command = .{ .mcp = .{} } };
@@ -493,6 +511,28 @@ fn parseXo(args: []const []const u8) ParseError!XoRequest {
         }
     }
     if (request.query.len == 0 or request.path_count == 0) return ParseError.MissingValue;
+    return request;
+}
+
+fn parseWhy(args: []const []const u8) ParseError!WhyRequest {
+    if (args.len == 0) return ParseError.MissingExpression;
+    var expression: ?[]const u8 = null;
+    var request = WhyRequest{ .expression = "", .paths = undefined, .path_count = 0 };
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--json")) {
+            request.json = true;
+        } else if (!std.mem.startsWith(u8, arg, "-")) {
+            if (expression == null) {
+                expression = arg;
+            } else {
+                if (request.path_count >= MAX_SEARCH_PATHS) return ParseError.MissingValue;
+                request.paths[request.path_count] = arg;
+                request.path_count += 1;
+            }
+        } else return ParseError.UnsupportedFlag;
+    }
+    request.expression = expression orelse return ParseError.MissingExpression;
+    if (request.path_count == 0) return ParseError.MissingValue;
     return request;
 }
 

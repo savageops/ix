@@ -39,6 +39,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  xo       Context-guided insight spans for agents
         \\  inspect  Read-only file windows and match context
         \\  explain  Expression plan JSON
+        \\  why      Posting-list lineage of a match (P29)
         \\  process  State-dir inspection and cleanup
         \\  help     Print this message or subcommand help
         \\
@@ -420,6 +421,106 @@ pub fn writeExplain(writer: anytype, plan: expr.ExpressionPlan) !void {
     try writer.writeAll("]");
     try writer.writeAll("}}\n");
 }
+
+/// P29: 'why' command — traces a match to its posting-list lineage.
+/// Shows which trigram evidence was extracted from the query, the
+/// query decomposition, and how the admission pipeline classifies it.
+/// This makes the sub-linear pruning transparent: the consumer sees
+/// exactly which grams would be looked up in the posting lists, which
+/// intersection mode applies, and what the verifier would do.
+pub fn writeWhy(writer: anytype, request: cli.WhyRequest, plan: expr.ExpressionPlan) !void {
+    const proof = corpus.compileProofProgram(plan);
+    if (request.json) {
+        try writeWhyJson(writer, request, plan, proof);
+    } else {
+        try writeWhyText(writer, request, plan, proof);
+    }
+}
+
+fn writeWhyText(writer: anytype, request: cli.WhyRequest, plan: expr.ExpressionPlan, proof: corpus.ProofProgram) !void {
+    try writer.print("== ix.why expression=\"{s}\" paths=", .{request.expression});
+    for (request.paths[0..request.path_count], 0..) |path, i| {
+        if (i > 0) try writer.writeAll(",");
+        try writer.writeAll(path);
+    }
+    try writer.print(" mode={s} ==\n", .{plan.modeText()});
+
+    try writer.print("query_class: {s}\n", .{proof.query_class});
+    try writer.print("verifier: {s}\n", .{proof.verifier});
+    if (proof.fallback) |fb| {
+        try writer.print("fallback: {s}\n", .{fb});
+    }
+
+    try writer.print("\nposting-list lineage ({} trigram evidence):\n", .{proof.term_count});
+    for (proof.terms[0..proof.term_count]) |term| {
+        const bytes = corpus.trigramBytes(term.key);
+        try writer.print("  gram \"{s}\" -> source_index={} repr={s}", .{
+            bytes[0..], term.source_index, term.repr.text(),
+        });
+        if (term.cardinality) |card| {
+            try writer.print(" cardinality={}", .{card});
+        }
+        try writer.writeAll("\n");
+    }
+
+    if (proof.candidate_files_before) |before| {
+        try writer.print("\ncandidate_files_before_intersection: {}\n", .{before});
+    }
+    if (proof.candidate_files_after) |after| {
+        try writer.print("candidate_files_after_intersection: {}\n", .{after});
+    }
+
+    // Show predicate decomposition.
+    try writer.print("\npredicate decomposition ({}):\n", .{plan.predicate_count});
+    for (plan.predicates[0..plan.predicate_count], 0..) |pred, i| {
+        try writer.print("  [{}] kind={s} value=\"{s}\" len={}\n", .{
+            i, pred.kindText(), pred.value, pred.value.len,
+        });
+    }
+}
+
+fn writeWhyJson(writer: anytype, request: cli.WhyRequest, plan: expr.ExpressionPlan, proof: corpus.ProofProgram) !void {
+    try writer.writeAll("{\"type\":\"why\",\"expression\":");
+    try writeJsonString(writer, request.expression);
+    try writer.print(",\"mode\":\"{s}\",\"query_class\":", .{plan.modeText()});
+    try writeJsonString(writer, proof.query_class);
+    try writer.writeAll(",\"verifier\":");
+    try writeJsonString(writer, proof.verifier);
+    try writer.writeAll(",\"fallback\":");
+    if (proof.fallback) |fb| {
+        try writeJsonString(writer, fb);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.print(",\"predicate_count\":{},\"posting_lineage\":[", .{plan.predicate_count});
+    for (proof.terms[0..proof.term_count], 0..) |term, i| {
+        if (i > 0) try writer.writeAll(",");
+        const bytes = corpus.trigramBytes(term.key);
+        try writer.writeAll("{\"gram\":");
+        try writeJsonString(writer, bytes[0..]);
+        try writer.print(",\"source_index\":{}", .{term.source_index});
+        if (term.cardinality) |card| {
+            try writer.print(",\"cardinality\":{}", .{card});
+        } else {
+            try writer.writeAll(",\"cardinality\":null");
+        }
+        try writer.print(",\"repr\":\"{s}\"}}", .{term.repr.text()});
+    }
+    try writer.writeAll("],\"candidate_files_before\":");
+    if (proof.candidate_files_before) |before| {
+        try writer.print("{}", .{before});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"candidate_files_after\":");
+    if (proof.candidate_files_after) |after| {
+        try writer.print("{}", .{after});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll("}\n");
+}
+
 
 /// P9: Pre-execution cost estimate. Classifies the query into a predicted
 /// cost class (instant/fast/moderate/slow) based on query shape, index

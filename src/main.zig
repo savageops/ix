@@ -240,6 +240,18 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
         },
+        .why => |request| {
+            const plan = parseExpression(request.expression) catch |err| {
+                try output.writeError(stderr, "invalid_expression", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            output.writeWhy(stdout, request, plan) catch |err| {
+                try output.writeError(stderr, "output_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
+        },
         .process => |request| {
             const report = process_tool.run(init.io, allocator, .{
                 .action = switch (request.action) {
