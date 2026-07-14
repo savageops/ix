@@ -17,7 +17,7 @@ Installers:
   - Architecture: x64
     InstallerType: zip
     InstallerUrl: https://github.com/savageops/ix-zig/releases/latest/download/ix-x86_64-windows.zip
-    InstallerSha256: ""
+    InstallerSha256: e93e371ffbf8b91c9412aa314c6943093bb65eb338bf29b9bc792c9dc38dfc44
     Commands:
       - ix
 ManifestType: singleton

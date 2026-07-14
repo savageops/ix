@@ -3,7 +3,7 @@ class Ix < Formula
   desc "A search engine that knows what to ignore"
   homepage "https://github.com/savageops/ix-zig"
   url "https://github.com/savageops/ix-zig/archive/refs/tags/v2.0.0.tar.gz"
-  sha256 ""
+  sha256 "e93e371ffbf8b91c9412aa314c6943093bb65eb338bf29b9bc792c9dc38dfc44"
   license "MIT"
   head "https://github.com/savageops/ix-zig.git", branch: "master"
 

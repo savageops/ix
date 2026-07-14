@@ -132,6 +132,7 @@ pub const IndexdRequest = struct {
     foreground: bool,
     once: bool,
     repair: bool,
+    serve: bool = false,
 };
 
 pub const ProcessAction = enum {
@@ -589,6 +590,9 @@ fn parseIndexd(args: []const []const u8) ParseError!IndexdRequest {
             request.foreground = true;
         } else if (std.mem.eql(u8, arg, "--once")) {
             request.once = true;
+        } else if (std.mem.eql(u8, arg, "--serve")) {
+            request.serve = true;
+            request.foreground = true;
         } else if (std.mem.eql(u8, arg, "--repair")) {
             request.repair = true;
         } else if (std.mem.startsWith(u8, arg, "-")) {

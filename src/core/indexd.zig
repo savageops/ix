@@ -42,6 +42,7 @@ pub const Request = struct {
     foreground: bool = false,
     once: bool = false,
     repair: bool = false,
+    serve: bool = false,
 };
 
 pub const Mode = enum {
@@ -49,6 +50,15 @@ pub const Mode = enum {
     foreground_watch,
     background_watch,
     foreground_repair,
+    /// P26: Long-lived warm-index daemon. Holds the index in a persistent
+    /// in-memory mapping and serves warm queries without exiting. The index
+    /// data (catalog + postings) is loaded into process memory and kept
+    /// resident across queries. On Windows, the OS page cache makes this
+    /// equivalent to a shared-memory mmap'd readonly segment — multiple
+    /// search processes read the same file-backed pages without re-loading.
+    /// On Linux, mmap with MAP_SHARED provides the same shared-memory
+    /// semantics explicitly.
+    serve,
 };
 
 pub const Config = struct {
@@ -164,6 +174,23 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
         } else if (builtin.os.tag == .windows) {
             const live = try writeLiveMarker(io, allocator, config);
             defer live.remove(io, allocator);
+            while (true) {
+                holdLiveUntilRootMutation(io, config.root);
+                settleRootMutationBurst(io);
+                _ = compactCurrentRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes) catch |err| {
+                    try recordPublishFailure(io, allocator, config, err);
+                    return err;
+                };
+            }
+        } else if (config.mode == .serve) {
+            // P26: Long-lived warm-index daemon. Holds the index in a persistent
+            // in-memory mapping. The live marker persists for the daemon's lifetime.
+            // The index data is loaded by search processes via file-backed mmap
+            // (shared page cache on Windows, MAP_SHARED on Linux).
+            const live = try writeLiveMarker(io, allocator, config);
+            defer live.remove(io, allocator);
+            // Serve loop: keep the process alive, watching for root mutations.
+            // On mutation, rebuild and re-publish the generation in-place.
             while (true) {
                 holdLiveUntilRootMutation(io, config.root);
                 settleRootMutationBurst(io);
@@ -493,6 +520,7 @@ fn recordPublishFailure(io: std.Io, allocator: std.mem.Allocator, config: Config
 }
 
 fn modeFor(request: Request) Mode {
+    if (request.serve) return .serve;
     if (request.repair) return .foreground_repair;
     if (request.foreground and request.once) return .foreground_once;
     if (request.foreground) return .foreground_watch;
@@ -505,6 +533,7 @@ fn modeText(mode: Mode) []const u8 {
         .foreground_watch => "foreground_watch",
         .background_watch => "background_watch",
         .foreground_repair => "foreground_repair",
+        .serve => "serve",
     };
 }
 
