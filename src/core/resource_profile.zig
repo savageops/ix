@@ -31,7 +31,9 @@ fn loadConfig() Config {
         return cfg;
     }
 
-    // No config file — env vars only
+    // No config file — create a default one so the user knows it exists
+    createDefaultConfigJson();
+    // Env vars only
     applyEnvOverrides(&cfg);
     cached_config = cfg;
     return cfg;
@@ -86,6 +88,47 @@ fn loadConfigJson(cfg: *Config) bool {
         if (val > 0 and val <= 100) cfg.thread_percent = val;
     }
     return true;
+}
+
+/// Creates ~/.ix/config.json with default values so the user can discover
+/// and tune the engine without recompiling. Best-effort — silently ignores
+/// failures (dir creation, write permission, disk full).
+fn createDefaultConfigJson() void {
+    // Resolve home directory
+    const home_env = if (@import("builtin").os.tag == .windows) "USERPROFILE" else "HOME";
+    const home_ptr = std.c.getenv(home_env ++ "\x00") orelse return;
+    const home = std.mem.span(home_ptr);
+    if (home.len == 0) return;
+
+    // Build paths
+    var dir_buf: [4096]u8 = undefined;
+    const ix_dir = std.fmt.bufPrintZ(&dir_buf, "{s}/.ix", .{home}) catch return;
+
+    // Create ~/.ix/ if it doesn't exist (best effort)
+    _ = std.c.mkdir(ix_dir, 0o755);
+
+    // Build config path
+    var config_buf: [4200]u8 = undefined;
+    const config_path = std.fmt.bufPrintZ(&config_buf, "{s}/config.json", .{ix_dir}) catch return;
+
+    // Don't overwrite if it exists
+    if (std.c.fopen(config_path, "rb")) |existing| {
+        _ = std.c.fclose(existing);
+        return;
+    }
+
+    // Write default config
+    const defaults =
+        \\{
+        \\  "memory_percent": 5,
+        \\  "thread_percent": 5
+        \\}
+        \\
+    ;
+    if (std.c.fopen(config_path, "wb")) |file| {
+        _ = std.c.fwrite(defaults.ptr, 1, defaults.len, file);
+        _ = std.c.fclose(file);
+    }
 }
 
 fn parseJsonField(json: []const u8, key: []const u8) ?usize {
