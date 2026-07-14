@@ -2,9 +2,11 @@
 
 # IX
 
-**32 bytes/cycle code search. Strategy-classified regex dispatch. PCRE2 JIT compiled regex. Trigram-gated file rejection. Warm-index foreground admission. BM25 degree-of-interest context. Furnas fisheye match lens. Thread-sharded execution. Exact-verified output.**
+**A search engine that knows what to ignore.**
 
-*AVX2 SIMD literal scan · Boolean predicate algebra · Generation-pinned warm index · Arena-allocated pipeline · Vendored C kernels compiled into one binary*
+32 bytes per cycle through 256-bit SIMD lanes. PCRE2 patterns compiled to native machine code. Mandatory-trigram evidence gates that reject impossible files before a single line is scanned. BM25 degree-of-interest context assembly. Furnas fisheye match lenses. Cursor-paginated, byte-budgeted, corpus-bound agent output. One binary. Zero dependencies. 5% of your machine.
+
+*AVX2 SIMD literal scan · Boolean predicate algebra · Generation-pinned warm index · Arena-allocated pipeline · Vendored C kernels*
 
 ---
 
@@ -28,21 +30,23 @@ IX started as a port of an existing Rust search engine. The initial goal was str
 
 That lasted about a week.
 
-Zig's compile-time execution, explicit control over memory layout, and direct access to SIMD intrinsics through `@Vector` made it clear that a line-by-line port would waste the language. The chunked I/O path was rebuilt around 1 MiB cache-line-aligned buffers instead of Rust's mmap abstraction. The regex dispatch was rebuilt as a compile-time strategy classifier that routes queries to the narrowest execution path before a single byte is read. The casefold pipeline was rebuilt as a custom `@Vector(32, u8)` operation that processes 32 bytes per iteration at the chunk level — not per-line. The thread model was rebuilt with thread-local shard accumulation and zero mutex contention on the hot path.
+Zig's compile-time execution, explicit control over memory layout, and direct access to SIMD intrinsics through `@Vector` made it clear that a line-by-line port would waste the language. The chunked I/O path was rebuilt around 1 MiB cache-line-aligned buffers. The regex dispatch was rebuilt as a compile-time strategy classifier that routes queries to the narrowest execution path before a single byte is read. The casefold pipeline was rebuilt as a custom `@Vector(32, u8)` operation that processes 32 bytes per iteration at the chunk level — not per-line. The thread model was rebuilt with thread-local shard accumulation and zero mutex contention on the hot path.
 
-What ships today is not a port. It is a search engine rebuilt from the ground up in Zig, shaped by what the language makes possible and what the hardware actually wants to do. The CLI contract and JSON output schema remain compatible — the engine underneath is its own.
+What ships today is not a port. The CLI contract and JSON output schema remain compatible. The engine underneath is its own.
 
 ---
 
 ## What It Is
 
-IX is a search engine built around one constraint: the fastest path to an exact result. Queries written in the IX expression language — `lit:`, `re:`, `prefix:`, `suffix:`, boolean `&&` / `||` — are each classified into the narrowest execution strategy before touching a byte of input.
+Every search engine scans files. The fastest ones also know which files to skip.
+
+IX classifies each query at parse time — `lit:`, `re:`, `prefix:`, `suffix:`, boolean `&&` / `||` — and routes it to the narrowest execution path before touching a byte of input. A literal query hits 256-bit SIMD lanes at 32 bytes per cycle. A regex with an extractable literal bypasses the regex engine entirely and hits the SIMD path. A full regex compiles through PCRE2 10.44 with JIT — the pattern becomes native machine code, compiled once per thread and reused for every line. AND/OR queries extract mandatory trigram evidence and reject ineligible files before scanning.
+
+The pipeline is `PathAdmission → FileAdmissionBytecode → ByteKernel → LineVerifier`: reject work before line splitting and before PCRE2, using path predicates, file metadata, PCRE2-proven byte facts, and one-pass trigram evidence. The warm index extends this to a corpus-global `FileCatalog` with generation-pinned trigram postings — when the live marker and current generation are valid, IX skips discovery, loads the retained candidate frontier, and invokes the canonical verifier only on the surviving files.
 
 Literal queries land on the SIMD byte-search path — 32 bytes per cycle through 256-bit vector lanes. Regex patterns with extractable literals bypass the regex engine and hit the SIMD path directly. Full regex patterns compile through PCRE2 10.44 with JIT — the pattern is compiled to native machine code once per thread and reused for every line. AND/OR queries extract mandatory trigram evidence and reject ineligible files before a single line is scanned. File scans shard across threads with thread-local accumulation — zero mutex contention on the hot path.
 
-The first executable admission slice now compiles trigram evidence once per query into a compact rolling membership program and threads that immutable program through the serial, mmap, and worker scan paths. The larger retained architecture lane is still `PathAdmission -> FileAdmissionBytecode -> ByteKernel -> LineVerifier`: reject work before line splitting and before PCRE2, using path predicates, file metadata, PCRE2-proven byte facts, and one-pass trigram evidence.
-
-The second architecture lane is the warm index: a corpus-global `FileCatalog`, generation-pinned trigram postings, live `__ix_indexd` ownership, USN/delta freshness substrate, and query-frontier reuse. When the live marker and current generation are valid, IX can skip discovery, skip full-corpus trigram scans, load the retained candidate frontier, and invoke the canonical verifier only on the surviving files. The verifier still owns correctness; the index only removes impossible work.
+The first executable admission slice compiles trigram evidence once per query into a compact rolling membership program — one streaming pass over each candidate buffer, no heap allocation, no repeated substring probes. `AND`/`OR` admission is decided from per-group satisfaction counters. The verifier still owns correctness; the index only removes impossible work.
 
 The third lane is agent-native output. Every result carries typed truth: canonical verification (the exact matcher confirmed every hit), scan coverage (were access errors present?), and projection completeness (are there more eligible hits?). Cursor pagination binds continuation to the request fingerprint and corpus signature — change the query or touch a file, and the cursor is rejected. Byte budgets fit the largest whole-record page without cutting a hit in half. BM25 degree-of-interest context assembly (`xo`) ranks source lines by lexical evidence and expands around focus points until the byte budget closes. The Furnas fisheye lens contracts previews geometrically — 143× reduction on minified content, zero overhead on normal source code.
 
@@ -872,7 +876,7 @@ src/
 
 <div align="center">
 
-**IX is a search engine. Not a wrapper. Not a port. Built from the ground up in Zig for the hardware it runs on. Per-thread faster than ripgrep at 1/16th the cores. BM25 degree-of-interest context assembly. Cursor-paginated, byte-budgeted, corpus-bound agent output. One binary, zero dependencies, 5% of your machine.**
+**A search engine that knows what to ignore. Per-thread faster than ripgrep at 1/16th the cores. One binary. Zero dependencies. 5% of your machine.**
 
 **[MIT License](LICENSE)**
 
