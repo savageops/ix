@@ -92,6 +92,50 @@ pub fn forgeByteSearch(target_byte: u8) ForgeError!ForgedFunction {
     };
 }
 
+/// P15: Compiles a multi-byte literal pattern search into native x86_64 code.
+///
+/// Emits a tight loop that compares each byte of the pattern against the
+/// corresponding byte at each position in the haystack. The pattern bytes
+/// are baked into the emitted instructions as immediate comparisons — this
+/// is pattern-specific compiled code, not an interpreter.
+///
+/// The emitted code checks position i by comparing:
+///   haystack[i+0] == pattern[0]
+///   haystack[i+1] == pattern[1]
+///   ... (up to pattern.len)
+/// If all bytes match, returns i. If any mismatch, advances to i+1.
+///
+/// For patterns ≤16 bytes, uses a sequence of CMP byte instructions with
+/// short-circuit JNE on first mismatch — the first mismatch exits the
+/// inner comparison chain immediately.
+pub fn forgeLiteralSearch(pattern: []const u8) ForgeError!ForgedFunction {
+    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .x86) {
+        return error.UnsupportedArchitecture;
+    }
+    if (pattern.len == 0 or pattern.len > 32) return error.PatternTooLong;
+
+    // Single-byte patterns use the specialized byte search.
+    if (pattern.len == 1) return forgeByteSearch(pattern[0]);
+
+    const page = try allocateExecutablePage(PAGE_SIZE);
+    errdefer freeExecutablePage(page, PAGE_SIZE);
+
+    var emitter = ByteEmitter{ .buf = page[0..PAGE_SIZE], .pos = 0 };
+    emitter.emitLiteralSearch(pattern);
+    const code_len = emitter.pos;
+
+    try protectExecutable(page, code_len);
+
+    const func_ptr: *const fn (*const u8, usize) callconv(.c) isize =
+        @ptrCast(@alignCast(page));
+
+    return .{
+        .code_page = page,
+        .page_size = PAGE_SIZE,
+        .func = func_ptr,
+    };
+}
+
 /// x86_64 opcode emitter for single-byte search.
 /// Produces position-independent code with the System V calling convention.
 const ByteEmitter = struct {
@@ -255,6 +299,147 @@ const ByteEmitter = struct {
         const jb_rel: i64 = @as(i64, @intCast(loop_offset)) - @as(i64, @intCast(jb_loop_pos + 2));
         self.buf[jb_loop_pos + 1] = @bitCast(@as(i8, @intCast(jb_rel)));
     }
+
+    /// Emits x86_64 machine code for multi-byte literal search.
+    /// The pattern bytes are baked into CMP byte [ptr_reg + rax + offset], imm8
+    /// instructions with short-circuit JNE on first mismatch.
+    ///
+    /// Structure:
+    ///   xor eax, eax              ; offset = 0
+    ///   test <len_reg>, <len_reg>
+    ///   jz .not_found
+    /// .outer_loop:
+    ///   ; Check if enough bytes remain (len - offset >= pattern_len)
+    ///   mov r11, <len_reg>
+    ///   sub r11, rax
+    ///   cmp r11, <pattern_len>
+    ///   jl .not_found             ; not enough bytes left
+    ///   ; Compare each pattern byte
+    ///   cmp byte [ptr_reg + rax + 0], pattern[0]
+    ///   jne .next
+    ///   cmp byte [ptr_reg + rax + 1], pattern[1]
+    ///   jne .next
+    ///   ... (for each pattern byte)
+    ///   ; All matched — return offset
+    ///   ret
+    /// .next:
+    ///   inc rax
+    ///   jmp .outer_loop
+    /// .not_found:
+    ///   mov rax, -1
+    ///   ret
+    fn emitLiteralSearch(self: *ByteEmitter, pattern: []const u8) void {
+        const ptr_reg: u8 = if (builtin.os.tag == .windows) 0b001 else 0b111;
+        const len_reg: u8 = if (builtin.os.tag == .windows) 0b010 else 0b110;
+        const pat_len: u8 = @intCast(pattern.len);
+
+        // xor eax, eax
+        self.emit(0x48);
+        self.emit(0x31);
+        self.emit(0xC0);
+
+        // test <len_reg>, <len_reg>
+        self.emit(0x48);
+        self.emit(0x85);
+        self.emit(0xC0 | (len_reg << 3) | len_reg);
+
+        // jz .not_found
+        const jz_not_found_pos = self.pos;
+        self.emit(0x74);
+        self.emit(0x00);
+
+        // .outer_loop:
+        const loop_offset = self.pos;
+
+        // mov r11, <len_reg>  (0x49 0x89 C0|len_reg<<3|011)
+        self.emit(0x49);
+        self.emit(0x89);
+        self.emit(0xC0 | (len_reg << 3) | 0b011); // mov r11, len_reg
+
+        // sub r11, rax  (0x49 0x29 C3)
+        self.emit(0x49);
+        self.emit(0x29);
+        self.emit(0xC3);
+
+        // cmp r11, <pat_len>  (0x49 0x83 FB pat_len) or imm32 for large
+        self.emit(0x49);
+        self.emit(0x83);
+        self.emit(0xFB);
+        self.emit(pat_len);
+
+        // jl .not_found  (0x0F 8C rel32)
+        const jl_not_found_pos = self.pos;
+        self.emit(0x0F);
+        self.emit(0x8C);
+        self.emitU32(0); // placeholder
+
+        // Compare each pattern byte with short-circuit JNE.
+        // For offsets 0-127, use disp8 addressing: [ptr_reg + rax + disp8]
+        // CMP r/m8, imm8: 80 /7 ib with SIB for [base+index+disp8]
+        const next_jumps = struct {
+            var list: [32]usize = undefined;
+            var count: usize = 0;
+        };
+        next_jumps.count = 0;
+
+        for (pattern, 0..) |pbyte, pi| {
+            // CMP byte [ptr_reg + rax + pi], imm8
+            // Encoding: optional REX, 80, ModRM(mod=01 reg=7 rm=100), SIB(scale=00 index=000 base=ptr_reg), disp8, imm8
+            self.emit(0x80);
+            self.emit(0x7C); // mod=01 reg=7 rm=100 (SIB)
+            self.emit(ptr_reg); // SIB: scale=0, index=rax(0), base=ptr_reg
+            self.emit(@intCast(pi)); // disp8 = pattern byte index
+            self.emit(pbyte); // imm8 = pattern byte
+
+            // jne .next  (75 rel8) — short jump if mismatch
+            next_jumps.list[next_jumps.count] = self.pos;
+            next_jumps.count += 1;
+            self.emit(0x75);
+            self.emit(0x00); // placeholder, patched to .next
+        }
+
+        // All bytes matched — return offset in rax.
+        self.emit(0xC3); // ret
+
+        // .next:
+        const next_offset = self.pos;
+
+        // Patch all JNE jumps to point to .next.
+        for (0..next_jumps.count) |i| {
+            self.buf[next_jumps.list[i] + 1] = @intCast(@as(i64, @intCast(next_offset)) - @as(i64, @intCast(next_jumps.list[i] + 2)));
+        }
+
+        // inc rax
+        self.emit(0x48);
+        self.emit(0xFF);
+        self.emit(0xC0);
+
+        // jmp .outer_loop (E9 rel32)
+        const jmp_loop_pos = self.pos;
+        self.emit(0xE9);
+        self.emitU32(0); // placeholder
+
+        // .not_found:
+        const not_found_offset = self.pos;
+
+        // mov rax, -1
+        self.emit(0x48);
+        self.emit(0xC7);
+        self.emit(0xC0);
+        self.emitU32(0xFFFFFFFF);
+
+        // ret
+        self.emit(0xC3);
+
+        // Patch relative jumps.
+        self.buf[jz_not_found_pos + 1] = @intCast(@as(i64, @intCast(not_found_offset)) - @as(i64, @intCast(jz_not_found_pos + 2)));
+        // jl .not_found (rel32)
+        const jl_rel: i32 = @intCast(@as(i64, @intCast(not_found_offset)) - @as(i64, @intCast(jl_not_found_pos + 6)));
+        std.mem.writeInt(i32, self.buf[jl_not_found_pos + 2 ..][0..4], jl_rel, .little);
+        // jmp .outer_loop (rel32)
+        const jmp_rel: i32 = @intCast(@as(i64, @intCast(loop_offset)) - @as(i64, @intCast(jmp_loop_pos + 5)));
+        std.mem.writeInt(i32, self.buf[jmp_loop_pos + 1 ..][0..4], jmp_rel, .little);
+    }
 };
 
 // ── Platform-Specific Page Management ──────────────────────────────
@@ -413,4 +598,55 @@ test "jit forge finds first byte in long buffer" {
     const haystack = "this is a long string without the target until the end;";
     const result = forged.execute(haystack);
     try std.testing.expectEqual(@as(isize, @intCast(haystack.len - 1)), result);
+}
+
+test "jit forge multi-byte literal search finds pattern" {
+    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .x86) return;
+
+    var forged = try forgeLiteralSearch("hello");
+    defer forged.deinit();
+
+    const result = forged.execute("say hello world");
+    try std.testing.expectEqual(@as(isize, 4), result);
+}
+
+test "jit forge multi-byte literal search returns -1 when not found" {
+    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .x86) return;
+
+    var forged = try forgeLiteralSearch("xyz");
+    defer forged.deinit();
+
+    try std.testing.expectEqual(@as(isize, -1), forged.execute("hello world"));
+}
+
+test "jit forge multi-byte partial match does not false-positive" {
+    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .x86) return;
+
+    var forged = try forgeLiteralSearch("hello");
+    defer forged.deinit();
+
+    // "hell" is a partial match — must not return a false positive.
+    try std.testing.expectEqual(@as(isize, -1), forged.execute("hell"));
+    // "help" matches first 3 but not all 5.
+    try std.testing.expectEqual(@as(isize, -1), forged.execute("help me"));
+}
+
+test "jit forge multi-byte pattern at end of buffer" {
+    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .x86) return;
+
+    var forged = try forgeLiteralSearch("end");
+    defer forged.deinit();
+
+    const result = forged.execute("the end");
+    try std.testing.expectEqual(@as(isize, 4), result);
+}
+
+test "jit forge multi-byte longer pattern" {
+    if (builtin.cpu.arch != .x86_64 and builtin.cpu.arch != .x86) return;
+
+    var forged = try forgeLiteralSearch("EXPORT_SYMBOL");
+    defer forged.deinit();
+
+    try std.testing.expect(forged.execute("void EXPORT_SYMBOL(void);") != null);
+    try std.testing.expectEqual(@as(isize, -1), forged.execute("no match here"));
 }
