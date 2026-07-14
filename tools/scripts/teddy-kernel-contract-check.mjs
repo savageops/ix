@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { DEFAULT_RIPGREP_LINUX_CORPUS, hasExperimentalBenchEnv } from "./lib/benchmark-config.mjs";
+import { defaultInstalledIxPath, DEFAULT_RIPGREP_LINUX_CORPUS, hasExperimentalBenchEnv } from "./lib/benchmark-config.mjs";
 import { argValue, timestampSlug } from "./lib/script-helpers.mjs";
 
 const ROOT = process.cwd();
@@ -52,7 +52,7 @@ function normalized(text) {
 }
 
 function nativeInstalledBaselinePath(filePath) {
-  return normalized(String(filePath ?? "")).endsWith("/appdata/local/programs/iex/bin/ix.exe");
+  return normalized(String(filePath ?? "")) === normalized(defaultInstalledIxPath());
 }
 
 function finiteNumber(value) {
@@ -308,7 +308,7 @@ if (installedDiagnosticPointer == null || typeof installedDiagnosticPointer !== 
 }
 if (installedDiagnosticPointer?.freshForCurrentBinary === true) {
   const installedDiagnosticPath = normalized(String(installedDiagnosticPointer.installedPath ?? ""));
-  if (!installedDiagnosticPath.includes("/appdata/local/programs/iex/bin/ix.exe")) {
+  if (installedDiagnosticPath !== normalized(defaultInstalledIxPath())) {
     failures.push("decision installed diagnostic pointer must use the native AppData install path");
   }
   if (installedDiagnosticPath.includes("/tmp-baselines/")) {

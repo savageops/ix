@@ -94,7 +94,7 @@ function resolveZigExe() {
 
 function nativeInstalledBaselinePath(filePath) {
   const normalizedPath = String(filePath ?? "").replaceAll("\\", "/").toLowerCase();
-  return normalizedPath.endsWith("/appdata/local/programs/iex/bin/ix.exe");
+  return normalizedPath === defaultInstalledIxPath().replaceAll("\\", "/").toLowerCase();
 }
 
 function measurePairedIx() {

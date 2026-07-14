@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { evidenceQualityFromFailures } from "./lib/benchmark-evidence-quality.mjs";
-import { DEFAULT_RIPGREP_LINUX_CORPUS, hasExperimentalBenchEnv } from "./lib/benchmark-config.mjs";
+import { defaultInstalledIxPath, DEFAULT_RIPGREP_LINUX_CORPUS, hasExperimentalBenchEnv } from "./lib/benchmark-config.mjs";
 import { argValue, preferHistoricalSelectionSeed, timestampSlug } from "./lib/script-helpers.mjs";
 import { phaseLeakSummaryFromRounds } from "./lib/speed-compare-utils.mjs";
 
@@ -98,7 +98,7 @@ function normalizedPathText(text) {
 }
 
 function nativeInstalledBaselinePath(filePath) {
-  return normalizedPathText(filePath).endsWith("/appdata/local/programs/iex/bin/ix.exe");
+  return normalizedPathText(filePath) === normalizedPathText(defaultInstalledIxPath());
 }
 
 function executableSha256File(filePath) {
