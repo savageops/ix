@@ -356,9 +356,27 @@ pub fn writeExplain(writer: anytype, plan: expr.ExpressionPlan) !void {
         const bytes = corpus.trigramBytes(term.key);
         try writer.writeAll("{\"key\":");
         try writeJsonString(writer, bytes[0..]);
-        try writer.print(",\"source_index\":{},\"cardinality\":null,\"repr\":\"{s}\"}}", .{ term.source_index, term.repr.text() });
+        try writer.print(",\"source_index\":{}", .{term.source_index});
+        if (term.cardinality) |card| {
+            try writer.print(",\"cardinality\":{}", .{card});
+        } else {
+            try writer.writeAll(",\"cardinality\":null");
+        }
+        try writer.print(",\"repr\":\"{s}\"}}", .{term.repr.text()});
     }
-    try writer.writeAll("],\"candidate_files_before\":null,\"candidate_files_after\":null,\"verifier\":");
+    try writer.writeAll("],\"candidate_files_before\":");
+    if (proof.candidate_files_before) |before| {
+        try writer.print("{}", .{before});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"candidate_files_after\":");
+    if (proof.candidate_files_after) |after| {
+        try writer.print("{}", .{after});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\"verifier\":");
     try writeJsonString(writer, proof.verifier);
     try writer.writeAll(",\"fallback\":");
     if (proof.fallback) |fallback| {
@@ -401,6 +419,45 @@ pub fn writeExplain(writer: anytype, plan: expr.ExpressionPlan) !void {
     }
     try writer.writeAll("]");
     try writer.writeAll("}}\n");
+}
+
+/// P9: Pre-execution cost estimate. Classifies the query into a predicted
+/// cost class (instant/fast/moderate/slow) based on query shape, index
+/// availability, and pattern characteristics. Emitted as JSON. No files
+/// are scanned — this is a planning primitive.
+pub fn writeEstimate(writer: anytype, plan: expr.ExpressionPlan, request: cli.SearchRequest) !void {
+    const proof = corpus.compileProofProgram(plan);
+    // Cost class heuristics:
+    // - instant: warm index available with trigram admission (sub-linear pruning)
+    // - fast: single literal ≤64 bytes (shift-Or / SIMD literal)
+    // - moderate: regex decomposition or literal alternates
+    // - slow: full regex scan, no admission
+    var cost_class: []const u8 = "slow";
+    if (request.index_enabled and proof.query_class.len > 0 and !std.mem.eql(u8, proof.query_class, "verifier_only")) {
+        cost_class = "instant";
+    } else if (plan.predicate_count == 1 and plan.predicates[0].kind == .literal and plan.predicates[0].value.len <= 64) {
+        cost_class = "fast";
+    } else if (plan.predicate_count > 0 and plan.predicates[0].kind == .literal) {
+        cost_class = "moderate";
+    }
+
+    try writer.writeAll("{\"type\":\"estimate\",\"expression\":");
+    try writeJsonString(writer, request.expression);
+    try writer.print(",\"cost_class\":\"{s}\",\"query_class\":", .{cost_class});
+    try writeJsonString(writer, proof.query_class);
+    try writer.print(",\"predicate_count\":{}", .{plan.predicate_count});
+    try writer.print(",\"index_enabled\":{s}", .{boolText(request.index_enabled)});
+    try writer.print(",\"trigram_eligible\":{s}", .{boolText(!std.mem.eql(u8, proof.query_class, "verifier_only"))});
+    if (proof.term_count > 0) {
+        try writer.print(",\"trigram_count\":{}", .{proof.term_count});
+    }
+    try writer.writeAll(",\"verifier\":");
+    try writeJsonString(writer, proof.verifier);
+    if (proof.fallback) |fallback| {
+        try writer.writeAll(",\"fallback\":");
+        try writeJsonString(writer, fallback);
+    }
+    try writer.writeAll("}\n");
 }
 
 pub fn writeSearchReport(writer: anytype, report: search.SearchReport) !void {

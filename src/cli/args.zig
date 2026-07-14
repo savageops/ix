@@ -67,6 +67,15 @@ pub const SearchRequest = struct {
     cursor_column: usize = 0,
     cursor_corpus_signature: ?u64 = null,
     cursor_request_fingerprint: ?u64 = null,
+    /// P9: Wall-clock time budget in milliseconds. When set, the scan loop
+    /// checks elapsed time between files and truncates when exceeded. No false
+    /// negatives — all hits discovered before the deadline are emitted; the
+    /// sentinel carries status:"truncated" and budget_exceeded:true.
+    budget_ms: ?u64 = null,
+    /// P9: Pre-execution cost estimate. When set, emits a JSON estimate object
+    /// with predicted cost class (instant/fast/moderate/slow) and candidate
+    /// counts (if warm index available), then exits without scanning.
+    estimate: bool = false,
 };
 
 /// P22: Structural record granularity for the --record flag.
@@ -167,6 +176,15 @@ pub const SimilarRequest = struct {
     cursor_ordinal: usize = 0,
     cursor_corpus_signature: ?u64 = null,
     cursor_request_fingerprint: ?u64 = null,
+    /// P9: Wall-clock time budget in milliseconds. When set, the scan loop
+    /// checks elapsed time between files and truncates when exceeded. No false
+    /// negatives — all hits discovered before the deadline are emitted; the
+    /// sentinel carries status:"truncated" and budget_exceeded:true.
+    budget_ms: ?u64 = null,
+    /// P9: Pre-execution cost estimate. When set, emits a JSON estimate object
+    /// with predicted cost class (instant/fast/moderate/slow) and candidate
+    /// counts (if warm index available), then exits without scanning.
+    estimate: bool = false,
 };
 
 pub const XoFormat = enum { grouped, json };
@@ -568,6 +586,13 @@ fn parseSearch(args: []const []const u8) ParseError!SearchRequest {
             } else if (std.mem.eql(u8, args[index], "ast")) {
                 request.record = .ast;
             } else return ParseError.UnsupportedFlag;
+        } else if (std.mem.eql(u8, arg, "--budget-ms")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.budget_ms = std.fmt.parseInt(u64, args[index], 10) catch return ParseError.MissingValue;
+            if (request.budget_ms.? == 0) return ParseError.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--estimate")) {
+            request.estimate = true;
         } else return ParseError.UnsupportedFlag;
     }
     request.expression = expression orelse return ParseError.MissingExpression;

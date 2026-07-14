@@ -117,6 +117,14 @@ pub fn main(init: std.process.Init) !void {
                 try stderr.flush();
                 std.process.exit(1);
             };
+            // P9: --estimate emits a pre-execution cost estimate and exits.
+            // Predicts the scan cost class based on query shape and index
+            // availability. No files are scanned.
+            if (effective_request.estimate) {
+                try output.writeEstimate(stdout, plan, effective_request);
+                try stdout.flush();
+                return;
+            }
             const report = search.run(init.io, allocator, effective_request, plan) catch |err| {
                 switch (err) {
                     error.StaleCursor => try output.writeError(stderr, "stale_cursor", "corpus or index identity changed; restart the search without --cursor"),

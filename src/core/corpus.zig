@@ -56,6 +56,7 @@ pub fn compileProofProgram(plan: expr.ExpressionPlan) ProofProgram {
             program.terms[program.term_count] = .{
                 .key = key,
                 .source_index = group.source_index,
+                .repr = .sorted_u32,
             };
             program.term_count += 1;
         }

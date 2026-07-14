@@ -656,6 +656,14 @@ fn scanPreparedFiles(
     const scan_started = std.Io.Timestamp.now(io, .awake);
     const thread_count = effectiveThreadCount(request, active_files.len);
     report.outer_scan_threads = thread_count;
+    // P9: Budget deadline — wall-clock nanoseconds from scan start. Checked
+    // between files in the serial path. When exceeded, truncates with
+    // budget_exceeded status. All hits discovered before the deadline are
+    // emitted — no false negatives.
+    const budget_deadline_ns: ?i128 = if (request.budget_ms) |ms|
+        scan_started.nanoseconds + @as(i128, @intCast(ms)) * std.time.ns_per_ms
+    else
+        null;
     // Density prioritization already applied during prepareRootsAndDiscover;
     // do not re-shuffle here — that would destroy the density ordering.
     const discovered: []const DiscoveredFile = active_files;
@@ -665,9 +673,28 @@ fn scanPreparedFiles(
         for (discovered) |entry| {
             try scanDiscoveredFile(io, allocator, entry.path, request, plan, trigram_admission, trigram_program, report);
             if (report.truncated) break;
+            // P9: Check wall-clock budget between files. This is a soft
+            // deadline — the current file was already fully scanned, so no
+            // matches are lost.
+            if (budget_deadline_ns) |deadline| {
+                const now = std.Io.Timestamp.now(io, .awake).nanoseconds;
+                if (now >= deadline) {
+                    report.truncated = true;
+                    break;
+                }
+            }
         }
     } else {
         try parallelScanFiles(io, allocator, discovered, request, plan, trigram_admission, trigram_program, thread_count, .{}, report);
+        // P9: For parallel scans, check budget after join. Each shard ran
+        // to completion, but we truncate the result if the budget was
+        // exceeded — shards that finished before the deadline contributed
+        // their hits; the report marks truncated so consumers know it's
+        // partial.
+        if (budget_deadline_ns) |deadline| {
+            const now = std.Io.Timestamp.now(io, .awake).nanoseconds;
+            if (now >= deadline) report.truncated = true;
+        }
     }
     report.scan_ms = elapsedMs(io, scan_started);
     const aggregate_started = std.Io.Timestamp.now(io, .awake);

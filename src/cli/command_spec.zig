@@ -53,6 +53,8 @@ pub const search_options = [_]OptionSpec{
     .{ .syntax = "--context <N>", .names = &.{"--context"}, .help = "Include exact coalesced context in v3", .search_only = true, .takes_value = true },
     .{ .syntax = "--max-bytes <N>", .names = &.{"--max-bytes"}, .help = "Bound one complete v3 envelope", .search_only = true, .takes_value = true },
     .{ .syntax = "--cursor <TOKEN>", .names = &.{"--cursor"}, .help = "Continue a request-bound v3 result", .search_only = true, .takes_value = true },
+    .{ .syntax = "--budget-ms <N>", .names = &.{"--budget-ms"}, .help = "Wall-clock time budget; truncate scan when exceeded (P9)", .takes_value = true },
+    .{ .syntax = "--estimate", .names = &.{"--estimate"}, .help = "Emit pre-execution cost estimate and exit (P9)" },
     .{ .syntax = "-n, --line-number [N]", .names = &.{ "-n", "--line-number" }, .help = "Emit line numbers; optional N also limits hits" },
     .{ .syntax = "-h, --help", .names = &.{ "-h", "--help" }, .help = "Print help" },
 };
