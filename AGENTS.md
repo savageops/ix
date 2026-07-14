@@ -24,11 +24,15 @@ If an optimization only satisfies level 1, it is incomplete. The roadmap items b
 
 Before writing code, acquire the strongest external source material first. That means current papers, arXiv, high-end systems articles, old but still dominant computer-science work, and frontier open-source implementations that already solve the same class of problem at a high level.
 
+**P4 Unbounded Epistemic Scan Gate (mandatory precondition):** No code mutation may commence until the agent has executed an Unbounded Epistemic Scan — querying global knowledge for cutting-edge search optimization, hardware physics, and sub-linear traversal algorithms. The scan must mine unattempted mathematical methods, bit-parallel formulas, and theoretical indexing structures. Source-Level Truth from `.docs/`, `.refs/`, and elite repositories (the "Gold Vein") must be ingested as structured data before any executable logic is generated. This is not a suggestion — it is a blocking precondition. Any mutation that skips the research gate constitutes a fatal kernel violation under P1 and must be reverted.
+
 - Default to copying or tightly adapting proven algorithms, layouts, state machines, benchmark methods, and tests from the highest-quality reference repos and papers.
 - Do not reinvent mechanisms locally when a stronger external implementation or paper already exists. Local invention is for glue, adaptation, integration, or a gap that remains after source search fails.
 - Research depth is part of the implementation contract: look for current frontier work and older overlooked work before deciding the mechanism.
 - Prefer primary sources and maintainer-grade repos over summaries or second-hand explanations.
 - When license, architecture, and ownership fit, import the real pattern instead of re-deriving it from scratch.
+
+**P5 Competitor Anatomy Map:** Every competitor is a free, fully-staffed research department. Before harvesting a technique, the competitor must be reduced to a measurable anatomy — algorithm, index shape, traversal order, ignore handling, observed weakness. The formal per-rival ledger lives at `.docs/research/competitor-anatomy-map.md`. No technique enters the kernel without passing through this autopsy; no claim of superiority is valid until measured against this map on identical hardware.
 
 ## Benchmark Falsification Before Runtime Blame
 
