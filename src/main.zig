@@ -40,6 +40,7 @@ test {
     _ = @import("core/preview.zig");
     _ = @import("core/jit_forge.zig");
     _ = @import("core/watch.zig");
+    _ = @import("core/tree_sitter.zig");
     _ = @import("cli/command_spec.zig");
     _ = @import("cli/cursor.zig");
 }

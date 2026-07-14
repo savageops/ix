@@ -143,5 +143,36 @@ fn createIxModule(
     });
     root_module.addIncludePath(b.path(".refs/pcre2/src"));
 
+    // P22: Tree-sitter runtime + Zig grammar for AST-aware record granularity.
+    // Compile only the core parser (no WASM store) — the WASM subsystem
+    // pulls in Unicode headers that aren't available in all environments.
+    // The core parser provides tree construction, node traversal, and
+    // query capabilities — everything needed for AST-aware record boundaries.
+    root_module.addCSourceFiles(.{
+        .files = &.{
+            ".refs/tree-sitter/lib/alloc.c",
+            ".refs/tree-sitter/lib/get_changed_ranges.c",
+            ".refs/tree-sitter/lib/language.c",
+            ".refs/tree-sitter/lib/lexer.c",
+            ".refs/tree-sitter/lib/node.c",
+            ".refs/tree-sitter/lib/parser.c",
+            ".refs/tree-sitter/lib/query.c",
+            ".refs/tree-sitter/lib/stack.c",
+            ".refs/tree-sitter/lib/subtree.c",
+            ".refs/tree-sitter/lib/tree.c",
+            ".refs/tree-sitter/lib/tree_cursor.c",
+            ".refs/tree-sitter/lib/wasm_stubs.c",
+            ".refs/tree-sitter-zig/src/parser.c",
+        },
+        .flags = &.{
+            "-std=c11",
+            "-O2",
+            "-DNDEBUG",
+        },
+    });
+    root_module.addIncludePath(b.path(".refs/tree-sitter/lib"));
+    root_module.addIncludePath(b.path(".refs/tree-sitter/include"));
+    root_module.addIncludePath(b.path(".refs/tree-sitter-zig/src"));
+
     return root_module;
 }
