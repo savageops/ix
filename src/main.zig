@@ -8,6 +8,7 @@ const expr = @import("core/expr.zig");
 const indexd = @import("core/indexd.zig");
 const inspect = @import("core/inspect.zig");
 const mcp = @import("core/mcp.zig");
+const watch = @import("core/watch.zig");
 const process_tool = @import("core/process_tool.zig");
 const pcre_regex = @import("core/pcre_regex.zig");
 const search = @import("core/search.zig");
@@ -38,6 +39,7 @@ test {
     _ = @import("core/fm_index.zig");
     _ = @import("core/preview.zig");
     _ = @import("core/jit_forge.zig");
+    _ = @import("core/watch.zig");
     _ = @import("cli/command_spec.zig");
     _ = @import("cli/cursor.zig");
 }
@@ -248,6 +250,19 @@ pub fn main(init: std.process.Init) !void {
             };
             output.writeWhy(stdout, request, plan) catch |err| {
                 try output.writeError(stderr, "output_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
+        },
+        .watch => |request| {
+            const plan = parseExpression(request.expression) catch |err| {
+                try output.writeError(stderr, "invalid_expression", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            // Watch streams NDJSON to stdout — it blocks until interrupted.
+            watch.runWatch(init.io, allocator, request, plan, stdout) catch |err| {
+                try output.writeError(stderr, "watch_failed", @errorName(err));
                 try stderr.flush();
                 std.process.exit(1);
             };

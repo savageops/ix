@@ -16,6 +16,7 @@ pub const CommandTag = enum {
     similar,
     xo,
     why,
+    watch,
     mcp,
     nexus,
     indexd,
@@ -210,6 +211,7 @@ pub const Command = union(CommandTag) {
     similar: SimilarRequest,
     xo: XoRequest,
     why: WhyRequest,
+    watch: SearchRequest,
     mcp: McpRequest,
     nexus: SearchRequest,
     indexd: IndexdRequest,
@@ -339,6 +341,10 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
     if (std.mem.eql(u8, first, "why")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .explain } };
         return .{ .command = .{ .why = try parseWhy(argv[2..]) } };
+    }
+    if (std.mem.eql(u8, first, "watch")) {
+        if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .search } };
+        return .{ .command = .{ .watch = try parseSearch(argv[2..]) } };
     }
     if (std.mem.eql(u8, first, "mcp")) {
         return .{ .command = .{ .mcp = .{} } };

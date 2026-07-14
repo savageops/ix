@@ -40,6 +40,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  inspect  Read-only file windows and match context
         \\  explain  Expression plan JSON
         \\  why      Posting-list lineage of a match (P29)
+        \\  watch    Stream new matches as files change (P29)
         \\  process  State-dir inspection and cleanup
         \\  help     Print this message or subcommand help
         \\
