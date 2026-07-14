@@ -469,9 +469,12 @@ fn appendLiteralBranchTrigrams(group: *LookupGroup, branch: []const u8) bool {
             else => {},
         }
 
+        // Lowercase to match the lowercased index keys (extractFileTrigramsLowercased).
+        byte = std.ascii.toLower(byte);
+
         if (decoded_len >= 2) {
-            const key = makeTrigramKey(&.{ last[0], last[1], byte });
-            appendUniqueLookupKey(group, key);
+            const tk = makeTrigramKey(&.{ last[0], last[1], byte });
+            appendUniqueLookupKey(group, tk);
         }
 
         if (decoded_len == 0) {

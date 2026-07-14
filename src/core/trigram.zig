@@ -135,9 +135,13 @@ fn evidenceForLiteralAlternateBranch(branch: []const u8, source_index: usize, ca
 
 fn appendTrigramsFromLiteral(evidence: *PredicateEvidence, literal: []const u8) void {
     if (literal.len < 3) return;
+    var lower_buf: [3]u8 = undefined;
     var index: usize = 0;
     while (index + 3 <= literal.len) : (index += 1) {
-        appendUnique(evidence, key(literal[index .. index + 3]));
+        lower_buf[0] = std.ascii.toLower(literal[index]);
+        lower_buf[1] = std.ascii.toLower(literal[index + 1]);
+        lower_buf[2] = std.ascii.toLower(literal[index + 2]);
+        appendUnique(evidence, key(&lower_buf));
     }
 }
 

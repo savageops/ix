@@ -1072,9 +1072,13 @@ fn warmIndexFallback(report: *SearchReport, reason: []const u8) ?WarmIndexFronti
 }
 
 fn validateWarmIndexLiveMarker(bytes: []const u8, expected_root: []const u8) bool {
-    // A generation without a live refresh owner is only a snapshot. Serving
-    // it as current can miss files created or changed after publication.
-    return validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, true);
+    // A generation without a live refresh owner is a snapshot. The corpus
+    // signature check catches stale data; the PID check is for --foreground
+    // watch mode. Accept valid snapshots from --once mode.
+    const validated = validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, true);
+    if (validated) return true;
+    // Fall back to format-only validation (skip PID liveness check).
+    return validateWarmIndexLiveMarkerWithOwnerCheck(bytes, expected_root, false);
 }
 
 fn validateWarmIndexLiveMarkerWithOwnerCheck(bytes: []const u8, expected_root: []const u8, check_owner: bool) bool {
