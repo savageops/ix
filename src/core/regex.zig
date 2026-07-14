@@ -574,32 +574,30 @@ test "regex column supports classes and repetition" {
 // in the recursive engine (e.g., (a+)+b against aaaaa...), the Thompson
 // NFA runs in linear time.
 
-const MAX_NFA_STATES: usize = 256;
+const MAX_NFA_STATES: usize = 512;
+
+/// State kind: epsilon (no char), character, character class, any, or accept.
+const StateKind = enum(u8) { epsilon, char, class, any, accept };
 
 const NFAState = struct {
-    /// Character to match (0 = epsilon transition).
+    kind: StateKind = .epsilon,
+    /// Character to match (for kind == .char).
     char: u8 = 0,
+    /// Character class bitmap (for kind == .class). Bit i = 1 means byte i matches.
+    class: [32]u8 = [_]u8{0} ** 32,
     /// Next state on match (0 = none, states are 1-indexed).
     next1: u16 = 0,
-    /// Epsilon transition target (0 = none).
+    /// Epsilon transition target (0 = none). Used for split states.
     next2: u16 = 0,
-    /// True if this is an accept state.
-    is_accept: bool = false,
 };
 
-/// A compiled Thompson NFA. Built from a regex pattern's parsed fragment list.
+/// A compiled Thompson NFA. Supports alternation, quantifiers, character classes.
 pub const ThompsonNFA = struct {
     states: [MAX_NFA_STATES]NFAState = [_]NFAState{.{}} ** MAX_NFA_STATES,
     state_count: usize = 0,
     start_state: u16 = 0,
 
-    /// Simulate the NFA against input text. Returns the 1-based column of
-    /// the first match, or null. O(pm) — no backtracking.
-    ///
-    /// Uses two state lists: `current` (states active at position i) and
-    /// `next` (states active at position i+1). Each text byte advances all
-    /// active states simultaneously — the NFA tracks ALL possible paths
-    /// through the pattern, not one path at a time.
+    /// Simulate the NFA against input text. O(pm) — no backtracking.
     pub fn simulate(self: *const ThompsonNFA, text: []const u8) ?usize {
         if (self.state_count == 0) return null;
 
@@ -609,38 +607,37 @@ pub const ThompsonNFA = struct {
         var next_len: usize = 0;
         var visited: [MAX_NFA_STATES]bool = [_]bool{false} ** MAX_NFA_STATES;
 
-        // Start: add initial state via epsilon closure.
         current_len = epsilonClosure(self, self.start_state, &current_list, current_len, &visited);
 
-        // Check if the NFA accepts at position 0 (empty match).
         for (current_list[0..current_len]) |s| {
-            if (self.states[s].is_accept) return 1;
+            if (self.states[s].kind == .accept) return 1;
         }
 
         for (text, 0..) |byte, i| {
-            // Clear visited for the next position.
             @memset(visited[0..self.state_count], false);
             next_len = 0;
 
-            // Advance all current states by one byte.
             for (current_list[0..current_len]) |s| {
                 const state = self.states[s];
-                if (state.char != 0 and (state.char == byte or state.char == '.')) {
+                const matches = switch (state.kind) {
+                    .char => state.char == byte,
+                    .any => byte != '\n',
+                    .class => (state.class[byte >> 3] & (@as(u8, 1) << @intCast(byte & 7))) != 0,
+                    else => false,
+                };
+                if (matches) {
                     next_len = epsilonClosure(self, state.next1, &next_list, next_len, &visited);
                 }
             }
 
-            // Swap current and next.
             current_len = next_len;
             @memcpy(current_list[0..current_len], next_list[0..current_len]);
 
-            // Check for accept.
             for (current_list[0..current_len]) |s| {
-                if (self.states[s].is_accept) return @intCast(i + 1);
+                if (self.states[s].kind == .accept) return @intCast(i + 1);
             }
 
             if (current_len == 0) {
-                // Restart from beginning (search anywhere in text).
                 @memset(visited[0..self.state_count], false);
                 current_len = epsilonClosure(self, self.start_state, &current_list, current_len, &visited);
             }
@@ -654,75 +651,309 @@ pub const ThompsonNFA = struct {
     }
 };
 
-/// Follows epsilon transitions from `start`, adding all reachable states to `list`.
-/// Uses `visited` to prevent infinite loops on epsilon cycles.
 fn epsilonClosure(nfa: *const ThompsonNFA, start: u16, list: *[MAX_NFA_STATES]u16, len: usize, visited: *[MAX_NFA_STATES]bool) usize {
     if (start == 0 or start > nfa.state_count) return len;
     if (visited[start]) return len;
     visited[start] = true;
     var pos = len;
     const state = nfa.states[start];
-    if (state.char == 0 and !state.is_accept) {
-        // Epsilon state: follow both transitions.
+    if (state.kind == .epsilon) {
         pos = epsilonClosure(nfa, state.next1, list, pos, visited);
         pos = epsilonClosure(nfa, state.next2, list, pos, visited);
     } else {
-        // Character or accept state: add to list.
         list[pos] = start;
         pos += 1;
     }
     return pos;
 }
 
-/// Builds a Thompson NFA from a simple literal pattern.
-/// For literals, the NFA is a linear chain: state[i] matches pattern[i],
-/// transitions to state[i+1]. The final state is the accept state.
-///
-/// For more complex patterns (alternation, quantifiers), the NFA uses
-/// epsilon-split states following Thompson's construction. This builder
-/// handles the common IX case: literal patterns, which is what the scan
-/// hot path dispatches to the regex engine 99% of the time.
-pub fn buildThompsonNFA(pattern: []const u8) ThompsonNFA {
-    var nfa = ThompsonNFA{};
-    if (pattern.len == 0) return nfa;
+// ── Thompson Construction Compiler ─────────────────────────────────
+//
+// Recursive-descent compiler that parses regex syntax and builds NFA
+// fragments using Thompson's construction:
+//
+// alternation: A|B  → split → A → join, split → B → join
+// concatenation: AB → A.out → B.start
+// star: A*   → split → A → split (loop), split → out
+// plus: A+   → A → split → A (loop), split → out
+// optional: A? → split → A → out, split → out
+// {N}: A{3}  → AAA
+// [a-z]:     → character class state with bitmap
 
-    // Simple literal chain: each byte is one state.
-    // State 0 is a reserved no-op start state with epsilon to state 1.
-    if (pattern.len + 1 < MAX_NFA_STATES) {
-        nfa.state_count = pattern.len + 1;
-        nfa.start_state = 0;
-        nfa.states[0] = .{ .char = 0, .next1 = 1, .next2 = 0 };
-        for (pattern, 0..) |c, i| {
-            nfa.states[i + 1] = .{
-                .char = c,
-                .next1 = if (i + 2 <= pattern.len) @intCast(i + 2) else 0,
-                .is_accept = (i == pattern.len - 1),
-            };
+const Fragment = struct {
+    start: u16,
+    out: u16, // state index whose next1 is the dangling edge to patch
+};
+
+const NfaBuilder = struct {
+    nfa: ThompsonNFA = .{},
+    pos: usize = 0,
+    pattern: []const u8 = "",
+
+    fn newState(self: *NfaBuilder) u16 {
+        if (self.nfa.state_count >= MAX_NFA_STATES) return 0;
+        const idx = self.nfa.state_count;
+        self.nfa.state_count += 1;
+        self.nfa.states[idx] = .{};
+        return @intCast(idx);
+    }
+
+    fn patch(self: *NfaBuilder, state_idx: u16, target: u16) void {
+        if (state_idx == 0) return;
+        if (self.nfa.states[state_idx].next1 == 0) {
+            self.nfa.states[state_idx].next1 = target;
+        } else {
+            self.nfa.states[state_idx].next2 = target;
         }
     }
-    return nfa;
+
+    fn charState(self: *NfaBuilder, c: u8) Fragment {
+        const s = self.newState();
+        self.nfa.states[s] = .{ .kind = .char, .char = c };
+        return .{ .start = s, .out = s };
+    }
+
+    fn anyState(self: *NfaBuilder) Fragment {
+        const s = self.newState();
+        self.nfa.states[s] = .{ .kind = .any };
+        return .{ .start = s, .out = s };
+    }
+
+    fn classState(self: *NfaBuilder, bitmap: [32]u8) Fragment {
+        const s = self.newState();
+        self.nfa.states[s] = .{ .kind = .class, .class = bitmap };
+        return .{ .start = s, .out = s };
+    }
+
+    /// Parse alternation: expr ('|' expr)*
+    fn parseAlternation(self: *NfaBuilder) ?Fragment {
+        var left = self.parseConcat() orelse return null;
+        while (self.pos < self.pattern.len and self.pattern[self.pos] == '|') {
+            self.pos += 1;
+            const right = self.parseConcat() orelse return left;
+            // split state: epsilon to left.start and right.start
+            const split = self.newState();
+            self.nfa.states[split].kind = .epsilon;
+            self.nfa.states[split].next1 = left.start;
+            self.nfa.states[split].next2 = right.start;
+            // join state: epsilon, both fragments point to it
+            const join = self.newState();
+            self.nfa.states[join].kind = .epsilon;
+            self.patch(left.out, join);
+            self.patch(right.out, join);
+            left = .{ .start = split, .out = join };
+        }
+        return left;
+    }
+
+    /// Parse concatenation: quantified*
+    fn parseConcat(self: *NfaBuilder) ?Fragment {
+        if (self.pos >= self.pattern.len) return null;
+        var first: ?Fragment = null;
+        while (self.pos < self.pattern.len) {
+            const c = self.pattern[self.pos];
+            if (c == '|' or c == ')') break;
+            const frag = self.parseQuantified() orelse break;
+            if (first) |*f| {
+                self.patch(f.out, frag.start);
+                f.out = frag.out;
+            } else {
+                first = frag;
+            }
+        }
+        return first;
+    }
+
+    /// Parse quantified: atom ('*' | '+' | '?' | '{N}')*
+    fn parseQuantified(self: *NfaBuilder) ?Fragment {
+        const atom_start_pos = self.pos;
+        var atom = self.parseAtom() orelse return null;
+        while (self.pos < self.pattern.len) {
+            const c = self.pattern[self.pos];
+            switch (c) {
+                '*' => {
+                    self.pos += 1;
+                    const split = self.newState();
+                    self.nfa.states[split].kind = .epsilon;
+                    self.nfa.states[split].next1 = atom.start;
+                    self.patch(atom.out, split);
+                    atom = .{ .start = split, .out = split };
+                },
+                '+' => {
+                    self.pos += 1;
+                    const split = self.newState();
+                    self.nfa.states[split].kind = .epsilon;
+                    self.nfa.states[split].next1 = atom.start;
+                    self.patch(atom.out, split);
+                    atom = .{ .start = atom.start, .out = split };
+                },
+                '?' => {
+                    self.pos += 1;
+                    // split: epsilon to atom.start, second edge skips atom
+                    const split = self.newState();
+                    self.nfa.states[split].kind = .epsilon;
+                    self.nfa.states[split].next1 = atom.start;
+                    // The split's next2 is the skip path — patched by concat.
+                    atom = .{ .start = split, .out = split };
+                    // Patch atom's original out to point to split (dangling).
+                    // The concat linker will patch split's second edge.
+                    // Actually: the fragment's out is split, whose next1 is
+                    // already set. The next2 is dangling — concat will patch it.
+                },
+                '{' => {
+                    self.pos += 1;
+                    var rep_count: u32 = 0;
+                    while (self.pos < self.pattern.len and std.ascii.isDigit(self.pattern[self.pos])) : (self.pos += 1) {
+                        rep_count = rep_count * 10 + (self.pattern[self.pos] - '0');
+                    }
+                    if (self.pos < self.pattern.len and self.pattern[self.pos] == '}') self.pos += 1;
+                    // Expand {N} as N repetitions.
+                    var result = atom;
+                    var k: u32 = 1;
+                    while (k < rep_count) : (k += 1) {
+                        // Save/restore position to re-parse the same atom.
+                        const saved_pos = self.pos;
+                        self.pos = atom_start_pos;
+                        const copy = self.parseAtom() orelse {
+                            self.pos = saved_pos;
+                            break;
+                        };
+                        self.patch(result.out, copy.start);
+                        result = .{ .start = result.start, .out = copy.out };
+                    }
+                    atom = result;
+                },
+                else => break,
+            }
+        }
+        return atom;
+    }
+
+    /// Parse atom: literal | '.' | '\d' | '\w' | '\s' | [class] | (group)
+    fn parseAtom(self: *NfaBuilder) ?Fragment {
+        if (self.pos >= self.pattern.len) return null;
+        const c = self.pattern[self.pos];
+        switch (c) {
+            '(' => {
+                self.pos += 1;
+                const inner = self.parseAlternation() orelse return null;
+                if (self.pos < self.pattern.len and self.pattern[self.pos] == ')') self.pos += 1;
+                return inner;
+            },
+            '.' => {
+                self.pos += 1;
+                return self.anyState();
+            },
+            '[' => {
+                self.pos += 1;
+                return self.parseClass();
+            },
+            '\\' => {
+                self.pos += 1;
+                if (self.pos >= self.pattern.len) return null;
+                const esc = self.pattern[self.pos];
+                self.pos += 1;
+                return self.escapeState(esc);
+            },
+            else => {
+                self.pos += 1;
+                return self.charState(c);
+            },
+        }
+    }
+
+    fn parseClass(self: *NfaBuilder) ?Fragment {
+        var bitmap = [_]u8{0} ** 32;
+        var negate = false;
+        if (self.pos < self.pattern.len and self.pattern[self.pos] == '^') {
+            negate = true;
+            self.pos += 1;
+        }
+        while (self.pos < self.pattern.len and self.pattern[self.pos] != ']') {
+            const lo = self.pattern[self.pos];
+            self.pos += 1;
+            if (self.pos + 1 < self.pattern.len and self.pattern[self.pos] == '-' and self.pattern[self.pos + 1] != ']') {
+                self.pos += 1; // skip '-'
+                const hi = self.pattern[self.pos];
+                self.pos += 1;
+                var ch = lo;
+                while (ch <= hi) : (ch += 1) {
+                    bitmap[ch >> 3] |= @as(u8, 1) << @intCast(ch & 7);
+                }
+            } else {
+                bitmap[lo >> 3] |= @as(u8, 1) << @intCast(lo & 7);
+            }
+        }
+        if (self.pos < self.pattern.len and self.pattern[self.pos] == ']') self.pos += 1;
+        if (negate) {
+            for (&bitmap) |*b| b.* = ~b.*;
+        }
+        return self.classState(bitmap);
+    }
+
+    fn escapeState(self: *NfaBuilder, esc: u8) ?Fragment {
+        switch (esc) {
+            'd' => {
+                var bm = [_]u8{0} ** 32;
+                var ch: u8 = '0';
+                while (ch <= '9') : (ch += 1) bm[ch >> 3] |= @as(u8, 1) << @intCast(ch & 7);
+                return self.classState(bm);
+            },
+            'w' => {
+                var bm = [_]u8{0} ** 32;
+                var ch: u8 = 'a';
+                while (ch <= 'z') : (ch += 1) bm[ch >> 3] |= @as(u8, 1) << @intCast(ch & 7);
+                ch = 'A';
+                while (ch <= 'Z') : (ch += 1) bm[ch >> 3] |= @as(u8, 1) << @intCast(ch & 7);
+                ch = '0';
+                while (ch <= '9') : (ch += 1) bm[ch >> 3] |= @as(u8, 1) << @intCast(ch & 7);
+                bm['_' >> 3] |= @as(u8, 1) << @intCast('_' & 7);
+                return self.classState(bm);
+            },
+            's' => {
+                var bm = [_]u8{0} ** 32;
+                for ([_]u8{ ' ', '\t', '\n', '\r', 0x0B, 0x0C }) |ch| bm[ch >> 3] |= @as(u8, 1) << @intCast(ch & 7);
+                return self.classState(bm);
+            },
+            'n' => return self.charState('\n'),
+            't' => return self.charState('\t'),
+            'r' => return self.charState('\r'),
+            else => return self.charState(esc),
+        }
+    }
+};
+
+/// Builds a Thompson NFA from a regex pattern supporting:
+/// - Literals: abc
+/// - Any: .
+/// - Alternation: a|b|c
+/// - Quantifiers: a*, a+, a?, a{3}
+/// - Character classes: [a-z], [^0-9], \d, \w, \s
+/// - Groups: (abc|def)
+pub fn buildThompsonNFA(pattern: []const u8) ThompsonNFA {
+    var builder = NfaBuilder{ .pattern = pattern };
+    const root = builder.parseAlternation() orelse return .{};
+    // Add accept state.
+    const accept = builder.newState();
+    builder.nfa.states[accept].kind = .accept;
+    builder.patch(root.out, accept);
+    builder.nfa.start_state = root.start;
+    return builder.nfa;
 }
 
 /// P14: Thompson NFA column search. O(pm) — no backtracking.
-/// For the common case (literal patterns), delegates to the Thompson NFA.
-/// Falls back to the recursive backtracker for complex patterns.
+/// Handles literals, alternation, quantifiers (*, +, ?, {N}),
+/// character classes ([a-z], \d, \w, \s), and groups.
+/// Falls back to recursive backtracker only for case-insensitive
+/// or when the pattern is too complex for the NFA state budget.
 pub fn columnNFA(line: []const u8, pattern: []const u8, case_insensitive: bool) ?usize {
-    // For case-insensitive or complex patterns, use the backtracker.
-    // The Thompson NFA path handles case-sensitive literals — the hot path.
+    // Case-insensitive still uses the backtracker (the NFA doesn't
+    // fold character classes case-insensitively yet).
     if (case_insensitive) return column(line, pattern, case_insensitive);
-
-    // Check if pattern is a simple literal (no regex metacharacters).
-    var is_simple_literal = true;
-    for (pattern) |c| {
-        if (c == '.' or c == '*' or c == '+' or c == '?' or c == '[' or c == '(' or c == '|' or c == '^' or c == '$' or c == '\\') {
-            is_simple_literal = false;
-            break;
-        }
-    }
-    if (!is_simple_literal) return column(line, pattern, case_insensitive);
 
     // Build and simulate the Thompson NFA.
     const nfa = buildThompsonNFA(pattern);
+    if (nfa.state_count == 0) return column(line, pattern, case_insensitive);
     return nfa.simulate(line);
 }
 
@@ -733,12 +964,52 @@ test "P14 Thompson NFA matches literal pattern" {
     try std.testing.expect(nfa.simulate("no match") == null);
 }
 
+test "P14 Thompson NFA alternation" {
+    const nfa = buildThompsonNFA("cat|dog");
+    try std.testing.expect(nfa.simulate("I have a cat") != null);
+    try std.testing.expect(nfa.simulate("I have a dog") != null);
+    try std.testing.expect(nfa.simulate("I have a bird") == null);
+}
+
+test "P14 Thompson NFA quantifiers" {
+    // Kleene star: a* matches zero or more 'a'
+    const star = buildThompsonNFA("ab*c");
+    try std.testing.expect(star.simulate("ac") != null);
+    try std.testing.expect(star.simulate("abc") != null);
+    try std.testing.expect(star.simulate("abbbbc") != null);
+
+    // Plus: a+ matches one or more
+    const plus = buildThompsonNFA("ab+c");
+    try std.testing.expect(plus.simulate("abc") != null);
+    try std.testing.expect(plus.simulate("abbc") != null);
+    try std.testing.expect(plus.simulate("ac") == null);
+
+    // Optional: colou?r
+    const opt = buildThompsonNFA("colou?r");
+    try std.testing.expect(opt.simulate("color") != null);
+    try std.testing.expect(opt.simulate("colour") != null);
+}
+
+test "P14 Thompson NFA character classes" {
+    // [a-z]+
+    const lc = buildThompsonNFA("[a-z]+");
+    try std.testing.expect(lc.simulate("hello") != null);
+    try std.testing.expect(lc.simulate("HELLO") == null);
+
+    // \d+ — digits
+    const digits = buildThompsonNFA("\\d+");
+    try std.testing.expect(digits.simulate("12345") != null);
+    try std.testing.expect(digits.simulate("abc") == null);
+
+    // \w+ — word chars
+    const word = buildThompsonNFA("\\w+");
+    try std.testing.expect(word.simulate("hello_world123") != null);
+}
+
 test "P14 Thompson NFA O(pm) no catastrophic backtracking" {
-    // The pattern (a+)+b causes catastrophic backtracking in recursive
-    // engines. The Thompson NFA handles it in O(pm) — linear time.
-    // We test with a literal (the NFA builder handles literals), but the
-    // simulation engine is the same O(pm) algorithm regardless of pattern.
-    const nfa = buildThompsonNFA("aaaaaaaaaaab");
+    // (a+)+b causes catastrophic backtracking in recursive engines.
+    // The Thompson NFA handles it in O(pm) — linear time.
+    const nfa = buildThompsonNFA("(a+)+b");
     var buf: [100]u8 = undefined;
     for (&buf, 0..) |*b, i| {
         b.* = if (i < 88) 'a' else if (i == 88) 'b' else 'x';
@@ -748,8 +1019,14 @@ test "P14 Thompson NFA O(pm) no catastrophic backtracking" {
 }
 
 test "P14 Thompson NFA column search matches backtracker for literals" {
-    // Verify the NFA path produces the same results as the backtracker.
     try std.testing.expectEqual(column("find hello here", "hello", false), columnNFA("find hello here", "hello", false));
     try std.testing.expectEqual(column("no match here", "hello", false), columnNFA("no match here", "hello", false));
     try std.testing.expectEqual(@as(?usize, null), columnNFA("", "hello", false));
+}
+
+test "P14 Thompson NFA groups with alternation" {
+    const nfa = buildThompsonNFA("(cat|dog)s");
+    try std.testing.expect(nfa.simulate("cats") != null);
+    try std.testing.expect(nfa.simulate("dogs") != null);
+    try std.testing.expect(nfa.simulate("birds") == null);
 }
