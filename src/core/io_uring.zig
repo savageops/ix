@@ -194,7 +194,7 @@ const IoUringImpl = struct {
             IORING_OFF_CQ_RING,
         );
         if (cq_ring_mmap == std.math.maxInt(usize)) {
-            _ = std.os.linux.munmap(@ptrCast(self.sq_ring_ptr), sq_ring_sz);
+            _ = std.os.linux.munmap(@constCast(@volatileCast(self.sq_ring_ptr)), sq_ring_sz);
             _ = std.os.linux.close(@intCast(self.fd));
             return error.MmapFailed;
         }
@@ -212,8 +212,8 @@ const IoUringImpl = struct {
             IORING_OFF_SQES,
         );
         if (sqes_mmap == std.math.maxInt(usize)) {
-            _ = std.os.linux.munmap(@ptrCast(self.cq_ring_ptr), cq_ring_sz);
-            _ = std.os.linux.munmap(@ptrCast(self.sq_ring_ptr), sq_ring_sz);
+            _ = std.os.linux.munmap(@constCast(@volatileCast(self.cq_ring_ptr)), cq_ring_sz);
+            _ = std.os.linux.munmap(@constCast(@volatileCast(self.sq_ring_ptr)), sq_ring_sz);
             _ = std.os.linux.close(@intCast(self.fd));
             return error.MmapFailed;
         }
@@ -237,9 +237,9 @@ const IoUringImpl = struct {
     }
 
     pub fn deinit(self: *IoUringImpl) void {
-        if (self.sq_ring_sz > 0) _ = std.os.linux.munmap(@ptrCast(self.sq_ring_ptr), self.sq_ring_sz);
-        if (self.cq_ring_sz > 0) _ = std.os.linux.munmap(@ptrCast(self.cq_ring_ptr), self.cq_ring_sz);
-        if (self.sqes_sz > 0) _ = std.os.linux.munmap(@ptrCast(self.sqes_ptr), self.sqes_sz);
+        if (self.sq_ring_sz > 0) _ = std.os.linux.munmap(@constCast(@volatileCast(self.sq_ring_ptr)), self.sq_ring_sz);
+        if (self.cq_ring_sz > 0) _ = std.os.linux.munmap(@constCast(@volatileCast(self.cq_ring_ptr)), self.cq_ring_sz);
+        if (self.sqes_sz > 0) _ = std.os.linux.munmap(@constCast(@volatileCast(self.sqes_ptr)), self.sqes_sz);
         if (self.fd >= 0) _ = std.os.linux.close(@intCast(self.fd));
         self.fd = -1;
     }
@@ -348,7 +348,7 @@ const IoUringImpl = struct {
         sq_array[sqe_index] = sqe_index;
 
         // Memory barrier before updating tail
-        asm volatile("" ::: "memory");
+        asm volatile("" ::: .{ .memory = true });
         self.writeSqU32(self.sq_tail_off, next_tail);
 
         // If SQPOLL is not enabled, we need to call io_uring_enter
@@ -371,7 +371,7 @@ const IoUringImpl = struct {
         const cqe = cqes[cq_index];
 
         // Advance the CQ head
-        asm volatile("" ::: "memory");
+        asm volatile("" ::: .{ .memory = true });
         self.writeCqU32(self.cq_head_off, (head + 1) & self.cq_mask);
 
         return Completion{
