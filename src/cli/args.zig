@@ -14,7 +14,6 @@ pub const CommandTag = enum {
     explain,
     process,
     similar,
-    min,
     xo,
     why,
     watch,
@@ -33,7 +32,6 @@ pub const HelpTopic = enum {
     explain,
     process,
     similar,
-    min,
     xo,
     completions_bash,
     completions_zsh,
@@ -197,17 +195,6 @@ pub const SimilarRequest = struct {
 
 pub const XoFormat = enum { grouped, json };
 
-pub const MinLevel = enum { low, med, high };
-pub const MinFormat = enum { text, json };
-
-pub const MinRequest = struct {
-    path: []const u8,
-    level: MinLevel = .med,
-    max_bytes: ?usize = null,
-    format: MinFormat = .text,
-    dry_run: bool = false,
-};
-
 pub const XoRequest = struct {
     query: []const u8,
     paths: [MAX_SEARCH_PATHS][]const u8,
@@ -226,7 +213,6 @@ pub const Command = union(CommandTag) {
     explain: ExplainRequest,
     process: ProcessRequest,
     similar: SimilarRequest,
-    min: MinRequest,
     xo: XoRequest,
     why: WhyRequest,
     watch: SearchRequest,
@@ -380,10 +366,6 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .similar } };
         return .{ .command = .{ .similar = try parseSimilar(argv[2..]) } };
     }
-    if (std.mem.eql(u8, first, "min")) {
-        if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .min } };
-        return .{ .command = .{ .min = try parseMin(argv[2..]) } };
-    }
     if (std.mem.eql(u8, first, "xo")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .xo } };
         return .{ .command = .{ .xo = try parseXo(argv[2..]) } };
@@ -442,7 +424,6 @@ fn helpTopic(arg: []const u8) ?HelpTopic {
     if (std.mem.eql(u8, arg, "explain")) return .explain;
     if (std.mem.eql(u8, arg, "process")) return .process;
     if (std.mem.eql(u8, arg, "similar")) return .similar;
-    if (std.mem.eql(u8, arg, "min")) return .min;
     if (std.mem.eql(u8, arg, "xo")) return .xo;
     return null;
 }
@@ -597,48 +578,6 @@ fn parseXo(args: []const []const u8) ParseError!XoRequest {
     }
     if (request.query.len == 0 or request.path_count == 0) return ParseError.MissingValue;
     return request;
-}
-
-/// Parses one-file compaction independently from exact inspection and query-guided context.
-fn parseMin(args: []const []const u8) ParseError!MinRequest {
-    var request = MinRequest{ .path = "" };
-    var index: usize = 0;
-    while (index < args.len) : (index += 1) {
-        const arg = args[index];
-        if (std.mem.eql(u8, arg, "--level")) {
-            index += 1;
-            if (index >= args.len) return ParseError.MissingValue;
-            request.level = parseMinLevel(args[index]) orelse return ParseError.MissingValue;
-        } else if (std.mem.startsWith(u8, arg, "--level=")) {
-            request.level = parseMinLevel(arg["--level=".len..]) orelse return ParseError.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--max-bytes")) {
-            index += 1;
-            if (index >= args.len) return ParseError.MissingValue;
-            request.max_bytes = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
-            if (request.max_bytes.? == 0) return ParseError.MissingValue;
-        } else if (std.mem.eql(u8, arg, "--json")) {
-            request.format = .json;
-        } else if (std.mem.eql(u8, arg, "--dry-run")) {
-            request.dry_run = true;
-        } else if (parseMinLevel(arg)) |level| {
-            request.level = level;
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            return ParseError.UnsupportedFlag;
-        } else if (request.path.len == 0) {
-            request.path = normalizePathArgument(arg);
-        } else {
-            return ParseError.MissingValue;
-        }
-    }
-    if (request.path.len == 0) return ParseError.MissingValue;
-    return request;
-}
-
-fn parseMinLevel(raw: []const u8) ?MinLevel {
-    if (std.ascii.eqlIgnoreCase(raw, "low")) return .low;
-    if (std.ascii.eqlIgnoreCase(raw, "med") or std.ascii.eqlIgnoreCase(raw, "medium")) return .med;
-    if (std.ascii.eqlIgnoreCase(raw, "high")) return .high;
-    return null;
 }
 
 fn parseWhy(args: []const []const u8) ParseError!WhyRequest {
@@ -1538,18 +1477,4 @@ test "xo parses bounded grouped insight request" {
     try std.testing.expectEqual(@as(usize, 4096), request.max_bytes);
     try std.testing.expectEqual(@as(usize, 7), request.max_spans);
     try std.testing.expectEqual(XoFormat.json, request.format);
-}
-
-test "min accepts canonical and shorthand level forms" {
-    const canonical = [_][]const u8{ "ix-zig", "min", "README.md", "--level", "high", "--max-bytes", "4096", "--json" };
-    const first = (try parseInvocation(std.testing.allocator, &canonical)).command.min;
-    try std.testing.expectEqualStrings("README.md", first.path);
-    try std.testing.expectEqual(MinLevel.high, first.level);
-    try std.testing.expectEqual(@as(?usize, 4096), first.max_bytes);
-    try std.testing.expectEqual(MinFormat.json, first.format);
-
-    const shorthand = [_][]const u8{ "ix-zig", "min", "med", "src/core/search.zig", "--dry-run" };
-    const second = (try parseInvocation(std.testing.allocator, &shorthand)).command.min;
-    try std.testing.expectEqual(MinLevel.med, second.level);
-    try std.testing.expect(second.dry_run);
 }

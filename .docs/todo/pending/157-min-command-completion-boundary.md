@@ -1,7 +1,7 @@
 ---
 id: 157-min-command-completion-boundary
 type: decision-required
-status: blocked
+status: complete
 priority: P0
 owner: cli-command-spine
 source: ix-perpetual-ascent-loop-019
@@ -33,3 +33,12 @@ not add a stub dispatch arm.
   behavior-test ownership.
 - `zig build -j1 -Doptimize=ReleaseSmall` passes without network access.
 - `zig build test --summary all` reports any non-command failures separately.
+
+## Closure evidence
+
+- Removed the unshipped tag, help topic, request type, parser branch, helper,
+  and parser-only tests together; no placeholder dispatch arm remains.
+- ReleaseFast executable build succeeds.
+- The full suite now reaches runtime tests and reports 539/549 passing; the ten
+  remaining failures are independently owned by warm-query-cache and Thompson
+  NFA paths.

@@ -4,27 +4,30 @@ Updated: 2026-07-15
 
 ## Current objective
 
-Restore build integrity without converting incomplete public surface into a
-compiled-but-false capability.
+Preserve the promoted native owner while isolating the remaining warm-cache
+and Thompson NFA test debt.
 
 ## Active loop
 
-- Receipt: `.docs/qc/loop-019-min-command-build-integrity.md`
-- Hypothesis: the build failure is an incomplete `min` command integration,
-  not a missing dispatch branch.
-- Current verdict: `BLOCKED`
+- Receipt: `.docs/qc/loop-020-native-promotion.md`
+- Hypothesis: removing the unshipped `min` surface and compiling the complete
+  pinned tree-sitter native source set restores a source-fresh promotable binary.
+- Current verdict: `PROMOTED`
 
 ## Verified state
 
-- `zig build -j1 -Doptimize=ReleaseSmall` reaches `src/main.zig:107` and
-  rejects the non-exhaustive command union switch.
-- `CommandTag.min` parses in `src/cli/args.zig`, but there is no executor,
-  output contract, help topic renderer, or behavior test.
-- Adding a no-op or error-only `main.zig` arm would hide the compiler signal and
-  violate the public-command completeness invariant.
+- The unshipped `min` parser, tag, request, and parser-only tests were removed
+  as one coherent public-surface rollback.
+- Tree-sitter now compiles upstream `point.c` and the non-WASM branch of
+  `wasm_store.c`; all four build refs verify and ReleaseFast links successfully.
+- The installed owner `C:\Users\Savage\AppData\ix\ix.exe` matches candidate
+  SHA-256 `5F66F4245CC2F80A1F9A04967AD8FE46B0BD8C0A2265647D30C19E1A899C8B5C`.
+- Native help, version, source-freshness, cold/warm parity, JSON v3 search, hash,
+  backup, and PATH-owner probes pass.
+- Full ReleaseFast tests report 539/549 passing; ten known failures remain in
+  warm-query-cache and Thompson NFA lanes and are not represented as green.
 
 ## Next action
 
-Choose the product owner for `min`: either complete its end-to-end contract in
-one slice or remove its unshipped parser surface in the owning change. Then
-rerun the hermetic build and the full test summary before performance work.
+Repair the ten remaining tests at their warm-cache and Thompson NFA owners,
+then rerun the strict `sync-native-install.mjs --build` lane.

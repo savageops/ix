@@ -53,6 +53,8 @@ or reset unrelated dirty work.
   restored and verified from the manifest alone.
 - `git ls-files .refs`: `.refs/index.md` only; all payload probes resolve to the
   `.gitignore` rule.
-- ReleaseSmall build and test compilation reached IX sources; the remaining
-  failure is the pre-existing `CommandTag.min` exhaustiveness defect at
-  `src/main.zig:107`. The test runner reports 130/130 passing.
+- The pinned tree-sitter build input now compiles upstream `point.c` and the
+  non-WASM branch of `wasm_store.c`; the manifest requires both real sources
+  instead of generating an empty legacy stub.
+- ReleaseFast executable build succeeds after 4/4 build refs verify. The full
+  suite reports 539/549 passing with ten non-ref warm-cache/NFA failures.
