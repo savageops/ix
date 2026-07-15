@@ -277,19 +277,21 @@ pub fn allocateHugePages(size: usize) ?[*]u8 {
     if (builtin.os.tag != .linux) return null;
     if (!supportsHugePages()) return null;
 
-    const PROT_READ: u32 = 0x1;
-    const PROT_WRITE: u32 = 0x2;
-    const MAP_PRIVATE: u32 = 0x02;
-    const MAP_ANONYMOUS: u32 = 0x20;
     const HUGE_PAGE_SIZE: usize = 2 * 1024 * 1024; // 2 MiB
 
     // Round up to huge page boundary.
     const rounded_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
 
-    // Use std.os.linux mmap which expects typed flags on Linux.
-    // Cast via @enumFromInt for PROT and @ptrCast for MAP.
-    const linux_prot = @as(std.os.linux.PROT, @enumFromInt(@as(u32, PROT_READ | PROT_WRITE)));
-    const linux_flags: std.os.linux.MAP = @enumFromInt(@as(u32, MAP_PRIVATE | MAP_ANONYMOUS | @as(u32, @intCast(hugePageFlag()))));
+    // Use std.os.linux mmap with typed struct flags.
+    const linux_prot = std.os.linux.PROT{
+        .READ = true,
+        .WRITE = true,
+    };
+    const linux_flags = std.os.linux.MAP{
+        .TYPE = .PRIVATE,
+        .ANONYMOUS = true,
+        .HUGETLB = true,
+    };
 
     const result = std.os.linux.mmap(
         null,
@@ -299,8 +301,8 @@ pub fn allocateHugePages(size: usize) ?[*]u8 {
         -1,
         0,
     );
-    if (@intFromPtr(result.addr) == std.math.maxInt(usize)) return null;
-    return result.addr;
+    if (result == std.math.maxInt(usize)) return null;
+    return @ptrFromInt(result);
 }
 
 /// P18: Frees a huge page-backed memory region.

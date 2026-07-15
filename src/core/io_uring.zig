@@ -171,16 +171,16 @@ const IoUringImpl = struct {
         const sq_ring_mmap = std.os.linux.mmap(
             null,
             sq_ring_sz,
-            std.os.linux.PROT.READ | std.os.linux.PROT.WRITE,
+            std.os.linux.PROT{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             self.fd,
             IORING_OFF_SQ_RING,
         );
-        if (sq_ring_mmap == std.os.linux.MAP.FAILED) {
+        if (sq_ring_mmap == std.math.maxInt(usize)) {
             _ = std.os.linux.close(@intCast(self.fd));
             return error.MmapFailed;
         }
-        self.sq_ring_ptr = @ptrCast(sq_ring_mmap);
+        self.sq_ring_ptr = @ptrFromInt(sq_ring_mmap);
 
         // mmap the CQ ring
         const cq_ring_sz = params.cq_entries * @sizeOf(io_uring_cqe) + params.cq_off.cqes;
@@ -188,17 +188,17 @@ const IoUringImpl = struct {
         const cq_ring_mmap = std.os.linux.mmap(
             null,
             cq_ring_sz,
-            std.os.linux.PROT.READ | std.os.linux.PROT.WRITE,
+            std.os.linux.PROT{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             self.fd,
             IORING_OFF_CQ_RING,
         );
-        if (cq_ring_mmap == std.os.linux.MAP.FAILED) {
+        if (cq_ring_mmap == std.math.maxInt(usize)) {
             _ = std.os.linux.munmap(@ptrCast(self.sq_ring_ptr), sq_ring_sz);
             _ = std.os.linux.close(@intCast(self.fd));
             return error.MmapFailed;
         }
-        self.cq_ring_ptr = @ptrCast(cq_ring_mmap);
+        self.cq_ring_ptr = @ptrFromInt(cq_ring_mmap);
 
         // mmap the SQE array
         const sqes_sz = params.sq_entries * @sizeOf(io_uring_sqe);
@@ -206,18 +206,18 @@ const IoUringImpl = struct {
         const sqes_mmap = std.os.linux.mmap(
             null,
             sqes_sz,
-            std.os.linux.PROT.READ | std.os.linux.PROT.WRITE,
+            std.os.linux.PROT{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             self.fd,
             IORING_OFF_SQES,
         );
-        if (sqes_mmap == std.os.linux.MAP.FAILED) {
+        if (sqes_mmap == std.math.maxInt(usize)) {
             _ = std.os.linux.munmap(@ptrCast(self.cq_ring_ptr), cq_ring_sz);
             _ = std.os.linux.munmap(@ptrCast(self.sq_ring_ptr), sq_ring_sz);
             _ = std.os.linux.close(@intCast(self.fd));
             return error.MmapFailed;
         }
-        self.sqes_ptr = @ptrCast(sqes_mmap);
+        self.sqes_ptr = @ptrFromInt(sqes_mmap);
 
         // Store ring offsets and mask
         self.sq_head_off = params.sq_off.head;
@@ -288,9 +288,9 @@ const IoUringImpl = struct {
         // Syscall number 427 on x86_64
         const ret = std.os.linux.io_uring_register(
             self.fd,
-            @enumFromInt(IORING_REGISTER_BUFFERS),
+            .REGISTER_BUFFERS,
             @ptrCast(&iovecs),
-            self.fixed_buffer_count + 1,
+            @intCast(self.fixed_buffer_count + 1),
         );
         if (@as(isize, @bitCast(ret)) < 0) return error.RegisterBuffersFailed;
 
