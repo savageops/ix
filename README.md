@@ -6,6 +6,8 @@
 
 *Every search engine scans files. IX also knows which files to skip — and which lines within those files actually matter.*
 
+The engine reasons about what happens inside the CPU's out-of-order execution engine: whether a `VPCMPEQB` fuses with the subsequent `TEST`/`JNZ` in the decoder, whether store-to-load forwarding succeeds on 32-byte alignment, whether the branch predictor stays trained across a 100k-line corpus. FM-Index backward search resolves pattern existence in O(p) via wavelet-tree-compressed bit-vectors. The JIT Forge allocates executable pages, compiles pattern-specific x86_64 opcodes with W^X protection, and the compiled code becomes the matching automaton — resident in the i-cache. io_uring submits DMA reads straight from the NVMe PCIe bus with zero context switches. This is not configuration. This is the register-instruction-cache boundary.
+
 ---
 
 [![Zig](https://img.shields.io/badge/Zig-0.16.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org/)
@@ -52,7 +54,24 @@ Each stage may prove a miss. None ever creates a match.
 
 The output contract separates three independent truth dimensions: **verification** (always `canonical` — the exact matcher confirmed every hit), **scan** (`complete` or `partial_access`), and **projection** (`complete` or `truncated`). Cursor pagination binds continuation to the request fingerprint and corpus signature — change the query or touch a file, the cursor is rejected. Byte budgets fit the largest whole-record page via binary search — no hit is ever cut in half.
 
-The binary vendors everything — StringZilla, PCRE2 with JIT — compiled from source into one static binary. No package manager. No network fetch. No runtime dependencies. It runs on 5% of your machine by default and matches ripgrep's wall time on a 1.34 GB Linux kernel corpus using 1/16th the cores. The per-thread throughput is the engine's advantage. The cap is a product choice.
+The binary vendors everything — StringZilla, PCRE2 with JIT, tree-sitter with the Zig grammar, the Thompson NFA — compiled from source into one static binary. No package manager. No network fetch. No runtime dependencies. It runs on 5% of your machine by default and matches ripgrep's wall time on a 1.34 GB Linux kernel corpus using 1/16th the cores. The per-thread throughput is the engine's advantage. The cap is a product choice.
+
+<details>
+<summary><strong>Eleven adjacent operations, one index</strong></summary>
+<br>
+
+The warmed index drives more than search:
+
+```sh
+ix why 'lit:EXPORT_SYMBOL' src/          # posting-list lineage of a match
+ix watch 'lit:TODO' .                     # stream matches as files change
+ix replace 'old_name' 'new_name' src/     # indexed structural rewrite (--dry-run)
+ix diff-matches 'lit:fn' HEAD~5 HEAD .    # results changed between commits
+```
+
+Count (`-c`), files (`-l`), explain (`explain`), context spans (`xo`), inspection (`inspect`), similarity (`similar`), and MCP server (`mcp`) share the same index. One index, many tools.
+
+</details>
 
 ---
 
@@ -223,6 +242,32 @@ IX_RESOURCE_PERCENT=20 ix search 'lit:fn' src
 On a 32-core / 203 GB machine, defaults are 2 threads and ~10 GB. At `IX_THREAD_PERCENT=50`, the same machine gets 16 threads — and IX matches ripgrep's wall time on a 1.34 GB Linux kernel corpus using 1/16th the cores. The per-thread throughput is the engine's advantage; the cap is a product choice, not a performance ceiling.
 
 The ceiling is part of the product contract. If a bounded lane cannot fit a complete result, IX reports the exact refusal; it does not quietly exceed the owner budget or return a pretend-complete projection.
+
+---
+
+## Register-Level Engineering
+
+IX operates at the boundary where a `VPCMPEQB` instruction fuses with the subsequent `TEST`/`JNZ` in the decoder. Every optimization decision is reasoned at three levels — algorithmic, microarchitectural, and memory hierarchy.
+
+**Thompson NFA with O(pm) guarantee.** Regex patterns compile through a recursive-descent Thompson construction: alternation, quantifiers (`*`, `+`, `?`, `{N}`), character classes (`[a-z]`, `\d`, `\w`), and groups — all resolved via forward-only simulation with two active-state lists. No backtracking. No catastrophic blowup. The pattern `(a+)+b` against 88 `a`s completes in linear time.
+
+**Wavelet tree compressed FM-Index.** Pattern existence resolves via O(p) backward search through BWT + LF-mapping. The Occ table is a wavelet tree: 8 levels of bit-vectors, one bit per character per position. ~2000× space compression over the uncompressed form. The index fits in L2 cache where the uncompressed table exceeds L3.
+
+**JIT Forge.** The engine allocates executable memory pages, emits x86_64 opcodes tailored to the exact search pattern, flips W^X protection, and the compiled code becomes the matcher. Pattern bytes are baked into CMP instructions as immediates — the code IS the automaton, resident in the i-cache. Up to 32-byte patterns with short-circuit JNE on first mismatch.
+
+**io_uring kernel bypass.** On Linux, file reads submit via `IORING_OP_READ_FIXED` with pre-registered buffers in SQPOLL mode. The kernel polls the submission queue from a dedicated thread — zero syscalls per I/O operation. DMA transfers go straight from the NVMe controller into user-space ring buffers with zero intermediate kernel copies.
+
+**Non-temporal streaming stores.** SearchHit result writes use `MOVNTDQ` — data flows from XMM registers through the write-combining buffer to DRAM without allocating cache lines. The hot scan working set (1 MiB chunk buffer, SIMD constants, predicate state) stays resident in L1/L2. `SFENCE` after shard merge ensures global visibility.
+
+**Cooperative speculative execution.** When two scan strategies race, the first to finish claims victory via atomic CAS. The losing thread checks the winner flag every 4096 bytes inside its SIMD loop and terminates mid-scan — the execution pointer swaps at the first atomic load, not at thread join.
+
+**Huge page arena.** On Linux, the arena backs allocations ≥2 MiB with `MAP_HUGETLB`. One TLB entry covers 2 MiB instead of 512 entries for 4 KiB pages — 512× TLB pressure reduction.
+
+**UCB1 multi-armed bandit traversal.** Directory traversal uses the upper-confidence-bound formula: `μ̂_d + c·√(ln(t)/n_d)`. Per-directory match density feeds back through a thread-local 256-bucket bandit table after every file scan. The traversal ordering adapts to real-world yield — high-density directories are scanned first.
+
+**Resource toggle.** `IX_RESOURCE_TOGGLE=low|medium|high` scales memory percentage, thread count, and SIMD lane width deterministically. Low: scalar (1 byte), single-threaded, 1% memory. High: AVX2 (32 bytes), full config. Elasticity in the field, determinism in the lab.
+
+**Tree-sitter AST records.** The `--record ast` flag uses a vendored tree-sitter runtime with the Zig grammar to parse source files into AST nodes. Matches deduplicate by enclosing declaration (FunctionDecl, VarDecl, TestDecl) — true structural boundaries, not brace-depth approximation.
 
 ---
 
@@ -877,7 +922,7 @@ src/
 
 <div align="center">
 
-**A search engine that knows what to ignore. Per-thread faster than ripgrep at 1/16th the cores. One binary. Zero dependencies. 5% of your machine.**
+**A search engine that knows what to ignore. Per-thread faster than ripgrep at 1/16th the cores. One binary. Zero dependencies. Sigstore-signed per platform. 5% of your machine.**
 
 **[MIT License](LICENSE)**
 
