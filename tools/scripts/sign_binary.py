@@ -33,14 +33,15 @@ import platform
 
 def sign_sigstore(binary_path):
     """Sign using Sigstore cosign keyless (OIDC). Works on all platforms."""
-    if not _which("cosign"):
+    cosign_cmd = _find_cosign()
+    if not cosign_cmd:
         print(f"[sign] cosign not found — skipping Sigstore signing for {binary_path}")
         return False
 
     cert_path = binary_path + ".pem"
     sig_path = binary_path + ".sig"
     cmd = [
-        "cosign", "sign-blob",
+        cosign_cmd, "sign-blob",
         "--yes",
         "--output-certificate", cert_path,
         "--output-signature", sig_path,
@@ -138,6 +139,24 @@ def _which(cmd):
         return False
 
 
+def _find_cosign():
+    """Find cosign binary — checks PATH, COSIGN_PATH env, and common locations."""
+    # Check COSIGN_PATH env var (set by cosign-installer in some setups).
+    env_path = os.environ.get("COSIGN_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    # Check HOME/.cosign (cosign-installer default).
+    home = os.environ.get("HOME", "")
+    if home:
+        for candidate in ["{}/.cosign/cosign".format(home), "{}/.cosign/bin/cosign".format(home)]:
+            if os.path.isfile(candidate):
+                return candidate
+    # Check PATH.
+    if _which("cosign"):
+        return "cosign"
+    return None
+
+
 def main():
     paths = [a for a in sys.argv[1:] if os.path.isfile(a)]
     if not paths:
@@ -155,7 +174,7 @@ def main():
                 signed_any = True
         elif sign_method == "auto":
             # Try Sigstore first (cross-platform, trusted).
-            if _which("cosign"):
+            if _find_cosign():
                 if sign_sigstore(binary_path):
                     signed_any = True
                     continue
