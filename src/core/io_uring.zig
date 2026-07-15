@@ -148,15 +148,15 @@ const IoUringImpl = struct {
 
         const entries: u32 = 32;
 
-        // io_uring_setup syscall — use stdlib wrapper
-        const fd_raw = std.os.linux.io_uring_setup(entries, &params);
+        // Use stdlib wrapper with ptrCast for local vs stdlib params struct compat.
+        const fd_raw = std.os.linux.io_uring_setup(entries, @ptrCast(&params));
         const fd: i32 = @intCast(@as(isize, @bitCast(fd_raw)));
         var self = IoUringImpl{ .fd = fd, .sqpoll_enabled = true };
 
         if (fd < 0) {
             // SQPOLL requires CAP_SYS_NICE — fall back without it
             params = std.mem.zeroes(io_uring_params);
-            const fd2_raw = std.os.linux.io_uring_setup(entries, &params);
+            const fd2_raw = std.os.linux.io_uring_setup(entries, @ptrCast(&params));
             const fd2: i32 = @intCast(@as(isize, @bitCast(fd2_raw)));
             if (fd2 < 0) return error.IoUringSetupFailed;
             self.fd = fd2;
@@ -288,8 +288,8 @@ const IoUringImpl = struct {
         // Syscall number 427 on x86_64
         const ret = std.os.linux.io_uring_register(
             self.fd,
-            IORING_REGISTER_BUFFERS,
-            &iovecs,
+            @enumFromInt(IORING_REGISTER_BUFFERS),
+            @ptrCast(&iovecs),
             self.fixed_buffer_count + 1,
         );
         if (@as(isize, @bitCast(ret)) < 0) return error.RegisterBuffersFailed;

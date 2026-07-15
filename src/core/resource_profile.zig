@@ -286,11 +286,16 @@ pub fn allocateHugePages(size: usize) ?[*]u8 {
     // Round up to huge page boundary.
     const rounded_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
 
-    const result = std.c.mmap(
+    // Use std.os.linux mmap which expects typed flags on Linux.
+    // Cast via @enumFromInt for PROT and @ptrCast for MAP.
+    const linux_prot = @as(std.os.linux.PROT, @enumFromInt(@as(u32, PROT_READ | PROT_WRITE)));
+    const linux_flags: std.os.linux.MAP = @enumFromInt(@as(u32, MAP_PRIVATE | MAP_ANONYMOUS | @as(u32, @intCast(hugePageFlag()))));
+
+    const result = std.os.linux.mmap(
         null,
         rounded_size,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS | @as(u32, @intCast(hugePageFlag())),
+        linux_prot,
+        linux_flags,
         -1,
         0,
     );

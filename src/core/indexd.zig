@@ -227,10 +227,13 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
                 // The name must start with '/' and contain no other slashes.
                 // The daemon ftruncate's the size, writes the index, then
                 // search processes mmap it with MAP_SHARED | PROT_READ.
-                const shm_name = try std.fmt.allocPrintZ(allocator, "/ix_index_{x}", .{
+                const shm_name_tmp = try std.fmt.allocPrint(allocator, "/ix_index_{x}", .{
                     std.hash.Wyhash.hash(0, config.root),
                 });
+                defer allocator.free(shm_name_tmp);
+                const shm_name = try allocator.allocSentinel(u8, shm_name_tmp.len, 0);
                 defer allocator.free(shm_name);
+                @memcpy(shm_name[0..shm_name_tmp.len], shm_name_tmp);
                 // O_RDWR | O_CREAT = 0x42, mode 0644
                 const shm_fd = std.c.shm_open(shm_name.ptr, 0x42, 0o644);
                 if (shm_fd >= 0) {
