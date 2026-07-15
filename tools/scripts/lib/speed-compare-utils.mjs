@@ -180,7 +180,9 @@ export function run(command, commandArgs, options = {}) {
       captureStdout: true,
       captureStderr: true,
       maxBuffer: options.maxBuffer ?? 128 * 1024 * 1024,
-    }, isolationPlan, { allowedCodes: [0] });
+    // Preserve the direct-run contract: search tools use exit code 1 for a
+    // valid no-match result, which callers inspect after measurement.
+    }, isolationPlan, { allowedCodes: [0, 1] });
     return {
       command: [command, ...commandArgs].join(" "),
       exitCode: isolated.status == null ? null : isolated.status,

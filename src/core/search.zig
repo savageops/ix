@@ -19,10 +19,12 @@ const io_uring = @import("io_uring.zig");
 /// files are processed), so caching the writes is pure waste.
 ///
 /// On non-x86 platforms, falls back to @prefetch(locality=0) hint.
-
 inline fn streamStoreHint(ptr: [*]const u8) void {
     if (builtin.cpu.arch == .x86_64) {
-        asm volatile ("prefetchnta (%[ptr])" :: [ptr] "r" (ptr));
+        asm volatile ("prefetchnta (%[ptr])"
+            :
+            : [ptr] "r" (ptr),
+        );
     } else {
         @prefetch(ptr, .{ .rw = .read, .locality = 0 });
     }
@@ -37,7 +39,9 @@ inline fn streamStore128(dest: [*]u8, src: [*]const u8) void {
         asm volatile (
             \\movdqu xmm0, (%[src])
             \\movntdq (%[dest]), xmm0
-            :: [src] "r" (src), [dest] "r" (dest)
+            :
+            : [src] "r" (src),
+              [dest] "r" (dest),
         );
     } else {
         @memcpy(dest[0..16], src[0..16]);
@@ -674,13 +678,10 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: cli.SearchRequest,
     const thread_count = effectiveThreadCount(request, active_files.len);
     report.outer_scan_threads = thread_count;
 
-    // Prioritize code-dense files first using directory-density heuristics.
-    // This implements P20 (Multi-Armed Bandit Traversal): instead of random
-    // shuffle, files are ordered by a UCB1-inspired score that estimates
-    // match-density potential from path heuristics. Code-dense subtrees
-    // (src/, lib/, core/) are scanned before low-density ones (vendor/,
-    // node_modules/, dist/). All files are still discovered — no false negatives.
-    if (thread_count > 1 and !request.stable_output) prioritizeFilesByDensity(active_files);
+    // Randomize the discovered order so adjacent workers do not contend on
+    // the same NTFS directory control block. Density sorting clustered paths
+    // and regressed exhaustive scan work by roughly 3.6x on the Linux corpus.
+    if (thread_count > 1 and !request.stable_output) shuffleFiles(active_files);
     const discovered: []const DiscoveredFile = active_files;
     if (discovered.len == 0) {
         // No files discovered -- nothing to scan.
@@ -2209,12 +2210,11 @@ fn fileDensityScore(path: []const u8) u16 {
 
 fn pathHasSourceExtension(path: []const u8) bool {
     const source_exts = [_][]const u8{
-        ".zig", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".rs", ".go",
-        ".ts", ".tsx", ".js", ".jsx", ".py", ".rb", ".java", ".kt", ".swift",
-        ".lua", ".sh", ".bash", ".zsh", ".fish", ".ps1",
-        ".css", ".scss", ".html", ".vue", ".svelte",
-        ".sql", ".proto", ".graphql", ".thrift",
-        ".yaml", ".yml", ".toml", ".json", ".xml", ".md",
+        ".zig",  ".c",      ".h",    ".cpp",   ".cc",      ".cxx",    ".hpp",  ".rs",   ".go",
+        ".ts",   ".tsx",    ".js",   ".jsx",   ".py",      ".rb",     ".java", ".kt",   ".swift",
+        ".lua",  ".sh",     ".bash", ".zsh",   ".fish",    ".ps1",    ".css",  ".scss", ".html",
+        ".vue",  ".svelte", ".sql",  ".proto", ".graphql", ".thrift", ".yaml", ".yml",  ".toml",
+        ".json", ".xml",    ".md",
     };
     for (source_exts) |ext| {
         if (std.mem.endsWith(u8, path, ext)) return true;
@@ -4320,14 +4320,13 @@ fn scanOpenFileIntoShardImpl(
     }
 
     // FM-Index backward-search admission (spec point 11).
-    // Env-gated: IX_FM_INDEX_ADMISSION=1 enables in-memory BWT construction
-    // and O(p) backward search for eligible files. Enabled by default as
-    // the sub-linear admission path (P11). The env gate IX_FM_INDEX_ADMISSION=0
-    // can disable it if needed. The check is cached per-thread.
+    // Opt-in: its negative proof must pass corpus parity before it can become a
+    // default gate, because a false negative suppresses the exact matcher.
+    // The check is cached per-thread so disabled cost is one predictable branch.
     if (!fm_index_admission_checked) {
         fm_index_admission_checked = true;
         const env_val = std.c.getenv("IX_FM_INDEX_ADMISSION\x00");
-        fm_index_admission_cached = !(env_val != null and std.mem.eql(u8, std.mem.span(env_val.?), "0"));
+        fm_index_admission_cached = env_val != null and std.mem.eql(u8, std.mem.span(env_val.?), "1");
     }
     if (fm_index_admission_cached and single_chunk and file_bytes <= FM_INDEX_ADMISSION_MAX_BYTES) {
         if (tryFmIndexAdmission(allocator, read_buffer[0..first_read], plan)) {
@@ -4630,12 +4629,7 @@ fn dynamicShardWorker(io: std.Io, allocator: std.mem.Allocator, next_file: *usiz
         while (!shard.truncated) {
             const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
             if (index >= files.len) break;
-            // P20: Snapshot matches before scan to compute per-file reward.
-            const matches_before = shard.matches_found;
             scanFileIntoShard(io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
-            // P20: Feed actual match density into the UCB1 bandit.
-            const matches_in_file: u32 = @intCast(shard.matches_found -| matches_before);
-            recordBanditResult(files[index].path, matches_in_file);
         }
     }
 }
@@ -4644,9 +4638,7 @@ fn dynamicShardWorkerTimed(io: std.Io, allocator: std.mem.Allocator, next_file: 
     while (!shard.truncated) {
         const index = @atomicRmw(usize, next_file, .Add, 1, .monotonic);
         if (index >= files.len) break;
-        const matches_before = shard.matches_found;
         scanFileIntoShardTimed(io, allocator, files[index].path, request, plan, trigram_admission, trigram_program, shard);
-        recordBanditResult(files[index].path, @intCast(shard.matches_found -| matches_before));
     }
 }
 
@@ -4668,18 +4660,14 @@ fn monoShardLoop(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocat
     if (shard.capture_scan_open_timing) return monoShardLoopTimed(mono, io, allocator, files, request, plan, trigram_admission, trigram_program, shard);
     for (files) |entry| {
         if (shard.truncated) break;
-        const matches_before = shard.matches_found;
         scanFileIntoShardMono(mono, io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
-        recordBanditResult(entry.path, @intCast(shard.matches_found -| matches_before));
     }
 }
 
 fn monoShardLoopTimed(comptime mono: MonoSpec, io: std.Io, allocator: std.mem.Allocator, files: []const DiscoveredFile, request: cli.SearchRequest, plan: expr.ExpressionPlan, trigram_admission: trigram.Admission, trigram_program: *const TrigramAdmissionProgram, shard: *ShardReport) void {
     for (files) |entry| {
         if (shard.truncated) break;
-        const matches_before = shard.matches_found;
         scanFileIntoShardMonoTimed(mono, io, allocator, entry.path, request, plan, trigram_admission, trigram_program, shard);
-        recordBanditResult(entry.path, @intCast(shard.matches_found -| matches_before));
     }
 }
 

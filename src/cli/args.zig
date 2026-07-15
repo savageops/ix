@@ -14,6 +14,7 @@ pub const CommandTag = enum {
     explain,
     process,
     similar,
+    min,
     xo,
     why,
     watch,
@@ -32,6 +33,7 @@ pub const HelpTopic = enum {
     explain,
     process,
     similar,
+    min,
     xo,
     completions_bash,
     completions_zsh,
@@ -175,7 +177,9 @@ pub const SimilarRequest = struct {
     json: bool,
     max_results: usize,
     output_format: OutputFormat = .text,
-    candidate_budget: usize = 512,
+    candidate_budget: usize = 12,
+    min_similarity: ?f64 = null,
+    max_similarity: ?f64 = null,
     cursor: ?[]const u8 = null,
     cursor_ordinal: usize = 0,
     cursor_corpus_signature: ?u64 = null,
@@ -192,6 +196,17 @@ pub const SimilarRequest = struct {
 };
 
 pub const XoFormat = enum { grouped, json };
+
+pub const MinLevel = enum { low, med, high };
+pub const MinFormat = enum { text, json };
+
+pub const MinRequest = struct {
+    path: []const u8,
+    level: MinLevel = .med,
+    max_bytes: ?usize = null,
+    format: MinFormat = .text,
+    dry_run: bool = false,
+};
 
 pub const XoRequest = struct {
     query: []const u8,
@@ -211,6 +226,7 @@ pub const Command = union(CommandTag) {
     explain: ExplainRequest,
     process: ProcessRequest,
     similar: SimilarRequest,
+    min: MinRequest,
     xo: XoRequest,
     why: WhyRequest,
     watch: SearchRequest,
@@ -364,6 +380,10 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .similar } };
         return .{ .command = .{ .similar = try parseSimilar(argv[2..]) } };
     }
+    if (std.mem.eql(u8, first, "min")) {
+        if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .min } };
+        return .{ .command = .{ .min = try parseMin(argv[2..]) } };
+    }
     if (std.mem.eql(u8, first, "xo")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .xo } };
         return .{ .command = .{ .xo = try parseXo(argv[2..]) } };
@@ -422,6 +442,7 @@ fn helpTopic(arg: []const u8) ?HelpTopic {
     if (std.mem.eql(u8, arg, "explain")) return .explain;
     if (std.mem.eql(u8, arg, "process")) return .process;
     if (std.mem.eql(u8, arg, "similar")) return .similar;
+    if (std.mem.eql(u8, arg, "min")) return .min;
     if (std.mem.eql(u8, arg, "xo")) return .xo;
     return null;
 }
@@ -490,6 +511,18 @@ fn parseSimilar(args: []const []const u8) ParseError!SimilarRequest {
             if (index >= args.len) return ParseError.MissingValue;
             request.candidate_budget = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
             if (request.candidate_budget == 0) return ParseError.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--min-similarity")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.min_similarity = parseSimilarity(args[index]) catch return ParseError.MissingValue;
+        } else if (std.mem.startsWith(u8, arg, "--min-similarity=")) {
+            request.min_similarity = parseSimilarity(arg["--min-similarity=".len..]) catch return ParseError.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--max-similarity")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.max_similarity = parseSimilarity(args[index]) catch return ParseError.MissingValue;
+        } else if (std.mem.startsWith(u8, arg, "--max-similarity=")) {
+            request.max_similarity = parseSimilarity(arg["--max-similarity=".len..]) catch return ParseError.MissingValue;
         } else if (std.mem.eql(u8, arg, "--cursor")) {
             index += 1;
             if (index >= args.len or args[index].len == 0) return ParseError.MissingValue;
@@ -510,9 +543,17 @@ fn parseSimilar(args: []const []const u8) ParseError!SimilarRequest {
     }
     if (request.query == null) return ParseError.MissingValue;
     if (request.path_count == 0) return ParseError.MissingValue;
+    if (request.min_similarity != null and request.max_similarity != null and request.min_similarity.? > request.max_similarity.?) return ParseError.MissingValue;
     if (request.cursor != null and request.output_format == .text) request.output_format = .agent_v3;
     if (request.cursor != null and request.output_format != .agent_v3 and request.output_format != .json_compact) return ParseError.ConflictingOutputFormat;
     return request;
+}
+
+/// Parses one closed cosine-domain bound without accepting NaN or infinities.
+fn parseSimilarity(raw: []const u8) !f64 {
+    const value = try std.fmt.parseFloat(f64, raw);
+    if (!std.math.isFinite(value) or value < 0 or value > 1) return error.InvalidSimilarity;
+    return value;
 }
 
 /// Parses the bounded insight lane independently from exact search and inspect grammars.
@@ -556,6 +597,48 @@ fn parseXo(args: []const []const u8) ParseError!XoRequest {
     }
     if (request.query.len == 0 or request.path_count == 0) return ParseError.MissingValue;
     return request;
+}
+
+/// Parses one-file compaction independently from exact inspection and query-guided context.
+fn parseMin(args: []const []const u8) ParseError!MinRequest {
+    var request = MinRequest{ .path = "" };
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--level")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.level = parseMinLevel(args[index]) orelse return ParseError.MissingValue;
+        } else if (std.mem.startsWith(u8, arg, "--level=")) {
+            request.level = parseMinLevel(arg["--level=".len..]) orelse return ParseError.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--max-bytes")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.max_bytes = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.MissingValue;
+            if (request.max_bytes.? == 0) return ParseError.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            request.format = .json;
+        } else if (std.mem.eql(u8, arg, "--dry-run")) {
+            request.dry_run = true;
+        } else if (parseMinLevel(arg)) |level| {
+            request.level = level;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return ParseError.UnsupportedFlag;
+        } else if (request.path.len == 0) {
+            request.path = normalizePathArgument(arg);
+        } else {
+            return ParseError.MissingValue;
+        }
+    }
+    if (request.path.len == 0) return ParseError.MissingValue;
+    return request;
+}
+
+fn parseMinLevel(raw: []const u8) ?MinLevel {
+    if (std.ascii.eqlIgnoreCase(raw, "low")) return .low;
+    if (std.ascii.eqlIgnoreCase(raw, "med") or std.ascii.eqlIgnoreCase(raw, "medium")) return .med;
+    if (std.ascii.eqlIgnoreCase(raw, "high")) return .high;
+    return null;
 }
 
 fn parseWhy(args: []const []const u8) ParseError!WhyRequest {
@@ -1430,15 +1513,20 @@ test "search rejects ambiguous format and bounded legacy combinations" {
 
 test "similar parses bounded versioned frontier controls" {
     const argv = [_][]const u8{
-        "ix-zig", "similar", "cache ownership", "src", "--format", "agent-v3", "--candidate-budget", "64", "--max-results", "9",
+        "ix-zig", "similar", "cache ownership", "src", "--format", "agent-v3", "--candidate-budget", "64", "--max-results", "9", "--min-similarity", "0.8777", "--max-similarity=0.9400",
     };
     const request = (try parseInvocation(std.testing.allocator, &argv)).command.similar;
     try std.testing.expectEqual(OutputFormat.agent_v3, request.output_format);
     try std.testing.expectEqual(@as(usize, 64), request.candidate_budget);
     try std.testing.expectEqual(@as(usize, 9), request.max_results);
+    try std.testing.expectEqual(@as(f64, 0.8777), request.min_similarity.?);
+    try std.testing.expectEqual(@as(f64, 0.94), request.max_similarity.?);
 
     const conflicting = [_][]const u8{ "ix-zig", "similar", "cache", "src", "--agent", "--json" };
     try std.testing.expectError(ParseError.ConflictingOutputFormat, parseInvocation(std.testing.allocator, &conflicting));
+
+    const inverted_band = [_][]const u8{ "ix-zig", "similar", "cache", "src", "--min-similarity", "0.95", "--max-similarity", "0.90" };
+    try std.testing.expectError(ParseError.MissingValue, parseInvocation(std.testing.allocator, &inverted_band));
 }
 
 test "xo parses bounded grouped insight request" {
@@ -1450,4 +1538,18 @@ test "xo parses bounded grouped insight request" {
     try std.testing.expectEqual(@as(usize, 4096), request.max_bytes);
     try std.testing.expectEqual(@as(usize, 7), request.max_spans);
     try std.testing.expectEqual(XoFormat.json, request.format);
+}
+
+test "min accepts canonical and shorthand level forms" {
+    const canonical = [_][]const u8{ "ix-zig", "min", "README.md", "--level", "high", "--max-bytes", "4096", "--json" };
+    const first = (try parseInvocation(std.testing.allocator, &canonical)).command.min;
+    try std.testing.expectEqualStrings("README.md", first.path);
+    try std.testing.expectEqual(MinLevel.high, first.level);
+    try std.testing.expectEqual(@as(?usize, 4096), first.max_bytes);
+    try std.testing.expectEqual(MinFormat.json, first.format);
+
+    const shorthand = [_][]const u8{ "ix-zig", "min", "med", "src/core/search.zig", "--dry-run" };
+    const second = (try parseInvocation(std.testing.allocator, &shorthand)).command.min;
+    try std.testing.expectEqual(MinLevel.med, second.level);
+    try std.testing.expect(second.dry_run);
 }

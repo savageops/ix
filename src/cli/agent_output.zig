@@ -118,9 +118,7 @@ fn write(
             boolText(hit.preview_elided_right),
         });
         if (hit.scope.len > 0) {
-            try writer.print(",\"fn\":\"", .{});
-            try writeJsonString(writer, hit.scope);
-            try writer.print("\",\"fnl\":{}", .{hit.scope_line});
+            try writeScope(writer, hit.scope, hit.scope_line);
         }
         try writer.writeByte('}');
     }
@@ -165,7 +163,26 @@ fn writeJsonString(writer: anytype, value: []const u8) !void {
     try legacy_output.writeJsonString(writer, value);
 }
 
+/// Emits scope metadata through the JSON-string owner so quoted symbols remain parseable.
+fn writeScope(writer: anytype, scope: []const u8, scope_line: usize) !void {
+    try writer.writeAll(",\"fn\":");
+    try writeJsonString(writer, scope);
+    try writer.print(",\"fnl\":{}", .{scope_line});
+}
+
 /// Serializes booleans without format-policy duplication.
 fn boolText(value: bool) []const u8 {
     return if (value) "true" else "false";
+}
+
+test "scope metadata escapes quoted symbol names once" {
+    var bytes: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer bytes.deinit();
+    try bytes.writer.writeByte('{');
+    try bytes.writer.writeAll("\"hit\":true");
+    try writeScope(&bytes.writer, "\"RouteInfo\"", 64);
+    try bytes.writer.writeByte('}');
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, bytes.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("\"RouteInfo\"", parsed.value.object.get("fn").?.string);
 }

@@ -644,9 +644,16 @@ fn nexusDisabled(init: std.process.Init) bool {
     return !sidecarEnvValueEnabled(value.*);
 }
 
+/// Enables warm indexing from persistent config while preserving an explicit environment override.
 fn indexdEnabled(init: std.process.Init) bool {
-    const value = init.environ_map.getPtr("IX_INDEX") orelse return false;
-    return sidecarEnvValueEnabled(value.*);
+    const value = if (init.environ_map.getPtr("IX_INDEX")) |entry| entry.* else null;
+    return indexdEnabledFromSources(value, resource_profile.warmEnabled());
+}
+
+/// Resolves warm-index activation with environment policy overriding persistent config.
+fn indexdEnabledFromSources(environment_value: ?[]const u8, configured: bool) bool {
+    const value = environment_value orelse return configured;
+    return sidecarEnvValueEnabled(value);
 }
 
 fn sidecarEnvValueEnabled(value: []const u8) bool {
@@ -697,13 +704,10 @@ fn shouldLaunchIndexdSidecar(enabled: bool, request: cli.SearchRequest, report: 
     if (request.case_insensitive) return false;
     if (request.hidden) return false;
     if (request.path_count != 1) return false;
-    // Don't launch sidecar if the warm index was already used OR if the index
-    // exists but wasn't used (stale signature, etc). The index.live marker
-    // existing means the index is built — launching another sidecar will
-    // race with the existing one, corrupt the marker, and degrade performance.
-    // Only launch on the FIRST run when no index exists at all.
-    if (report.stats.catalog_index.available) return false;
-    if (report.stats.catalog_index.enabled) return false;
+    // Launch only when warm admission proves there is no live owner. Other
+    // fallbacks may still have an owner rebuilding or protecting stale state.
+    if (report.stats.postings_index.available) return false;
+    if (!std.mem.eql(u8, report.stats.postings_index.fallback_reason, "no_live_owner")) return false;
     return report.files_discovered > 0;
 }
 
@@ -843,9 +847,14 @@ test "indexd sidecar launch is default-on single root and workload gated" {
     request.paths[0] = "src";
     var report = testSearchReportForSidecar(0);
     report.files_discovered = 12;
+    report.stats.postings_index.fallback_reason = "no_live_owner";
 
     try std.testing.expect(!shouldLaunchIndexdSidecar(false, request, report));
     try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
+
+    report.stats.postings_index.fallback_reason = "stale_signature";
+    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
+    report.stats.postings_index.fallback_reason = "no_live_owner";
 
     request.path_count = 2;
     try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
@@ -863,6 +872,7 @@ test "indexd sidecar launch allows generated-looking roots after central state s
     var request = testSearchRequestForSidecar(false);
     var report = testSearchReportForSidecar(0);
     report.files_discovered = 12;
+    report.stats.postings_index.fallback_reason = "no_live_owner";
 
     request.paths[0] = "src";
     try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
@@ -887,6 +897,14 @@ test "background sidecar environment gate is explicit opt in" {
     try std.testing.expect(!sidecarEnvValueEnabled("off"));
     try std.testing.expect(!sidecarEnvValueEnabled(""));
     try std.testing.expect(!sidecarEnvValueEnabled("yes"));
+}
+
+test "warm config activates indexd unless the environment disables it" {
+    try std.testing.expect(indexdEnabledFromSources(null, true));
+    try std.testing.expect(!indexdEnabledFromSources(null, false));
+    try std.testing.expect(indexdEnabledFromSources("1", false));
+    try std.testing.expect(!indexdEnabledFromSources("0", true));
+    try std.testing.expect(!indexdEnabledFromSources("invalid", true));
 }
 
 test "windows command argument quoting preserves spaces quotes and trailing slashes" {

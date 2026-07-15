@@ -36,7 +36,6 @@ const builtin = @import("builtin");
 /// For longer patterns the Forge would emit PCMPEQB + PMOVMSKB loops,
 /// but single-byte demonstrates the full pipeline: page allocation,
 /// W^X transition, opcode emission, and native execution.
-
 const PAGE_SIZE: usize = 4096;
 
 /// Error set for JIT Forge operations.
@@ -647,6 +646,6 @@ test "jit forge multi-byte longer pattern" {
     var forged = try forgeLiteralSearch("EXPORT_SYMBOL");
     defer forged.deinit();
 
-    try std.testing.expect(forged.execute("void EXPORT_SYMBOL(void);") != null);
+    try std.testing.expectEqual(@as(isize, 5), forged.execute("void EXPORT_SYMBOL(void);"));
     try std.testing.expectEqual(@as(isize, -1), forged.execute("no match here"));
 }

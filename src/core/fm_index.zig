@@ -23,7 +23,6 @@ const std = @import("std");
 ///   last   = C[P[j]] + Occ(P[j], last)
 /// If last > first after all pattern bytes, the pattern exists.
 /// Total: O(p) time independent of text length — sub-linear in corpus size.
-
 const ALPHABET_SIZE: usize = 256;
 const SENTINEL: u8 = 0; // We use byte 0 as the unique sentinel.
 
@@ -88,33 +87,25 @@ pub const WaveletTree = struct {
         break :blk lut;
     };
 
-    /// Count 1-bits in positions [lo, hi) of a bit-vector stored as u64 array.
+    /// Counts set bits in [lo, hi) without reading the word after an exact
+    /// 64-bit boundary. Keeping the primitive prefix-shaped makes the bit
+    /// orientation explicit and prevents partial-word masks from drifting.
     fn popcountRange(bits: []const u64, lo: usize, hi: usize) usize {
         if (lo >= hi) return 0;
+        return popcountPrefix(bits, hi) - popcountPrefix(bits, lo);
+    }
+
+    /// Counts set bits in [0, end), where bit i occupies the i%64 LSB-first
+    /// position used by buildWaveletTree.
+    fn popcountPrefix(bits: []const u64, end: usize) usize {
         var count: usize = 0;
-        // Bit i is in word i/64 at position i%64.
-        const start_word = lo / 64;
-        const end_word = hi / 64;
-        if (start_word == end_word) {
-            // Single word partial.
-            const mask = (~@as(u64, 0) >> @intCast(lo % 64)) & (~@as(u64, 0) << @intCast(@as(u8, @intCast(64 - (hi - start_word * 64))) & 63));
-            count += @popCount(bits[start_word] & mask);
-        } else {
-            // Start partial.
-            if (lo % 64 != 0) {
-                count += @popCount(bits[start_word] >> @intCast(lo % 64));
-            } else {
-                count += @popCount(bits[start_word]);
-            }
-            // Full words.
-            for (start_word + 1..end_word) |w| count += @popCount(bits[w]);
-            // End partial.
-            if (hi % 64 != 0) {
-                const shift: u6 = @intCast(64 - (hi % 64));
-                count += @popCount(bits[end_word] << shift >> shift);
-            } else {
-                count += @popCount(bits[end_word]);
-            }
+        const full_words = end / 64;
+        for (bits[0..full_words]) |word| count += @popCount(word);
+
+        const remainder = end % 64;
+        if (remainder != 0) {
+            const mask = (@as(u64, 1) << @intCast(remainder)) - 1;
+            count += @popCount(bits[full_words] & mask);
         }
         return count;
     }
@@ -425,4 +416,15 @@ test "fm-index backward search handles overlapping patterns" {
     try std.testing.expectEqual(@as(usize, 3), fmi.count("aba"));
     try std.testing.expectEqual(@as(usize, 4), fmi.count("ab"));
     try std.testing.expect(fmi.contains("babab"));
+}
+
+test "fm-index rank remains exact across 64-bit word boundaries" {
+    const prefix = "0123456789abcdef" ** 5;
+    const text = prefix ++ " PM_RESUME " ++ prefix;
+    var fmi = try buildFMIndex(std.testing.allocator, text);
+    defer fmi.deinit();
+
+    try std.testing.expect(fmi.contains("PM_RESUME"));
+    try std.testing.expectEqual(@as(usize, 10), fmi.count("0123456789abcdef"));
+    try std.testing.expect(!fmi.contains("PM_SUSPEND"));
 }

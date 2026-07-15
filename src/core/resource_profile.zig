@@ -105,14 +105,15 @@ const FALLBACK_FRAMEWORK_MEMORY_BYTES: usize = 512 * MIB;
 const Config = struct {
     memory_percent: usize = DEFAULT_MEMORY_PERCENT,
     thread_percent: usize = DEFAULT_THREAD_PERCENT,
+    warm: bool = false,
 };
 
 var cached_config: ?Config = null;
 
-/// Loads the effective config from, in priority order:
+/// Loads the effective framework config from, in priority order:
 ///   1. IX_MEMORY_PERCENT / IX_THREAD_PERCENT env vars
 ///   2. ~/.ix/config.json (persistent, no recompile needed)
-///   3. Built-in defaults (5% / 5%)
+///   3. Built-in defaults (5% / 5%, warm indexing disabled)
 fn loadConfig() Config {
     if (cached_config) |c| return c;
 
@@ -182,6 +183,7 @@ fn loadConfigJson(cfg: *Config) bool {
     if (parseJsonField(contents, "thread_percent")) |val| {
         if (val > 0 and val <= 100) cfg.thread_percent = val;
     }
+    if (parseJsonBool(contents, "warm")) |val| cfg.warm = val;
     return true;
 }
 
@@ -216,7 +218,8 @@ fn createDefaultConfigJson() void {
     const defaults =
         \\{
         \\  "memory_percent": 5,
-        \\  "thread_percent": 5
+        \\  "thread_percent": 5,
+        \\  "warm": false
         \\}
         \\
     ;
@@ -248,6 +251,33 @@ fn parseJsonField(json: []const u8, key: []const u8) ?usize {
     return null;
 }
 
+/// Reads one exact JSON boolean without treating quoted text or numeric values as policy.
+fn parseJsonBool(json: []const u8, key: []const u8) ?bool {
+    var i: usize = 0;
+    while (i + key.len + 3 < json.len) : (i += 1) {
+        if (json[i] != '"') continue;
+        if (!std.mem.startsWith(u8, json[i + 1 ..], key)) continue;
+        if (json[i + 1 + key.len] != '"') continue;
+        var j = i + 2 + key.len;
+        while (j < json.len and json[j] != ':') j += 1;
+        if (j >= json.len) return null;
+        j += 1;
+        while (j < json.len and std.ascii.isWhitespace(json[j])) j += 1;
+        if (jsonBoolToken(json[j..], "true")) return true;
+        if (jsonBoolToken(json[j..], "false")) return false;
+        return null;
+    }
+    return null;
+}
+
+/// Accepts a boolean token only when its next byte is a legal JSON value boundary.
+fn jsonBoolToken(source: []const u8, token: []const u8) bool {
+    if (!std.mem.startsWith(u8, source, token)) return false;
+    if (source.len == token.len) return true;
+    const next = source[token.len];
+    return std.ascii.isWhitespace(next) or next == ',' or next == '}';
+}
+
 fn envUsize(comptime name: []const u8) ?usize {
     const value_ptr = std.c.getenv(name ++ "\x00") orelse return null;
     const value = std.mem.span(value_ptr);
@@ -265,9 +295,18 @@ pub fn threadPercent() usize {
     return loadConfig().thread_percent;
 }
 
+/// Returns whether persistent warm indexing is enabled by the canonical state config.
+pub fn warmEnabled() bool {
+    return loadConfig().warm;
+}
+
 /// Computes the thread ceiling from the effective thread percent.
 pub fn threadLimit(available: usize) usize {
-    const pct = loadConfig().thread_percent;
+    return threadLimitForPercent(available, loadConfig().thread_percent);
+}
+
+/// Computes a deterministic worker ceiling for tests and configured runtime use.
+fn threadLimitForPercent(available: usize, pct: usize) usize {
     const total = @max(available, 1);
     const quotient = total / 100;
     const remainder = total % 100;
@@ -589,11 +628,19 @@ test "thread and memory percents are independent" {
     try std.testing.expectEqual(@as(usize, 5), DEFAULT_THREAD_PERCENT);
 }
 
+test "warm config accepts only JSON booleans" {
+    try std.testing.expectEqual(true, parseJsonBool("{\"warm\": true}", "warm").?);
+    try std.testing.expectEqual(false, parseJsonBool("{\"warm\":false}", "warm").?);
+    try std.testing.expect(parseJsonBool("{\"warm\": \"true\"}", "warm") == null);
+    try std.testing.expect(parseJsonBool("{\"warm\": truefalse}", "warm") == null);
+    try std.testing.expect(parseJsonBool("{\"not_warm\": true}", "warm") == null);
+}
+
 test "thread ceiling scales by thread percent" {
     // 5% of 32 = 2
-    try std.testing.expectEqual(@as(usize, 2), threadLimit(32));
-    try std.testing.expectEqual(@as(usize, 4), threadLimit(64));
-    try std.testing.expectEqual(@as(usize, 1), threadLimit(8));
+    try std.testing.expectEqual(@as(usize, 2), threadLimitForPercent(32, 5));
+    try std.testing.expectEqual(@as(usize, 4), threadLimitForPercent(64, 5));
+    try std.testing.expectEqual(@as(usize, 1), threadLimitForPercent(8, 5));
 }
 
 test "memory ceiling is independent from threads" {

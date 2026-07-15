@@ -74,7 +74,7 @@ pub fn requestFingerprint(request: cli.SearchRequest) u64 {
 }
 
 /// Fingerprints semantic membership and frontier ordering independently from presentation.
-pub fn similarRequestFingerprint(request: cli.SimilarRequest) u64 {
+pub fn similarRequestFingerprint(request: cli.SimilarRequest, min_similarity: f64, max_similarity: f64) u64 {
     var hasher = std.hash.Wyhash.init(0x4958_5349_4d49_4c41);
     hashField(&hasher, "schema", "ix.similar.cursor.v2");
     hashField(&hasher, "query", request.query orelse "");
@@ -82,6 +82,8 @@ pub fn similarRequestFingerprint(request: cli.SimilarRequest) u64 {
     for (request.paths[0..request.path_count]) |path| hashField(&hasher, "path", path);
     hashUsize(&hasher, "candidate_budget", request.candidate_budget);
     hashBool(&hasher, "anti", request.anti);
+    hashF64(&hasher, "min_similarity", min_similarity);
+    hashF64(&hasher, "max_similarity", max_similarity);
     return hasher.final();
 }
 
@@ -113,6 +115,17 @@ fn hashUsize(hasher: *std.hash.Wyhash, tag: []const u8, value: usize) void {
     hasher.update(tag);
     hashRawUsize(hasher, @sizeOf(u64));
     hashRawUsize(hasher, value);
+}
+
+/// Encodes one finite IEEE-754 value so calibrated cursor pages cannot cross bands.
+fn hashF64(hasher: *std.hash.Wyhash, tag: []const u8, value: f64) void {
+    hashRawUsize(hasher, tag.len);
+    hasher.update(tag);
+    hashRawUsize(hasher, @sizeOf(u64));
+    const bits: u64 = @bitCast(value);
+    var bytes: [8]u8 = undefined;
+    for (&bytes, 0..) |*byte, index| byte.* = @truncate(bits >> @intCast(index * 8));
+    hasher.update(&bytes);
 }
 
 /// Writes an unframed fixed-width integer for the framing helpers above.
@@ -171,5 +184,6 @@ test "request fingerprints frame variable fields and semantic ordering" {
     const anti_argv = [_][]const u8{ "ix-zig", "similar", "cache", "src", "--format", "agent-v3", "--anti" };
     const normal = (try cli.parseInvocation(std.testing.allocator, &normal_argv)).command.similar;
     const anti = (try cli.parseInvocation(std.testing.allocator, &anti_argv)).command.similar;
-    try std.testing.expect(similarRequestFingerprint(normal) != similarRequestFingerprint(anti));
+    try std.testing.expect(similarRequestFingerprint(normal, 0.2, 1.0) != similarRequestFingerprint(anti, 0.2, 1.0));
+    try std.testing.expect(similarRequestFingerprint(normal, 0.2, 1.0) != similarRequestFingerprint(normal, 0.2001, 1.0));
 }

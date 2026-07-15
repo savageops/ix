@@ -126,3 +126,29 @@ Each competitor is reduced to a measurable anatomy before its techniques are har
 | BM25 context | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
 
 IX is the union of every competitor's strongest independently-verified element, composed into one binary. No single competitor holds all of these.
+
+---
+
+## Reference Collection Admission: 2026-07-15
+
+The following pinned sources were admitted to `.refs/index.md`. This is the
+transfer boundary: source code is available locally for inspection, while no
+claim below means that IX has adopted the mechanism without a matching local
+proof.
+
+| Source | Algorithm / primitive | Index shape | Traversal / execution | Ignore or admission behavior | Observed transfer boundary |
+|---|---|---|---|---|---|
+| ugrep | SIMD grep and regex pipelines | none | recursive streaming search | glob and ignore filtering | broad feature surface; benchmark on Windows before borrowing heuristics |
+| Vectorscan | Hyperscan-compatible SIMD automata | none | compiled multi-pattern execution | caller-owned filtering | portable SIMD reference; retains library integration cost |
+| aho-corasick | failure-linked multi-pattern automaton | transition graph | single pass over input | caller-owned admission | strong alternate-literal baseline; compare against IX strategy classification |
+| simdjson | structural-character indexing and staged SIMD parse | structural indexes | stage 1 index then stage 2 parse | parser-specific validation | boundary detection pattern; JSON-specific state is non-transferable |
+| simdutf | vectorized UTF validation/transcoding | none | chunked SIMD with scalar tails | input validation | fallback structure and alignment discipline transfer |
+| Tantivy | inverted index, postings, BM25 | segments and postings | indexed query traversal | tokenizer/analyzer policy | postings and segment lifecycle transfer; Rust ownership does not |
+| Lucene | mature inverted index and segment merge | segments, terms, postings | query planner over segment readers | analyzer and field policy | durable format ideas transfer; JVM/codec baggage does not |
+| Quickwit | distributed Tantivy-backed indexing | shards and segments | service/shard traversal | schema and ingestion policy | operational ownership boundary transfer; service topology does not |
+| SQLite | B-tree storage and journaling | pages and B-trees | cursor/page traversal | SQL planner semantics | recovery and page ownership transfer; SQL surface does not |
+| TigerBeetle | static allocation and invariant-driven systems code | bounded arrays/LSM structures | deterministic shard/replica flow | caller-owned filtering | allocator and failure-test patterns transfer directly to Zig |
+| zig-regex | PikeVM/automaton regex execution | compiled program | VM instruction traversal | regex syntax policy | Zig implementation reference; feature/performance parity remains unproven |
+| zimdjson | Zig SIMD JSON parser | structural indexes | staged vector scan | JSON grammar admission | Zig SIMD organization transfers; parser-specific states do not |
+| USearch | compact vector index and SIMD distance kernels | graph/quantized vector structures | approximate nearest-neighbor traversal | vector metric and filter policy | packed storage ideas transfer only to semantic-index work |
+| gitoxide | Git object and pack traversal | object database and pack indexes | object graph / pack lookup | repository ignore rules are separate | repository traversal and object ownership transfer |

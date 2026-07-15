@@ -184,11 +184,11 @@ IX can build a persistent trigram index for a corpus and use it to prune files b
 # Build the index (one-time per corpus, ~3-5 min for large trees)
 IX_INDEXD_MEMORY_LIMIT_MB=16384 ix.exe __ix_indexd "/path/to/corpus" --foreground --once
 
-# Search with the index enabled
+# Search with the index enabled for this process
 IX_INDEX=1 ix.exe "lit:search_term" "/path/to/corpus" --json
 ```
 
-Set `IX_INDEX=1` (or `true`/`on`) to enable foreground warm-index admission. The index lives at `~/.ix/index/` and persists across invocations. `~/.ix/` is the single owner for mutable IX state, including future `config.json` and `auth.json` contracts; the replaceable executable never owns user state. Rebuild after large corpus changes.
+Set `"warm": true` in `~/.ix/config.json` to keep warm indexing enabled. `IX_INDEX=1` (or `true`/`on`) enables it for one process; `IX_INDEX=0` explicitly overrides persistent config. The index lives at `~/.ix/index/` and persists across invocations. The replaceable executable never owns user state.
 
 Warm postings are not a flat list. Validated segments carry block metadata and a max-postings proof; blocks that cannot contain a surviving FileId are discarded before decompression. Generation pins, tombstones, and reader protection keep the negative proof safe while compaction moves around active readers.
 
@@ -232,7 +232,8 @@ IX_MEMORY_PERCENT=15 IX_THREAD_PERCENT=50 ix search 'lit:fn' src
 # ~/.ix/config.json
 {
   "memory_percent": 15,
-  "thread_percent": 25
+  "thread_percent": 25,
+  "warm": true
 }
 
 # Legacy: sets both at once
@@ -384,7 +385,7 @@ Fisheye applies to lossy search previews in v1, v2, and v3. It does not contract
 | Nexus evidence frontier | Public `search` / `matches` launch a hidden `__ix_nexus` sidecar after the foreground report is computed. The sidecar is stats-only, stdout/stderr-silent, no-window on Windows, and writes `.ix-evidence-{key}.cache` only from the background path. Foreground searches never synchronously build the artifact; they consume a validated expression/root/path-set frontier if it already exists and skip redundant sidecar rebuilds after a successful evidence-pruned reuse. |
 | Warm FileCatalog | Corpus-global warm substrate. It assigns one root fingerprint and deterministic file IDs to path metadata, serializes the catalog as `IXCAT001`, publishes by generation, and rejects wrong-root, malformed, truncated, or unsorted state before search can observe it. The catalog is now a foreground-adoption dependency: warm searches map retained FileIds back through this snapshot, while the canonical verifier still owns match correctness. |
 | Warm trigram postings | Cross-query warm-index primitive. `core/postings.zig` builds a root/generation-pinned trigram-to-FileId segment (`IXPOST01`), validates magic/version/root/generation/counts/sortedness/density, lowers expression mandatory evidence into lookup keys, intersects/unions candidate FileIds, and hands selected catalog entries back to the verifier. Unsafe lowering returns `RequiresFullScan`; malformed or wrong-root state is rejected before it can prune candidates. |
-| Warm indexd lifecycle | Hidden `__ix_indexd` is the maintenance-process boundary for the warm layer. Public `search` / `matches` detach it only when `IX_INDEX=1`, `IX_INDEX=true`, or `IX_INDEX=on`, and only for compatible single-root workloads. Detached stdio is ignored, heartbeat state is process-owned, a root lock prevents overlapping mutation owners, and watch mode writes `index.live` only while the generation owner remains alive. |
+| Warm indexd lifecycle | Hidden `__ix_indexd` is the maintenance-process boundary for the warm layer. Public `search` / `matches` detach it when `warm` config or the `IX_INDEX` override enables compatible single-root workloads. Detached stdio is ignored, heartbeat state is process-owned, a root lock prevents overlapping mutation owners, and watch mode continuously republishes `index.live` after corpus mutations. |
 | Warm generation refresh | `core/generation.zig` owns search-visible warm-index publication. Catalog/postings payloads publish into `.ix/index/generations/<epoch>/`, then atomically refresh `.ix/index/current.ixgen`; foreground readers pin a complete epoch and malformed, wrong-root, incomplete, or missing current manifests fail closed. `refresh_status` reports `live_pinned`, `live_query_cache`, or `fallback` in JSON telemetry. |
 | Warm query frontier | Repeated identical warm searches store an epoch-pinned `.ix/index/query/<hash>.ixq` candidate frontier. The first live-index hit pays postings parse/evaluation; the next identical query loads the retained file list directly, reports `generation_refresh.refresh_status="live_query_cache"`, sets `discover_ms=0`, and verifies only cached candidates. |
 | Warm compaction ops | Compaction and operations hardening are implemented under generation ownership. The planner selects small, dense, and tombstoned segments without touching reader-pinned state; compacted generations publish canonical catalog/postings payloads; catalog tombstone folding removes stale file IDs and paths while preserving sorted metadata alignment; generation GC only selects obsolete epochs after current, newest-retained, and reader-pinned epochs are protected. Hidden `__ix_indexd --repair` writes an explicit reconcile marker under `.ix/index/repair.state`, and diagnostics render manifest/generation/journal/lock state. |

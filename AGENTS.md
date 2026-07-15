@@ -81,7 +81,16 @@ argv → parse → classify → discover → shard → scan → merge → output
 | StringZilla v4.6.0 | `.refs/stringzilla/include/` | Header-only → C shim → `-mavx2 -O3` |
 | PCRE2 10.44 | `.refs/pcre2/src/` | 27 translation units, `SUPPORT_JIT=1`, sljit backend |
 
-Zero external packages. Zero network fetches. Everything compiles from source via `zig build`.
+`.refs/index.md` is the only tracked ref payload. Build-critical payloads are
+restored by the explicit `scripts/bootstrap-refs.ps1` command; research-only
+repos live under `.refs/codebases/` and never enter `build.zig`. `zig build` is
+network-free and must fail clearly when a required ref is absent. Every entry is
+pinned to an upstream commit, archive SHA-256, license, and local path in the
+manifest.
+
+The build-critical set also includes tree-sitter and the Zig grammar under
+`.refs/tree-sitter/` and `.refs/tree-sitter-zig/`; both are pinned in
+`.refs/index.md` and restored by the same explicit bootstrap.
 
 ## Optimization Invariants
 

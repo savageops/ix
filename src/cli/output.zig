@@ -61,15 +61,20 @@ fn writeTopHelp(writer: anytype) !void {
         \\  --context N    Add exact coalesced source context to v3 search output
         \\
         \\Similar:
-        \\  --anti         Rank least similar first (parity drift)
+        \\  --anti         Return below-floor files, most drifted first
         \\  --max-results N     Limit returned rankings (default: 20)
-        \\  --candidate-budget N Bound provider candidates per page (default: 512)
+        \\  --candidate-budget N Bound provider candidates per page (default: 12)
+        \\  --min-similarity N  Cosine floor (text: 0.50, file: 0.88)
+        \\  --max-similarity N  Cosine ceiling (default: 1.00)
         \\
         \\Config (similar):
         \\  IX_AI_API_KEY        Required (DEEPINFRA_TOKEN also accepted)
         \\  IX_AI_BASE_URL       Default: https://api.deepinfra.com/v1/openai
         \\  IX_AI_EMBED_MODEL    Default: Qwen/Qwen3-Embedding-8B
         \\  IX_AI_RERANK_MODEL   Default: cross-encoder/ms-marco-MiniLM-L-12-v2
+        \\  IX_SIMILAR_TEXT_MIN  Override text-query cosine floor
+        \\  IX_SIMILAR_FILE_MIN  Override file-anchor cosine floor
+        \\  IX_SIMILAR_MAX       Override cosine ceiling
         \\
         \\Expression:
         \\  lit:text | re:pattern | prefix:x | suffix:x | A && B | A || B
@@ -79,7 +84,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  ix search 'lit:fn' src --agent
         \\  ix search 're:TODO|FIXME' . --context 3
         \\  ix similar "cancellation pattern" apps/src --agent
-        \\  ix similar "transport closure" apps/src --anti --max-results 10
+        \\  ix similar "transport closure" apps/src --anti --min-similarity 0.8777
         \\  ix inspect src/main.zig --range 40:80 --format records
         \\  ix xo "agentSimulation code with system administration ENV_VAR and a function for worker events" src
         \\  ix explain 'lit:auth && re:token_\d+'
@@ -114,16 +119,18 @@ fn writeSimilarHelp(writer: anytype) !void {
         \\
         \\QUERY is a text concept or an anchor file path.
         \\PATHs are candidate files or directories to discover from.
-        \\Embeddings provide recall; a reranker provides final precision.
+        \\Cosine similarity admits a calibrated interval; a reranker orders only admitted files.
         \\
         \\Options:
-        \\  --anti              Rank least similar first (parity drift)
+        \\  --anti              Return scores below the floor, most drifted first
         \\  --agent             Compact ix.similar.v1 format
         \\  --json              Full structured JSON
         \\  --format agent-v3   Versioned ix.similar.v2 with coverage and cursor
         \\  --format json-compact Raw ix.similar.v2 JSON
         \\  --max-results N     Limit returned rankings (default: 20)
-        \\  --candidate-budget N Bound provider candidates per page (default: 512)
+        \\  --candidate-budget N Bound provider candidates per page (default: 12)
+        \\  --min-similarity N  Inclusive cosine floor (text: 0.50, file: 0.88)
+        \\  --max-similarity N  Inclusive cosine ceiling (default: 1.00)
         \\  --cursor VALUE      Continue the same candidate frontier
         \\
         \\Config:
@@ -131,11 +138,15 @@ fn writeSimilarHelp(writer: anytype) !void {
         \\  IX_AI_BASE_URL      Default: https://api.deepinfra.com/v1/openai
         \\  IX_AI_EMBED_MODEL   Default: Qwen/Qwen3-Embedding-8B
         \\  IX_AI_RERANK_MODEL  Default: cross-encoder/ms-marco-MiniLM-L-12-v2
+        \\  IX_SIMILAR_TEXT_MIN Override text-query cosine floor
+        \\  IX_SIMILAR_FILE_MIN Override file-anchor cosine floor
+        \\  IX_SIMILAR_MAX      Override cosine ceiling
         \\
         \\Examples:
         \\  ix similar "cancellation pattern" apps/src --agent
         \\  ix similar "cancellation pattern" apps/src --format agent-v3 --candidate-budget 128
-        \\  ix similar "transport closure" apps/src --anti --max-results 10
+        \\  ix similar "transport closure" apps/src --anti --min-similarity 0.8777
+        \\  ix similar src/auth.zig src --min-similarity 0.8777 --max-similarity 0.9400
         \\  ix similar src/auth.zig src/session.zig src/transport.zig --json
         \\
     );

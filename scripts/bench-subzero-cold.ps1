@@ -10,12 +10,7 @@ param(
 $ErrorActionPreference = "Stop"
 [System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
 [System.Threading.Thread]::CurrentThread.CurrentUICulture = [System.Globalization.CultureInfo]::InvariantCulture
-
-function Median([double[]]$Values) {
-  if ($Values.Count -eq 0) { return $null }
-  $sorted = @($Values | Sort-Object)
-  return $sorted[[int][math]::Floor($sorted.Count / 2)]
-}
+. (Join-Path $PSScriptRoot 'benchmark-metrics.ps1')
 
 function Get-TextSha256([string]$Text) {
   $bytes = [System.Text.Encoding]::UTF8.GetBytes($Text)
@@ -109,6 +104,7 @@ function Invoke-IxSearch($Bin, $Engine, $Profile, [bool]$DisableNexus, [bool]$Di
     regex_decomposition = $json.stats.regex_decomposition
     linux_dominant_file = $json.stats.linux_dominant_file
     concurrency = $json.stats.concurrency
+    process_memory = $json.stats.process_memory
     slowest_files = $json.stats.slowest_files
     generation_refresh = $json.stats.generation_refresh
   }
@@ -133,12 +129,17 @@ function Summarize($Rows, $ProfileName, $Engine) {
     engine = $Engine
     runs = $set.Count
     comparison_invalid_rows = $invalid.Count
-    median_total_ms = Median $totals
+    median_total_ms = Get-IxMedian $totals
     best_total_ms = (@($totals | Sort-Object))[0]
-    median_wall_ms = Median $walls
-    median_discover_ms = Median $discovers
-    median_scan_ms = Median $scans
-    median_scan_work_ms_total = Median $scanWork
+    median_wall_ms = Get-IxMedian $walls
+    median_discover_ms = Get-IxMedian $discovers
+    median_scan_ms = Get-IxMedian $scans
+    median_scan_work_ms_total = Get-IxMedian $scanWork
+    median_rough_linear_one_thread_ms = Get-IxMedian @($set | ForEach-Object {
+      $threads = if ($null -eq $_.concurrency.outer_scan_threads) { 1 } else { [int]$_.concurrency.outer_scan_threads }
+      (Get-IxResourceNormalization -WallMs ([double]$_.total_ms) -Threads $threads).rough_linear_one_thread_ms
+    })
+    median_peak_resident_mib = Get-IxMedian @($set | Where-Object { $null -ne $_.process_memory.peak_resident_bytes } | ForEach-Object { [double]$_.process_memory.peak_resident_bytes / 1MB })
     totals_ms = $totals
     matches = @($set | ForEach-Object { $_.matches })
     files_last = @($first.discovered, $first.scanned, $first.skipped)
@@ -225,6 +226,12 @@ function Compress-Row($Row) {
       sharding_enabled = $Row.concurrency.sharding_enabled
       sharded_files = $Row.concurrency.sharded_files
     }
+    process_memory = $Row.process_memory
+    resource_normalized = Get-IxResourceNormalization `
+      -WallMs ([double]$Row.total_ms) `
+      -Threads $(if ($null -eq $Row.concurrency.outer_scan_threads) { 1 } else { [int]$Row.concurrency.outer_scan_threads }) `
+      -PeakResidentBytes $(if ($null -eq $Row.process_memory.peak_resident_bytes) { $null } else { [long]$Row.process_memory.peak_resident_bytes }) `
+      -AllocationLimitBytes $(if ($null -eq $Row.process_memory.allocation_limit_bytes) { $null } else { [long]$Row.process_memory.allocation_limit_bytes })
     slowest_files = @($Row.slowest_files)
     generation_refresh = [pscustomobject]@{
       enabled = $Row.generation_refresh.enabled

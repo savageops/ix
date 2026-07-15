@@ -217,7 +217,7 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
                     null, // Backed by system page file
                     null, // Default security
                     0x02, // PAGE_READONLY
-                    0,    // High 32 bits of size (0 for <4GB)
+                    0, // High 32 bits of size (0 for <4GB)
                     @intCast(config.memory_limit_bytes & 0xFFFFFFFF),
                     wide_name.ptr,
                 );
@@ -253,9 +253,20 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
                 };
             }
         } else {
-            const live = try writeLiveMarker(io, allocator, config);
+            var live = try writeLiveMarker(io, allocator, config);
             defer live.remove(io, allocator);
-            holdLiveUntilRootMutation(io, config.root);
+            while (true) {
+                holdLiveUntilRootMutation(io, config.root);
+                settleRootMutationBurst(io);
+                _ = compactCurrentRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes) catch |err| {
+                    try recordPublishFailure(io, allocator, config, err);
+                    return err;
+                };
+                // The marker pins the published epoch. Refresh it only after the
+                // atomic generation swap so readers never admit partial state.
+                live.remove(io, allocator);
+                live = try writeLiveMarker(io, allocator, config);
+            }
         }
     }
     return .{

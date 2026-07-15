@@ -48,3 +48,5 @@ The versioned semantic contract reports eligible/read files, embedded ranges, pr
 ## Warm and cold lanes
 
 Cold discovery and warm-index frontiers must preserve match and route parity. Versioned output may impose deterministic ordering, but it must not disable the warm frontier. Performance claims require same-query, same-corpus measurements for both lanes and a valid predecessor.
+
+Set `"warm": true` in `~/.ix/config.json` for persistent activation. `IX_INDEX=1` or `IX_INDEX=0` overrides config for a process. A warm measurement is valid only when telemetry reports the warm route; a repeated cold process scan is not a warm sample.

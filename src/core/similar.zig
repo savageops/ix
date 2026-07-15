@@ -2,27 +2,164 @@ const std = @import("std");
 const cli = @import("../cli/args.zig");
 const semantic_cursor = @import("../cli/cursor.zig");
 const output_contract = @import("../cli/output_contract.zig");
+const state_dir = @import("state_dir.zig");
+
+const DEFAULT_TEXT_MIN_SIMILARITY: f64 = 0.50;
+const DEFAULT_FILE_MIN_SIMILARITY: f64 = 0.88;
+const DEFAULT_MAX_SIMILARITY: f64 = 1.0;
 
 pub const Config = struct {
+    allocator: std.mem.Allocator,
     base_url: []const u8,
     api_key: ?[]const u8,
     embedding_model: []const u8,
     rerank_model: []const u8,
+    text_min_similarity: f64,
+    file_min_similarity: f64,
+    max_similarity: f64,
 
-    pub fn fromEnv(env: *const std.process.Environ.Map) Config {
-        return .{
-            .base_url = value(env, "IX_AI_BASE_URL") orelse "https://api.deepinfra.com/v1/openai",
-            .api_key = value(env, "IX_AI_API_KEY") orelse value(env, "DEEPINFRA_TOKEN"),
-            .embedding_model = value(env, "IX_AI_EMBED_MODEL") orelse "Qwen/Qwen3-Embedding-8B",
-            .rerank_model = value(env, "IX_AI_RERANK_MODEL") orelse "cross-encoder/ms-marco-MiniLM-L-12-v2",
+    /// Loads semantic-provider settings from the canonical state config, then
+    /// applies process environment overrides so deployment wiring stays explicit.
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, env: *const std.process.Environ.Map) !Config {
+        const root = try state_dir.resolveStateDir(allocator);
+        defer allocator.free(root);
+        const path = try std.fs.path.join(allocator, &.{ root, "config.json" });
+        defer allocator.free(path);
+        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return fromSources(allocator, env, null),
+            else => return err,
         };
+        defer allocator.free(bytes);
+        return fromSources(allocator, env, bytes);
+    }
+
+    pub fn fromSources(allocator: std.mem.Allocator, env: *const std.process.Environ.Map, config_json: ?[]const u8) !Config {
+        var base_url: []const u8 = "https://api.deepinfra.com/v1/openai";
+        var api_key: ?[]const u8 = null;
+        var embedding_model: []const u8 = "Qwen/Qwen3-Embedding-8B";
+        var rerank_model: []const u8 = "cross-encoder/ms-marco-MiniLM-L-12-v2";
+        var text_min_similarity = DEFAULT_TEXT_MIN_SIMILARITY;
+        var file_min_similarity = DEFAULT_FILE_MIN_SIMILARITY;
+        var max_similarity = DEFAULT_MAX_SIMILARITY;
+
+        var parsed: ?std.json.Parsed(std.json.Value) = null;
+        defer if (parsed) |*document| document.deinit();
+        if (config_json) |bytes| {
+            parsed = try std.json.parseFromSlice(std.json.Value, allocator, bytes, .{});
+            if (objectValue(parsed.?.value, "similar")) |similar| {
+                base_url = resolvedString(similar, "base_url", env) orelse base_url;
+                api_key = resolvedString(similar, "api_key", env);
+                embedding_model = resolvedString(similar, "embedding_model", env) orelse embedding_model;
+                rerank_model = resolvedString(similar, "rerank_model", env) orelse rerank_model;
+                text_min_similarity = numberValue(similar, "text_min_similarity") orelse text_min_similarity;
+                file_min_similarity = numberValue(similar, "file_min_similarity") orelse file_min_similarity;
+                max_similarity = numberValue(similar, "max_similarity") orelse max_similarity;
+            }
+        }
+
+        base_url = value(env, "IX_AI_BASE_URL") orelse base_url;
+        api_key = value(env, "IX_AI_API_KEY") orelse value(env, "DEEPINFRA_TOKEN") orelse api_key;
+        embedding_model = value(env, "IX_AI_EMBED_MODEL") orelse embedding_model;
+        rerank_model = value(env, "IX_AI_RERANK_MODEL") orelse rerank_model;
+        text_min_similarity = try environmentNumber(env, "IX_SIMILAR_TEXT_MIN") orelse text_min_similarity;
+        file_min_similarity = try environmentNumber(env, "IX_SIMILAR_FILE_MIN") orelse file_min_similarity;
+        max_similarity = try environmentNumber(env, "IX_SIMILAR_MAX") orelse max_similarity;
+        try validateSimilarityBand(text_min_similarity, max_similarity);
+        try validateSimilarityBand(file_min_similarity, max_similarity);
+
+        const owned_base_url = try allocator.dupe(u8, base_url);
+        errdefer allocator.free(owned_base_url);
+        const owned_api_key = if (api_key) |key| try allocator.dupe(u8, key) else null;
+        errdefer if (owned_api_key) |key| allocator.free(key);
+        const owned_embedding_model = try allocator.dupe(u8, embedding_model);
+        errdefer allocator.free(owned_embedding_model);
+        const owned_rerank_model = try allocator.dupe(u8, rerank_model);
+
+        return .{
+            .allocator = allocator,
+            .base_url = owned_base_url,
+            .api_key = owned_api_key,
+            .embedding_model = owned_embedding_model,
+            .rerank_model = owned_rerank_model,
+            .text_min_similarity = text_min_similarity,
+            .file_min_similarity = file_min_similarity,
+            .max_similarity = max_similarity,
+        };
+    }
+
+    pub fn deinit(self: Config) void {
+        self.allocator.free(self.base_url);
+        if (self.api_key) |key| self.allocator.free(key);
+        self.allocator.free(self.embedding_model);
+        self.allocator.free(self.rerank_model);
     }
 
     fn value(env: *const std.process.Environ.Map, name: []const u8) ?[]const u8 {
         if (env.getPtr(name)) |entry| return entry.*;
         return null;
     }
+
+    fn objectValue(root: std.json.Value, name: []const u8) ?std.json.Value {
+        if (root != .object) return null;
+        const child = root.object.get(name) orelse return null;
+        return if (child == .object) child else null;
+    }
+
+    fn resolvedString(object: std.json.Value, name: []const u8, env: *const std.process.Environ.Map) ?[]const u8 {
+        const field = object.object.get(name) orelse return null;
+        if (field != .string) return null;
+        const raw = field.string;
+        if (std.mem.startsWith(u8, raw, "${") and std.mem.endsWith(u8, raw, "}")) {
+            var env_name = raw[2 .. raw.len - 1];
+            if (std.mem.startsWith(u8, env_name, "process.env.")) env_name = env_name[12..];
+            return value(env, env_name);
+        }
+        return raw;
+    }
+
+    /// Reads one numeric config field while preserving integer JSON spellings.
+    fn numberValue(object: std.json.Value, name: []const u8) ?f64 {
+        const field = object.object.get(name) orelse return null;
+        return switch (field) {
+            .float => |number| number,
+            .integer => |number| @floatFromInt(number),
+            else => null,
+        };
+    }
+
+    /// Lets deployment environments override calibration without splitting ownership.
+    fn environmentNumber(env: *const std.process.Environ.Map, name: []const u8) !?f64 {
+        const raw = value(env, name) orelse return null;
+        const number = try std.fmt.parseFloat(f64, raw);
+        if (!std.math.isFinite(number)) return error.InvalidSimilarityBand;
+        return number;
+    }
 };
+
+const SimilarityBand = struct {
+    min: f64,
+    max: f64,
+
+    /// Resolves CLI-over-config precedence after the query mode is known.
+    fn resolve(request: cli.SimilarRequest, config: Config, query_is_file: bool) SimilarityBand {
+        return .{
+            .min = request.min_similarity orelse if (query_is_file) config.file_min_similarity else config.text_min_similarity,
+            .max = request.max_similarity orelse config.max_similarity,
+        };
+    }
+
+    /// Similar mode admits the closed calibrated interval; drift mode admits below-floor files.
+    fn admits(self: SimilarityBand, score: f64, anti: bool) bool {
+        return if (anti) score < self.min else score >= self.min and score <= self.max;
+    }
+};
+
+/// Rejects impossible calibration before any provider request can consume it.
+fn validateSimilarityBand(min_similarity: f64, max_similarity: f64) !void {
+    if (!std.math.isFinite(min_similarity) or !std.math.isFinite(max_similarity) or min_similarity < 0 or max_similarity > 1 or min_similarity > max_similarity) {
+        return error.InvalidSimilarityBand;
+    }
+}
 
 const Document = struct {
     path: []const u8,
@@ -61,8 +198,10 @@ const Coverage = struct {
     read_errors: usize,
 };
 
-const MAX_FILE_BYTES: usize = 256 * 1024;
+const MAX_FILE_BYTES: usize = 512 * 1024;
 const BINARY_SNIFF_BYTES: usize = 1024;
+const SEMANTIC_SAMPLE_COUNT: usize = 8;
+const SEMANTIC_SAMPLE_BYTES: usize = 4 * 1024;
 
 /// Runs the agent-facing semantic similarity lane.
 ///
@@ -82,7 +221,8 @@ pub fn run(
     env: *const std.process.Environ.Map,
     writer: anytype,
 ) !void {
-    const config = Config.fromEnv(env);
+    const config = try Config.load(io, allocator, env);
+    defer config.deinit();
     const key = config.api_key orelse return error.ApiKeyRequired;
     if (key.len == 0) return error.ApiKeyRequired;
 
@@ -95,6 +235,8 @@ pub fn run(
         std.Io.Dir.cwd().access(io, query, .{}) catch break :blk false;
         break :blk true;
     };
+    const band = SimilarityBand.resolve(request, config, query_is_file);
+    try validateSimilarityBand(band.min, band.max);
 
     var candidate_list = std.ArrayList(Candidate).empty;
     var skipped_oversize: usize = 0;
@@ -105,7 +247,7 @@ pub fn run(
     canonicalizeCandidates(&candidate_list);
     const candidates = candidate_list.items;
     const corpus_signature = candidateCorpusSignature(candidates);
-    const request_fingerprint = semantic_cursor.similarRequestFingerprint(request);
+    const request_fingerprint = semantic_cursor.similarRequestFingerprint(request, band.min, band.max);
     if (request.cursor_request_fingerprint) |expected| {
         if (expected != request_fingerprint) return error.CursorRequestMismatch;
     }
@@ -151,14 +293,17 @@ pub fn run(
     if (candidate_document_count == 0) {
         if (isVersioned(request.output_format)) {
             const next_cursor = try semanticNextCursor(allocator, candidates, frontier_order, frontier_end, corpus_signature, request_fingerprint);
-            try writeVersionedResult(writer, request, config, query, corpus_signature, request_fingerprint, coverage, &.{}, 0, next_cursor, null);
+            try writeVersionedResult(writer, request, config, band, query, corpus_signature, request_fingerprint, coverage, &.{}, 0, next_cursor, null);
             return;
         }
         return error.MissingValue;
     }
 
     var documents = try document_list.toOwnedSlice(allocator);
-    defer allocator.free(documents);
+    defer {
+        for (documents) |document| allocator.free(document.text);
+        allocator.free(documents);
+    }
 
     // Embed all documents (including anchor if legacy mode).
     const inputs = try allocator.alloc([]const u8, documents.len);
@@ -174,7 +319,7 @@ pub fn run(
         .model = config.embedding_model,
         .input = inputs,
         .encoding_format = "float",
-    })) catch |err| return reportSemanticFailure(writer, request, config, query, corpus_signature, request_fingerprint, coverage, "embedding", err);
+    })) catch |err| return reportSemanticFailure(writer, request, config, band, query, corpus_signature, request_fingerprint, coverage, "embedding", err);
     defer allocator.free(embedding_response);
     const embeddings = try parseEmbeddings(allocator, embedding_response, documents.len);
     for (documents, 0..) |*document, index| document.embedding = embeddings[index];
@@ -188,7 +333,7 @@ pub fn run(
             .model = config.embedding_model,
             .input = &query_input,
             .encoding_format = "float",
-        })) catch |err| return reportSemanticFailure(writer, request, config, query, corpus_signature, request_fingerprint, coverage, "query_embedding", err);
+        })) catch |err| return reportSemanticFailure(writer, request, config, band, query, corpus_signature, request_fingerprint, coverage, "query_embedding", err);
         defer allocator.free(query_response);
         const query_embeddings = try parseEmbeddings(allocator, query_response, 1);
         break :blk query_embeddings[0];
@@ -198,53 +343,97 @@ pub fn run(
     const candidate_start: usize = if (query_is_file) 1 else 0;
     const candidate_count = documents.len - candidate_start;
 
-    var results = try allocator.alloc(Result, candidate_count);
+    const similarities = try allocator.alloc(f64, candidate_count);
+    defer allocator.free(similarities);
+    var admitted_indices = std.ArrayList(usize).empty;
+    defer admitted_indices.deinit(allocator);
+    for (documents[candidate_start..], 0..) |document, index| {
+        const score = cosine(anchor_embedding, document.embedding);
+        similarities[index] = score;
+        if (band.admits(score, request.anti)) try admitted_indices.append(allocator, index);
+    }
+
+    var results = try allocator.alloc(Result, admitted_indices.items.len);
     defer allocator.free(results);
 
-    const rerank_documents = try allocator.alloc([]const u8, candidate_count);
-    defer allocator.free(rerank_documents);
-    for (documents[candidate_start..], 0..) |document, index| {
-        rerank_documents[index] = document.text;
-        coverage.bytes_submitted += document.text.len;
-    }
-    coverage.bytes_submitted += if (query_is_file) documents[0].text.len else query.len;
-
-    const rerank_url = try rerankUrl(allocator, config.base_url, config.rerank_model);
-    defer allocator.free(rerank_url);
-    const rerank_response = postJson(io, allocator, rerank_url, key, try jsonPayload(allocator, .{
-        .query = if (query_is_file) documents[0].text else query,
-        .documents = rerank_documents,
-    })) catch |err| return reportSemanticFailure(writer, request, config, query, corpus_signature, request_fingerprint, coverage, "rerank", err);
-    defer allocator.free(rerank_response);
-    const rerank_scores = try parseScores(allocator, rerank_response, candidate_count);
-
-    for (documents[candidate_start..], 0..) |document, index| {
-        results[index] = .{
-            .path = document.path,
-            .start_line = document.start_line,
-            .end_line = document.end_line,
-            .embedding_score = cosine(anchor_embedding, document.embedding),
-            .rerank_score = rerank_scores[index],
-        };
-    }
-    std.sort.block(Result, results, {}, struct {
-        fn lessThan(_: void, lhs: Result, rhs: Result) bool {
-            return lhs.rerank_score > rhs.rerank_score;
+    if (admitted_indices.items.len != 0) {
+        const rerank_documents = try allocator.alloc([]const u8, admitted_indices.items.len);
+        defer allocator.free(rerank_documents);
+        for (admitted_indices.items, 0..) |candidate_index, index| {
+            const document = documents[candidate_start + candidate_index];
+            rerank_documents[index] = document.text;
+            coverage.bytes_submitted += document.text.len;
         }
-    }.lessThan);
-    if (request.anti) std.mem.reverse(Result, results);
+        coverage.bytes_submitted += if (query_is_file) documents[0].text.len else query.len;
+
+        const rerank_url = try rerankUrl(allocator, config.base_url, config.rerank_model);
+        defer allocator.free(rerank_url);
+        const rerank_response = postRerank(
+            io,
+            allocator,
+            rerank_url,
+            key,
+            if (query_is_file) documents[0].text else query,
+            rerank_documents,
+        ) catch |err| return reportSemanticFailure(writer, request, config, band, query, corpus_signature, request_fingerprint, coverage, "rerank", err);
+        defer allocator.free(rerank_response);
+        const rerank_scores = try parseScores(allocator, rerank_response, admitted_indices.items.len);
+        defer allocator.free(rerank_scores);
+
+        for (admitted_indices.items, 0..) |candidate_index, index| {
+            const document = documents[candidate_start + candidate_index];
+            results[index] = .{
+                .path = document.path,
+                .start_line = document.start_line,
+                .end_line = document.end_line,
+                .embedding_score = similarities[candidate_index],
+                .rerank_score = rerank_scores[index],
+            };
+        }
+        if (request.anti) {
+            std.sort.block(Result, results, {}, struct {
+                fn lessThan(_: void, lhs: Result, rhs: Result) bool {
+                    if (lhs.embedding_score != rhs.embedding_score) return lhs.embedding_score < rhs.embedding_score;
+                    return lhs.rerank_score < rhs.rerank_score;
+                }
+            }.lessThan);
+        } else {
+            std.sort.block(Result, results, {}, struct {
+                fn lessThan(_: void, lhs: Result, rhs: Result) bool {
+                    if (lhs.rerank_score != rhs.rerank_score) return lhs.rerank_score > rhs.rerank_score;
+                    return lhs.embedding_score > rhs.embedding_score;
+                }
+            }.lessThan);
+        }
+    }
     const count = @min(request.max_results, results.len);
 
     const next_cursor = try semanticNextCursor(allocator, candidates, frontier_order, frontier_end, corpus_signature, request_fingerprint);
 
-    // Output. Legacy surfaces remain byte-compatible; the versioned surface owns coverage.
+    try writeSimilarResults(writer, request, config, band, query, corpus_signature, request_fingerprint, coverage, results, count, next_cursor);
+}
+
+/// Keeps every projection on the same admitted set and calibrated score vocabulary.
+fn writeSimilarResults(
+    writer: anytype,
+    request: cli.SimilarRequest,
+    config: Config,
+    band: SimilarityBand,
+    query: []const u8,
+    corpus_signature: u64,
+    request_fingerprint: u64,
+    coverage: Coverage,
+    results: []const Result,
+    count: usize,
+    next_cursor: ?[]const u8,
+) !void {
     if (isVersioned(request.output_format)) {
-        try writeVersionedResult(writer, request, config, query, corpus_signature, request_fingerprint, coverage, results, count, next_cursor, null);
+        try writeVersionedResult(writer, request, config, band, query, corpus_signature, request_fingerprint, coverage, results, count, next_cursor, null);
     } else if (request.output_format == .agent_v2) {
         try writeAgentResult(writer, query, request.anti, results, count);
     } else if (request.json) {
         try writer.writeAll("{\"status\":\"ok\",\"query\":");
-        try std.json.Stringify.value(if (query_is_file) documents[0].path else query, .{}, writer);
+        try std.json.Stringify.value(query, .{}, writer);
         try writer.writeAll(",\"anti\":");
         try writer.writeAll(if (request.anti) "true" else "false");
         try writer.writeAll(",\"results\":[");
@@ -252,11 +441,11 @@ pub fn run(
             if (index != 0) try writer.writeByte(',');
             try writer.writeAll("{\"path\":");
             try std.json.Stringify.value(result.path, .{}, writer);
-            try writer.print(",\"embedding\":{d:.6},\"rerank\":{d:.6}}}", .{ result.embedding_score, result.rerank_score });
+            try writer.print(",\"similarity\":{d:.6},\"embedding\":{d:.6},\"rerank\":{d:.6}}}", .{ result.embedding_score, result.embedding_score, result.rerank_score });
         }
         try writer.writeAll("]}\n");
     } else {
-        for (results[0..count]) |result| try writer.print("{d:.6}\t{d:.6}\t{s}\n", .{ result.rerank_score, result.embedding_score, result.path });
+        for (results[0..count]) |result| try writer.print("similarity:{d:.4}\trerank:{d:.4}\t{s}\n", .{ result.embedding_score, result.rerank_score, result.path });
     }
 }
 
@@ -272,7 +461,7 @@ fn writeAgentResult(writer: anytype, query: []const u8, anti: bool, results: []c
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"path\":");
         try std.json.Stringify.value(result.path, .{}, writer);
-        try writer.print(",\"e\":{d:.4},\"r\":{d:.4}}}", .{ result.embedding_score, result.rerank_score });
+        try writer.print(",\"s\":{d:.4},\"e\":{d:.4},\"r\":{d:.4}}}", .{ result.embedding_score, result.embedding_score, result.rerank_score });
     }
     try writer.writeAll("]} --\n");
 }
@@ -460,13 +649,17 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-/// Reads the explicit file anchor through the same bounded whole-file policy.
+/// Reads the explicit file anchor through the same bounded projection policy.
 fn readAnchorDocument(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Document {
     const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
     if (stat.kind != .file or stat.size > MAX_FILE_BYTES) return error.MissingValue;
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(MAX_FILE_BYTES));
-    if (bytes.len == 0 or isBinary(bytes)) return error.MissingValue;
-    return .{ .path = path, .text = bytes, .end_line = sourceLineCount(bytes) };
+    if (bytes.len == 0 or isBinary(bytes)) {
+        allocator.free(bytes);
+        return error.MissingValue;
+    }
+    const end_line = sourceLineCount(bytes);
+    return .{ .path = path, .text = try semanticProjection(allocator, bytes), .end_line = end_line };
 }
 
 /// Reads one selected candidate and records every non-embedded outcome explicitly.
@@ -486,7 +679,34 @@ fn readCandidateDocument(io: std.Io, allocator: std.mem.Allocator, candidate: Ca
         allocator.free(bytes);
         return null;
     }
-    return .{ .path = candidate.path, .text = bytes, .end_line = sourceLineCount(bytes) };
+    const end_line = sourceLineCount(bytes);
+    return .{ .path = candidate.path, .text = try semanticProjection(allocator, bytes), .end_line = end_line };
+}
+
+/// Samples large files across their full span so provider cost stays bounded
+/// without reducing semantic evidence to a head-only truncation.
+fn semanticProjection(allocator: std.mem.Allocator, owned_bytes: []u8) ![]u8 {
+    if (owned_bytes.len <= SEMANTIC_SAMPLE_COUNT * SEMANTIC_SAMPLE_BYTES) return owned_bytes;
+    errdefer allocator.free(owned_bytes);
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    errdefer output.deinit();
+    const last_start = owned_bytes.len - SEMANTIC_SAMPLE_BYTES;
+    for (0..SEMANTIC_SAMPLE_COUNT) |sample_index| {
+        if (sample_index != 0) try output.writer.writeAll("\n...\n");
+        const raw_start = (sample_index * last_start) / (SEMANTIC_SAMPLE_COUNT - 1);
+        var start = raw_start;
+        while (start < owned_bytes.len and isUtf8Continuation(owned_bytes[start])) : (start += 1) {}
+        var end = @min(start + SEMANTIC_SAMPLE_BYTES, owned_bytes.len);
+        while (end > start and end < owned_bytes.len and isUtf8Continuation(owned_bytes[end])) : (end -= 1) {}
+        try output.writer.writeAll(owned_bytes[start..end]);
+    }
+    allocator.free(owned_bytes);
+    return output.toOwnedSlice();
+}
+
+/// Detects a UTF-8 continuation byte at a projection boundary.
+fn isUtf8Continuation(byte: u8) bool {
+    return byte & 0b1100_0000 == 0b1000_0000;
 }
 
 /// Applies the bounded binary sniff used by the semantic body reader.
@@ -532,6 +752,7 @@ fn writeVersionedResult(
     writer: anytype,
     request: cli.SimilarRequest,
     config: Config,
+    band: SimilarityBand,
     query: []const u8,
     corpus_signature: u64,
     request_fingerprint: u64,
@@ -552,6 +773,13 @@ fn writeVersionedResult(
         corpus_signature,
         request_fingerprint,
     });
+    try writer.writeAll(",\"admission\":{\"metric\":\"cosine\",\"mode\":");
+    try writeJsonString(writer, if (request.anti) "drift" else "similar");
+    try writer.print(",\"predicate\":\"{s}\",\"min_similarity\":{d:.4},\"max_similarity\":{d:.4}}}", .{
+        if (request.anti) "score_below_min" else "closed_interval",
+        band.min,
+        band.max,
+    });
     // Provenance is deliberately descriptive: expose the retrieval recipe, never
     // credentials or transport identity. This lets agents judge ranking evidence
     // without turning provider secrets or deployment topology into output data.
@@ -559,11 +787,13 @@ fn writeVersionedResult(
     try writeJsonString(writer, config.embedding_model);
     try writer.writeAll(",\"rerank_model\":");
     try writeJsonString(writer, config.rerank_model);
-    try writer.writeAll(",\"passage_unit\":\"whole_file\",\"limits\":{");
-    try writer.print("\"candidate_budget\":{},\"max_results\":{},\"max_file_bytes\":{}", .{
+    try writer.writeAll(",\"passage_unit\":\"sampled_file_projection\",\"limits\":{");
+    try writer.print("\"candidate_budget\":{},\"max_results\":{},\"max_file_bytes\":{},\"sample_count\":{},\"sample_bytes\":{}", .{
         request.candidate_budget,
         request.max_results,
         MAX_FILE_BYTES,
+        SEMANTIC_SAMPLE_COUNT,
+        SEMANTIC_SAMPLE_BYTES,
     });
     try writer.writeAll("}}");
     const coverage_partial = coverage.candidates_omitted != 0 or coverage.discovery_errors != 0 or coverage.read_errors != 0;
@@ -604,9 +834,10 @@ fn writeVersionedResult(
         if (index != 0) try writer.writeByte(',');
         try writer.writeAll("{\"path\":");
         try writeJsonString(writer, result.path);
-        try writer.print(",\"start_line\":{},\"end_line\":{},\"embedding\":{d:.6},\"rerank\":{d:.6}}}", .{
+        try writer.print(",\"start_line\":{},\"end_line\":{},\"similarity\":{d:.6},\"embedding\":{d:.6},\"rerank\":{d:.6}}}", .{
             result.start_line,
             result.end_line,
+            result.embedding_score,
             result.embedding_score,
             result.rerank_score,
         });
@@ -620,6 +851,7 @@ fn reportSemanticFailure(
     writer: anytype,
     request: cli.SimilarRequest,
     config: Config,
+    band: SimilarityBand,
     query: []const u8,
     corpus_signature: u64,
     request_fingerprint: u64,
@@ -628,7 +860,7 @@ fn reportSemanticFailure(
     source_error: anyerror,
 ) !void {
     if (!isVersioned(request.output_format)) return source_error;
-    try writeVersionedResult(writer, request, config, query, corpus_signature, request_fingerprint, coverage, &.{}, 0, null, .{
+    try writeVersionedResult(writer, request, config, band, query, corpus_signature, request_fingerprint, coverage, &.{}, 0, null, .{
         .phase = phase,
         .code = "provider_request_failed",
     });
@@ -656,17 +888,23 @@ test "versioned similar output records retrieval provenance without transport se
     var buffer: [4096]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
     const config = Config{
+        .allocator = std.testing.allocator,
         .base_url = "https://secret.invalid/v1",
         .api_key = "never-emit-this",
         .embedding_model = "embed-test",
         .rerank_model = "rerank-test",
+        .text_min_similarity = DEFAULT_TEXT_MIN_SIMILARITY,
+        .file_min_similarity = DEFAULT_FILE_MIN_SIMILARITY,
+        .max_similarity = DEFAULT_MAX_SIMILARITY,
     };
-    try writeVersionedResult(&writer, request, config, "cache ownership", 1, 2, coverage, &.{}, 0, null, null);
+    try writeVersionedResult(&writer, request, config, .{ .min = 0.8777, .max = 0.94 }, "cache ownership", 1, 2, coverage, &.{}, 0, null, null);
     const out = writer.buffered();
     try std.testing.expect(std.mem.indexOf(u8, out, "candidate_strategy") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "embed-test") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "rerank-test") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "whole_file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "sampled_file_projection") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"metric\":\"cosine\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"min_similarity\":0.8777") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "secret.invalid") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "never-emit-this") == null);
 }
@@ -704,6 +942,73 @@ fn jsonPayload(allocator: std.mem.Allocator, value: anytype) ![]u8 {
 }
 
 fn postJson(io: std.Io, allocator: std.mem.Allocator, url: []const u8, key: []const u8, payload: []const u8) ![]u8 {
+    const response = try postJsonResponse(io, allocator, url, key, payload);
+    if (response.status != .ok) {
+        allocator.free(response.body);
+        return error.ApiRequestFailed;
+    }
+    return response.body;
+}
+
+const HttpResponse = struct {
+    status: std.http.Status,
+    body: []u8,
+};
+
+/// Negotiates only provider-declared query cardinality. A structured 422 that
+/// names a missing `queries` field promotes the request from scalar to batch;
+/// unrelated provider failures remain explicit and are never guessed around.
+fn postRerank(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    key: []const u8,
+    query: []const u8,
+    documents: []const []const u8,
+) ![]u8 {
+    const scalar = try postJsonResponse(io, allocator, url, key, try jsonPayload(allocator, .{
+        .query = query,
+        .documents = documents,
+    }));
+    if (scalar.status == .ok) return scalar.body;
+    if (!requiresPluralQueries(scalar.status, scalar.body)) {
+        allocator.free(scalar.body);
+        return error.ApiRequestFailed;
+    }
+    allocator.free(scalar.body);
+
+    const queries = [_][]const u8{query};
+    const batch = try postJsonResponse(io, allocator, url, key, try jsonPayload(allocator, .{
+        .queries = &queries,
+        .documents = documents,
+    }));
+    if (batch.status != .ok) {
+        allocator.free(batch.body);
+        return error.ApiRequestFailed;
+    }
+    return batch.body;
+}
+
+fn requiresPluralQueries(status: std.http.Status, body: []const u8) bool {
+    if (@intFromEnum(status) != 422) return false;
+    var parsed = std.json.parseFromSlice(std.json.Value, std.heap.page_allocator, body, .{}) catch return false;
+    defer parsed.deinit();
+    const detail = parsed.value.object.get("detail") orelse return false;
+    if (detail != .array) return false;
+    for (detail.array.items) |item| {
+        if (item != .object) continue;
+        const kind = item.object.get("type") orelse continue;
+        const location = item.object.get("loc") orelse continue;
+        if (kind != .string or !std.mem.eql(u8, kind.string, "missing") or location != .array) continue;
+        for (location.array.items) |segment| {
+            if (segment == .string and std.mem.eql(u8, segment.string, "queries")) return true;
+        }
+    }
+    return false;
+}
+
+fn postJsonResponse(io: std.Io, allocator: std.mem.Allocator, url: []const u8, key: []const u8, payload: []const u8) !HttpResponse {
+    defer allocator.free(payload);
     var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
     const auth = try std.fmt.allocPrint(allocator, "Bearer {s}", .{key});
@@ -717,8 +1022,7 @@ fn postJson(io: std.Io, allocator: std.mem.Allocator, url: []const u8, key: []co
         .headers = .{ .content_type = .{ .override = "application/json" }, .authorization = .{ .override = auth } },
         .response_writer = &response.writer,
     });
-    if (result.status != .ok) return error.ApiRequestFailed;
-    return response.toOwnedSlice();
+    return .{ .status = result.status, .body = try response.toOwnedSlice() };
 }
 
 fn rerankUrl(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8) ![]u8 {
@@ -780,15 +1084,59 @@ test "similar config defaults and env overrides" {
     defer env.deinit();
     try env.put("IX_AI_API_KEY", "secret");
     try env.put("IX_AI_RERANK_MODEL", "custom-reranker");
-    const config = Config.fromEnv(&env);
+    const config = try Config.fromSources(std.testing.allocator, &env, null);
+    defer config.deinit();
     try std.testing.expectEqualStrings("secret", config.api_key.?);
     try std.testing.expectEqualStrings("custom-reranker", config.rerank_model);
+    try std.testing.expectEqual(DEFAULT_TEXT_MIN_SIMILARITY, config.text_min_similarity);
+    try std.testing.expectEqual(DEFAULT_FILE_MIN_SIMILARITY, config.file_min_similarity);
+}
+
+test "similar config reads placeholders and yields to environment overrides" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try env.put("CONFIG_KEY", "from-placeholder");
+    try env.put("IX_AI_EMBED_MODEL", "from-environment");
+    const config = try Config.fromSources(std.testing.allocator, &env,
+        \\{"similar":{"base_url":"https://provider.example/v1","api_key":"${process.env.CONFIG_KEY}","embedding_model":"from-config","rerank_model":"reranker","text_min_similarity":0.2111,"file_min_similarity":0.8777,"max_similarity":0.9400}}
+    );
+    defer config.deinit();
+    try std.testing.expectEqualStrings("https://provider.example/v1", config.base_url);
+    try std.testing.expectEqualStrings("from-placeholder", config.api_key.?);
+    try std.testing.expectEqualStrings("from-environment", config.embedding_model);
+    try std.testing.expectEqualStrings("reranker", config.rerank_model);
+    try std.testing.expectEqual(@as(f64, 0.2111), config.text_min_similarity);
+    try std.testing.expectEqual(@as(f64, 0.8777), config.file_min_similarity);
+    try std.testing.expectEqual(@as(f64, 0.94), config.max_similarity);
 }
 
 test "similar rerank URL derives from OpenAI-compatible base" {
     const url = try rerankUrl(std.testing.allocator, "https://api.deepinfra.com/v1/openai", "model");
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://api.deepinfra.com/v1/inference/model", url);
+}
+
+test "rerank negotiation recognizes only structured missing queries errors" {
+    try std.testing.expect(requiresPluralQueries(.unprocessable_entity,
+        \\{"detail":[{"type":"missing","loc":["queries"],"msg":"Field required"}]}
+    ));
+    try std.testing.expect(!requiresPluralQueries(.unprocessable_entity,
+        \\{"detail":[{"type":"missing","loc":["documents"],"msg":"Field required"}]}
+    ));
+    try std.testing.expect(!requiresPluralQueries(.unauthorized,
+        \\{"detail":[{"type":"missing","loc":["queries"]}]}
+    ));
+}
+
+test "similarity band admits calibrated peers and isolates below-floor drift" {
+    const band = SimilarityBand{ .min = 0.8777, .max = 0.94 };
+    try std.testing.expect(!band.admits(0.8776, false));
+    try std.testing.expect(band.admits(0.8777, false));
+    try std.testing.expect(band.admits(0.91, false));
+    try std.testing.expect(band.admits(0.94, false));
+    try std.testing.expect(!band.admits(0.9401, false));
+    try std.testing.expect(band.admits(0.8776, true));
+    try std.testing.expect(!band.admits(0.8777, true));
 }
 
 test "semantic frontier unions lexical signal with corpus coverage without hard filtering" {

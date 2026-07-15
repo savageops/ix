@@ -9,6 +9,9 @@
 /.untrack/
 /tools/reports/
 /tools/scripts/competitors.json
+/.refs/*
+!/.refs/
+!/.refs/index.md
 /.ix-evidence-*.cache
 /.ix-evidence-*.cache.build
 /.ix-evidence-*.cache.live

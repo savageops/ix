@@ -7,6 +7,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        ".refs",
+        ".refs/index.md",
+        "scripts/bootstrap-refs.ps1",
     },
 }
