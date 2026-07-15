@@ -19,3 +19,4 @@ data/keys.sqlite
 *.ix*
 ix-signing.pfx
 *.pfx
+/.zcode/
