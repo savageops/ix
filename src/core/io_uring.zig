@@ -239,7 +239,7 @@ const IoUringImpl = struct {
     pub fn deinit(self: *IoUringImpl) void {
         if (self.sq_ring_sz > 0) _ = std.os.linux.munmap(@constCast(@volatileCast(self.sq_ring_ptr)), self.sq_ring_sz);
         if (self.cq_ring_sz > 0) _ = std.os.linux.munmap(@constCast(@volatileCast(self.cq_ring_ptr)), self.cq_ring_sz);
-        if (self.sqes_sz > 0) _ = std.os.linux.munmap(@constCast(@volatileCast(self.sqes_ptr)), self.sqes_sz);
+        if (self.sqes_sz > 0) _ = std.os.linux.munmap(@ptrCast(@constCast(@volatileCast(self.sqes_ptr))), self.sqes_sz);
         if (self.fd >= 0) _ = std.os.linux.close(@intCast(self.fd));
         self.fd = -1;
     }
