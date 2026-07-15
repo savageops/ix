@@ -65,7 +65,8 @@ pub fn main(init: std.process.Init) !void {
     // ≥ 2 MiB, falling back to regular pages if huge pages are exhausted.
     // On Windows/non-Linux, it passes through to the child allocator.
     var hp_alloc = resource_profile.HugePageAllocator.init(std.heap.page_allocator);
-    var framework_budget = resource_profile.CappedAllocator.init(hp_alloc.allocator(), resource_profile.memoryLimitBytes());
+    // P27: Use the effective memory limit (adjusted for resource toggle).
+    var framework_budget = resource_profile.CappedAllocator.init(hp_alloc.allocator(), resource_profile.effectiveMemoryLimitBytes());
     var framework_arena = std.heap.ArenaAllocator.init(framework_budget.allocator());
     defer framework_arena.deinit();
     const allocator = framework_arena.allocator();

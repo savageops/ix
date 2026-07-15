@@ -807,12 +807,13 @@ fn scanPreparedHitPrefixFiles(
 ///  1000 files -> 31 threads
 ///  5000 files -> capped at cpu count
 fn effectiveThreadCount(request: cli.SearchRequest, file_count: usize) usize {
-    const cpus = availableThreads();
-    if (request.threads) |threads| return resource_profile.clampThreads(threads, cpus);
-    if (file_count <= 4) return resource_profile.clampThreads(@max(file_count, 1), cpus);
+    // P27: Use effectiveThreadLimit which respects the resource toggle.
+    const cpus = resource_profile.effectiveThreadLimit(availableThreads());
+    if (request.threads) |threads| return @min(@max(threads, 1), cpus);
+    if (file_count <= 4) return @min(@max(file_count, 1), cpus);
     const sqrt_files = std.math.sqrt(@as(f64, @floatFromInt(file_count)));
     const scaled: usize = @intFromFloat(@min(sqrt_files, @as(f64, @floatFromInt(cpus))));
-    return resource_profile.clampThreads(@max(scaled, 1), cpus);
+    return @min(@max(scaled, 1), cpus);
 }
 
 /// A discovered file entry -- path is arena-allocated and lives for the

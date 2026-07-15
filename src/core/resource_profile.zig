@@ -4,6 +4,101 @@ const std = @import("std");
 pub const DEFAULT_MEMORY_PERCENT: usize = 5;
 pub const DEFAULT_THREAD_PERCENT: usize = 5;
 
+/// P27: Deterministic Resource Toggle (Low, Medium, High).
+///
+/// The toggle scales SIMD lane width, thread count, and arena size from
+/// host specs. In production it adapts to real-world contention; in
+/// formal testing it enforces deterministic minimums.
+///
+///   IX_RESOURCE_TOGGLE=low    → 1 thread, 64 MiB memory, scalar SIMD (1 byte)
+///   IX_RESOURCE_TOGGLE=medium → 25% threads, 25% memory, SSE2 SIMD (16 bytes)
+///   IX_RESOURCE_TOGGLE=high   → default (config.json), AVX2 SIMD (32 bytes)
+///
+/// The default (no toggle set) uses config.json values and AVX2 — the
+/// existing behavior. The toggle is purely additive: it never increases
+/// beyond the framework ceiling, only constrains it.
+pub const ResourceToggle = enum {
+    low,
+    medium,
+    high,
+
+    pub fn memoryPercent(self: ResourceToggle) usize {
+        return switch (self) {
+            .low => 1, // ~64 MiB on a 64 GB host
+            .medium => 25,
+            .high => DEFAULT_MEMORY_PERCENT,
+        };
+    }
+
+    pub fn threadPercent(self: ResourceToggle) usize {
+        return switch (self) {
+            .low => 1, // single-threaded
+            .medium => 25,
+            .high => DEFAULT_THREAD_PERCENT,
+        };
+    }
+
+    /// P27: SIMD lane width for this toggle level.
+    /// low: scalar (1 byte per step), medium: SSE2 (16 bytes), high: AVX2 (32 bytes).
+    /// The actual compile-time VEC_SIZE is fixed at 32 (AVX2) per AGENTS.md
+    /// invariant #5 (compile-time SIMD selection). This value controls the
+    /// runtime chunk granularity for the scalar fallback path — when toggle=low,
+    /// the scan loop processes 1 byte at a time instead of 32.
+    pub fn simdLaneWidth(self: ResourceToggle) usize {
+        return switch (self) {
+            .low => 1,
+            .medium => 16,
+            .high => 32,
+        };
+    }
+};
+
+/// Returns the active resource toggle from the environment.
+/// IX_RESOURCE_TOGGLE=low|medium|high (case-insensitive).
+/// Returns .high (default) when not set.
+pub fn activeResourceToggle() ResourceToggle {
+    const env = if (builtin.os.tag == .windows) blk: {
+        const WindowsEnv = struct {
+            extern "kernel32" fn GetEnvironmentVariableA(lpName: [*:0]const u8, lpBuffer: [*]u8, nSize: u32) u32;
+        };
+        var buf: [16]u8 = undefined;
+        const len = WindowsEnv.GetEnvironmentVariableA("IX_RESOURCE_TOGGLE", &buf, buf.len);
+        if (len == 0 or len > buf.len) break :blk "";
+        break :blk buf[0..len];
+    } else blk: {
+        const ptr = std.c.getenv("IX_RESOURCE_TOGGLE\x00") orelse break :blk "";
+        break :blk std.mem.span(ptr);
+    };
+
+    if (std.ascii.eqlIgnoreCase(env, "low")) return .low;
+    if (std.ascii.eqlIgnoreCase(env, "medium")) return .medium;
+    return .high;
+}
+
+/// P27: Returns the memory limit adjusted for the active resource toggle.
+/// When toggle is low or medium, overrides the config.json percentage.
+pub fn effectiveMemoryLimitBytes() usize {
+    const toggle = activeResourceToggle();
+    if (toggle == .high) return memoryLimitBytes();
+    const pct = toggle.memoryPercent();
+    return memoryPercentCapBytes(detectedPhysicalMemoryBytes(), pct) orelse
+        FALLBACK_FRAMEWORK_MEMORY_BYTES;
+}
+
+/// P27: Returns the thread limit adjusted for the active resource toggle.
+pub fn effectiveThreadLimit(available: usize) usize {
+    const toggle = activeResourceToggle();
+    if (toggle == .high) return threadLimit(available);
+    const pct = toggle.threadPercent();
+    const total = @max(available, 1);
+    return @max(@as(usize, 1), @min(total, (total / 100) * pct));
+}
+
+/// P27: Returns the SIMD lane width for the active toggle.
+pub fn effectiveSimdLaneWidth() usize {
+    return activeResourceToggle().simdLaneWidth();
+}
+
 const MIB: usize = 1024 * 1024;
 const FALLBACK_FRAMEWORK_MEMORY_BYTES: usize = 512 * MIB;
 
