@@ -1,0 +1,596 @@
+================================================================================
+IX CHANGELOG
+================================================================================
+
+Most recent entries at the top. Oldest at the bottom.
+Format: YYYY-MM-DD hash - description
+
+--------------------------------------------------------------------------------
+v2.0.0 - SEARCH DOMINANCE KERNEL (2026-07-14 to 2026-07-15)
+--------------------------------------------------------------------------------
+
+2026-07-15 bd2e04cd - readme: distill register-level engineering as natural product facts
+2026-07-15 f3c048e3 - implement P27 deterministic Resource Toggle (Low/Medium/High)
+2026-07-15 577791eb - fix: cosign path detection (HOME/.cosign, COSIGN_PATH env)
+2026-07-15 3fa7539f - fix: munmap sqes_ptr needs ptrCast to [*]const u8 for io_uring_sqe
+2026-07-15 4adcca56 - fix: volatile ptrCast + asm clobber syntax for Linux CI
+2026-07-15 4ce8ef9a - fix: Linux mmap types (PROT/MAP packed structs, ptrFromInt, MAP.FAILED)
+2026-07-15 351fd30f - fix: Linux CI compatibility (stdlib types, allocPrintZ → allocSentinel)
+2026-07-15 d7893197 - fix: use stdlib io_uring wrappers for Linux CI compatibility
+2026-07-15 75a70a53 - fix: CI build compatibility (C99 flags, syscall number types)
+2026-07-15 0702dc32 - ci: add pcre2 + stringzilla as regular files (not submodules)
+2026-07-15 e6c4b115 - ci: commit .refs/ vendored deps for reproducible CI builds
+2026-07-15 66a923de - fix: download tree-sitter + Zig grammar in CI
+2026-07-15 0079773d - fix: download .refs dependencies in CI before build
+2026-07-15 97f18fe7 - fix: use setup-zig action for CI Zig installation
+2026-07-15 736ab4a3 - wire P18 huge pages into arena path + add P28 competitor benchmarks
+2026-07-15 fc8a70a6 - configure P30 Sigstore keyless signing for all 3 platforms
+2026-07-15 cf9ee032 - implement P11 wavelet tree compressed Occ table for FM-Index
+2026-07-15 6bc0ded3 - implement P19 mid-scan cancellation via periodic atomic flag checks
+2026-07-15 4994891f - upgrade P15 JIT Forge with multi-byte literal pattern compilation
+2026-07-15 b8be5ed7 - extend P14 Thompson NFA with alternation, quantifiers, character classes
+2026-07-15 65ac6d05 - vendor tree-sitter runtime + Zig grammar for P22 AST-aware records
+2026-07-15 920e9b1d - produce signed binary (P30) — Authenticode signature verified
+2026-07-15 fd079285 - wire P20 UCB1 bandit reward updates into scan loop
+2026-07-15 5c6b4d57 - implement P30 binary signing infrastructure
+2026-07-15 4307de31 - implement P29 'diff-matches' — compare results between git commits
+2026-07-15 803308ac - implement P29 'replace' command — indexed structural rewrite
+2026-07-15 794039bc - implement P19 cooperative execution-pointer swap
+2026-07-15 ba83105e - document P16 io_uring scan hot path integration point
+2026-07-14 a6916f17 - implement P17 non-temporal streaming store intrinsics
+2026-07-14 e938e88f - implement P14 Thompson NFA with O(pm) simulation
+2026-07-14 93ec5acd - implement P20 true UCB1 multi-armed bandit traversal
+2026-07-14 282b8bbd - implement P29 'watch' command — stream matches as files change
+2026-07-14 67c14b5d - implement P29 'why' command — posting-list lineage
+2026-07-14 b06886ac - document FM-Index scan hot path wiring (P11)
+2026-07-14 04730571 - implement P15 JIT Forge — self-modifying automata
+2026-07-14 2f5bc034 - implement P9 budget primitives --budget-ms and --estimate
+2026-07-14 c7839737 - implement P23 NDJSON streaming format
+2026-07-14 ca8a37d0 - complete 30-pillar audit, fix P21/P22 gaps
+2026-07-14 381e0b16 - fix warm-search OOM, case-sensitive path filter, serve dispatch
+2026-07-14 a6f05767 - add P22 paragraph record mode + P26 shared-memory segment
+2026-07-14 5c55a203 - wire io_uring into scan pipeline for multi-chunk file reads (P16)
+2026-07-14 7097bd51 - P16 use IORING_OP_READ_FIXED with io_uring_register for pre-registered buffers
+2026-07-14 60406c39 - complete P26 warm-index serve daemon + P30 signed manifests
+2026-07-14 da238d41 - implement P16 functional io_uring with mmap'd SQ/CQ rings
+2026-07-14 5d2891ff - implement P24 typed client generation (TypeScript + Python)
+2026-07-14 a705f6ac - implement P19 parallel shadow threads for speculative scan
+2026-07-14 75f5702b - implement P22 --record flag (line
+2026-07-14 7dd90c45 - wire Roaring Bitmap into postings.zig intersection path (P10 complete)
+2026-07-14 f8322006 - final 30-pillar Harvest Doctrine completion audit
+2026-07-14 6748a45e - complete P16 io_uring, P26 daemon docs, P30 package manifests
+2026-07-14 0d7b86e0 - enable P11 FM-Index as default sub-linear admission (remove env gate)
+2026-07-14 137ae3f2 - implement P10 Roaring Bitmap posting-list compression
+2026-07-14 ec509cd7 - complete P4 (research-gate) and P5 (competitor anatomy map)
+2026-07-14 9391d322 - add shell completions for bash/zsh/fish/PowerShell (P30)
+2026-07-14 25153936 - implement P30 MCP server — agent-native distribution stratum
+2026-07-14 a516d0b3 - implement P18 NUMA-Pinned Arena Allocators & Topology Sympathy
+2026-07-14 4e3a01ac - implement P19 Speculative Parallelism — dual-strategy scan race
+2026-07-14 cde9a7cf - implement P17 Non-Temporal Streaming for result buffer writes
+2026-07-14 47da5104 - document P13 Branchless SWAR & Vector Permutation as fully implemented
+2026-07-14 a5697bba - implement P20 Multi-Armed Bandit directory traversal
+2026-07-14 b551c55d - implement P25 Sacred Handshake — --version exits zero on every surface
+2026-07-14 01e8124e - implement P22 structural scope tracking — the moat no line rival offers
+2026-07-14 079eaaba - fix warm index postings lookup false-negative bug (P10/P26)
+2026-07-14 2a07b931 - harvest doctrine audit — 30-pillar codebase assessment
+2026-07-14 e8a89c72 - rewrite README applying 15 universal rhetorical patterns from 6 repos
+2026-07-14 7f2d92f6 - extend psychological depth across README sections
+2026-07-14 d12f35c4 - aggressive-compaction pass on README What It Is section
+2026-07-14 26c4fdfb - rewrite README opening with psychological engagement techniques
+2026-07-14 1eb30914 - document xo fisheye integration in README
+2026-07-14 d6143e3e - distill full technical depth into README — agent lane, resource ceiling, correctness, design properties
+2026-07-14 b7fbc61a - inject missing features into README — resource ceiling, cursor, v3 contract, cross-platform, source layout
+2026-07-14 ac29c95c - docs: restore ix fisheye voice
+2026-07-14 fbab3bc1 - docs: surface shipped agent context capabilities
+2026-07-14 3990a3e7 - docs: record help contract QC
+2026-07-14 e458c74f - sharpen agent-facing help
+2026-07-14 e8c9f0c4 - remove retired install path detection
+2026-07-14 aeb0b537 - docs: close cursor finding in QC pass
+2026-07-14 001ac5b0 - harden output and benchmark contracts
+2026-07-14 a29fde3a - auto-create ~/.ix/config.json on first run
+2026-07-14 f6e5a325 - update install dir to AppData/Local/ix consistently
+2026-07-13 3b895be8 - independent memory/thread percent configs with config.json support
+2026-07-13 5c014a98 - perf remediation QC — 50x gap was measurement error, IX matches ripgrep at 1/16th threads
+2026-07-13 e6b3debc - qc: record ripgrep corpus ix experience
+2026-07-13 bb0142f1 - unify native install and state ownership
+2026-07-13 0d9f6bf4 - fix inspect records path repetition and xo error messages
+2026-07-13 c4481958 - fix truncation signal in stats-only fast-count paths
+2026-07-13 c9279da8 - enforce single native executable layout
+2026-07-13 6b8964ef - docs: preserve architecture and change history
+2026-07-13 84127e11 - docs: retain output contract research and qc
+2026-07-13 50839f5c - close response context quality pass
+2026-07-13 eae268ae - add runtime testing QC pass with extensive command observations
+2026-07-13 df356ddc - preserve json stats benchmark composition
+2026-07-13 9e62dbe1 - unify bounded records and restore platform parity
+2026-07-13 e1fed22a - fix truncation signal, xo fisheye, structural prior, multiplatform build
+2026-07-13 ec128a19 - add xo implementation and multiplatform resource cap QC passes
+2026-07-13 f8bd7f00 - add bounded context retrieval and framework resource policy
+2026-07-13 3c485c7c - repair output contracts and warm freshness
+2026-07-13 5879c2ed - fix: gate benchmarks on parity evidence
+2026-07-13 d68924e1 - fix: close qc output and benchmark boundaries
+2026-07-13 b9cbfdc1 - fix: reject malformed search expressions
+2026-07-13 6ee552a4 - feat: repair agent output and semantic contracts
+2026-07-13 6cc365a8 - chore: checkpoint before agent output contract repair
+2026-07-12 b2666073 - revert batch-claim, cache FM-Index env check
+2026-07-12 d63567b4 - bench: drain isolated process streams concurrently
+2026-07-12 9c2be53f - stabilize evidence frontier identity validation
+2026-07-12 9ca9f130 - docs: document similar command and context flag in README
+2026-07-12 d15453c4 - upgrade similar to text-query mode, clean help text
+2026-07-12 e410ffee - eliminate sentinel hit duplication
+2026-07-12 1a438e91 - agent-native compact output format (ix.result.v2)
+2026-07-12 8e38b680 - docs: fisheye preview — match-centered adaptive context window
+2026-07-12 0340d18f - fisheye preview + batch-claim work scheduling
+2026-07-12 1e927b51 - zero-write case-insensitive admission infrastructure
+2026-07-12 319a5f05 - refactor scan buffer to constant, add Shift-Or admission infrastructure
+2026-07-12 3a78fba5 - integrate FM-Index backward search into warm-path scan pipeline (spec point 11)
+2026-07-12 b83915ac - IOCP batch file I/O prototype (spec point 16)
+2026-07-12 c95e2027 - wire algorithmic kernel candidates into explain output (points 11,12,13)
+2026-07-12 bee55c4a - branchless SWAR primitives for zero-byte and byte-value detection (spec point 13)
+2026-07-12 80776d8b - FM-Index on BWT with LF-Mapping backward search (spec point 11)
+2026-07-12 09505911 - Bit-Parallel Shift-Or for case-insensitive patterns ≤64 bytes (spec point 12)
+2026-07-12 6d52e4c8 - add Adjacent Operations Vector — count and files-with-matches modes
+2026-07-12 2fbd48f3 - report index freshness provenance — index_created_ns and index_age_ms in stats
+2026-07-12 037c40e4 - bench: clean stale IX markers before strict process gate
+2026-07-12 f8df61db - test: harden evidence frontier tests with temp dirs and real file paths
+2026-07-12 714050e0 - SIMD byteset admission fast path — single VPSHUFB replaces N indexOfByte
+2026-07-12 f1ad1a17 - search: gate evidence frontier on file identity
+2026-07-12 d28cba38 - bench: record historical settle delay
+2026-07-12 12f47a1b - bench: settle installed paired launches
+2026-07-12 9fff61ac - bench: add paired settle delay controls
+2026-07-06 7b434fb2 - add --clear-warm-cache benchmark mode to measure warm cache-MISS path
+2026-07-06 c848fc0b - remove redundant compaction from foreground_once — warm MISS 6000ms→32ms (187×)
+2026-07-06 42bd3f66 - pre-load postings entry table into memory — eliminates random-offset binary search syscalls
+2026-07-06 78e74193 - warm cache-MISS path — batch file-ID reads + skip signature walk + drop per-miss checksum
+2026-07-05 a06793ab - split warm-index pin — cache hit skips 922 MB payload checksum re-read
+2026-07-05 0e3ad801 - rarity-pivoted Teddy fingerprint offset — BurntSushi freq_rank absorbed
+2026-07-05 4536f826 - canonical state dir at %LOCALAPPDATA%\ix — installed binary warm-index parity
+2026-07-05 28a6aa32 - debounce sidecar — don't launch when index already available
+2026-07-05 5a6d2946 - remove case_insensitive gate from warm path — cold lane uses index in compat mode
+2026-07-05 6148faa5 - lowercased trigram index — cold lane uses warm index for (?i) queries
+2026-07-05 b26d00d9 - skip casefold when needle first-byte absent in raw buffer
+2026-07-05 b611f2c6 - check frontier cache before signature walk — 48% warm improvement
+2026-07-05 020bddfa - reorder warm path — query cache BEFORE signature walk
+2026-07-05 1eb9ec6f - remove wasteful file.length() syscall on binary sniff path
+2026-07-05 2da6f9c7 - fix delta generation staleness — walk parent chain for signature (commit 3 fix)
+2026-07-05 58746478 - wire corpus signature into warm path — staleness detection (commit 3)
+2026-07-05 63c8d849 - indexer writes corpus.ixsignature at publish time (commit 2)
+2026-07-05 0549e3cf - add corpus_signature.zig — shared hash + CorpusSignature struct
+2026-07-05 939d5224 - update package.json — name, description, repo URL, license
+2026-07-05 aff689e0 - update README to match code — 3-byte fingerprint, warm index docs, new modules
+2026-07-05 c4a60e1c - enable warm-index foreground admission — 76% warm lane improvement
+2026-07-05 40025aff - fix warm-index foreground marker + canonical root validation
+2026-07-05 de0d53c9 - replace per-line std.mem.trimEnd with branch trimCR
+2026-07-05 8552cbe4 - increase FileList initial capacity to 4096 (round 4)
+2026-07-05 3be326b6 - enable case-insensitive trigram admission for literal alternates
+2026-07-04 88a11f28 - fix compat layer for lit:prefix:suffix: with -i flag
+2026-07-04 8f2a4600 - update perpetual goal predecessor to installed ix.exe (308d3ac3)
+2026-07-04 308d3ac3 - add byte-frequency table for rare-byte admission heuristic
+2026-07-04 63061cd6 - Expose runtime process memory stats
+2026-07-04 357235e5 - Expose benchmark memory metric truth
+2026-07-04 94c00e14 - Harden benchmark provenance gates
+2026-07-04 102e811d - casefold-buffer admission for case-insensitive prune (round 3, +24.5% median)
+2026-07-04 8809bec3 - enable case-insensitive trigram admission (round 2, +8.3% median)
+2026-07-04 679f35d6 - secure 54.3% median win vs June 13 predecessor (round 1)
+2026-07-02 258ec5a1 - attribute discovery and scan-open evidence
+2026-07-02 f22442d0 - explain whole-engine repair target basis
+2026-07-02 673dade7 - require real scan split telemetry
+2026-07-02 0baab162 - split residual wall attribution
+2026-07-02 98de4f66 - harden scan-file residual evidence
+2026-07-02 222a2b7f - qualify scan-file residual attribution
+2026-07-02 2f7bc749 - route teddy focus by verifier fanout
+2026-07-02 1ca69819 - require deeper focused teddy proof
+2026-07-02 223995d5 - harden focused teddy proof builds
+2026-07-02 aae2c133 - require rebuilt binaries in teddy proof gates
+2026-07-02 068fdb2e - repair parallel range benchmark attribution
+2026-07-02 c6fa3f03 - Record rejected whole-range Teddy count
+2026-07-02 8d9ff49a - Route Teddy regression proof to scan-open probe
+2026-07-02 d2aecb51 - Centralize benchmark host noise thresholds
+2026-07-02 11b79b89 - Harden benchmark host noise gate
+2026-07-02 228a5dad - Harden speed proof evidence selection
+2026-07-02 f2af3b1d - Harden executable-aware speed proof gates
+2026-07-01 f86bac00 - Tighten executable identity in speed gates
+2026-07-01 174150bd - Tighten Teddy leak proof routing
+2026-07-01 763ec8d1 - Track failed predecessor speed proof
+2026-07-01 6bb7c366 - Block rejected Teddy shortcut decisions
+2026-07-01 367a4490 - Make previous-IX benchmark lanes predecessor-first
+2026-07-01 121d89ef - Enforce predecessor-first historical speed reports
+2026-07-01 6076e7d8 - Make historical speed gates predecessor-first
+2026-07-01 1e05b509 - Record benchmark binary layout metadata
+2026-07-01 bcb181ed - Tighten identity control attempt selection
+2026-07-01 e2c5c70d - Guard retainable installed speed pointer
+2026-07-01 623544df - Harden installed speed promotion gate
+2026-07-01 0ae298b9 - Exclude diagnostic installed runs from promotion proof
+2026-07-01 6474d23d - Harden alternates repeat stability gate
+2026-07-01 87b7cd09 - Record repeat stability for alternates probes
+2026-07-01 27d9c6a9 - Track preservation targets in alternates decisions
+2026-07-01 20e3e2a7 - Clarify failed installed promotion blockers
+2026-07-01 63518e94 - Require installed promotion target in alternates gate
+2026-07-01 80eca8df - Require installed promotion deficit in Teddy contract
+2026-07-01 d160834d - Expose installed promotion deficit in Teddy decisions
+2026-07-01 d25446b6 - Clarify benchmark noise repair routing
+2026-07-01 bf4ce93e - Record ripgrep mmap benchmark variants
+2026-07-01 3bad4e86 - Require freshest native installed speed evidence
+2026-07-01 9f59a6bf - Select native installed speed evidence
+2026-07-01 e11d5af3 - Clarify blocked Teddy speed decisions
+2026-07-01 24233349 - Select fresh installed speed evidence
+2026-07-01 552836c1 - Protect installed speed promotion pointers
+2026-07-01 a8bac0ba - Block stale Teddy evidence loops
+2026-07-01 8991f99e - Separate diagnostic evidence moves
+2026-07-01 c6945e3b - Require bucketed Teddy kernel proof
+2026-07-01 80043f9d - Reject failed shifted Teddy shapes
+2026-07-01 8cb25547 - Expose actual predecessor speed evidence
+2026-07-01 cdfacf6c - Track full speed gate status in Teddy decision
+2026-07-01 e53ed87f - Guard Teddy decision against rejected kernels
+2026-07-01 f8edaf38 - Expose scan-file residual attribution
+2026-07-01 c9e1d1c7 - Harden Teddy diagnostic attribution gate
+2026-07-01 54c6d7f1 - Require canonical installed speed thread config
+2026-07-01 40e278a8 - Ignore diagnostic historical speed reports
+2026-07-01 c3e6e545 - Preserve retainable installed speed proof
+2026-07-01 b886a459 - Record rejected branch-four Teddy unroll
+2026-07-01 b993d35a - Require installed speed proof for Teddy finalization
+2026-07-01 eb96b715 - Bound older snapshot child benchmarks
+2026-07-01 caa1efd7 - Isolate older snapshot speed pointers
+2026-07-01 b04adb1a - Require retainable proof after scan-open diagnostics
+2026-07-01 64e10fbb - Record rejected Teddy branch-mask verifier
+2026-07-01 a74cf3b8 - Clarify benchmark timing attribution basis
+2026-07-01 773a6ee9 - Split route kind parity from range cardinality
+2026-07-01 7230fb6b - Expose byte-shard fanout in speed reports
+2026-07-01 0cf57887 - Clarify historical speed gate attribution
+2026-06-30 aca9b960 - Propagate scan-open attribution splits
+2026-06-30 f9559e83 - Tighten planning gate archived debt signal
+2026-06-30 10065670 - Bound benchmark loop default
+2026-06-30 ad862662 - Fix run-once benchmark help path
+2026-06-30 ec958671 - Harden installed speed evidence gate
+2026-06-30 4d35dba1 - Harden installed speed evidence quality
+2026-06-30 749923b7 - Centralize speed benchmark defaults
+2026-06-30 f811d6ac - Harden speed benchmark attribution
+2026-06-30 6a58eb57 - Harden speed regression diagnostics
+2026-06-30 37442bcc - Require built repo binary for historical speed comparisons
+2026-06-30 0546a404 - Track effective benchmark environment
+2026-06-30 28529104 - Track optional scan subphase benchmark fields
+2026-06-30 34a0973d - Route scan-work repair to regressing subphase
+2026-06-30 91d9e50e - Require file-count parity for scan-open attribution
+2026-06-30 fbd48bb7 - Measure scan-open pressure per file
+2026-06-30 d28e9496 - Require retainable speed proof for Teddy decisions
+2026-06-30 233dc0b4 - Preserve strict historical speed pointer
+2026-06-30 eea31f86 - Route Teddy repair to scan-open attribution
+2026-06-30 4cd6b4d4 - Require scan-open timing for leak attribution
+2026-06-30 3cb63dc4 - Record rejected folded trigram admission path
+2026-06-29 1e7f127a - Attribute alternate full-scan timing evidence
+2026-06-29 df9433b8 - Surface scanFile residual hotspots
+2026-06-29 d6099d5f - Attribute scanFile residual pressure
+2026-06-29 436864d2 - Enforce scanWork split attribution
+2026-06-29 d5f70b05 - Route clean Teddy regressions to leak attribution
+2026-06-29 a0077164 - Require complete older snapshot identity controls
+2026-06-29 f3a8b883 - Require complete identity control attempts in gates
+2026-06-29 1ccf0890 - Run all requested identity control attempts
+2026-06-29 7f976cfd - Separate diagnostic and strict speed proof commands
+2026-06-29 9ec0624e - Fail speed comparators closed by default
+2026-06-29 fabaf06e - Harden predecessor speed promotion gates
+2026-06-29 254a9882 - Extend historical speed repair diagnosis
+2026-06-29 4bf5b589 - Improve installed speed regression diagnosis
+2026-06-29 3de67b83 - Improve scan phase leak attribution
+2026-06-29 46b0e3b9 - Gate planning queue drift
+2026-06-29 43b29501 - Surface candidate scan-open shares in leak reports
+2026-06-29 ecabb89c - Expose scan-work leak attribution in historical speed reports
+2026-06-29 637d7202 - Fix historical speed ledger validation wiring
+2026-06-29 10575b43 - Summarize speed lane readiness blockers
+2026-06-29 9c3cd9c1 - Surface benchmark control blocker details
+2026-06-29 ee6baa7b - Summarize benchmark control failures
+2026-06-29 8bd780d0 - Summarize older snapshot failure evidence
+2026-06-29 89cfc349 - Use paired strict benchmark smoke
+2026-06-14 89b2ebca - Collect retainable older snapshot evidence
+2026-06-14 67e98ea3 - Require strict older snapshot proof
+2026-06-14 d3a0f762 - Require older snapshot speed margins
+2026-06-14 80abb7f1 - Collect runnable older snapshot comparisons
+2026-06-14 0421ef23 - Add multi-attempt benchmark identity control
+2026-06-14 c2041401 - Rank benchmark phase leaks by time pressure
+2026-06-14 c6423da1 - Normalize benchmark noise phase units
+2026-06-14 b107d6e6 - Stratify benchmark identity noise
+2026-06-14 6ae4b74c - Expose residual engine attribution
+2026-06-14 fe7e6242 - Tighten benchmark identity controls
+2026-06-14 b1579c21 - Extract benchmark phase attribution
+2026-06-14 94b4c3a1 - Centralize benchmark evidence quality
+2026-06-14 92b12dd3 - Extract search admission program
+2026-06-14 085a15cd - Enrich older snapshot benchmark evidence
+2026-06-13 6d705ee2 - Separate older snapshot smoke from retention
+2026-06-13 daa1c754 - Add native install sync tooling
+2026-06-13 ff801b7f - Harden benchmark readiness diagnostics
+2026-06-13 5b5820e5 - Gate older snapshot speed comparisons
+2026-06-13 849e5647 - Add older snapshot benchmark ladder
+2026-06-13 a375de8f - Harden IX search architecture and speed gates
+2026-06-09 54b1c53f - Tighten benchmark improvement gate
+2026-06-09 3c64b583 - Stream generation segment validation
+2026-06-09 179488cd - Harden generation recovery gate
+2026-06-09 03504948 - Harden warm cold parity gate
+2026-06-09 fa032de3 - Consolidate IX default state ownership
+2026-06-09 5822cd43 - Harden IX process scan gate
+2026-06-09 86fe6dc1 - Generalize architecture gate planning chain
+2026-06-09 470ab0ec - Publish compacted index generations
+2026-06-09 660b5251 - Expose delta overlay route telemetry
+2026-06-09 01d34c47 - Add delta overlay planning model
+2026-06-09 fd1ebcde - Gate agent path contracts
+2026-06-09 def78d08 - Harden agent path output contracts
+2026-06-09 5d57c664 - Guard warm index coverage gaps
+2026-06-09 568fb7a2 - Preserve warm search source-dir parity
+2026-06-09 4216234f - Fix stale warm search paths
+2026-05-31 71fe5298 - Gate speed proof on clean host
+2026-05-31 5d7b5a56 - Classify benchmark host health
+2026-05-31 36471306 - Capture benchmark host context
+2026-05-30 c99ae31c - Add benchmark sample spread evidence
+2026-05-30 63312ad9 - Harden architecture regression proofing
+2026-05-30 092bc26b - Validate warm generation payloads
+2026-05-30 7028b13a - Tighten regression gate semantics
+2026-05-30 4d9c4c57 - Harden architecture regression evidence
+2026-05-30 d34d9611 - Harden architecture regression gates
+2026-05-30 110f03ae - Add runtime state location gate
+2026-05-30 de5e3fb0 - Consolidate index state paths
+2026-05-30 ad44e35b - Validate architecture gate report shape
+2026-05-30 aa459c80 - Tighten benchmark regression guard
+2026-05-30 5f5573b0 - Generalize architecture planning gate
+2026-05-30 87e4f3d9 - Harden architecture planning gate
+2026-05-30 f460c8c8 - Use native agent sessions for eval
+2026-05-30 e158ee6b - Harden index daemon resource gates
+2026-05-30 eff1b43a - Compile literal alternate probes
+2026-05-30 7d93d339 - Compile file admission probes
+2026-05-30 32d6c7ca - Apply warm index delta overlay
+2026-05-30 ee67eb2b - Anchor IX state beside AppData executable
+2026-05-30 636437be - Harden warm index live owner validation
+2026-05-30 0ea5f1b8 - Centralize warm index state ownership
+2026-05-22 22d13e8b - Make IX sidecars opt in by default
+2026-05-22 b03c0ceb - Gate indexd sidecars to managed roots
+2026-05-22 bb66fc70 - Use freeing allocator for indexd watch
+2026-05-21 7aca0b79 - Route inspect matches through search
+2026-05-20 69d9ab86 - repair word-boundary linux scan regression
+2026-05-20 d33992c3 - speed up fixed word-chain regex counts
+2026-05-20 03a41005 - repair zero-regression search lanes
+2026-05-20 b42ba48f - prune impossible multi-literal files
+2026-05-20 c1c30ab8 - preflight negative postings
+2026-05-20 da934bff - align warm admission parity
+2026-05-20 d605f846 - model ram delta overlays
+2026-05-20 18f16905 - keep warm stats cache hits read-only
+2026-05-20 41cc2974 - cache bounded warm stats results
+2026-05-19 5adce285 - keep warm generation live during rebuild
+2026-05-19 da2d7a75 - enable warm index by default
+2026-05-19 3c8332f4 - coalesce warm index mutations
+2026-05-19 c986cc97 - keep warm indexd recaching
+2026-05-19 1f133849 - require live warm index owner
+2026-05-19 5a5521c3 - skip stats-only line repair
+2026-05-19 46cc8308 - align broad Linux traversal
+2026-05-19 c7e6a550 - admit literals before byte-shard counting
+2026-05-19 ae8c2137 - chore: ignore local toolchains
+2026-05-19 9d716d22 - chore: untrack local documentation artifacts
+2026-05-19 053a4ffb - chore: ignore local artifact surfaces
+2026-05-19 c883d917 - index on develop-subzero: 46fcfa80 subzero: parallelize protected Windows discovery
+2026-05-19 eb75794a - untracked files on develop-subzero: 46fcfa80 subzero: parallelize protected Windows discovery
+2026-05-18 1ac64fea - parallelize protected Windows discovery
+2026-05-18 3686f730 - skip protected Windows binary stores
+2026-05-18 de7c9c62 - index extensionless build manifests
+2026-05-18 6b60f369 - index broad config artifacts
+2026-05-18 d1e56dba - index large structured text artifacts
+2026-05-18 5fb213d4 - skip protected Windows binary containers
+2026-05-18 cb9f52c1 - route literal columns through StringZilla
+2026-05-18 b7444ba2 - widen bounded source index coverage
+2026-05-18 a080a01d - index native functional source files
+2026-05-18 b39ed10e - index bounded devops script sources
+2026-05-18 2d38e519 - index bounded component source files
+2026-05-18 725465de - index bounded analytic source files
+2026-05-18 291ce6d8 - index bounded dynamic source files
+2026-05-18 bbc0fa77 - index bounded polyglot source files
+2026-05-18 9dd63ccf - index bounded JS source files
+2026-05-18 40c68ea3 - index bounded large source files
+2026-05-18 805c328c - seed stats cache from warm hits
+2026-05-18 99695e28 - prefix capped hits from stats cache
+2026-05-18 9c761a1e - cache capped warm hits
+2026-05-18 a6d3e706 - reuse warm hits for capped output
+2026-05-18 7b63c593 - cache warm hit results
+2026-05-18 6c378b91 - cache warm stats results
+2026-05-18 d65da0fc - count large alternates with pcre range pass
+2026-05-18 d8c7953d - widen byte-shard range budget
+2026-05-18 cdb08471 - trust pinned warm generations after stale owner
+2026-05-18 dd1856ee - byte-shard literal stats before admission
+2026-05-18 637489b8 - index literal alternate regexes
+2026-05-18 5ec38fab - stream warm postings lookup
+2026-05-18 c5a9b4c1 - shard parenthesized literal alternates
+2026-05-16 c98de512 - rollback admission skip-table cache
+2026-05-16 ab9bab40 - cache admission skip tables
+2026-05-16 89432e4d - remove cold foreground frontier tax
+2026-05-13 d72dd2d3 - Reduce cold discovery overhead
+2026-05-13 aa4b25a7 - Tune byte-shard worker stack
+2026-05-13 7e50548a - Tune subzero word-boundary cold sharding
+2026-05-13 9757ce5a - Add subzero long-needle admission selector
+2026-05-13 454b2056 - Instrument subzero cold tail telemetry
+2026-05-12 ed9c9db9 - Subzero cold path benchmark and admission
+2026-05-12 ee58e6a8 - Checkpoint warm frontier baseline
+2026-05-12 fc899028 - Harden warm frontier lead
+2026-05-12 369e3ffb - Cap default byte shard fanout
+2026-05-12 6f641615 - Restore warm correctness and regex lead
+2026-05-12 654276fa - Add regex decomposition fast count
+2026-05-12 8f32a122 - Regain protected cold-path lead
+2026-05-12 32a750ad - Implement live warm index query reuse
+2026-05-12 c84b485f - Fix protected-tree partial scan handling
+2026-05-12 5448c0cc - Add warm index compaction ops hardening
+2026-05-12 73ce4473 - Add USN delta apply substrate
+2026-05-11 70702212 - Add bounded USN read batch parser
+2026-05-11 2893af38 - Add USN cursor substrate
+2026-05-11 1dfd3475 - Add warm generation refresh foundation
+2026-05-11 827d894d - Add hidden warm indexd lifecycle
+2026-05-11 55d3896c - Add warm trigram postings foundation
+2026-05-11 f5e94f5d - Complete warm FileCatalog foundation
+2026-05-11 3834be88 - Start warm index file catalog
+2026-05-11 aed58406 - Checkpoint warm evidence frontier
+2026-05-11 936605d0 - Update .gitignore
+2026-05-11 a720d254 - add nexus evidence frontier
+2026-05-10 fbca0988 - comptime monomorphize scan hot loop for single-predicate plans
+2026-05-09 a2d959a7 - Initial commit: IX search engine
+
+--------------------------------------------------------------------------------
+FEATURE INVENTORY
+--------------------------------------------------------------------------------
+
+CLI Commands:
+  - search, matches, inspect, explain, similar, xo, why, watch, replace
+  - diff-matches, mcp, process, version, help, completions
+
+Output Formats:
+  - text, json, agent (v2), agent-v3, json-compact, files, count, stats, ndjson
+
+Core Modules (41 source files in src/core/):
+  - expr.zig, search.zig, search_admission.zig, simd.zig, sz.zig
+  - byte_frequencies.zig, byte_shard.zig, pcre_regex.zig, regex.zig
+  - shift_or.zig, jit_forge.zig, fm_index.zig, io_uring.zig
+  - trigram.zig, literal_alternates.zig, postings.zig, catalog.zig
+  - generation.zig, indexd.zig, usn.zig, delta_overlay.zig
+  - corpus_signature.zig, corpus.zig, preview.zig, xo.zig
+  - inspect.zig, similar.zig, mcp.zig, watch.zig, tree_sitter.zig
+  - roaring.zig, resource_profile.zig, nt_open.zig, scan_input_policy.zig
+  - scan_timing.zig, state_dir.zig, protected_paths.zig
+  - process_memory.zig, process_tool.zig, discovered_files.zig
+  - stats.zig, admission.zig
+
+CLI Modules (7 source files in src/cli/):
+  - args.zig, output.zig, agent_output.zig, cursor.zig
+  - output_contract.zig, command_spec.zig, main.zig
+
+Build: StringZilla v4.6.0 + PCRE2 10.44 (27 TUs) + Tree-sitter v0.25.3 + Zig grammar v1.1.2
+Packaging: winget, brew, scoop, cargo, apt
+Clients: TypeScript (ix.d.ts), Python (ix_types.py)
+CI: Ubuntu + Windows + macOS with Sigstore keyless signing
+
+--------------------------------------------------------------------------------
+PERFORMANCE BENCHMARKS
+--------------------------------------------------------------------------------
+
+  2026-07-15 Warm cached frontier: ~35ms (178x faster than first warm query)
+  2026-07-15 Warm first-query: ~6.2s, 5,867 candidates (92.6% pruned)
+  2026-07-15 Cold 79,405 files: 35,582 matches, ~8,000ms
+  2026-07-15 Scan work: 227,448ms across 2 threads = 113x parallelism
+  2026-07-15 Agent output: 4.2x token reduction vs json
+  2026-07-15 JIT Forge: <1us native code execution
+  2026-07-15 Wavelet tree: ~2000x space compression
+  2026-07-15 Binary: 4.8 MiB ReleaseFast
+  2026-07-15 CI: Ubuntu 2m16s, macOS 2m24s, Windows 4m39s
+  2026-07-15 Warm index: 922 MiB postings, 14.6 MiB catalog
+  2026-05-12 Warm PM_RESUME: 37.6x faster engine time vs Rust
+  2026-05-12 Warm PM_RESUME: 23.8x faster wall time vs Rust
+  2026-05-12 Protected cold: Zig 574ms vs Rust 626ms
+  2026-05-12 Windows System32: Zig 53ms vs Rust 259ms
+  2026-05-11 Warm MISS: 6000ms to 32ms after compaction fix (187x)
+
+================================================================================
+END OF CHANGELOG
+================================================================================
+
+--------------------------------------------------------------------------------
+DETAILED FEATURE LEDGER
+--------------------------------------------------------------------------------
+
+Public Functions and APIs:
+  - expr.parse: classify query shape into ExpressionPlan at parse time
+  - expr.MatcherStrategy: 11 variants (literal, casefold, word-boundary, alternates)
+  - search.run: full search pipeline execution to SearchReport
+  - search.ScopeTracker: per-line enclosing declaration scope tracking
+  - search.BanditArm.ucb1: UCB1 formula mu + c*sqrt(ln(t)/n)
+  - search.recordBanditResult: per-directory reward via Wyhash bucket
+  - search.speculativeScanCount: cooperative dual-strategy race
+  - search.tryFmIndexAdmission: per-file BWT + backward search O(p) admission
+  - pcre_regex.validate/column/span/count: PCRE2 JIT matching
+  - regex.column/span/count: Zig-native backtracking fallback
+  - regex.buildThompsonNFA: recursive-descent Thompson construction
+  - regex.columnNFA: O(pm) forward simulation for all regex
+  - shift_or.indexOf/count/contains: bit-parallel matching
+  - jit_forge.forgeByteSearch: single-byte compiled x86_64 search
+  - jit_forge.forgeLiteralSearch: multi-byte CMP+JNE chain (up to 32 bytes)
+  - fm_index.buildFMIndex: BWT + suffix array + wavelet tree
+  - fm_index.WaveletTree.rank: 8-level compressed bit-vector rank
+  - fm_index.FMIndex.contains/count/locate: O(p) backward search
+  - io_uring.createWorkerRing: thread-local io_uring instance
+  - io_uring.registerFixedBuffer: IORING_OP_READ_FIXED pre-registration
+  - io_uring.readBlocking: submit + poll convenience
+  - trigram.admit: lower expression plan to trigram admission
+  - TrigramAdmissionProgram: 4096-slot rolling membership table
+  - postings.buildPostingsSegment: trigram-to-FileId inverted index
+  - postings.proveBlockPruning: max-postings block proof
+  - postings.lowerExpressionToLookupPlan: query-to-lookup lowering
+  - postings.evaluateLookupPlanFromFile: candidate evaluation from disk
+  - catalog.identifyRoot: root fingerprint + canonical path
+  - catalog.foldTombstonedCatalogEntries: stale file ID removal
+  - generation.pinCurrentGeneration: manifest-only epoch pin
+  - generation.planCompaction: segment selection under reader protection
+  - indexd.run: full daemon lifecycle (foreground, once, watch, serve, repair)
+  - indexd.acquireRootLock: prevent overlapping mutation owners
+  - indexd.writeLiveMarker: IXINDEX_LIVE1 ownership marker
+  - usn.classifyJournalAvailability: USN availability probe
+  - usn.parseReadBatch: bounded read-batch parsing
+  - usn.mapRecordToDeltaTask: journal record to delta mapping
+  - usn.coalesceDeltaTasks: rename-storm coalescing
+  - corpus.compileProofProgram: explain command lowering
+  - preview.make: Furnas fisheye preview with UTF-8-safe contraction
+  - xo.run: BM25 degree-of-interest context assembly
+  - inspect.window/windowForPath: bounded file window extraction
+  - similar.run: semantic similarity via embeddings + reranker
+  - mcp.run: MCP JSON-RPC server loop
+  - watch.runWatch: file-change streaming with ReadDirectoryChangesW
+  - tree_sitter.parseSource: tree-sitter AST parsing for Zig files
+  - tree_sitter.enclosingNodeName: enclosing FunctionDecl/VarDecl for offset
+  - roaring.RoaringBitmap.add/contains/intersect: Roaring operations
+  - resource_profile.CappedAllocator: atomic memory ceiling
+  - resource_profile.HugePageAllocator: MAP_HUGETLB for 2 MiB+ allocations
+  - resource_profile.ResourceToggle: Low/Medium/High scaling enum
+  - resource_profile.pinThreadToCore: NUMA thread pinning
+  - nt_open.openFile: Windows NT object path file open
+  - admission.Engine.decide: path-class admission decision
+  - output.writeSearchNdjson: NDJSON streaming renderer
+  - output.writeEstimate: pre-execution cost class
+  - output.writeWhy: posting-list lineage
+  - output.writeReplaceResult: replace command output
+  - output.writeDiffMatchesResult: diff-matches output
+  - agent_output.render: ix.result.v3 bounded renderer
+  - cursor.encode/decode: ixc1 pagination token
+  - command_spec.writeBashCompletion/Zsh/Fish/PowerShell: completion generators
+
+Warm Index File Formats:
+  - IXINDEX_LIVE1: live-owner marker (PID, process start, root)
+  - IXGEN001: generation manifest (epoch, root fingerprint, segments)
+  - IXCAT001: file catalog (root fingerprint, file IDs, metadata)
+  - IXPOST01: trigram postings (root fingerprint, generation, density)
+  - IXQUERY_FRONTIER1: query-frontier cache (epoch, candidates)
+  - IXQUERY_HITS1: query-hit cache (epoch, matches, hits)
+  - IXQUERY_STATS2: query-stats cache (epoch, matches)
+  - IXEVIDENCE2: nexus evidence cache (expression, root, path-set)
+
+30-Pillar Harvest Doctrine Status:
+  - P1 Prime Directive: v3 agent output, fisheye, byte budget
+  - P2 Universal Agnosticism: arch-gated SIMD, TTY/JSON/MCP consumers
+  - P3 Competitor Harvest: vendored refs, anatomy map, research files
+  - P4 Epistemic Scan: policy in AGENTS.md, research corpus
+  - P5 Reverse-Engineering: NT-syscall recon + competitor anatomy map
+  - P6 Cross-Pollination: all 6 named techniques fused
+  - P7 De-Branding: algorithm attribution not vendor branding
+  - P8 Determinism: fixed seeds, stable sorts, deterministic signatures
+  - P9 Predictive Planning: budget-ms, estimate, explain proof program
+  - P10 Q-Gram Substrate: trigram IXPOST01, scalar merge intersection
+  - P11 FM-Index: wavelet tree compressed Occ, O(p) backward search
+  - P12 Shift-Or: Baeza-Yates-Gonnet for patterns <=64 bytes
+  - P13 Branchless SWAR: zero-byte collision, AVX2 Vector(32,u8)
+  - P14 Thompson NFA: alternation, quantifiers, classes, O(pm)
+  - P15 JIT Forge: executable pages, W^X, multi-byte pattern compilation
+  - P16 Kernel Bypass: io_uring SQPOLL + READ_FIXED on scan path
+  - P17 Non-Temporal: MOVNTDQ + PREFETCHNTA + SFENCE
+  - P18 NUMA Arena: MAP_HUGETLB HugePageAllocator, thread pinning
+  - P19 Speculative: atomic CAS swap, mid-scan cancellation 4096 bytes
+  - P20 UCB1 Bandit: reward tracking all 4 scan workers
+  - P21 Ignore Parity: gitignore + ignore + agignore loaded
+  - P22 AST Records: tree-sitter Zig grammar, --record ast functional
+  - P23 Cognitive I/O: NDJSON streaming, compact tuples, sentinels
+  - P24 Frozen Schema: v1/v2/v3 sentinels, TS + Python typed clients
+  - P25 Sacred Handshake: version/help exit 0, shell completions
+  - P26 Warm Daemon: serve/watch/once/repair modes, freshness
+  - P27 Elasticity: Resource Toggle Low/Medium/High
+  - P28 Apex Challenger: ripgrep + ag + ack + grep in benchmark suite
+  - P29 Adjacent Ops: 11 operations (count, files, why, watch, replace, diff-matches, explain, xo, inspect, similar, mcp)
+  - P30 Distribution: MCP server, Sigstore signed, 5 package manifests
+
+================================================================================
+END OF CHANGELOG
+================================================================================
