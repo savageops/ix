@@ -4,6 +4,35 @@ type: log
 
 # Agent Progress Log
 
+## 2026-07-16 - Bounded warm-index architecture after 250 GB generation leak
+
+Status: research and architecture design complete; runtime remains disabled and unrepaired.
+
+- Confirmed the failure is lifecycle-wide: mutation wakes drive complete generation republication, manifests physically duplicate unchanged payloads, the GC planner has no production deletion owner, and memory policy does not bound disk.
+- Studied six primary systems: Sourcegraph Zoekt, Tantivy, Quickwit, Watchman, Livegrep, and GitHub Blackbird. Reused pinned local source for Zoekt/Tantivy/Quickwit and primary official architecture sources for Watchman/Livegrep/Blackbird.
+- Added `.docs/research/2026-07-16-bounded-warm-index-architecture.md`: one explicit writer per enrolled root, one immutable base plus bounded deltas, tiny reference manifests, content identity, journal-driven freshness, atomic publication, managed-object mark-and-sweep, hard disk caps, free-space floors, and cold fallback.
+- Made ordinary search a consumer rather than a daemon launcher. Background enrollment and one-shot bootstrap are explicit operator actions with disk preflight; broad roots are resolved, estimated, and refused by default when unsafe.
+- Sequenced adoption into five independently provable results, beginning with recurrence prevention: physical GC, managed accounting, disk quota, write reservation, startup cleanup, and suspension before delta or richer-index work.
+- Extended the canonical competitor anatomy map with the six lifecycle rivals and the exact mechanism retained versus complexity rejected.
+
+## 2026-07-16 - Perpetual-ascent goal widened to the whole architecture
+
+Status: broad architecture doctrine complete; runtime gaps identified, not repaired in this documentation-only round.
+
+- Replaced the feature-fixated Goal 001 with a reusable `/goal` contract spanning command/control, planning, discovery/admission, persistent evidence, scan and verification engines, concurrency/resources, merge/output, reading/retrieval, agent protocols, build provenance, installation, and recovery.
+- Added explicit end-to-end pipeline maps and an architectural proof map so each round traces changes through canonical owners instead of optimizing one visible stage in isolation.
+- Made incomplete capability reconciliation a standing priority: command tags, parser arms, dispatch, output schemas, help, completions, tests, docs, MCP projections, optimized builds, and installed behavior must agree before a capability is called complete.
+- Preserved repository-versus-installed performance qualification as a regression-safety gate rather than the goal’s center. Ripgrep assets remain workloads; backups remain one-at-a-time historical sentinels; hard correctness cannot be traded for aggregate speed.
+- Added core-code stewardship for oversized owners, prefactoring at domain boundaries, algorithmic/microarchitectural/memory-hierarchy analysis, platform-native semantics, resource governance, clean-build truth, and explicit unsupported-runtime boundaries.
+- Refreshed `.docs/qc/ix-loop-state.md` so the goal no longer boots from the superseded claim that `min` was removed; the new capsule routes the next round through a broad architecture capability matrix and keeps partial runtime evidence explicit.
+- Deepened Goal 001 with a fourteen-pass independent reviewer mandate covering source identity, capability completeness, canonical ownership, route equivalence, pruning safety, index freshness, hot-path mechanics, concurrency and resources, platform semantics, output loss, build/release provenance, proof quality, unfinished debt, and maintainability.
+- Added a concrete code-owner review matrix for CLI/dispatch, expression planning, the multi-phase `search.run` owner, discovery/admission, persistent index lifecycle, specialist scanners, I/O backends, resources/merge, serializers, retrieval modes, MCP, and build/install owners.
+- Added falsification rules, P0-P3 finding requirements, `PASS`/`REWORK`/`EXPERIMENTAL`/`BLOCK` verdicts, and a governability removal test so review cannot collapse into changed-line inspection or benchmark theater.
+- Recorded current review pressure without claiming repair: MCP descriptor/dispatch divergence, broad `search.run` responsibility, platform-specific index freshness behavior, and explicit `not_wired` index telemetry remain capability-matrix inputs.
+- Ran the required semantic duplicate audit on the CLI/MCP seam after a broader five-file pass exceeded its bounded runtime; the narrowed two-file pass found zero candidate pairs, confirming that the review concern is behavioral parity and ownership rather than embedding-level duplication.
+- Refocused Goal 001 on one measurable consumer result per round. Added a six-line result contract, evidence-adjusted selection rule, result ladder, and compact before/after scorecard so research, review, refactoring, benchmarks, and documentation cannot become proxy accomplishments.
+- Reframed the fourteen reviewer passes as a risk-proportionate coverage catalog: apply relevant passes, mark irrelevant lanes `N/A`, and stop investigating when more detail cannot change the mechanism, acceptance threshold, implementation boundary, or verdict.
+
 ## 2026-07-16 - 600-item product achievement, challenge, breakthrough, and performance report
 
 Status: completed with a current warm-parity correction.

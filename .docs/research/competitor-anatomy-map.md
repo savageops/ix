@@ -165,3 +165,18 @@ These six pinned implementations establish the adjacent-tool boundary for bounde
 | Gitingest | bounded repository ingestion and full-content framing | in-memory filesystem tree | recursive sorted traversal then concatenation and token estimate | gitignore/include/exclude, max depth/files/file size/total bytes | skips oversized files and materializes accepted content; resource accounting transfers, compaction does not |
 | Code2Prompt | selected-file processing, optional entity map, template rendering, token count | session-owned file vector, tree, metadata, optional entities | traverse, decode/process, render through one session owner | include/exclude and interactive selection engine | prompt packer rather than compactor; lossy decoding breaks byte-exact provenance |
 | Files-to-prompt | deterministic file framing with optional XML/Markdown and line numbers | none | sorted recursive walk and whole-file read | simplified gitignore, extension, hidden-file, and glob filters | no semantic reduction or resource budget; delimiter safety and source framing transfer |
+
+---
+
+## Warm-index lifecycle supplement — 2026-07-16
+
+The bounded warm-index design in `.docs/research/2026-07-16-bounded-warm-index-architecture.md` adds six lifecycle rivals selected specifically against IX's 250 GB generation leak.
+
+| Rival | Index/lifecycle anatomy | Mechanism retained | Weakness IX avoids |
+|---|---|---|---|
+| Sourcegraph Zoekt | repository-keyed queue, persistent shards, serialized merge, trash grace, tmp cleanup | keyed coalescing, one writer, reversible retirement, crash-residue cleanup | service-scale queue/merge surface and repo-rebuild bias |
+| Tantivy | immutable segments, atomic `meta.json`, managed-file inventory, exact live-set GC, single segment updater | register-before-create, atomic commit point, mark-and-sweep GC | general full-text schema and unconstrained segment-policy complexity |
+| Quickwit | staged/published/deletion-marked splits with janitor-owned GC | typed physical lifecycle and crash convergence | distributed metastore, object storage, actor topology |
+| Watchman | root clocks, settle, fresh-instance detection, conservative recrawl, node GC | event coalescing, continuity cursor, explicit uncertainty | watcher alone provides no searchable index |
+| Livegrep | standalone mmap index with simple reader | immutable mmap-friendly serving unit | whole-index rebuild and documented 3–5× index size |
+| GitHub Blackbird | blob-ID dedup, event/delta ingest, commit-consistent publication, ngram/path/symbol indices, compaction | content identity, batch consistency, rich evidence plus exact verification | proprietary distributed Kafka/shard architecture is unnecessary locally |
