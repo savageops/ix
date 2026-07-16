@@ -59,6 +59,17 @@ pub const search_options = [_]OptionSpec{
     .{ .syntax = "-h, --help", .names = &.{ "-h", "--help" }, .help = "Print help" },
 };
 
+pub const min_options = [_]OptionSpec{
+    .{ .syntax = "--level <LEVEL>", .names = &.{"--level"}, .help = "Select low, med, or high", .takes_value = true },
+    .{ .syntax = "--max-bytes <N>", .names = &.{"--max-bytes"}, .help = "Bound the complete stdout payload", .takes_value = true },
+    .{ .syntax = "--format <FORMAT>", .names = &.{"--format"}, .help = "Select text or json", .takes_value = true },
+    .{ .syntax = "--json", .names = &.{"--json"}, .help = "Alias for --format json" },
+    .{ .syntax = "-h, --help", .names = &.{ "-h", "--help" }, .help = "Print help" },
+};
+
+pub const min_levels = [_][]const u8{ "low", "med", "high" };
+pub const min_formats = [_][]const u8{ "text", "json" };
+
 /// One table owns accepted format names, migration posture, and help text.
 pub const formats = [_]FormatSpec{
     .{ .name = "records", .format = .text, .compatibility = "current", .help = "Hit records with the v1 terminal result" },
@@ -113,6 +124,15 @@ test "search help metadata covers every bounded agent control" {
     }
 }
 
+test "all shell completion command sources advertise min" {
+    var found = false;
+    for (commands) |command| if (std.mem.eql(u8, command, "min")) {
+        found = true;
+        break;
+    };
+    try std.testing.expect(found);
+}
+
 // ── Shell Completions (P30) ─────────────────────────────────────────
 //
 // Generated from the same command_spec tables that own the parser and
@@ -120,7 +140,7 @@ test "search help metadata covers every bounded agent control" {
 // canonical command list and option list — single source of truth.
 
 pub const commands = [_][]const u8{
-    "search", "matches", "inspect", "explain", "process", "similar", "xo", "why", "watch", "replace", "diff-matches", "mcp", "help",
+    "search", "matches", "inspect", "min", "explain", "process", "similar", "xo", "why", "watch", "replace", "diff-matches", "mcp", "help",
 };
 
 /// Writes bash completion to the given writer.
@@ -140,9 +160,12 @@ pub fn writeBashCompletion(writer: anytype) !void {
     try writer.writeAll("        COMPREPLY=( $(compgen -W \"$cmds\" -- \"$cur\") )\n");
     try writer.writeAll("        return 0\n");
     try writer.writeAll("    fi\n");
-    // Format values for --format
+    // Format and level values remain command-specific so completion cannot advertise invalid enums.
     try writer.writeAll("    case \"$prev\" in\n");
+    try writer.writeAll("        --level)\n");
+    try writer.writeAll("            if [ \"${COMP_WORDS[1]}\" = \"min\" ]; then COMPREPLY=( $(compgen -W \"low med high\" -- \"$cur\") ); return 0; fi ;;\n");
     try writer.writeAll("        --format)\n");
+    try writer.writeAll("            if [ \"${COMP_WORDS[1]}\" = \"min\" ]; then COMPREPLY=( $(compgen -W \"text json\" -- \"$cur\") ); return 0; fi\n");
     try writer.writeAll("            COMPREPLY=( $(compgen -W \"");
     for (formats, 0..) |spec, i| {
         if (i > 0) try writer.writeByte(' ');
@@ -162,6 +185,11 @@ pub fn writeBashCompletion(writer: anytype) !void {
         }
     }
     try writer.writeAll("--version\" -- \"$cur\") )\n");
+    try writer.writeAll("            ;;\n");
+    try writer.writeAll("        min)\n");
+    try writer.writeAll("            COMPREPLY=( $(compgen -W \"");
+    for (min_options) |spec| for (spec.names) |name| try writer.print("{s} ", .{name});
+    try writer.writeAll("\" -- \"$cur\") )\n");
     try writer.writeAll("            ;;\n");
     try writer.writeAll("    esac\n");
     try writer.writeAll("    COMPREPLY=( $(compgen -f -- \"$cur\") )\n");
@@ -208,6 +236,9 @@ pub fn writeZshCompletion(writer: anytype) !void {
     }
     try writer.writeAll("\n");
     try writer.writeAll("                    ;;\n");
+    try writer.writeAll("                min)\n");
+    try writer.writeAll("                    _arguments '--level[Compaction policy]:level:(low med high)' '--max-bytes[Complete stdout byte cap]:bytes:' '--format[Output format]:format:(text json)' '--json[Emit JSON]' '-h[Print help]' '--help[Print help]'\n");
+    try writer.writeAll("                    ;;\n");
     try writer.writeAll("            esac\n");
     try writer.writeAll("            case \"$state\" in\n");
     try writer.writeAll("                fmts) _describe 'format' formats ;;\n");
@@ -232,6 +263,13 @@ pub fn writeFishCompletion(writer: anytype) !void {
             try writer.writeAll("\n");
         }
     }
+    for (min_levels) |level| try writer.print("complete -c ix -n \"__fish_seen_subcommand_from min; and __fish_seen_argument --level\" -a \"{s}\"\n", .{level});
+    for (min_formats) |format| try writer.print("complete -c ix -n \"__fish_seen_subcommand_from min; and __fish_seen_argument --format\" -a \"{s}\"\n", .{format});
+    for (min_options) |spec| {
+        for (spec.names) |name| {
+            if (std.mem.startsWith(u8, name, "--")) try writer.print("complete -c ix -n \"__fish_seen_subcommand_from min\" -l \"{s}\"\n", .{name[2..]});
+        }
+    }
 }
 
 /// Writes PowerShell completion to the given writer.
@@ -251,9 +289,16 @@ pub fn writePowerShellCompletion(writer: anytype) !void {
     }
     try writer.writeAll(")\n");
     try writer.writeAll("    $options = @(");
-    for (search_options, 0..) |spec, i| {
-        if (i > 0) try writer.writeAll(", ");
+    var option_index: usize = 0;
+    for (search_options) |spec| {
+        if (option_index > 0) try writer.writeAll(", ");
         try writer.print("'{s}'", .{spec.names[0]});
+        option_index += 1;
+    }
+    for (min_options) |spec| {
+        if (option_index > 0) try writer.writeAll(", ");
+        try writer.print("'{s}'", .{spec.names[0]});
+        option_index += 1;
     }
     try writer.writeAll(")\n");
     try writer.writeAll("    if ($wordToComplete.StartsWith('-')) {\n");

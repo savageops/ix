@@ -11,6 +11,7 @@ pub const CommandTag = enum {
     search,
     matches,
     inspect,
+    min,
     explain,
     process,
     similar,
@@ -29,6 +30,7 @@ pub const HelpTopic = enum {
     search,
     matches,
     inspect,
+    min,
     explain,
     process,
     similar,
@@ -144,6 +146,16 @@ pub const InspectFormat = enum {
     json,
 };
 
+pub const MinLevel = enum { low, med, high };
+pub const MinFormat = enum { text, json };
+
+pub const MinRequest = struct {
+    path: []const u8,
+    level: MinLevel = .med,
+    max_bytes: usize = 16_384,
+    format: MinFormat = .text,
+};
+
 pub const ExplainRequest = struct {
     expression: []const u8,
 };
@@ -210,6 +222,7 @@ pub const Command = union(CommandTag) {
     search: SearchRequest,
     matches: SearchRequest,
     inspect: InspectRequest,
+    min: MinRequest,
     explain: ExplainRequest,
     process: ProcessRequest,
     similar: SimilarRequest,
@@ -281,6 +294,10 @@ pub const ParseError = error{
     ConflictingOutputFormat,
     StatsOnlyOutputCapConflict,
     AmbiguousBooleanRegex,
+    InvalidMinLevel,
+    InvalidMinFormat,
+    InvalidMinBudget,
+    MultipleMinFiles,
 };
 
 pub const ParseFailureDetail = struct {
@@ -296,6 +313,16 @@ pub fn diagnoseParseFailure(argv: []const []const u8, err: anyerror) ParseFailur
     if (err == ParseError.StatsOnlyOutputCapConflict) return .{
         .hint = "remove --total-count/--max-hits for a complete stats-only scan, or remove --stats-only for a bounded projection",
     };
+    if (argv.len > 1 and std.mem.eql(u8, argv[1], "min")) {
+        return switch (err) {
+            ParseError.InvalidMinLevel => .{ .hint = "use --level low, med, or high" },
+            ParseError.InvalidMinFormat => .{ .hint = "use --format text or json" },
+            ParseError.InvalidMinBudget => .{ .hint = "use --max-bytes with a positive decimal byte count" },
+            ParseError.MultipleMinFiles => .{ .hint = "run one file per invocation" },
+            ParseError.MissingValue => .{ .hint = "usage: ix min [low|med|high] FILE [--max-bytes N]" },
+            else => .{ .hint = "run ix help min to list accepted options" },
+        };
+    }
     if (err != ParseError.UnsupportedFlag or argv.len < 2) return .{};
     const is_search = std.mem.eql(u8, argv[1], "search");
     const is_matches = std.mem.eql(u8, argv[1], "matches");
@@ -352,6 +379,10 @@ pub fn parseInvocation(allocator: std.mem.Allocator, argv: []const []const u8) !
     if (std.mem.eql(u8, first, "inspect")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .inspect } };
         return .{ .command = .{ .inspect = try parseInspect(argv[2..]) } };
+    }
+    if (std.mem.eql(u8, first, "min")) {
+        if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .min } };
+        return .{ .command = .{ .min = try parseMin(argv[2..]) } };
     }
     if (std.mem.eql(u8, first, "explain")) {
         if (argv.len >= 3 and isHelpArg(argv[2])) return .{ .command = .{ .help = .explain } };
@@ -421,11 +452,120 @@ fn helpTopic(arg: []const u8) ?HelpTopic {
     if (std.mem.eql(u8, arg, "search")) return .search;
     if (std.mem.eql(u8, arg, "matches")) return .matches;
     if (std.mem.eql(u8, arg, "inspect")) return .inspect;
+    if (std.mem.eql(u8, arg, "min")) return .min;
     if (std.mem.eql(u8, arg, "explain")) return .explain;
     if (std.mem.eql(u8, arg, "process")) return .process;
     if (std.mem.eql(u8, arg, "similar")) return .similar;
     if (std.mem.eql(u8, arg, "xo")) return .xo;
     return null;
+}
+
+/// Parses one explicit file plus typed compaction policy; positional LEVEL is a deliberate short form.
+fn parseMin(args: []const []const u8) ParseError!MinRequest {
+    var request = MinRequest{ .path = "" };
+    var level_explicit = false;
+    var budget_explicit = false;
+    var format_explicit: ?MinFormat = null;
+    var path_set = false;
+    var index: usize = 0;
+    while (index < args.len) : (index += 1) {
+        const arg = args[index];
+        if (std.mem.eql(u8, arg, "--level")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.level = parseMinLevel(args[index]) orelse return ParseError.InvalidMinLevel;
+            level_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--max-bytes")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            request.max_bytes = std.fmt.parseInt(usize, args[index], 10) catch return ParseError.InvalidMinBudget;
+            if (request.max_bytes == 0) return ParseError.InvalidMinBudget;
+            budget_explicit = true;
+        } else if (std.mem.eql(u8, arg, "--format")) {
+            index += 1;
+            if (index >= args.len) return ParseError.MissingValue;
+            const format: MinFormat = if (std.mem.eql(u8, args[index], "text")) .text else if (std.mem.eql(u8, args[index], "json")) .json else return ParseError.InvalidMinFormat;
+            if (format_explicit) |selected| if (selected != format) return ParseError.ConflictingOutputFormat;
+            request.format = format;
+            format_explicit = format;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            if (format_explicit) |selected| if (selected != .json) return ParseError.ConflictingOutputFormat;
+            request.format = .json;
+            format_explicit = .json;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return ParseError.UnsupportedFlag;
+        } else if (!path_set and !level_explicit and parseMinLevel(arg) != null) {
+            request.level = parseMinLevel(arg).?;
+            level_explicit = true;
+        } else if (!path_set) {
+            request.path = arg;
+            path_set = true;
+        } else return ParseError.MultipleMinFiles;
+    }
+    if (!path_set) return ParseError.MissingValue;
+    if (!budget_explicit) request.max_bytes = defaultMinBudget(request.level);
+    return request;
+}
+
+/// Converts the public profile vocabulary into the typed policy owner.
+fn parseMinLevel(value: []const u8) ?MinLevel {
+    if (std.mem.eql(u8, value, "low")) return .low;
+    if (std.mem.eql(u8, value, "med")) return .med;
+    if (std.mem.eql(u8, value, "high")) return .high;
+    return null;
+}
+
+/// Maps increasing loss pressure to monotonically smaller complete-output defaults.
+fn defaultMinBudget(level: MinLevel) usize {
+    return switch (level) {
+        .low => 32_768,
+        .med => 16_384,
+        .high => 8192,
+    };
+}
+
+test "min positional and canonical level forms lower identically" {
+    const positional = [_][]const u8{ "ix", "min", "low", "C:/large.txt" };
+    const canonical = [_][]const u8{ "ix", "min", "C:/large.txt", "--level", "low" };
+    const a = (try parseInvocation(std.testing.allocator, &positional)).command.min;
+    const b = (try parseInvocation(std.testing.allocator, &canonical)).command.min;
+    try std.testing.expectEqual(a.level, b.level);
+    try std.testing.expectEqual(a.max_bytes, b.max_bytes);
+    try std.testing.expectEqualStrings(a.path, b.path);
+    try std.testing.expectEqual(@as(usize, 32_768), a.max_bytes);
+}
+
+test "min defaults and explicit output controls are typed" {
+    const defaults = [_][]const u8{ "ix", "min", "large.txt" };
+    const low = [_][]const u8{ "ix", "min", "low", "large.txt" };
+    const high = [_][]const u8{ "ix", "min", "high", "large.txt" };
+    const explicit = [_][]const u8{ "ix", "min", "high", "large.txt", "--max-bytes", "4096", "--format", "json" };
+    const a = (try parseInvocation(std.testing.allocator, &defaults)).command.min;
+    const conservative = (try parseInvocation(std.testing.allocator, &low)).command.min;
+    const emergency = (try parseInvocation(std.testing.allocator, &high)).command.min;
+    const b = (try parseInvocation(std.testing.allocator, &explicit)).command.min;
+    try std.testing.expectEqual(MinLevel.med, a.level);
+    try std.testing.expectEqual(@as(usize, 16_384), a.max_bytes);
+    try std.testing.expectEqual(@as(usize, 32_768), conservative.max_bytes);
+    try std.testing.expectEqual(@as(usize, 8192), emergency.max_bytes);
+    try std.testing.expect(conservative.max_bytes > a.max_bytes);
+    try std.testing.expect(a.max_bytes > emergency.max_bytes);
+    try std.testing.expectEqual(MinLevel.high, b.level);
+    try std.testing.expectEqual(@as(usize, 4096), b.max_bytes);
+    try std.testing.expectEqual(MinFormat.json, b.format);
+}
+
+test "min rejects missing duplicate and malformed arguments" {
+    const missing = [_][]const u8{ "ix", "min" };
+    const duplicate = [_][]const u8{ "ix", "min", "a.txt", "b.txt" };
+    const level = [_][]const u8{ "ix", "min", "a.txt", "--level", "extreme" };
+    const budget = [_][]const u8{ "ix", "min", "a.txt", "--max-bytes", "0" };
+    const format = [_][]const u8{ "ix", "min", "a.txt", "--format", "yaml" };
+    try std.testing.expectError(ParseError.MissingValue, parseInvocation(std.testing.allocator, &missing));
+    try std.testing.expectError(ParseError.MultipleMinFiles, parseInvocation(std.testing.allocator, &duplicate));
+    try std.testing.expectError(ParseError.InvalidMinLevel, parseInvocation(std.testing.allocator, &level));
+    try std.testing.expectError(ParseError.InvalidMinBudget, parseInvocation(std.testing.allocator, &budget));
+    try std.testing.expectError(ParseError.InvalidMinFormat, parseInvocation(std.testing.allocator, &format));
 }
 
 fn parseProcess(args: []const []const u8) ParseError!ProcessRequest {

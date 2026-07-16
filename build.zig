@@ -31,6 +31,17 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run Zig unit tests");
     test_step.dependOn(&test_cmd.step);
 
+    const min_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/min_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const min_test_cmd = b.addRunArtifact(min_tests);
+    const min_test_step = b.step("test-min", "Run bounded compaction tests");
+    min_test_step.dependOn(&min_test_cmd.step);
+
     const delta_overlay_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/core/delta_overlay.zig"),

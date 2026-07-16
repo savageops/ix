@@ -7,6 +7,7 @@ const output = @import("cli/output.zig");
 const expr = @import("core/expr.zig");
 const indexd = @import("core/indexd.zig");
 const inspect = @import("core/inspect.zig");
+const min = @import("core/min.zig");
 const mcp = @import("core/mcp.zig");
 const watch = @import("core/watch.zig");
 const process_tool = @import("core/process_tool.zig");
@@ -236,6 +237,26 @@ pub fn main(init: std.process.Init) !void {
                     std.process.exit(1);
                 };
             }
+        },
+        .min => |request| {
+            min.run(init.io, allocator, request, stdout) catch |err| {
+                if (err == error.NotFile)
+                    try output.writeErrorDetail(stderr, "min_not_file", "compaction accepts one regular file", request.path, "provide a regular UTF-8 text file")
+                else if (err == error.BinaryInput)
+                    try output.writeError(stderr, "min_binary_input", "compaction accepts text; use an exact binary-aware tool")
+                else if (err == error.InvalidUtf8)
+                    try output.writeError(stderr, "min_invalid_utf8", "transcode explicitly before compaction so byte provenance remains exact")
+                else if (err == error.UnitLimit)
+                    try output.writeError(stderr, "min_unit_limit", "the adaptive planner exceeded its fixed metadata ceiling")
+                else if (err == error.ByteBudgetTooSmall)
+                    try output.writeError(stderr, "min_budget_too_small", "increase --max-bytes or choose a lossier level")
+                else if (err == error.OutOfMemory)
+                    try output.writeError(stderr, "min_resource_limit", "the command reached the framework-wide memory ceiling")
+                else
+                    try output.writeError(stderr, "min_read_failed", @errorName(err));
+                try stderr.flush();
+                std.process.exit(1);
+            };
         },
         .explain => |request| {
             const plan = parseExpression(request.expression) catch |err| {

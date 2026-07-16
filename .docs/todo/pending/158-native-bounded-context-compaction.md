@@ -1,7 +1,7 @@
 ---
 id: 158-native-bounded-context-compaction
 type: implementation-spec
-status: active
+status: complete
 priority: P0
 owner: cli-command-spine
 date: 2026-07-16
@@ -31,7 +31,7 @@ The command is worth implementing as a narrow, query-free reading projection. It
 
 ## Contract
 
-`ix min [LEVEL] FILE` compacts one regular text file. `LEVEL` is `low`, `med`, or `high`; `--level LEVEL` is the canonical flag form and the optional positional level is retained as the short command requested by the user. `--max-bytes N` bounds the complete stdout payload, not only retained content. `--format text|json` selects a human projection or the stable `ix.min.v1` machine envelope. Defaults are owned by `src/core/min.zig`: low 32768 bytes, med 16384 bytes, high 8192 bytes. An explicit budget below the minimum truthful envelope fails before stdout is written.
+`ix min [LEVEL] FILE` compacts one regular text file. `LEVEL` is `low`, `med`, or `high`; `--level LEVEL` is the canonical flag form and the optional positional level is retained as the short command requested by the user. `--max-bytes N` bounds the complete stdout payload, not only retained content. `--format text|json` selects a human projection or the stable `ix.min.v1` machine envelope. Defaults are owned by `src/cli/args.zig`: low 32768 bytes, med 16384 bytes, high 8192 bytes. An explicit budget below the minimum truthful envelope fails before stdout is written.
 
 The command is read-only and accepts exactly one file. Directories, stdin, recursive packing, output-file mutation, network calls, model providers, and hidden subprocesses are outside this surface. `inspect` remains the exact follow-up owner. `xo` remains query-guided. `similar` remains semantic ranking. Persistent index compaction is unrelated and must not share the public noun without qualification.
 
@@ -41,10 +41,10 @@ Retained content is copied byte-for-byte from the source. Each retained unit inc
 
 ## Native pipeline
 
-1. Preflight the path, regular-file status, size, and output budget. Reject NUL-bearing/binary input, invalid UTF-8, and arithmetic overflow with typed errors. Compute an adaptive target unit size from file size and `MAX_UNITS = 65536`, with a 4 KiB floor. This keeps metadata input-independent while retaining line boundaries.
+1. Preflight the path, regular-file status, size, and output budget. Reject NUL-bearing/binary input and invalid UTF-8 with typed errors. Compute an adaptive target unit size from file size and `MAX_UNITS = 65536`, with a 256-byte floor. This keeps metadata bounded while retaining complete-line boundaries and avoids forcing unrelated evidence into coarse multi-kilobyte blocks.
 2. Pass one streams through a fixed read buffer under the framework allocator. It computes SHA-256, exact line coordinates, structural-unit metadata, a bounded lexical-frequency sketch, a 256-bit feature signature, and a 128-bit duplicate-candidate digest. Units prefer blank-line, heading, declaration, and record boundaries; the adaptive target groups adjacent complete lines. A pathological line remains one complete unit.
 3. Duplicate admission groups matching digest and length. Equality is proven by chunked positional byte comparison before a unit is marked duplicate. Digest equality alone can never remove content.
-4. Hard-preserve classification is syntactic and explainable: headings/declarations, obligation or negation terms, paths/URLs, command/flag forms, hashes, numeric metrics/formulas, error/status markers, and first/last document units. It is a floor, not a claim of semantic understanding.
+4. Preservation classification is syntactic and explainable. First/last document units are the absolute floor. Headings/declarations, obligation or negation terms, paths/URLs, command/flag forms, hashes, numeric metrics/formulas, and error/status markers receive strong score weight and labeled retention gates; they are not an absolute per-unit floor because adversarial documents can contain one on every line.
 5. Soft score is a saturating integer tuple: structural role, bounded lexical rarity, obligation density, identifier density, numeric/path/error evidence, source-boundary prior, and duplicate penalty. Med/high greedily add the greatest marginal score per exact rendered byte, subtracting overlap against selected 256-bit signatures. Stable ties resolve by source offset. Selection is returned to source order.
 6. The canonical serializer preflights exact escaped/rendered byte length, including metadata, omission sentinels, delimiters, and final newline. It drops only soft-selected units until the payload fits. If protected units plus the minimum truthful envelope exceed the budget, it returns `min_budget_too_small`; it never truncates stdout.
 
@@ -55,8 +55,8 @@ Retained content is copied byte-for-byte from the source. Each retained unit inc
 - `MinRequest { path, level, max_bytes, format }`
 - `SourceRange { start_byte, end_byte, start_line, end_line }`
 - `UnitClass { heading, declaration, paragraph, record, block, long_line }`
-- `OmissionReason { exact_duplicate, budget, low_marginal_value }`
-- `MinUnit { range, class, digest, feature_bits, score, hard_preserve, duplicate_of }`
+- `OmissionReason { exact_duplicate, budget }`
+- `MinUnit { range, class, digest, feature_bits, score, boundary_preserve, duplicate_of }`
 - `MinOmission { range, input_bytes, units, reason }`
 - `MinReport { schema, path, source_sha256, level, lossy, complete, input_bytes, input_lines, max_bytes, output_bytes, retained_bytes, retained_units, omitted_bytes, omitted_units, units, omissions }`
 
@@ -73,7 +73,7 @@ Retained content is copied byte-for-byte from the source. Each retained unit inc
 - `min_invalid_utf8`: transcode explicitly before compaction so byte provenance remains honest.
 - `min_unit_limit`: the adaptive unit planner could not represent the source within the fixed metadata ceiling.
 - `min_resource_limit`: the framework-wide allocator ceiling was reached.
-- `min_budget_too_small`: raise `--max-bytes` or choose a lossier level; include the minimum truthful size when calculable.
+- `min_budget_too_small`: raise `--max-bytes` or choose a lossier level; stdout remains empty.
 - `min_read_failed`: include the path and underlying operation class without leaking internals.
 
 ## Architecture challenge contracts
@@ -122,11 +122,11 @@ Retained content is copied byte-for-byte from the source. Each retained unit inc
 23. Equal digest plus unequal bytes does not deduplicate.
 24. Low retains every unique unit or fails budget-too-small.
 25. Med/high mark unique omission as lossy.
-26. Negation-bearing requirement is hard-preserved.
-27. Path, URL, command, and flag forms are hard-preserved.
-28. Hash, metric, formula, error, and status evidence are hard-preserved.
+26. Negation-bearing requirements receive higher score than equal-size ordinary prose.
+27. Path, URL, command, and flag forms receive explicit preservation score.
+28. Hash, metric, formula, error, and status evidence receive explicit preservation score.
 29. First and last document units are hard-preserved.
-30. Protected material exceeding budget fails instead of truncating it.
+30. Boundary-preserved material exceeding budget fails instead of truncating it.
 31. Marginal selection chooses distinct evidence over repeated high-score boilerplate.
 32. Stable ties resolve by source offset.
 33. Final retained units remain in source order.
@@ -155,6 +155,18 @@ Retained content is copied byte-for-byte from the source. Each retained unit inc
 - Value gate: med improves required-fact density over bounded sequential inspection on at least four representative classes, and no profile is selected by compression ratio alone.
 - Regression gate: targeted tests, full suite with existing unrelated failures separated, ReleaseSmall/ReleaseFast builds, help/completion probes, and installed binary smoke pass.
 - Surface gate: README and `SKILL.md` agree with executable help. MCP remains unchanged unless a real bounded tool is implemented and tested in the same round.
+
+## Implementation evidence
+
+- Native owner: `src/core/min.zig`; parser, dispatch, help, and command metadata remain in the existing CLI spine.
+- Focused gate: `zig build test-min -Doptimize=ReleaseFast --summary all` passes 48/48 imported and feature tests in about one second after compilation.
+- Build gate: both `zig build -j1 -Doptimize=ReleaseSmall` and `zig build -j1 -Doptimize=ReleaseFast` pass without network access.
+- Budget/provenance gate: the 384,300-byte `src/core/search.zig` projection is deterministic, stays within 16,384 bytes, carries the independently matching SHA-256, emits source-ordered units, and reproduces retained bytes from exact offsets.
+- Failure gate: an undersized conservative request exits 1, writes zero stdout bytes, and emits `ix.error.v1` with `min_budget_too_small` on stderr.
+- Value gate: the checked report `.docs/reports/min-context-compaction-20260716.json` measures code, Markdown, operational ledger, repetitive generated logs, JSONL, benchmark journal, and low-redundancy prose. Medium beats equal-byte prefix recall on seven of eight cases and loses honestly on the small doctrine case.
+- Comparator boundary: intelligent-compactor is useful on small/repetitive inputs, but several oversized runs either exceed the requested budget or fail it; invalid runs are recorded and cannot win.
+- Widened regression boundary: `zig build test -j1 -Doptimize=ReleaseFast --summary all` remained silent and CPU-bound beyond 300 seconds and was terminated. This matches the existing wider-suite debt; it is not reported as green. The isolated new lane remains fast and green.
+- Installed-path gate: the canonical `C:\Users\Savage\AppData\ix\ix.exe` was atomically promoted with predecessor backup, its SHA-256 matches the fresh repo ReleaseFast binary, and an installed `min med README.md --max-bytes 16384 --format json` probe returned `ix.min.v1`, exact `output_bytes = 16238`, empty stderr, and exit 0.
 
 ## Rollback
 

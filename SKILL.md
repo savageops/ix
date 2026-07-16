@@ -1,6 +1,6 @@
 ---
 name: ix
-description: Agent-native repository search, exact bounded inspection, expression explanation, and bounded semantic similarity.
+description: Agent-native repository search, exact bounded inspection, oversized-file compaction, expression explanation, and bounded semantic similarity.
 ---
 
 # IX
@@ -13,8 +13,9 @@ IX searches repository content and returns evidence that can be inspected exactl
 2. Search the narrowest useful roots.
 3. Use `--format agent-v3` when the result needs explicit coverage, exact spans, byte budgets, or continuation.
 4. Continue only with the returned opaque `--cursor`; restart without it if IX reports a stale or mismatched cursor.
-5. Use `inspect` for exact source windows before changing code.
-6. Use `explain` when the selected matcher route matters.
+5. Use `min` when one file is too large for direct reading and there is no query yet.
+6. Follow retained `min` coordinates with `inspect` before changing code.
+7. Use `explain` when the selected matcher route matters.
 
 ## Search
 
@@ -36,6 +37,16 @@ ix inspect --expr 'lit:SearchConfig' src --context 2 --json
 ```
 
 Honor `ix.next.v1` continuation hints for bounded file windows. Do not infer omitted lines from a preview.
+
+## Oversized-file compaction
+
+```sh
+ix min med path/to/large.log
+ix min low src/core/search.zig --max-bytes 32768
+ix min high path/to/report.md --max-bytes 8192 --format json
+```
+
+`low` removes only byte-verified duplicate units and fails if unique content cannot fit. `med` and `high` may omit unique units and declare `lossy:true`. The complete stdout payload stays within `--max-bytes`. Retained blocks are exact source bytes with line and byte coordinates; omissions are explicit and the source SHA-256 is included. Use `inspect --range` for source truth. Never treat a compacted projection as exhaustive evidence.
 
 ## Semantic similarity
 

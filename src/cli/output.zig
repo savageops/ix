@@ -14,6 +14,7 @@ pub fn writeHelp(writer: anytype, topic: cli.HelpTopic) !void {
         .search => writeSearchHelp(writer, "Hit records plus terminal result state", "search"),
         .matches => writeSearchHelp(writer, "Hit records only, same search engine", "matches"),
         .inspect => writeInspectHelp(writer),
+        .min => writeMinHelp(writer),
         .explain => writeExplainHelp(writer),
         .process => writeProcessHelp(writer),
         .similar => writeSimilarHelp(writer),
@@ -38,6 +39,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  similar  Semantic similarity ranking (requires IX_AI_API_KEY)
         \\  xo       Context-guided insight spans for agents
         \\  inspect  Read-only file windows and match context
+        \\  min      Bounded whole-file context compaction
         \\  explain  Expression plan JSON
         \\  why      Posting-list lineage of a match (P29)
         \\  watch    Stream new matches as files change (P29)
@@ -51,7 +53,7 @@ fn writeTopHelp(writer: anytype) !void {
         \\  Inspect: ix inspect FILE --range START:END --format records
         \\  Context: ix xo 'concept' ROOT --max-bytes 8000
         \\  Explain: ix explain 'lit:TERM && re:OTHER'
-        \\  Help:    ix help <search|inspect|xo|similar|explain|process>
+        \\  Help:    ix help <search|inspect|min|xo|similar|explain|process>
         \\
         \\Common controls (see lane help for exact scope):
         \\  --format NAME  Choose a stable output projection
@@ -88,6 +90,40 @@ fn writeTopHelp(writer: anytype) !void {
         \\  ix inspect src/main.zig --range 40:80 --format records
         \\  ix xo "agentSimulation code with system administration ENV_VAR and a function for worker events" src
         \\  ix explain 'lit:auth && re:token_\d+'
+        \\
+    );
+}
+
+fn writeMinHelp(writer: anytype) !void {
+    try writer.writeAll(
+        \\Deterministic bounded compaction of one oversized text file
+        \\
+        \\Usage: ix min [LEVEL] <FILE> [OPTIONS]
+        \\
+        \\Arguments:
+        \\  [LEVEL]  Compaction policy [default: med] [possible values: low, med, high]
+        \\  <FILE>   One regular UTF-8 text file
+        \\
+        \\Options:
+        \\      --level <LEVEL>      Typed policy: low, med, or high
+        \\      --max-bytes <N>      Bound the complete stdout payload
+        \\      --format <FORMAT>    Output format [default: text] [possible values: text, json]
+        \\      --json               Alias for --format json
+        \\  -h, --help               Print help
+        \\
+        \\CONTRACT
+        \\  low removes only byte-verified duplicate units; unique material fits or the command fails
+        \\  med/high may omit unique units and report lossy=true with exact source ranges
+        \\  retained bytes are copied exactly; ix inspect remains the exact follow-up owner
+        \\  no profile uses a model, network provider, Python runtime, or substring truncation
+        \\
+        \\DEFAULT BUDGETS
+        \\  low: 32768 bytes; med: 16384 bytes; high: 8192 bytes
+        \\
+        \\SNIPS
+        \\  ix min med path/to/large.log
+        \\  ix min path/to/source.zig --level low --max-bytes 24000
+        \\  ix min high path/to/report.md --format json
         \\
     );
 }
@@ -1513,6 +1549,16 @@ test "error sentinel is versioned" {
     var writer = std.Io.Writer.fixed(&buffer);
     try writeError(&writer, "invalid_arguments", "MissingCommand");
     try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ix.error.v1") != null);
+}
+
+test "min help states profiles budgets loss and exact followup" {
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeHelp(&writer, .min);
+    const help = writer.buffered();
+    inline for (.{ "low, med, high", "--max-bytes", "complete stdout", "lossy=true", "ix inspect", "32768", "16384", "8192" }) |needle| {
+        try std.testing.expect(std.mem.indexOf(u8, help, needle) != null);
+    }
 }
 
 test "json strings escape controls and invalid utf8" {

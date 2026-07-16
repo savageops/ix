@@ -4,6 +4,17 @@ type: log
 
 # Agent Progress Log
 
+## 2026-07-16 - Native bounded context compaction
+
+Status: complete and promoted through the canonical installed path.
+
+- Added native `ix min [low|med|high] FILE` with complete-stdout byte budgets, exact retained bytes/ranges, SHA-256 provenance, visible omission accounting, deterministic selection, and typed failures.
+- Studied 13 decision-changing sources and six pinned comparator repositories before mutation; recorded architecture decisions and competitor anatomy under canonical research owners.
+- Added a focused 48-test lane plus an eight-class exact-fact benchmark against prefix reading and intelligent-compactor. Medium beats equal-byte prefix recall on seven classes and loses on the small front-loaded doctrine case.
+- ReleaseSmall and ReleaseFast builds pass. The widened ReleaseFast repository suite remained silent and CPU-bound beyond 300 seconds; the isolated new lane remains fast and green.
+- QC 4/4 repaired overbroad hard preservation, duplicate source-order provenance, omission-metadata fragmentation, and a weak ordinal-only profile test.
+- Promoted the fresh ReleaseFast binary to `C:\Users\Savage\AppData\ix\ix.exe`; archived the predecessor under `AppData\ix\backups`, verified candidate/installed SHA-256 parity, and passed an installed JSON smoke probe with exact complete-payload byte accounting.
+
 ## 2026-07-15 - Tracked-index-only `.refs` collection
 
 Status: complete for the refs contract; full build remains blocked by a

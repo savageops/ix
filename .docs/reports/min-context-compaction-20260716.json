@@ -1,0 +1,965 @@
+﻿{
+    "schema":  "ix.min-verification.v1",
+    "generated_at":  "2026-07-16T15:57:52.5618961Z",
+    "candidate":  "E:\\Workspaces\\01_Projects\\01_Github\\ix-zig\\zig-out\\bin\\ix-zig.exe",
+    "candidate_sha256":  "373EF49DDB2A810BEA0240F65967D89DBA2A64F4EB3900603EAAF39199C2AF23",
+    "compactor":  "C:\\Users\\Savage\\.codex\\skills\\intelligent-compactor\\scripts\\compact.py",
+    "host":  {
+                 "os":  "Microsoft Windows NT 10.0.26100.0",
+                 "powershell":  "5.1.26100.8875"
+             },
+    "interpretation":  "Exact required-fact retention is measured under case-specific byte budgets and approximately equivalent four-bytes-per-token comparator budgets. Invalid or over-budget runs cannot win. Size reduction alone is not a pass criterion.",
+    "cases":  [
+                  {
+                      "name":  "goal-doctrine",
+                      "path":  ".docs/goals/002-ix-min-context-compaction.md",
+                      "input_bytes":  11130,
+                      "required_facts":  [
+                                             "Research must prove that the knowledge is valuable.",
+                                             "must not invoke the local intelligent-compactor skill by path",
+                                             "never substring-cut unique retained material",
+                                             "Use streaming or bounded-memory segmentation",
+                                             "Compression ratio alone cannot select",
+                                             "MCP only where the capability genuinely works"
+                                         ],
+                      "native":  {
+                                     "exit_code":  0,
+                                     "elapsed_ms":  580.172,
+                                     "peak_working_set_bytes":  3051520,
+                                     "output_bytes":  7922,
+                                     "within_budget":  true,
+                                     "valid":  true,
+                                     "declared_output_bytes":  7922,
+                                     "retained_units":  12,
+                                     "omitted_units":  10,
+                                     "lossy":  true,
+                                     "retention":  {
+                                                       "required":  6,
+                                                       "retained":  4,
+                                                       "recall":  0.66666666666666663,
+                                                       "missing":  [
+                                                                       "must not invoke the local intelligent-compactor skill by path",
+                                                                       "Compression ratio alone cannot select"
+                                                                   ]
+                                                   },
+                                     "stderr":  ""
+                                 },
+                      "native_profiles":  [
+                                              {
+                                                  "level":  "low",
+                                                  "max_bytes":  32768,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  13801,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  6,
+                                                                    "recall":  1,
+                                                                    "missing":  [
+
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "med",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  7922,
+                                                  "peak_working_set_bytes":  3051520,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  4,
+                                                                    "recall":  0.66666666666666663,
+                                                                    "missing":  [
+                                                                                    "must not invoke the local intelligent-compactor skill by path",
+                                                                                    "Compression ratio alone cannot select"
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "high",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  7923,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  4,
+                                                                    "recall":  0.66666666666666663,
+                                                                    "missing":  [
+                                                                                    "must not invoke the local intelligent-compactor skill by path",
+                                                                                    "Compression ratio alone cannot select"
+                                                                                ]
+                                                                }
+                                              }
+                                          ],
+                      "intelligent_compactor":  {
+                                                    "exit_code":  0,
+                                                    "elapsed_ms":  107.77,
+                                                    "peak_working_set_bytes":  2678784,
+                                                    "output_bytes":  7920,
+                                                    "within_budget":  true,
+                                                    "valid":  true,
+                                                    "retention":  {
+                                                                      "required":  6,
+                                                                      "retained":  1,
+                                                                      "recall":  0.16666666666666666,
+                                                                      "missing":  [
+                                                                                      "Research must prove that the knowledge is valuable.",
+                                                                                      "must not invoke the local intelligent-compactor skill by path",
+                                                                                      "Use streaming or bounded-memory segmentation",
+                                                                                      "Compression ratio alone cannot select",
+                                                                                      "MCP only where the capability genuinely works"
+                                                                                  ]
+                                                                  },
+                                                    "stderr":  ""
+                                                },
+                      "prefix_baseline":  {
+                                              "character_budget":  8192,
+                                              "retention":  {
+                                                                "required":  6,
+                                                                "retained":  5,
+                                                                "recall":  0.83333333333333337,
+                                                                "missing":  [
+                                                                                "MCP only where the capability genuinely works"
+                                                                            ]
+                                                            }
+                                          }
+                  },
+                  {
+                      "name":  "search-owner",
+                      "path":  "src/core/search.zig",
+                      "input_bytes":  384300,
+                      "required_facts":  [
+                                             "pub fn run(io: std.Io, allocator: std.mem.Allocator",
+                                             "pub const MAX_RETAINED_HITS = 4096;",
+                                             "const WARM_QUERY_CACHE_MAGIC = \"IXQUERY_FRONTIER1\";",
+                                             "Spawning 32 threads for 100 files adds ~3 ms",
+                                             "Maps the entire file via NtCreateSection/NtMapViewOfSection",
+                                             "const CASEFOLD_LINE_MAX = 2 * 1024;"
+                                         ],
+                      "native":  {
+                                     "exit_code":  0,
+                                     "elapsed_ms":  449.106,
+                                     "peak_working_set_bytes":  2678784,
+                                     "output_bytes":  16366,
+                                     "within_budget":  true,
+                                     "valid":  true,
+                                     "declared_output_bytes":  16366,
+                                     "retained_units":  34,
+                                     "omitted_units":  1274,
+                                     "lossy":  true,
+                                     "retention":  {
+                                                       "required":  6,
+                                                       "retained":  5,
+                                                       "recall":  0.83333333333333337,
+                                                       "missing":  [
+                                                                       "const WARM_QUERY_CACHE_MAGIC = \"IXQUERY_FRONTIER1\";"
+                                                                   ]
+                                                   },
+                                     "stderr":  ""
+                                 },
+                      "native_profiles":  [
+                                              {
+                                                  "level":  "low",
+                                                  "max_bytes":  32768,
+                                                  "exit_code":  1,
+                                                  "output_bytes":  0,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  false,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  0,
+                                                                    "recall":  0,
+                                                                    "missing":  [
+                                                                                    "pub fn run(io: std.Io, allocator: std.mem.Allocator",
+                                                                                    "pub const MAX_RETAINED_HITS = 4096;",
+                                                                                    "const WARM_QUERY_CACHE_MAGIC = \"IXQUERY_FRONTIER1\";",
+                                                                                    "Spawning 32 threads for 100 files adds ~3 ms",
+                                                                                    "Maps the entire file via NtCreateSection/NtMapViewOfSection",
+                                                                                    "const CASEFOLD_LINE_MAX = 2 * 1024;"
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "med",
+                                                  "max_bytes":  16384,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  16366,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  5,
+                                                                    "recall":  0.83333333333333337,
+                                                                    "missing":  [
+                                                                                    "const WARM_QUERY_CACHE_MAGIC = \"IXQUERY_FRONTIER1\";"
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "high",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  8133,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  2,
+                                                                    "recall":  0.33333333333333331,
+                                                                    "missing":  [
+                                                                                    "const WARM_QUERY_CACHE_MAGIC = \"IXQUERY_FRONTIER1\";",
+                                                                                    "Spawning 32 threads for 100 files adds ~3 ms",
+                                                                                    "Maps the entire file via NtCreateSection/NtMapViewOfSection",
+                                                                                    "const CASEFOLD_LINE_MAX = 2 * 1024;"
+                                                                                ]
+                                                                }
+                                              }
+                                          ],
+                      "intelligent_compactor":  {
+                                                    "exit_code":  2,
+                                                    "elapsed_ms":  676.309,
+                                                    "peak_working_set_bytes":  2678784,
+                                                    "output_bytes":  43914,
+                                                    "within_budget":  false,
+                                                    "valid":  false,
+                                                    "retention":  {
+                                                                      "required":  6,
+                                                                      "retained":  0,
+                                                                      "recall":  0,
+                                                                      "missing":  [
+                                                                                      "pub fn run(io: std.Io, allocator: std.mem.Allocator",
+                                                                                      "pub const MAX_RETAINED_HITS = 4096;",
+                                                                                      "const WARM_QUERY_CACHE_MAGIC = \"IXQUERY_FRONTIER1\";",
+                                                                                      "Spawning 32 threads for 100 files adds ~3 ms",
+                                                                                      "Maps the entire file via NtCreateSection/NtMapViewOfSection",
+                                                                                      "const CASEFOLD_LINE_MAX = 2 * 1024;"
+                                                                                  ]
+                                                                  },
+                                                    "stderr":  ""
+                                                },
+                      "prefix_baseline":  {
+                                              "character_budget":  16384,
+                                              "retention":  {
+                                                                "required":  6,
+                                                                "retained":  2,
+                                                                "recall":  0.33333333333333331,
+                                                                "missing":  [
+                                                                                "pub fn run(io: std.Io, allocator: std.mem.Allocator",
+                                                                                "Spawning 32 threads for 100 files adds ~3 ms",
+                                                                                "Maps the entire file via NtCreateSection/NtMapViewOfSection",
+                                                                                "const CASEFOLD_LINE_MAX = 2 * 1024;"
+                                                                            ]
+                                                            }
+                                          }
+                  },
+                  {
+                      "name":  "product-readme",
+                      "path":  "README.md",
+                      "input_bytes":  91339,
+                      "required_facts":  [
+                                             "ix min low path/to/large.log --max-bytes 32768",
+                                             "ix min med src/core/search.zig",
+                                             "ix min high path/to/report.md --max-bytes 8192 --format json",
+                                             "IX_MEMORY_PERCENT=15 IX_THREAD_PERCENT=50 ix search",
+                                             "### Strategy Routing",
+                                             "### Tiered contraction"
+                                         ],
+                      "native":  {
+                                     "exit_code":  0,
+                                     "elapsed_ms":  53.826,
+                                     "peak_working_set_bytes":  2682880,
+                                     "output_bytes":  16238,
+                                     "within_budget":  true,
+                                     "valid":  true,
+                                     "declared_output_bytes":  16238,
+                                     "retained_units":  31,
+                                     "omitted_units":  179,
+                                     "lossy":  true,
+                                     "retention":  {
+                                                       "required":  6,
+                                                       "retained":  5,
+                                                       "recall":  0.83333333333333337,
+                                                       "missing":  [
+                                                                       "ix min high path/to/report.md --max-bytes 8192 --format json"
+                                                                   ]
+                                                   },
+                                     "stderr":  ""
+                                 },
+                      "native_profiles":  [
+                                              {
+                                                  "level":  "low",
+                                                  "max_bytes":  32768,
+                                                  "exit_code":  1,
+                                                  "output_bytes":  0,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  false,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  0,
+                                                                    "recall":  0,
+                                                                    "missing":  [
+                                                                                    "ix min low path/to/large.log --max-bytes 32768",
+                                                                                    "ix min med src/core/search.zig",
+                                                                                    "ix min high path/to/report.md --max-bytes 8192 --format json",
+                                                                                    "IX_MEMORY_PERCENT=15 IX_THREAD_PERCENT=50 ix search",
+                                                                                    "### Strategy Routing",
+                                                                                    "### Tiered contraction"
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "med",
+                                                  "max_bytes":  16384,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  16238,
+                                                  "peak_working_set_bytes":  2682880,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  5,
+                                                                    "recall":  0.83333333333333337,
+                                                                    "missing":  [
+                                                                                    "ix min high path/to/report.md --max-bytes 8192 --format json"
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "high",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  7962,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  3,
+                                                                    "recall":  0.5,
+                                                                    "missing":  [
+                                                                                    "ix min high path/to/report.md --max-bytes 8192 --format json",
+                                                                                    "IX_MEMORY_PERCENT=15 IX_THREAD_PERCENT=50 ix search",
+                                                                                    "### Strategy Routing"
+                                                                                ]
+                                                                }
+                                              }
+                                          ],
+                      "intelligent_compactor":  {
+                                                    "exit_code":  2,
+                                                    "elapsed_ms":  309.684,
+                                                    "peak_working_set_bytes":  2678784,
+                                                    "output_bytes":  48341,
+                                                    "within_budget":  false,
+                                                    "valid":  false,
+                                                    "retention":  {
+                                                                      "required":  6,
+                                                                      "retained":  4,
+                                                                      "recall":  0.66666666666666663,
+                                                                      "missing":  [
+                                                                                      "### Strategy Routing",
+                                                                                      "### Tiered contraction"
+                                                                                  ]
+                                                                  },
+                                                    "stderr":  ""
+                                                },
+                      "prefix_baseline":  {
+                                              "character_budget":  16384,
+                                              "retention":  {
+                                                                "required":  6,
+                                                                "retained":  4,
+                                                                "recall":  0.66666666666666663,
+                                                                "missing":  [
+                                                                                "### Strategy Routing",
+                                                                                "### Tiered contraction"
+                                                                            ]
+                                                            }
+                                          }
+                  },
+                  {
+                      "name":  "operations-ledger",
+                      "path":  ".docs/log.md",
+                      "input_bytes":  191026,
+                      "required_facts":  [
+                                             "## 2026-07-15 - Tracked-index-only `.refs` collection",
+                                             "## 2026-07-15 - Pass 018 condensed-changelog runtime-truth audit",
+                                             "## 2026-07-13 - QC pass 001: max-2-words stress closure",
+                                             "## 2026-07-12 - Post-byteset benchmark: +6.69% engine improvement",
+                                             "## 2026-07-15 - Native promotion closure",
+                                             "## 2026-07-16 - Native bounded-context compaction research and plan"
+                                         ],
+                      "native":  {
+                                     "exit_code":  0,
+                                     "elapsed_ms":  118.397,
+                                     "peak_working_set_bytes":  2678784,
+                                     "output_bytes":  16293,
+                                     "within_budget":  true,
+                                     "valid":  true,
+                                     "declared_output_bytes":  16293,
+                                     "retained_units":  31,
+                                     "omitted_units":  563,
+                                     "lossy":  true,
+                                     "retention":  {
+                                                       "required":  6,
+                                                       "retained":  5,
+                                                       "recall":  0.83333333333333337,
+                                                       "missing":  [
+                                                                       "## 2026-07-16 - Native bounded-context compaction research and plan"
+                                                                   ]
+                                                   },
+                                     "stderr":  ""
+                                 },
+                      "native_profiles":  [
+                                              {
+                                                  "level":  "low",
+                                                  "max_bytes":  32768,
+                                                  "exit_code":  1,
+                                                  "output_bytes":  0,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  false,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  0,
+                                                                    "recall":  0,
+                                                                    "missing":  [
+                                                                                    "## 2026-07-15 - Tracked-index-only `.refs` collection",
+                                                                                    "## 2026-07-15 - Pass 018 condensed-changelog runtime-truth audit",
+                                                                                    "## 2026-07-13 - QC pass 001: max-2-words stress closure",
+                                                                                    "## 2026-07-12 - Post-byteset benchmark: +6.69% engine improvement",
+                                                                                    "## 2026-07-15 - Native promotion closure",
+                                                                                    "## 2026-07-16 - Native bounded-context compaction research and plan"
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "med",
+                                                  "max_bytes":  16384,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  16293,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  5,
+                                                                    "recall":  0.83333333333333337,
+                                                                    "missing":  [
+                                                                                    "## 2026-07-16 - Native bounded-context compaction research and plan"
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "high",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  8165,
+                                                  "peak_working_set_bytes":  2682880,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  2,
+                                                                    "recall":  0.33333333333333331,
+                                                                    "missing":  [
+                                                                                    "## 2026-07-15 - Tracked-index-only `.refs` collection",
+                                                                                    "## 2026-07-12 - Post-byteset benchmark: +6.69% engine improvement",
+                                                                                    "## 2026-07-15 - Native promotion closure",
+                                                                                    "## 2026-07-16 - Native bounded-context compaction research and plan"
+                                                                                ]
+                                                                }
+                                              }
+                                          ],
+                      "intelligent_compactor":  {
+                                                    "exit_code":  2,
+                                                    "elapsed_ms":  664.006,
+                                                    "peak_working_set_bytes":  2678784,
+                                                    "output_bytes":  62099,
+                                                    "within_budget":  false,
+                                                    "valid":  false,
+                                                    "retention":  {
+                                                                      "required":  6,
+                                                                      "retained":  0,
+                                                                      "recall":  0,
+                                                                      "missing":  [
+                                                                                      "## 2026-07-15 - Tracked-index-only `.refs` collection",
+                                                                                      "## 2026-07-15 - Pass 018 condensed-changelog runtime-truth audit",
+                                                                                      "## 2026-07-13 - QC pass 001: max-2-words stress closure",
+                                                                                      "## 2026-07-12 - Post-byteset benchmark: +6.69% engine improvement",
+                                                                                      "## 2026-07-15 - Native promotion closure",
+                                                                                      "## 2026-07-16 - Native bounded-context compaction research and plan"
+                                                                                  ]
+                                                                  },
+                                                    "stderr":  ""
+                                                },
+                      "prefix_baseline":  {
+                                              "character_budget":  16384,
+                                              "retention":  {
+                                                                "required":  6,
+                                                                "retained":  3,
+                                                                "recall":  0.5,
+                                                                "missing":  [
+                                                                                "## 2026-07-12 - Post-byteset benchmark: +6.69% engine improvement",
+                                                                                "## 2026-07-15 - Native promotion closure",
+                                                                                "## 2026-07-16 - Native bounded-context compaction research and plan"
+                                                                            ]
+                                                            }
+                                          }
+                  },
+                  {
+                      "name":  "repetitive-generated-log",
+                      "path":  "E:\\Workspaces\\01_Projects\\01_Github\\ix-zig\\.zig-cache\\min-verification-repetitive.log",
+                      "input_bytes":  42598,
+                      "required_facts":  [
+                                             "BOUNDARY_FACT alpha admission rejects binary input before scoring",
+                                             "RECOVERY_FACT beta retry ceiling is exactly 3 attempts",
+                                             "OWNER_FACT gamma src/core/min.zig owns bounded compaction",
+                                             "ERROR_FACT delta min_budget_too_small preserves honest failure",
+                                             "PROOF_FACT epsilon output_bytes equals serialized UTF-8 bytes",
+                                             "FINAL_FACT zeta source order survives selection"
+                                         ],
+                      "native":  {
+                                     "exit_code":  0,
+                                     "elapsed_ms":  35.68,
+                                     "peak_working_set_bytes":  2678784,
+                                     "output_bytes":  4021,
+                                     "within_budget":  true,
+                                     "valid":  true,
+                                     "declared_output_bytes":  4021,
+                                     "retained_units":  7,
+                                     "omitted_units":  153,
+                                     "lossy":  false,
+                                     "retention":  {
+                                                       "required":  6,
+                                                       "retained":  6,
+                                                       "recall":  1,
+                                                       "missing":  [
+
+                                                                   ]
+                                                   },
+                                     "stderr":  ""
+                                 },
+                      "native_profiles":  [
+                                              {
+                                                  "level":  "low",
+                                                  "max_bytes":  32768,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  4022,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  6,
+                                                                    "recall":  1,
+                                                                    "missing":  [
+
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "med",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  4021,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  6,
+                                                                    "recall":  1,
+                                                                    "missing":  [
+
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "high",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  4022,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  6,
+                                                                    "retained":  6,
+                                                                    "recall":  1,
+                                                                    "missing":  [
+
+                                                                                ]
+                                                                }
+                                              }
+                                          ],
+                      "intelligent_compactor":  {
+                                                    "exit_code":  0,
+                                                    "elapsed_ms":  98.267,
+                                                    "peak_working_set_bytes":  2674688,
+                                                    "output_bytes":  430,
+                                                    "within_budget":  true,
+                                                    "valid":  true,
+                                                    "retention":  {
+                                                                      "required":  6,
+                                                                      "retained":  4,
+                                                                      "recall":  0.66666666666666663,
+                                                                      "missing":  [
+                                                                                      "BOUNDARY_FACT alpha admission rejects binary input before scoring",
+                                                                                      "RECOVERY_FACT beta retry ceiling is exactly 3 attempts"
+                                                                                  ]
+                                                                  },
+                                                    "stderr":  ""
+                                                },
+                      "prefix_baseline":  {
+                                              "character_budget":  8192,
+                                              "retention":  {
+                                                                "required":  6,
+                                                                "retained":  1,
+                                                                "recall":  0.16666666666666666,
+                                                                "missing":  [
+                                                                                "RECOVERY_FACT beta retry ceiling is exactly 3 attempts",
+                                                                                "OWNER_FACT gamma src/core/min.zig owns bounded compaction",
+                                                                                "ERROR_FACT delta min_budget_too_small preserves honest failure",
+                                                                                "PROOF_FACT epsilon output_bytes equals serialized UTF-8 bytes",
+                                                                                "FINAL_FACT zeta source order survives selection"
+                                                                            ]
+                                                            }
+                                          }
+                  },
+                  {
+                      "name":  "structured-jsonl",
+                      "path":  "E:\\Workspaces\\01_Projects\\01_Github\\ix-zig\\.zig-cache\\min-verification-events.jsonl",
+                      "input_bytes":  20610,
+                      "required_facts":  [
+                                             "\"code\":\"E_JSONL_17\"",
+                                             "\"path\":\"src/core/min.zig\"",
+                                             "\"schema\":\"ix.min.v1\"",
+                                             "\"code\":\"min_budget_too_small\"",
+                                             "\"partial_stdout\":false"
+                                         ],
+                      "native":  {
+                                     "exit_code":  0,
+                                     "elapsed_ms":  309.98,
+                                     "peak_working_set_bytes":  2678784,
+                                     "output_bytes":  7994,
+                                     "within_budget":  true,
+                                     "valid":  true,
+                                     "declared_output_bytes":  7994,
+                                     "retained_units":  16,
+                                     "omitted_units":  57,
+                                     "lossy":  true,
+                                     "retention":  {
+                                                       "required":  5,
+                                                       "retained":  5,
+                                                       "recall":  1,
+                                                       "missing":  [
+
+                                                                   ]
+                                                   },
+                                     "stderr":  ""
+                                 },
+                      "native_profiles":  [
+                                              {
+                                                  "level":  "low",
+                                                  "max_bytes":  32768,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  32576,
+                                                  "peak_working_set_bytes":  2682880,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  5,
+                                                                    "retained":  5,
+                                                                    "recall":  1,
+                                                                    "missing":  [
+
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "med",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  7994,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  5,
+                                                                    "retained":  5,
+                                                                    "recall":  1,
+                                                                    "missing":  [
+
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "high",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  7995,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  5,
+                                                                    "retained":  5,
+                                                                    "recall":  1,
+                                                                    "missing":  [
+
+                                                                                ]
+                                                                }
+                                              }
+                                          ],
+                      "intelligent_compactor":  {
+                                                    "exit_code":  0,
+                                                    "elapsed_ms":  140.755,
+                                                    "peak_working_set_bytes":  2674688,
+                                                    "output_bytes":  267,
+                                                    "within_budget":  true,
+                                                    "valid":  true,
+                                                    "retention":  {
+                                                                      "required":  5,
+                                                                      "retained":  5,
+                                                                      "recall":  1,
+                                                                      "missing":  [
+
+                                                                                  ]
+                                                                  },
+                                                    "stderr":  ""
+                                                },
+                      "prefix_baseline":  {
+                                              "character_budget":  8192,
+                                              "retention":  {
+                                                                "required":  5,
+                                                                "retained":  1,
+                                                                "recall":  0.2,
+                                                                "missing":  [
+                                                                                "\"path\":\"src/core/min.zig\"",
+                                                                                "\"schema\":\"ix.min.v1\"",
+                                                                                "\"code\":\"min_budget_too_small\"",
+                                                                                "\"partial_stdout\":false"
+                                                                            ]
+                                                            }
+                                          }
+                  },
+                  {
+                      "name":  "benchmark-journal",
+                      "path":  "E:\\Workspaces\\01_Projects\\01_Github\\ix-zig\\.zig-cache\\min-verification-benchmark.log",
+                      "input_bytes":  23824,
+                      "required_facts":  [
+                                             "BASELINE_FACT predecessor_sha=8e7c4f2 p50_ms=13.880",
+                                             "PARITY_FACT matches=4096 route=literal binary_sha=4f12aa90",
+                                             "DECISION_FACT candidate_p50_ms=12.750 improvement_pct=8.141"
+                                         ],
+                      "native":  {
+                                     "exit_code":  0,
+                                     "elapsed_ms":  319.637,
+                                     "peak_working_set_bytes":  2678784,
+                                     "output_bytes":  8009,
+                                     "within_budget":  true,
+                                     "valid":  true,
+                                     "declared_output_bytes":  8009,
+                                     "retained_units":  19,
+                                     "omitted_units":  72,
+                                     "lossy":  true,
+                                     "retention":  {
+                                                       "required":  3,
+                                                       "retained":  3,
+                                                       "recall":  1,
+                                                       "missing":  [
+
+                                                                   ]
+                                                   },
+                                     "stderr":  ""
+                                 },
+                      "native_profiles":  [
+                                              {
+                                                  "level":  "low",
+                                                  "max_bytes":  32768,
+                                                  "exit_code":  1,
+                                                  "output_bytes":  0,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  false,
+                                                  "retention":  {
+                                                                    "required":  3,
+                                                                    "retained":  0,
+                                                                    "recall":  0,
+                                                                    "missing":  [
+                                                                                    "BASELINE_FACT predecessor_sha=8e7c4f2 p50_ms=13.880",
+                                                                                    "PARITY_FACT matches=4096 route=literal binary_sha=4f12aa90",
+                                                                                    "DECISION_FACT candidate_p50_ms=12.750 improvement_pct=8.141"
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "med",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  8009,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  3,
+                                                                    "retained":  3,
+                                                                    "recall":  1,
+                                                                    "missing":  [
+
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "high",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  8010,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  3,
+                                                                    "retained":  3,
+                                                                    "recall":  1,
+                                                                    "missing":  [
+
+                                                                                ]
+                                                                }
+                                              }
+                                          ],
+                      "intelligent_compactor":  {
+                                                    "exit_code":  0,
+                                                    "elapsed_ms":  93.091,
+                                                    "peak_working_set_bytes":  2678784,
+                                                    "output_bytes":  3717,
+                                                    "within_budget":  true,
+                                                    "valid":  true,
+                                                    "retention":  {
+                                                                      "required":  3,
+                                                                      "retained":  3,
+                                                                      "recall":  1,
+                                                                      "missing":  [
+
+                                                                                  ]
+                                                                  },
+                                                    "stderr":  ""
+                                                },
+                      "prefix_baseline":  {
+                                              "character_budget":  8192,
+                                              "retention":  {
+                                                                "required":  3,
+                                                                "retained":  1,
+                                                                "recall":  0.33333333333333331,
+                                                                "missing":  [
+                                                                                "PARITY_FACT matches=4096 route=literal binary_sha=4f12aa90",
+                                                                                "DECISION_FACT candidate_p50_ms=12.750 improvement_pct=8.141"
+                                                                            ]
+                                                            }
+                                          }
+                  },
+                  {
+                      "name":  "low-redundancy-prose",
+                      "path":  "E:\\Workspaces\\01_Projects\\01_Github\\ix-zig\\.zig-cache\\min-verification-low-redundancy.md",
+                      "input_bytes":  62041,
+                      "required_facts":  [
+                                             "EARLY_PROSE_FACT exact inspection remains the source-truth owner.",
+                                             "MIDDLE_PROSE_FACT omission metadata must expose every missing source range.",
+                                             "FINAL_PROSE_FACT compression ratio alone never proves retained knowledge is valuable."
+                                         ],
+                      "native":  {
+                                     "exit_code":  0,
+                                     "elapsed_ms":  313.837,
+                                     "peak_working_set_bytes":  2678784,
+                                     "output_bytes":  7839,
+                                     "within_budget":  true,
+                                     "valid":  true,
+                                     "declared_output_bytes":  7839,
+                                     "retained_units":  16,
+                                     "omitted_units":  165,
+                                     "lossy":  true,
+                                     "retention":  {
+                                                       "required":  3,
+                                                       "retained":  2,
+                                                       "recall":  0.66666666666666663,
+                                                       "missing":  [
+                                                                       "EARLY_PROSE_FACT exact inspection remains the source-truth owner."
+                                                                   ]
+                                                   },
+                                     "stderr":  ""
+                                 },
+                      "native_profiles":  [
+                                              {
+                                                  "level":  "low",
+                                                  "max_bytes":  32768,
+                                                  "exit_code":  1,
+                                                  "output_bytes":  0,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  false,
+                                                  "retention":  {
+                                                                    "required":  3,
+                                                                    "retained":  0,
+                                                                    "recall":  0,
+                                                                    "missing":  [
+                                                                                    "EARLY_PROSE_FACT exact inspection remains the source-truth owner.",
+                                                                                    "MIDDLE_PROSE_FACT omission metadata must expose every missing source range.",
+                                                                                    "FINAL_PROSE_FACT compression ratio alone never proves retained knowledge is valuable."
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "med",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  7839,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  3,
+                                                                    "retained":  2,
+                                                                    "recall":  0.66666666666666663,
+                                                                    "missing":  [
+                                                                                    "EARLY_PROSE_FACT exact inspection remains the source-truth owner."
+                                                                                ]
+                                                                }
+                                              },
+                                              {
+                                                  "level":  "high",
+                                                  "max_bytes":  8192,
+                                                  "exit_code":  0,
+                                                  "output_bytes":  7840,
+                                                  "peak_working_set_bytes":  2678784,
+                                                  "valid":  true,
+                                                  "retention":  {
+                                                                    "required":  3,
+                                                                    "retained":  2,
+                                                                    "recall":  0.66666666666666663,
+                                                                    "missing":  [
+                                                                                    "EARLY_PROSE_FACT exact inspection remains the source-truth owner."
+                                                                                ]
+                                                                }
+                                              }
+                                          ],
+                      "intelligent_compactor":  {
+                                                    "exit_code":  0,
+                                                    "elapsed_ms":  94.651,
+                                                    "peak_working_set_bytes":  2678784,
+                                                    "output_bytes":  1734,
+                                                    "within_budget":  true,
+                                                    "valid":  true,
+                                                    "retention":  {
+                                                                      "required":  3,
+                                                                      "retained":  1,
+                                                                      "recall":  0.33333333333333331,
+                                                                      "missing":  [
+                                                                                      "EARLY_PROSE_FACT exact inspection remains the source-truth owner.",
+                                                                                      "FINAL_PROSE_FACT compression ratio alone never proves retained knowledge is valuable."
+                                                                                  ]
+                                                                  },
+                                                    "stderr":  ""
+                                                },
+                      "prefix_baseline":  {
+                                              "character_budget":  8192,
+                                              "retention":  {
+                                                                "required":  3,
+                                                                "retained":  1,
+                                                                "recall":  0.33333333333333331,
+                                                                "missing":  [
+                                                                                "MIDDLE_PROSE_FACT omission metadata must expose every missing source range.",
+                                                                                "FINAL_PROSE_FACT compression ratio alone never proves retained knowledge is valuable."
+                                                                            ]
+                                                            }
+                                          }
+                  }
+              ]
+}

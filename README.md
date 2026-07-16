@@ -95,6 +95,7 @@ ix search 'lit:fn' src --agent          # agent-native compact format
 ix matches 're:TODO|FIXME' .
 ix inspect src/main.zig --range 40:80
 ix inspect --expr 'lit:SearchConfig' src --context 2 --json
+ix min med src/core/search.zig --max-bytes 8192
 ix explain 'lit:auth && re:token_\d+'
 ```
 
@@ -110,6 +111,7 @@ ix explain 'lit:auth && re:token_\d+'
 | `xo` | Deterministic BM25-ranked context spans for agent reading |
 | `matches` | Hit records only — same engine, no sentinel |
 | `inspect` | Read-only file windows and match context |
+| `min` | Query-free bounded compaction of one oversized text file |
 | `explain` | Expression plan JSON with strategy annotation |
 
 <details>
@@ -215,6 +217,21 @@ ix xo "worker event lifecycle" src --format json --max-spans 8
 ```
 
 `xo` is a bounded reading lens, not a match oracle. Use `ix search` when every hit must be exact-verified. Lines exceeding 300 bytes in `xo` output are fisheye-contracted around the focus term — minified or generated content gets the same tiered contraction as search previews, preserving the focus substring while collapsing the surrounding noise.
+
+`min` is the query-free lane for a single file that is too large to read directly. It streams the source into complete line-bounded units, scores declarations, headings, obligations, paths, commands, hashes, metrics, errors, and lexical rarity, then selects a deterministic source-ordered projection. Retained bytes are copied exactly. Every gap names its line/byte range and reason; SHA-256 binds the projection to the source.
+
+```sh
+# Conservative: remove only byte-verified duplicate units; unique content must fit
+ix min low path/to/large.log --max-bytes 32768
+
+# Balanced default, using the short form
+ix min med src/core/search.zig
+
+# Emergency projection with a stable machine envelope
+ix min high path/to/report.md --max-bytes 8192 --format json
+```
+
+`low` never omits unique units: an undersized budget returns `min_budget_too_small`. `med` and `high` may omit unique units and report `lossy:true`. No profile rewrites retained bytes, substring-cuts a unit, invokes a model, or contacts a provider. The byte cap covers the complete stdout payload, including metadata. Use `ix inspect FILE --range START:END` to verify any retained range against exact source.
 
 ## Framework Resource Ceiling
 
@@ -393,6 +410,7 @@ Fisheye applies to lossy search previews in v1, v2, and v3. It does not contract
 | Protected cold path | Protected Windows roots now reject volatile stores and non-text protected-root extensions before open, route recoverable open/read failures through structured `access_errors`, and account open latency in `scan_work_ms_total` plus slow-file telemetry. This protects cold searches from blocking on system database/log handles while still returning structured partial status when the OS refuses a file. |
 | Byte kernels | Current hot kernels are Zig `@Vector(32, u8)` and StringZilla AVX2. Planned narrow C shim additions are limited to primitives Zig cannot emit cleanly: `ix_count_byte_avx2`, `ix_ascii_ci_memmem_avx2`, and `ix_trigram_admit_scalar_or_avx2`. |
 | Inspect | Bounded read-only windows, match-context mode, `ix.inspect.*` sentinels, `ix.next.v1` continuation hints for agent pagination |
+| Min context compaction | Two-pass fixed-memory lexical evidence, byte-verified duplicate removal, complete-unit marginal selection, source SHA-256, exact line/byte coordinates, visible omissions, and whole-stdout byte budgets |
 | XO context ranking | Deterministic BM25 line scoring with document-frequency weighting, path/structural tie-breakers, concept aliases, degree-of-interest span expansion, and explicit byte/file/span coverage |
 | Fisheye preview | Match-centered adaptive context window (Furnas 1986). UTF-8-safe boundary cuts. Geometrically contracting half-width at dyadic line-length tiers: T0 ≤300 bytes (full line), T1 ≤600 (150-byte half-width), T2 ≤1200 (75), T3 >1200 (37). Match substring always fully visible; elision marked with `…`. Up to 143× output reduction on minified/generated content. |
 | v3 output contract | Three independent truth dimensions: `verification: canonical`, `scan: complete|partial_access`, `projection: complete|truncated`. Typed truncation reason. `next_cursor` bound to request fingerprint + corpus signature. `--max-bytes` binary-search-fitted page. Stats visibility tiers: agent (6 fields) / standard / debug (236 fields). |
@@ -429,6 +447,7 @@ Fisheye applies to lossy search previews in v1, v2, and v3. It does not contract
 - Trigram admission gates use boolean predicate algebra to reject files before scan.
 - Warm-index query reuse can collapse repeated searches to a generation-pinned candidate frontier with `discover_ms=0`.
 - `inspect` is agent-native: bounded, read-only, structured, continuable via `ix.next.v1`.
+- `min` is query-free and visibly lossy: exact retained bytes and omission coordinates keep `inspect` as the truth owner.
 - Thread-local shard reports eliminate mutex contention. Each thread accumulates its own counters and hit buffers; results merge after join.
 - Every result carries typed truth: canonical verification independent of scan coverage independent of projection completeness. An agent can branch on three failure modes without parsing prose.
 - Cursor pagination is corpus-bound. The cursor encodes the request fingerprint and a content signature over every discovered file. Change the expression, paths, or touch a file — the cursor is rejected with a typed error.
@@ -812,6 +831,7 @@ src/
     simd.zig        Zig @Vector byte-search kernels (3-byte anomaly fingerprint, indexOfByte, indexOf)
     similar.zig     semantic similarity (embeddings + reranker, lexical frontier ordering)
     inspect.zig     bounded file windows and match context
+    min.zig         deterministic bounded whole-file context compaction
     state_dir.zig   ~/.ix/ state directory resolution (cross-platform)
     trigram.zig     trigram extraction and admission gates (case-insensitive support)
     stats.zig       telemetry model
