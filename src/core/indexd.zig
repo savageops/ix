@@ -69,6 +69,7 @@ pub const Config = struct {
     once: bool,
     repair: bool,
     memory_limit_bytes: usize,
+    disk_limit_bytes: usize,
 
     pub fn deinit(self: Config, allocator: std.mem.Allocator) void {
         allocator.free(self.index_dir);
@@ -325,6 +326,7 @@ pub fn buildConfig(allocator: std.mem.Allocator, request: Request) !Config {
         .once = request.once,
         .repair = request.repair,
         .memory_limit_bytes = configuredMemoryLimitBytes(),
+        .disk_limit_bytes = resource_profile.indexDiskLimitBytes(),
     };
 }
 
@@ -480,16 +482,20 @@ pub fn publishRootGeneration(io: std.Io, allocator: std.mem.Allocator, root: []c
 }
 
 fn publishRootGenerationForConfig(io: std.Io, allocator: std.mem.Allocator, config: Config) !generation.ReaderPin {
-    return publishRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes);
+    return publishRootGenerationWithResourceBudgets(io, allocator, config.root, config.memory_limit_bytes, config.disk_limit_bytes);
 }
 
 pub fn publishRootGenerationWithBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, memory_limit_bytes: usize) !generation.ReaderPin {
-    return publishRootGenerationWithParentBudget(io, allocator, root, null, memory_limit_bytes);
+    return publishRootGenerationWithResourceBudgets(io, allocator, root, memory_limit_bytes, resource_profile.indexDiskLimitBytes());
+}
+
+pub fn publishRootGenerationWithResourceBudgets(io: std.Io, allocator: std.mem.Allocator, root: []const u8, memory_limit_bytes: usize, disk_limit_bytes: usize) !generation.ReaderPin {
+    return publishRootGenerationWithParentBudget(io, allocator, root, null, memory_limit_bytes, disk_limit_bytes);
 }
 
 pub fn publishCompactedRootGenerationWithBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, parent_epoch: generation.Epoch, memory_limit_bytes: usize) !generation.ReaderPin {
     if (parent_epoch == generation.INVALID_EPOCH) return error.InvalidParentGeneration;
-    return publishRootGenerationWithParentBudget(io, allocator, root, parent_epoch, memory_limit_bytes);
+    return publishRootGenerationWithParentBudget(io, allocator, root, parent_epoch, memory_limit_bytes, resource_profile.indexDiskLimitBytes());
 }
 
 pub fn compactCurrentRootGenerationWithBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, memory_limit_bytes: usize) !generation.ReaderPin {
@@ -506,7 +512,7 @@ pub fn compactCurrentRootGenerationWithBudget(io: std.Io, allocator: std.mem.All
     return publishCompactedRootGenerationWithBudget(io, allocator, root, current_pin.epoch, memory_limit_bytes);
 }
 
-fn publishRootGenerationWithParentBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, parent_epoch: ?generation.Epoch, memory_limit_bytes: usize) !generation.ReaderPin {
+fn publishRootGenerationWithParentBudget(io: std.Io, allocator: std.mem.Allocator, root: []const u8, parent_epoch: ?generation.Epoch, memory_limit_bytes: usize, disk_limit_bytes: usize) !generation.ReaderPin {
     try enforceMemoryBudget(memory_limit_bytes);
     var files = std.ArrayList(IndexedFile).empty;
     defer {
@@ -573,12 +579,62 @@ fn publishRootGenerationWithParentBudget(io: std.Io, allocator: std.mem.Allocato
         .{ .kind = .postings, .relative_path = "postings.ixpost", .bytes = postings_bytes },
         .{ .kind = .signature, .relative_path = "corpus.ixsignature", .bytes = signature_bytes },
     };
-    return generation.publishGenerationPayloads(io, allocator, paths, root_identity.fingerprint, epoch, parent_epoch, &payloads);
+    const proposed_bytes = try generationPayloadByteSize(&payloads);
+    try enforceIndexDiskBudget(io, allocator, state.index_dir, proposed_bytes, disk_limit_bytes);
+    const pin = try generation.publishGenerationPayloads(io, allocator, paths, root_identity.fingerprint, epoch, parent_epoch, &payloads);
+    _ = try generation.collectGenerationGarbage(io, allocator, state.index_dir, pin.epoch, &.{pin}, .{ .retain_newest = 2 });
+    return pin;
+}
+
+/// Accounts every managed byte before publication so a writer cannot begin a
+/// generation that would exceed the root's hard storage envelope.
+fn enforceIndexDiskBudget(io: std.Io, allocator: std.mem.Allocator, index_dir: []const u8, proposed_bytes: u64, disk_limit_bytes: usize) !void {
+    if (disk_limit_bytes == 0) return error.IndexDiskBudgetExceeded;
+    const managed_bytes = try directoryByteSize(io, allocator, index_dir);
+    const projected = std.math.add(u64, managed_bytes, proposed_bytes) catch return error.IndexDiskBudgetExceeded;
+    if (projected > disk_limit_bytes) return error.IndexDiskBudgetExceeded;
+}
+
+/// Sums the immutable payload reservation before any generation file is made visible.
+fn generationPayloadByteSize(payloads: []const generation.SegmentPayload) !u64 {
+    var total: u64 = 0;
+    for (payloads) |payload| {
+        total = std.math.add(u64, total, payload.bytes.len) catch return error.IndexDiskBudgetExceeded;
+    }
+    return total;
+}
+
+/// Measures one root-owned index tree without crossing symlink or special-file boundaries.
+fn directoryByteSize(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !u64 {
+    const dir = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var total: u64 = 0;
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        switch (entry.kind) {
+            .file => {
+                const stat = try dir.statFile(io, entry.name, .{});
+                total = std.math.add(u64, total, stat.size) catch return error.IndexDiskBudgetExceeded;
+            },
+            .directory => {
+                const child = try std.fs.path.join(allocator, &.{ path, entry.name });
+                defer allocator.free(child);
+                total = std.math.add(u64, total, try directoryByteSize(io, allocator, child)) catch return error.IndexDiskBudgetExceeded;
+            },
+            else => {},
+        }
+    }
+    return total;
 }
 
 fn recordPublishFailure(io: std.Io, allocator: std.mem.Allocator, config: Config, err: anyerror) !void {
     switch (err) {
         error.MemoryBudgetExceeded => try writeRepairState(io, allocator, config, "memory_budget_exceeded"),
+        error.IndexDiskBudgetExceeded => try writeRepairState(io, allocator, config, "disk_budget_exceeded"),
         else => {},
     }
 }
@@ -1394,6 +1450,53 @@ test "indexd compact current generation falls back to initial publish when no cu
     const current_pin = (try generation.tryPinCurrentGenerationWithPayloads(std.testing.io, std.testing.allocator, state.index_dir, current_path, root_identity.fingerprint)) orelse return error.TestExpectedCurrentGeneration;
     try std.testing.expectEqual(pin.epoch, current_pin.epoch);
     try std.testing.expectEqual(@as(?generation.Epoch, null), current_pin.parent_epoch);
+}
+
+test "indexd refuses publication before crossing the root disk budget" {
+    const root = ".zig-cache\\ix-indexd-disk-budget-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const sample_path = try std.fs.path.join(std.testing.allocator, &.{ root, "sample.txt" });
+    defer std.testing.allocator.free(sample_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sample_path, .data = "disk admission must fail closed\n" });
+
+    const identity = try catalog.identifyRoot(std.testing.allocator, root);
+    defer identity.deinit(std.testing.allocator);
+    const state = try state_dir.buildRootIndexState(std.testing.allocator, identity.fingerprint);
+    defer state.deinit(std.testing.allocator);
+    std.Io.Dir.cwd().deleteTree(std.testing.io, state.index_dir) catch {};
+
+    try std.testing.expectError(error.IndexDiskBudgetExceeded, publishRootGenerationWithResourceBudgets(std.testing.io, std.testing.allocator, root, 0, 1));
+    const current_path = try std.fs.path.join(std.testing.allocator, &.{ state.index_dir, "current.ixgen" });
+    defer std.testing.allocator.free(current_path);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(std.testing.io, current_path, .{}));
+}
+
+test "indexd repeated compaction physically bounds retained generations" {
+    const root = ".zig-cache\\ix-indexd-generation-retention-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, root);
+    const sample_path = try std.fs.path.join(std.testing.allocator, &.{ root, "sample.txt" });
+    defer std.testing.allocator.free(sample_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sample_path, .data = "generation one\n" });
+
+    const first = try publishRootGenerationWithBudget(std.testing.io, std.testing.allocator, root, 0);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sample_path, .data = "generation two\n" });
+    _ = try compactCurrentRootGenerationWithBudget(std.testing.io, std.testing.allocator, root, 0);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = sample_path, .data = "generation three\n" });
+    const third = try compactCurrentRootGenerationWithBudget(std.testing.io, std.testing.allocator, root, 0);
+
+    const identity = try catalog.identifyRoot(std.testing.allocator, root);
+    defer identity.deinit(std.testing.allocator);
+    const state = try state_dir.buildRootIndexState(std.testing.allocator, identity.fingerprint);
+    defer state.deinit(std.testing.allocator);
+    const first_paths = try generation.buildGenerationPathsInIndexDir(std.testing.allocator, state.index_dir, first.epoch);
+    defer first_paths.deinit(std.testing.allocator);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(std.testing.io, first_paths.generation_dir, .{}));
+    try std.testing.expect(third.parent_epoch != null);
+    try std.testing.expect(third.parent_epoch.? != first.epoch);
 }
 
 test "indexd compact current generation rejects corrupt current manifest" {

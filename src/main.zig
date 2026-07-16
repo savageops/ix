@@ -151,7 +151,6 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
-            if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
             writeSearchResult(init.io, effective_request, report, stdout) catch |err| {
                 switch (err) {
                     error.ByteBudgetTooSmall => try output.writeError(stderr, "byte_budget_too_small", "increase --max-bytes; the budget cannot fit one complete result"),
@@ -182,7 +181,6 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
             if (shouldLaunchNexusSidecar(init.io, allocator, effective_request, plan, report)) launchNexusSidecar(init.io, allocator, argv[0], effective_request);
-            if (shouldLaunchIndexdSidecar(effective_request.index_enabled, effective_request, report)) launchIndexdSidecar(init.io, allocator, argv[0], effective_request.paths[0]);
             writeMatchesResult(effective_request, report, stdout) catch |err| {
                 if (err == error.ProjectionIncomplete)
                     try output.writeError(stderr, "projection_incomplete", "increase --max-hits or use a complete search result format")
@@ -719,19 +717,6 @@ fn shouldConsiderNexusSidecar(request: cli.SearchRequest, report: search.SearchR
     return true;
 }
 
-fn shouldLaunchIndexdSidecar(enabled: bool, request: cli.SearchRequest, report: search.SearchReport) bool {
-    if (!enabled) return false;
-    if (request.nexus_build) return false;
-    if (request.case_insensitive) return false;
-    if (request.hidden) return false;
-    if (request.path_count != 1) return false;
-    // Launch only when warm admission proves there is no live owner. Other
-    // fallbacks may still have an owner rebuilding or protecting stale state.
-    if (report.stats.postings_index.available) return false;
-    if (!std.mem.eql(u8, report.stats.postings_index.fallback_reason, "no_live_owner")) return false;
-    return report.files_discovered > 0;
-}
-
 fn launchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, argv0: []const u8, request: cli.SearchRequest) void {
     if (request.nexus_build) return;
     if (request.case_insensitive) return;
@@ -755,17 +740,6 @@ fn launchNexusSidecar(io: std.Io, allocator: std.mem.Allocator, argv0: []const u
         argv.append(allocator, "--threads") catch return;
         argv.append(allocator, std.fmt.allocPrint(allocator, "{}", .{threads}) catch return) catch return;
     }
-    launchDetachedProcess(io, allocator, argv.items) catch return;
-}
-
-fn launchIndexdSidecar(io: std.Io, allocator: std.mem.Allocator, argv0: []const u8, root: []const u8) void {
-    if (!std.process.can_spawn) return;
-
-    var argv = std.ArrayList([]const u8).empty;
-    argv.append(allocator, argv0) catch return;
-    argv.append(allocator, "__ix_indexd") catch return;
-    argv.append(allocator, root) catch return;
-
     launchDetachedProcess(io, allocator, argv.items) catch return;
 }
 
@@ -861,51 +835,6 @@ test "nexus sidecar launch is gated after evidence-pruned foreground reuse" {
     try std.testing.expect(!shouldConsiderNexusSidecar(enabled, testSearchReportForSidecar(1)));
     try std.testing.expect(!shouldConsiderNexusSidecar(enabled, testSearchReportForSidecar(79041)));
     try std.testing.expect(!shouldConsiderNexusSidecar(disabled, testSearchReportForSidecar(0)));
-}
-
-test "indexd sidecar launch is default-on single root and workload gated" {
-    var request = testSearchRequestForSidecar(false);
-    request.paths[0] = "src";
-    var report = testSearchReportForSidecar(0);
-    report.files_discovered = 12;
-    report.stats.postings_index.fallback_reason = "no_live_owner";
-
-    try std.testing.expect(!shouldLaunchIndexdSidecar(false, request, report));
-    try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
-
-    report.stats.postings_index.fallback_reason = "stale_signature";
-    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
-    report.stats.postings_index.fallback_reason = "no_live_owner";
-
-    request.path_count = 2;
-    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
-    request.path_count = 1;
-
-    request.case_insensitive = true;
-    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
-    request.case_insensitive = false;
-
-    report.files_discovered = 0;
-    try std.testing.expect(!shouldLaunchIndexdSidecar(true, request, report));
-}
-
-test "indexd sidecar launch allows generated-looking roots after central state split" {
-    var request = testSearchRequestForSidecar(false);
-    var report = testSearchReportForSidecar(0);
-    report.files_discovered = 12;
-    report.stats.postings_index.fallback_reason = "no_live_owner";
-
-    request.paths[0] = "src";
-    try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
-
-    request.paths[0] = "apps/backend/node_modules/convex/dist";
-    try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
-
-    request.paths[0] = ".docs/reports/subzero";
-    try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
-
-    request.paths[0] = "zig-out/bin";
-    try std.testing.expect(shouldLaunchIndexdSidecar(true, request, report));
 }
 
 test "background sidecar environment gate is explicit opt in" {

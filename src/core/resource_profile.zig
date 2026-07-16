@@ -101,19 +101,21 @@ pub fn effectiveSimdLaneWidth() usize {
 
 const MIB: usize = 1024 * 1024;
 const FALLBACK_FRAMEWORK_MEMORY_BYTES: usize = 512 * MIB;
+const DEFAULT_INDEX_DISK_LIMIT_MB: usize = 4096;
 
 const Config = struct {
     memory_percent: usize = DEFAULT_MEMORY_PERCENT,
     thread_percent: usize = DEFAULT_THREAD_PERCENT,
     warm: bool = false,
+    index_disk_limit_mb: usize = DEFAULT_INDEX_DISK_LIMIT_MB,
 };
 
 var cached_config: ?Config = null;
 
 /// Loads the effective framework config from, in priority order:
-///   1. IX_MEMORY_PERCENT / IX_THREAD_PERCENT env vars
+///   1. IX_MEMORY_PERCENT / IX_THREAD_PERCENT / IX_INDEX_DISK_LIMIT_MB env vars
 ///   2. ~/.ix/config.json (persistent, no recompile needed)
-///   3. Built-in defaults (5% / 5%, warm indexing disabled)
+///   3. Built-in defaults (5% / 5%, warm disabled, 4 GiB per index root)
 fn loadConfig() Config {
     if (cached_config) |c| return c;
 
@@ -141,6 +143,9 @@ fn applyEnvOverrides(cfg: *Config) void {
     }
     if (envUsize("IX_THREAD_PERCENT")) |pct| {
         if (pct > 0 and pct <= 100) cfg.thread_percent = pct;
+    }
+    if (envUsize("IX_INDEX_DISK_LIMIT_MB")) |limit_mb| {
+        if (limit_mb > 0) cfg.index_disk_limit_mb = limit_mb;
     }
     // Legacy: IX_RESOURCE_PERCENT sets both if present
     if (envUsize("IX_RESOURCE_PERCENT")) |pct| {
@@ -184,6 +189,9 @@ fn loadConfigJson(cfg: *Config) bool {
         if (val > 0 and val <= 100) cfg.thread_percent = val;
     }
     if (parseJsonBool(contents, "warm")) |val| cfg.warm = val;
+    if (parseJsonField(contents, "index_disk_limit_mb")) |limit_mb| {
+        if (limit_mb > 0) cfg.index_disk_limit_mb = limit_mb;
+    }
     return true;
 }
 
@@ -219,7 +227,8 @@ fn createDefaultConfigJson() void {
         \\{
         \\  "memory_percent": 5,
         \\  "thread_percent": 5,
-        \\  "warm": false
+        \\  "warm": false,
+        \\  "index_disk_limit_mb": 4096
         \\}
         \\
     ;
@@ -298,6 +307,11 @@ pub fn threadPercent() usize {
 /// Returns whether persistent warm indexing is enabled by the canonical state config.
 pub fn warmEnabled() bool {
     return loadConfig().warm;
+}
+
+/// Returns the hard per-root index-store ceiling in bytes.
+pub fn indexDiskLimitBytes() usize {
+    return std.math.mul(usize, loadConfig().index_disk_limit_mb, MIB) catch std.math.maxInt(usize);
 }
 
 /// Computes the thread ceiling from the effective thread percent.
@@ -634,6 +648,12 @@ test "warm config accepts only JSON booleans" {
     try std.testing.expect(parseJsonBool("{\"warm\": \"true\"}", "warm") == null);
     try std.testing.expect(parseJsonBool("{\"warm\": truefalse}", "warm") == null);
     try std.testing.expect(parseJsonBool("{\"not_warm\": true}", "warm") == null);
+}
+
+test "index disk limit accepts only positive integer megabytes" {
+    try std.testing.expectEqual(@as(?usize, 4096), parseJsonField("{\"index_disk_limit_mb\":4096}", "index_disk_limit_mb"));
+    try std.testing.expectEqual(@as(?usize, 1), parseJsonField("{\"index_disk_limit_mb\": 1}", "index_disk_limit_mb"));
+    try std.testing.expect(parseJsonField("{\"index_disk_limit_mb\": \"4096\"}", "index_disk_limit_mb") == null);
 }
 
 test "thread ceiling scales by thread percent" {

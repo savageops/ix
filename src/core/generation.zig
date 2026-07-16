@@ -198,6 +198,47 @@ pub fn planGenerationGc(
     return delete_epochs.toOwnedSlice(allocator);
 }
 
+/// Reclaims generation directories excluded by the canonical retention plan.
+/// Publication remains atomic because only epochs older than the current
+/// manifest and outside the retained/pinned set can enter the delete plan.
+pub fn collectGenerationGarbage(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    index_root: []const u8,
+    current_epoch: Epoch,
+    reader_pins: []const ReaderPin,
+    policy: GenerationGcPolicy,
+) !usize {
+    const generations_dir = try std.fs.path.join(allocator, &.{ index_root, "generations" });
+    defer allocator.free(generations_dir);
+    const dir = std.Io.Dir.cwd().openDir(io, generations_dir, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return err,
+    };
+    defer dir.close(io);
+
+    var epochs = std.ArrayList(Epoch).empty;
+    defer epochs.deinit(allocator);
+    var iterator = dir.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind != .directory) continue;
+        const epoch = std.fmt.parseInt(Epoch, entry.name, 10) catch continue;
+        if (epoch == INVALID_EPOCH) continue;
+        try epochs.append(allocator, epoch);
+    }
+
+    const delete_epochs = try planGenerationGc(allocator, epochs.items, reader_pins, current_epoch, policy);
+    defer allocator.free(delete_epochs);
+    for (delete_epochs) |epoch| {
+        const epoch_text = try std.fmt.allocPrint(allocator, "{d}", .{epoch});
+        defer allocator.free(epoch_text);
+        const generation_dir = try std.fs.path.join(allocator, &.{ generations_dir, epoch_text });
+        defer allocator.free(generation_dir);
+        try std.Io.Dir.cwd().deleteTree(io, generation_dir);
+    }
+    return delete_epochs.len;
+}
+
 pub fn planCompaction(
     allocator: std.mem.Allocator,
     states: []const CompactionSegmentState,
@@ -958,6 +999,31 @@ test "generation gc planner deduplicates and refuses invalid current epoch" {
     try std.testing.expectEqual(@as(Epoch, 2), delete_epochs[1]);
     try std.testing.expectEqual(@as(Epoch, 3), delete_epochs[2]);
     try std.testing.expectError(error.InvalidGenerationEpoch, planGenerationGc(std.testing.allocator, &epochs, &.{}, INVALID_EPOCH, .{}));
+}
+
+test "generation gc physically retains only current and rollback epochs" {
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    for ([_]Epoch{ 41, 42, 43 }) |epoch| {
+        const paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, epoch);
+        defer paths.deinit(std.testing.allocator);
+        try std.Io.Dir.cwd().createDirPath(std.testing.io, paths.generation_dir);
+        const marker = try std.fs.path.join(std.testing.allocator, &.{ paths.generation_dir, "payload" });
+        defer std.testing.allocator.free(marker);
+        try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = marker, .data = "managed" });
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), try collectGenerationGarbage(std.testing.io, std.testing.allocator, root, 43, &.{}, .{ .retain_newest = 2 }));
+    const old_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 41);
+    defer old_paths.deinit(std.testing.allocator);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().openDir(std.testing.io, old_paths.generation_dir, .{}));
+    const rollback_paths = try buildGenerationPathsInIndexDir(std.testing.allocator, root, 42);
+    defer rollback_paths.deinit(std.testing.allocator);
+    const rollback_dir = try std.Io.Dir.cwd().openDir(std.testing.io, rollback_paths.generation_dir, .{});
+    rollback_dir.close(std.testing.io);
 }
 
 test "generation payload publish writes catalog postings and manifest through epoch directory" {

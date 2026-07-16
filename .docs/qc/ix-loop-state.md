@@ -22,6 +22,8 @@ regression.
 - Result doctrine: research, review, tests, benchmarks, and refactoring are
   supporting evidence, never substitutes for a proven before/after outcome.
 - Runtime verdict: unchanged by the documentation-only doctrine round.
+- Warm-index containment verdict: ordinary search no longer launches indexd;
+  physical generation GC and pre-publication per-root disk admission are wired.
 
 ## Verified state
 
@@ -46,12 +48,16 @@ regression.
   found no embedding-level duplicate candidates; the concern is behavioral
   request/projection divergence, which requires route-parity review rather than
   textual deduplication.
+- The recurrence probe published three generations under a 1 MiB test envelope
+  and retained exactly two. Warm-enabled ordinary search created no daemon and
+  no index state. The 4 GiB default root cap is configurable through
+  `index_disk_limit_mb` / `IX_INDEX_DISK_LIMIT_MB`.
+- The broad test runner is still not green: 563/576 passed, with unrelated
+  warm-cache and Thompson-NFA failures/crashes retained as explicit debt.
 
 ## Next action
 
-Build the architecture capability and reviewer route matrices required by Goal
-001 from current source and runtime evidence. Begin with command-to-owner
-completeness, cold/warm/cache execution equivalence, freshness identity, and
-projection parity. Rank the first executable slice by correctness, surfaced
-incompleteness, downstream leverage, regression risk, and proof cost; do not
-inherit the prior loop's favored subsystem without requalification.
+Complete the remaining bounded-lifecycle result: volume free-space floor,
+startup/temp cleanup, explicit suspension/status accounting, and deletion
+retry semantics. Then replace watcher-triggered full republication with
+coalesced content-identity deltas. Do not re-enable automatic daemon ownership.

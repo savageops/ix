@@ -4,6 +4,18 @@ type: log
 
 # Agent Progress Log
 
+## 2026-07-16 - Warm-index runaway containment implemented
+
+Status: recurrence-critical containment implemented and locally proven; delta indexing and native journal continuity remain future results.
+
+- Removed automatic `__ix_indexd` spawning from ordinary `search` and `matches`; warm-enabled searches now consume an existing owner or remain cold without creating background state.
+- Added a canonical 4 GiB per-root index ceiling, configurable through `index_disk_limit_mb` or `IX_INDEX_DISK_LIMIT_MB`; publication accounts existing managed bytes plus the proposed immutable payload before writing a generation.
+- Connected the existing generation-GC planner to physical deletion after atomic publication, retaining only current plus rollback generations.
+- Added focused tests for typed disk-budget refusal before `current.ixgen`, physical GC, repeated-compaction retention, and strict config parsing. All focused tests passed.
+- Built `ReleaseSmall` successfully and ran an isolated production-binary probe: three publications retained exactly two generations totaling 2,767 bytes; warm-enabled ordinary search exited successfully with zero daemon processes and no index directory created.
+- Interleaved repository-versus-installed cold search on the 6.6 GB ripgrep Linux corpus preserved 0-match/79,402-file parity. Medians were 1,245.31 ms repository and 1,224.56 ms installed; the 1.69% difference sits inside overlapping run ranges and is not promotion evidence or an attributable regression.
+- The existing broad suite remains non-green independently of this slice: its runner reported 563/576 passing with warm-cache and Thompson-NFA failures/crashes. No assertion was weakened.
+
 ## 2026-07-16 - Bounded warm-index architecture after 250 GB generation leak
 
 Status: research and architecture design complete; runtime remains disabled and unrepaired.
