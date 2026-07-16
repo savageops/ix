@@ -4,6 +4,16 @@ type: log
 
 # Agent Progress Log
 
+## 2026-07-16 - 600-item product achievement, challenge, breakthrough, and performance report
+
+Status: completed with a current warm-parity correction.
+
+- Added `.docs/qc/pass-025-600-item-product-achievement-challenge-breakthrough-performance-report.md` with exactly 600 contiguous, non-duplicate product-level entries: 355 achievements, 60 breakthroughs, 80 challenges, 62 performance findings, 39 strategic findings, two boundaries, and two verdicts.
+- Synthesized current README/SKILL/help/runtime truth, prior 200/500 inventories, QC and benchmark history, the compaction report, repository counts, and fresh installed probes; avoided a per-function or per-commit changelog shape.
+- Preserved historical July 15 warm-index performance as dated evidence, but corrected current status after fresh `src` parity returned 887 cold matches across 52 files versus 874 warm-enabled matches across 50 files.
+- Fresh full-root evidence also showed 7,201 cold-discovered files versus 1,615 represented by the current warm generation; current warm speed is therefore not promotion-admissible until regeneration and convergence proof close.
+- Verified exact numbering 1–600, zero duplicate numbers, zero duplicate entry text, Markdown diff integrity, and high-profile self-review through the installed `ix min` command.
+
 ## 2026-07-16 - Native bounded context compaction
 
 Status: complete and promoted through the canonical installed path.
