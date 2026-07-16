@@ -1,0 +1,42 @@
+[
+  {
+    "title": "The Design of Fast Content-Defined Chunking for Data Deduplication ...",
+    "url": "https://ieeexplore.ieee.org/document/9055082",
+    "snippet": "ieeexplore.ieee.org/document/9055082"
+  },
+  {
+    "title": "FastCDC | Proceedings of the 2016 USENIX Conference on Usenix Annual ...",
+    "url": "https://dl.acm.org/doi/10.5555/3026959.3026969",
+    "snippet": "dl.acm.org/doi/10.5555/3026959.3026969"
+  },
+  {
+    "title": "FastCDC: A Fast and Efficient Content-Defined Chunking ... - USENIX",
+    "url": "https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia",
+    "snippet": "www.usenix.org/conference/atc16/technical-sessions/presentation/xia"
+  },
+  {
+    "title": "The Design of Fast Content-Defined Chunking for Data Deduplication ...",
+    "url": "https://www.researchgate.net/publication/340391934_The_Design_of_Fast_Content-Defined_Chunking_for_Data_Deduplication_Based_Storage_Systems",
+    "snippet": "www.researchgate.net/publication/340391934_The_Design_of_Fast_Content-Defined_Chunking_for_Data_Deduplication_Based_Storage_Systems"
+  },
+  {
+    "title": "PDF FastCDC: a Fast and Efficient Content-Defined Chunking ... - USENIX",
+    "url": "https://www.usenix.org/system/files/conference/atc16/atc16-paper-xia.pdf",
+    "snippet": "www.usenix.org/system/files/conference/atc16/atc16-paper-xia.pdf"
+  },
+  {
+    "title": "FastCDC: a Fast and Efficient Content-Defined Chunking Approach for ...",
+    "url": "https://www.semanticscholar.org/paper/FastCDC:-a-Fast-and-Efficient-Content-Defined-for-Xia-Zhou/64b5ce9ff6c7f5396cd1ec6bba8a9f5f27bc8dba",
+    "snippet": "www.semanticscholar.org/paper/FastCDC:-a-Fast-and-Efficient-Content-Defined-for-Xia-Zhou/64b5ce9ff6c7f5396cd1ec6bba8a9f5f27bc8dba"
+  },
+  {
+    "title": "Joshleeb's Blog | Improving on Gear Hashing with FastCDC",
+    "url": "https://joshleeb.com/posts/fastcdc.html",
+    "snippet": "joshleeb.com/posts/fastcdc.html"
+  },
+  {
+    "title": "(PDF) FastCDC: a Fast and Efficient Content-Defined ... - ResearchGate",
+    "url": "https://www.researchgate.net/publication/304352287_FastCDC_a_Fast_and_Efficient_Content-Defined_Chunking_Approach_for_Data_Deduplication",
+    "snippet": "www.researchgate.net/publication/304352287_FastCDC_a_Fast_and_Efficient_Content-Defined_Chunking_Approach_for_Data_Deduplication"
+  }
+]

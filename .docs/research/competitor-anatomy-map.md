@@ -152,3 +152,16 @@ proof.
 | zimdjson | Zig SIMD JSON parser | structural indexes | staged vector scan | JSON grammar admission | Zig SIMD organization transfers; parser-specific states do not |
 | USearch | compact vector index and SIMD distance kernels | graph/quantized vector structures | approximate nearest-neighbor traversal | vector metric and filter policy | packed storage ideas transfer only to semantic-index work |
 | gitoxide | Git object and pack traversal | object database and pack indexes | object graph / pack lookup | repository ignore rules are separate | repository traversal and object ownership transfer |
+
+## Context-Compaction Comparator Admission: 2026-07-16
+
+These six pinned implementations establish the adjacent-tool boundary for bounded context compaction. Their source trees are restored by `scripts/bootstrap-refs.ps1 -Group research`; the detailed decision and falsification record lives in `2026-07-16-bounded-context-compaction.md`.
+
+| Rival | Algorithm | Index shape | Traversal / execution | Ignore or admission behavior | Observed weakness and transfer boundary |
+|---|---|---|---|---|---|
+| Repomix | Tree-sitter query captures select names, comments, and imports; exact capture de-duplication and adjacency merge | per-file syntax tree plus capture list | whole-file parse, capture sort, merge, render | repository include/exclude plus per-file compression level; parser failure falls back to original | structurally useful, but whole-file WASM parsing and content-only output are not bounded or coordinate-complete |
+| Aider | definitions/references graph, rare-identifier weighting, PageRank, ranked-tag budget fitting | repository symbol graph and token-count cache | parse tags, rank graph, binary-search rendered prefix to budget | caller-selected chat and repository files influence ranking | query/repository-specific and Python-heavy; transfer budget fitting and structural rarity only |
+| LLMLingua | model-scored context, sentence, and token filtering with forced preservation | model/tokenizer state plus segmented contexts | multi-stage learned filtering to target rate/tokens | explicit forced contexts/tokens and keep-first/last controls | opaque token deletion, model weights, and tokenizer drift violate deterministic exact-source projection |
+| Gitingest | bounded repository ingestion and full-content framing | in-memory filesystem tree | recursive sorted traversal then concatenation and token estimate | gitignore/include/exclude, max depth/files/file size/total bytes | skips oversized files and materializes accepted content; resource accounting transfers, compaction does not |
+| Code2Prompt | selected-file processing, optional entity map, template rendering, token count | session-owned file vector, tree, metadata, optional entities | traverse, decode/process, render through one session owner | include/exclude and interactive selection engine | prompt packer rather than compactor; lossy decoding breaks byte-exact provenance |
+| Files-to-prompt | deterministic file framing with optional XML/Markdown and line numbers | none | sorted recursive walk and whole-file read | simplified gitignore, extension, hidden-file, and glob filters | no semantic reduction or resource budget; delimiter safety and source framing transfer |

@@ -2852,3 +2852,12 @@ Conclusion:
 - Repaired the tracked refs build contract to compile tree-sitter `point.c` and the upstream non-WASM `wasm_store.c` implementation. Build-ref verification is 4/4 and the ReleaseFast executable build is green.
 - Full ReleaseFast tests report 539/549 passing. Ten existing warm-query-cache and Thompson NFA failures remain explicit and were not described as green.
 - Promoted source-fresh SHA `5F66F4245CC2F80A1F9A04967AD8FE46B0BD8C0A2265647D30C19E1A899C8B5C` to `C:\Users\Savage\AppData\ix\ix.exe`; preserved predecessor `D135996FCAAE7F0621E8BE6790E977DE077EDB757C872772714233AB95C895C4` at `backups\ix.old.150726.exe`. Installed version, help, v3 JSON search, hash, PATH owner, and isolated cold/warm parity probes pass.
+
+## 2026-07-16 - Native bounded-context compaction research and plan
+
+- Opened durable goal `.docs/goals/002-ix-min-context-compaction.md` with 18 doctrine paragraphs covering source proof, decision-changing knowledge value, architecture alignment, bounded execution, exact attribution, and completion evidence.
+- Studied the intelligent-compactor skill and rejected direct inheritance: its whole-file Python path violates the large-file boundary, and aggressive profiles lost exact symbols and source coordinates in local probes.
+- Completed a 13-source neutral research ledger across primary papers, pinned implementations, and current tool behavior; added six context-compaction rivals to the canonical anatomy map.
+- Pinned and restored Repomix, Aider, LLMLingua, Gitingest, Code2Prompt, and Files-to-prompt through `.refs/index.md`; `scripts/bootstrap-refs.ps1 -Group research` verified 24 research entries.
+- Passed planning QC 1/4 through 3/4 in `.docs/qc/pass-021*` through `pass-023*`. Spec 158 now owns the two-pass extractive design, complete-stdout budget, exact duplicate verification, fixed metadata ceiling, typed profile semantics, 48-test ledger, deployment boundary, and rollback contract.
+- No production source changed in this research/planning checkpoint. Implementation starts at the coherent command/schema spine; MCP remains deferred until a real bounded contract exists.
