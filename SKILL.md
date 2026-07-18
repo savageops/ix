@@ -38,6 +38,8 @@ ix inspect --expr 'lit:SearchConfig' src --context 2 --json
 
 Honor `ix.next.v1` continuation hints for bounded file windows. Do not infer omitted lines from a preview.
 
+When IX emits `ix.error.v1`, preserve the raw receipt. If it conflicts with observed filesystem or command state (for example, `FileNotFound` for a present path), report it as an IX issue or regression with the command and target.
+
 ## Oversized-file compaction
 
 ```sh

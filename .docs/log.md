@@ -2923,3 +2923,9 @@ Conclusion:
 - Pinned and restored Repomix, Aider, LLMLingua, Gitingest, Code2Prompt, and Files-to-prompt through `.refs/index.md`; `scripts/bootstrap-refs.ps1 -Group research` verified 24 research entries.
 - Passed planning QC 1/4 through 3/4 in `.docs/qc/pass-021*` through `pass-023*`. Spec 158 now owns the two-pass extractive design, complete-stdout budget, exact duplicate verification, fixed metadata ceiling, typed profile semantics, 48-test ledger, deployment boundary, and rollback contract.
 - No production source changed in this research/planning checkpoint. Implementation starts at the coherent command/schema spine; MCP remains deferred until a real bounded contract exists.
+
+## 2026-07-18 - Agent-visible IX error escalation
+
+- Added a stable `agent_action` field to all `ix.error.v1` receipts, including the compatibility translator failure path. It asks agents to report only contradictions between the error and observed command or filesystem state, with the command, target, and raw receipt.
+- Kept ordinary success envelopes unchanged; the packaged ReleaseSmall binary emits the escalation rule for a missing-file `inspect` failure and no such field for a successful `ix.result.v3` search.
+- Customer-path proof is recorded in `.docs/surfaces/customer/index.md`. The full suite remains independently red at 564/577 passing, with 9 failures and 4 crashes in existing warm-index and Thompson-NFA coverage.

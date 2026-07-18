@@ -359,6 +359,7 @@ pub fn writeError(writer: anytype, code: []const u8, message: []const u8) !void 
     return writeErrorDetail(writer, code, message, null, null);
 }
 
+/// Emits a recoverable error receipt while giving agents a bounded escalation rule for IX contradictions.
 pub fn writeErrorDetail(writer: anytype, code: []const u8, message: []const u8, argument: ?[]const u8, hint: ?[]const u8) !void {
     try writer.writeAll("-- ix.error.v1 {\"schema\":\"ix.error.v1\",\"status\":\"error\",\"code\":");
     try writeJsonString(writer, code);
@@ -372,12 +373,13 @@ pub fn writeErrorDetail(writer: anytype, code: []const u8, message: []const u8, 
         try writer.writeAll(",\"hint\":");
         try writeJsonString(writer, value);
     }
+    try writer.writeAll(",\"agent_action\":\"If this error conflicts with observed state, report it as an IX issue or regression with the command, target, and raw error.\"");
     try writer.writeAll("} --\n");
 }
 
 pub fn writeCompatUnsupportedFlag(writer: anytype, flag: []const u8) !void {
     try writer.print(
-        "-- ix.error.v1 {{\"cmd\":\"ix\",\"code\":\"command_failed\",\"hint\":null,\"message\":\"rg-shaped compatibility translator does not support `{s}`. Supported subset: `ix PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, `--hidden`, `--no-ignore`, `-u/--unrestricted`, and `--ignore-file`. Use canonical `ix search <expr> [PATH]...` for native IX syntax.\",\"severity\":\"error\",\"status\":\"error\"}} --\n",
+        "-- ix.error.v1 {{\"cmd\":\"ix\",\"code\":\"command_failed\",\"hint\":null,\"message\":\"rg-shaped compatibility translator does not support `{s}`. Supported subset: `ix PATTERN [PATH]...`, `-e/--regexp`, `-F/--fixed-strings`, `-i/--ignore-case`, `-j/--threads`, `-n/--line-number`, `--json`, `--hidden`, `--no-ignore`, `-u/--unrestricted`, and `--ignore-file`. Use canonical `ix search <expr> [PATH]...` for native IX syntax.\",\"severity\":\"error\",\"status\":\"error\",\"agent_action\":\"If this error conflicts with observed state, report it as an IX issue or regression with the command, target, and raw error.\"}} --\n",
         .{flag},
     );
 }
@@ -1544,11 +1546,21 @@ fn writeJsonStringContents(writer: anytype, value: []const u8) !void {
     }
 }
 
-test "error sentinel is versioned" {
-    var buffer: [128]u8 = undefined;
+test "error receipt is versioned and tells agents how to report contradictions" {
+    var buffer: [512]u8 = undefined;
     var writer = std.Io.Writer.fixed(&buffer);
-    try writeError(&writer, "invalid_arguments", "MissingCommand");
-    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ix.error.v1") != null);
+    try writeErrorDetail(&writer, "search_failed", "FileNotFound", "src/main.zig", null);
+    const receipt = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, receipt, "ix.error.v1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, receipt, "\"argument\":\"src/main.zig\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, receipt, "\"agent_action\":\"If this error conflicts with observed state") != null);
+}
+
+test "compatibility errors retain the IX contradiction escalation rule" {
+    var buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try writeCompatUnsupportedFlag(&writer, "--glob");
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "\"agent_action\":\"If this error conflicts with observed state") != null);
 }
 
 test "min help states profiles budgets loss and exact followup" {
