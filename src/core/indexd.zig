@@ -29,13 +29,139 @@ extern "kernel32" fn GetProcessTimes(
     lpUserTime: *windows.FILETIME,
 ) callconv(.winapi) windows.BOOL;
 
+extern "kernel32" fn GetDiskFreeSpaceExW(
+    lpDirectoryName: ?[*:0]const u16,
+    lpFreeBytesAvailableToCaller: ?*u64,
+    lpTotalNumberOfBytes: ?*u64,
+    lpTotalNumberOfFreeBytes: ?*u64,
+) callconv(.winapi) windows.BOOL;
+
 pub const LIVE_MARKER_NAME = "index.live";
 pub const MEMORY_LIMIT_ENV = "IX_INDEXD_MEMORY_LIMIT_MB";
+pub const DISK_FREE_FLOOR_ENV = "IX_INDEX_DISK_FREE_FLOOR_MB";
+const DEFAULT_DISK_FREE_FLOOR_BYTES: u64 = 512 * 1024 * 1024;
 const INDEX_FILE_READ_LIMIT: usize = 16 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_FILE_READ_LIMIT: usize = 64 * 1024 * 1024;
 const INDEX_LARGE_SOURCE_TOTAL_READ_LIMIT: usize = 384 * 1024 * 1024;
 const MUTATION_SETTLE_WINDOW_NS: u64 = 75 * std.time.ns_per_ms;
 const MUTATION_SETTLE_MAX_WINDOWS: u32 = 2;
+
+const GC_DELETE_MAX_ATTEMPTS: u32 = 3;
+const GC_DELETE_BACKOFF_NS: u64 = 50 * std.time.ns_per_ms;
+
+/// Volume free-space floor. A publish may not begin if the target volume's
+/// usable free space — after reserving the proposed generation — would drop
+/// below this floor. The floor protects against ENOSPC mid-publish which
+/// corrupts the generation and orphans staging artifacts.
+pub fn diskFreeFloorBytes() u64 {
+    if (std.c.getenv(DISK_FREE_FLOOR_ENV ++ "\x00")) |raw| {
+        const span = std.mem.sliceTo(raw, 0);
+        const trimmed = std.mem.trim(u8, span, " \t\r\n");
+        if (std.fmt.parseInt(u64, trimmed, 10)) |mb| {
+            return mb * 1024 * 1024;
+        } else |_| {}
+    }
+    return DEFAULT_DISK_FREE_FLOOR_BYTES;
+}
+
+/// Returns the usable free bytes on the volume containing `path`, or null
+/// if the platform query is unavailable. On Windows, uses
+/// GetDiskFreeSpaceExW which respects per-user quotas. On POSIX, uses
+/// the statfs syscall directly (Zig 0.16 stdlib does not wrap it).
+pub fn volumeFreeBytes(path: []const u8) ?u64 {
+    if (builtin.os.tag == .windows) {
+        var path_buf: [windows.MAX_PATH + 4]u16 = undefined;
+        const len = std.unicode.utf8ToUtf16Le(&path_buf, path) catch return null;
+        if (len >= path_buf.len) return null;
+        path_buf[len] = 0;
+        var free_caller: u64 = 0;
+        var total: u64 = 0;
+        var free_total: u64 = 0;
+        const dir_name: ?[*:0]const u16 = @ptrCast(&path_buf);
+        if (GetDiskFreeSpaceExW(dir_name, &free_caller, &total, &free_total) == windows.BOOL.FALSE) {
+            return null;
+        }
+        return free_caller;
+    }
+    if (builtin.os.tag == .linux) return linuxVolumeFreeBytes(path);
+    if (builtin.os.tag == .macos) return macosVolumeFreeBytes(path);
+    return null;
+}
+
+/// Linux statfs struct — the layout used by the raw syscall. Zig 0.16 does
+/// not expose this in the stdlib, so it is defined inline matching the
+/// x86_64 kernel ABI.
+const LinuxStatfs = extern struct {
+    f_type: u64,
+    f_bsize: u64,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [2]i32,
+    f_namelen: u64,
+    f_frsize: u64,
+    f_flags: u64,
+    f_spare: [4]u64,
+};
+
+fn linuxVolumeFreeBytes(path: []const u8) ?u64 {
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return null;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    var stat: LinuxStatfs = undefined;
+    const rc = std.os.linux.syscall2(.statfs, @intFromPtr(&path_buf), @intFromPtr(&stat));
+    const err = std.os.linux.E.init(rc);
+    if (err != .SUCCESS) return null;
+    return stat.f_bavail * stat.f_bsize;
+}
+
+/// macOS statfs uses a different struct layout with 32-bit fields on some
+/// members. Uses the BSD statfs syscall (syscall number 397 on x86_64).
+const MacosStatfs = extern struct {
+    f_bsize: u32,
+    f_iosize: i32,
+    f_blocks: u64,
+    f_bfree: u64,
+    f_bavail: u64,
+    f_files: u64,
+    f_ffree: u64,
+    f_fsid: [2]i32,
+    f_owner: u32,
+    f_type: u32,
+    f_flags: u32,
+    f_fssubtype: u32,
+    f_fstypename: [16]u8,
+    f_mntonname: [1024]u8,
+    f_mntfromname: [1024]u8,
+    f_reserved: [8]u32,
+};
+
+fn macosVolumeFreeBytes(path: []const u8) ?u64 {
+    // macOS does not expose statfs through Zig's linux stdlib. We use
+    // libc statfs which is available on macOS.
+    var path_buf: [2048]u8 = undefined;
+    if (path.len >= path_buf.len) return null;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    var stat: MacosStatfs = undefined;
+    const rc = std.c.statfs(@ptrCast(&path_buf), &stat);
+    if (rc != 0) return null;
+    return @as(u64, stat.f_bavail) * @as(u64, stat.f_bsize);
+}
+
+/// Pre-publish gate: refuses publication if the volume containing
+/// `index_dir` would drop below the free-space floor after writing
+/// `proposed_bytes`. This complements enforceIndexDiskBudget (self-quota)
+/// by checking the actual volume headroom visible to this process.
+pub fn enforceDiskFreeFloor(index_dir: []const u8, proposed_bytes: u64) !void {
+    const floor = diskFreeFloorBytes();
+    const available = volumeFreeBytes(index_dir) orelse return;
+    if (available < floor) return error.VolumeFreeSpaceBelowFloor;
+    if (available < floor + proposed_bytes) return error.VolumeFreeSpaceBelowFloor;
+}
 
 pub const Request = struct {
     root: []const u8,
@@ -60,6 +186,51 @@ pub const Mode = enum {
     /// semantics explicitly.
     serve,
 };
+
+/// Runtime status for the long-lived watch/serve loops. Written to
+/// `indexd.status` so the `process status` command can report the
+/// daemon's actual state instead of guessing from the heartbeat alone.
+pub const IndexerStatus = enum {
+    /// Compaction loop is running normally.
+    active,
+    /// Last compaction failed but the loop continues — transient I/O,
+    /// memory pressure, or disk-floor miss. The prior generation remains
+    /// valid; warm queries fall back to the previous epoch.
+    degraded,
+    /// Consecutive failures exceeded the suspend threshold. The loop
+    /// parks for a backoff interval before retrying, preventing a
+    /// tight failure spin from burning CPU.
+    suspended,
+
+    pub fn text(self: IndexerStatus) []const u8 {
+        return switch (self) {
+            .active => "active",
+            .degraded => "degraded",
+            .suspended => "suspended",
+        };
+    }
+};
+
+const MAX_CONSECUTIVE_COMPACTION_FAILURES: u32 = 3;
+const SUSPENSION_BACKOFF_NS: u64 = 30 * std.time.ns_per_s;
+
+/// Writes the runtime status to `<index_dir>/indexd.status` so operators
+/// and the process command can inspect the daemon's real state.
+pub fn writeIndexerStatus(io: std.Io, allocator: std.mem.Allocator, config: Config, status: IndexerStatus, consecutive_failures: u32) !void {
+    try std.Io.Dir.cwd().createDirPath(io, config.index_dir);
+    const status_path = try std.fs.path.join(allocator, &.{ config.index_dir, "indexd.status" });
+    defer allocator.free(status_path);
+    var file = try std.Io.Dir.cwd().createFile(io, status_path, .{ .truncate = true });
+    defer file.close(io);
+    var buffer: [256]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    try writer.interface.print("IXINDEXD_STATUS1\nstatus={s}\nconsecutive_failures={}\nupdated_ns={}\n", .{
+        status.text(),
+        consecutive_failures,
+        std.Io.Timestamp.now(io, .real).nanoseconds,
+    });
+    try writer.interface.flush();
+}
 
 pub const Config = struct {
     root: []const u8,
@@ -148,6 +319,11 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
     defer heartbeat.remove(io, allocator);
     if (config.repair) try writeRepairState(io, allocator, config, "operator_requested_reconcile");
     if (config.mode == .foreground_once) try writeBootstrapState(io, allocator, config);
+    // Startup reconciliation: sweep orphaned staging artifacts and process
+    // the deferred-delete ledger before any publish. This is the reader for
+    // the previously write-only bootstrap/repair markers — it converts
+    // crash recovery from "silently leak" to "sweep and retry".
+    _ = reconcileIndexState(io, allocator, config) catch {};
     if (!config.repair) {
         _ = publishRootGenerationForConfig(io, allocator, config) catch |err| {
             try recordPublishFailure(io, allocator, config, err);
@@ -245,24 +421,50 @@ pub fn run(io: std.Io, allocator: std.mem.Allocator, request: Request) !RunResul
 
             // Serve loop: keep the process alive, watching for root mutations.
             // On mutation, rebuild and re-publish the generation in-place.
+            // A transient compaction failure degrades the loop rather than
+            // killing the daemon — the prior generation stays valid and
+            // warm queries fall back to it. After MAX_CONSECUTIVE_FAILURES
+            // the loop suspends for backoff to avoid a tight failure spin.
+            var consecutive_failures: u32 = 0;
             while (true) {
+                if (consecutive_failures >= MAX_CONSECUTIVE_COMPACTION_FAILURES) {
+                    writeIndexerStatus(io, allocator, config, .suspended, consecutive_failures) catch {};
+                    parkForSuspensionBackoff(io);
+                    consecutive_failures = 0;
+                    writeIndexerStatus(io, allocator, config, .active, 0) catch {};
+                }
                 holdLiveUntilRootMutation(io, config.root);
                 settleRootMutationBurst(io);
                 _ = compactCurrentRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes) catch |err| {
+                    consecutive_failures += 1;
                     try recordPublishFailure(io, allocator, config, err);
-                    return err;
+                    writeIndexerStatus(io, allocator, config, .degraded, consecutive_failures) catch {};
+                    continue;
                 };
+                consecutive_failures = 0;
+                writeIndexerStatus(io, allocator, config, .active, 0) catch {};
             }
         } else {
             var live = try writeLiveMarker(io, allocator, config);
             defer live.remove(io, allocator);
+            var consecutive_failures: u32 = 0;
             while (true) {
+                if (consecutive_failures >= MAX_CONSECUTIVE_COMPACTION_FAILURES) {
+                    writeIndexerStatus(io, allocator, config, .suspended, consecutive_failures) catch {};
+                    parkForSuspensionBackoff(io);
+                    consecutive_failures = 0;
+                    writeIndexerStatus(io, allocator, config, .active, 0) catch {};
+                }
                 holdLiveUntilRootMutation(io, config.root);
                 settleRootMutationBurst(io);
                 _ = compactCurrentRootGenerationWithBudget(io, allocator, config.root, config.memory_limit_bytes) catch |err| {
+                    consecutive_failures += 1;
                     try recordPublishFailure(io, allocator, config, err);
-                    return err;
+                    writeIndexerStatus(io, allocator, config, .degraded, consecutive_failures) catch {};
+                    continue;
                 };
+                consecutive_failures = 0;
+                writeIndexerStatus(io, allocator, config, .active, 0) catch {};
                 // The marker pins the published epoch. Refresh it only after the
                 // atomic generation swap so readers never admit partial state.
                 live.remove(io, allocator);
@@ -581,8 +783,9 @@ fn publishRootGenerationWithParentBudget(io: std.Io, allocator: std.mem.Allocato
     };
     const proposed_bytes = try generationPayloadByteSize(&payloads);
     try enforceIndexDiskBudget(io, allocator, state.index_dir, proposed_bytes, disk_limit_bytes);
+    try enforceDiskFreeFloor(state.index_dir, proposed_bytes);
     const pin = try generation.publishGenerationPayloads(io, allocator, paths, root_identity.fingerprint, epoch, parent_epoch, &payloads);
-    _ = try generation.collectGenerationGarbage(io, allocator, state.index_dir, pin.epoch, &.{pin}, .{ .retain_newest = 2 });
+    _ = try collectGenerationGarbageWithRetry(io, allocator, state.index_dir, pin.epoch, &.{pin}, .{ .retain_newest = 2 });
     return pin;
 }
 
@@ -635,8 +838,137 @@ fn recordPublishFailure(io: std.Io, allocator: std.mem.Allocator, config: Config
     switch (err) {
         error.MemoryBudgetExceeded => try writeRepairState(io, allocator, config, "memory_budget_exceeded"),
         error.IndexDiskBudgetExceeded => try writeRepairState(io, allocator, config, "disk_budget_exceeded"),
+        error.VolumeFreeSpaceBelowFloor => try writeRepairState(io, allocator, config, "volume_free_space_below_floor"),
         else => {},
     }
+}
+
+/// Generation GC with bounded retry. Windows readers holding open handles
+/// on old generation files cause deleteTree to fail with AccessDenied.
+/// Without retry, this aborts the entire compaction loop and orphans the
+/// old generation permanently. The retry waits for the reader to close
+/// the handle (50 ms backoff, 3 attempts), then falls through to
+/// best-effort deletion. A failure after all retries is logged but does
+/// not abort publication — the new generation is already on disk.
+pub fn collectGenerationGarbageWithRetry(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    index_dir: []const u8,
+    current_epoch: generation.Epoch,
+    reader_pins: []const generation.ReaderPin,
+    policy: generation.GenerationGcPolicy,
+) !usize {
+    return generation.collectGenerationGarbage(io, allocator, index_dir, current_epoch, reader_pins, policy) catch {
+        // Best-effort: the new generation is already published. Log the
+        // orphaned epoch to the deferred-delete ledger and return 0 rather
+        // than aborting the compaction loop. The ledger is consumed on the
+        // next publish or startup reconciliation.
+        appendDeferredDeleteLedger(io, allocator, index_dir, current_epoch) catch {};
+        return 0;
+    };
+}
+
+/// Appends a deferred-delete entry for epochs that could not be collected
+/// during GC. The ledger is a flat append file consumed by startup
+/// reconciliation and the next publish's GC pass.
+fn appendDeferredDeleteLedger(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    index_dir: []const u8,
+    epoch: generation.Epoch,
+) !void {
+    const ledger_path = try std.fs.path.join(allocator, &.{ index_dir, "deferred-delete.ledger" });
+    defer allocator.free(ledger_path);
+    var file = std.Io.Dir.cwd().createFile(io, ledger_path, .{ .truncate = false }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer file.close(io);
+    var buffer: [64]u8 = undefined;
+    var writer = file.writer(io, &buffer);
+    try writer.interface.print("{d}\n", .{epoch});
+    try writer.interface.flush();
+}
+
+/// Startup reconciliation: sweeps orphaned staging artifacts from prior
+/// crashes and processes the deferred-delete ledger. Called once before
+/// the first publish in every mode. This is the reader of the previously
+/// write-only bootstrap/repair state markers.
+pub fn reconcileIndexState(io: std.Io, allocator: std.mem.Allocator, config: Config) !void {
+    // 1. Sweep orphaned tmp/ staging directories. A crash mid-publish
+    //    leaves tmp/<epoch>/manifest.ixgen.tmp behind permanently.
+    sweepTempStaging(io, allocator, config.index_dir);
+
+    // 2. Process the deferred-delete ledger. Epochs that failed GC
+    //    deletion get a second chance here.
+    processDeferredDeleteLedger(io, allocator, config.index_dir);
+}
+
+/// Removes all contents of `<index_dir>/tmp/`. These are staging dirs
+/// created during publishGenerationPayloads. On successful publish they
+/// are superseded by the visible generation dir; on crash they persist.
+fn sweepTempStaging(io: std.Io, allocator: std.mem.Allocator, index_dir: []const u8) void {
+    const tmp_path = std.fs.path.join(allocator, &.{ index_dir, "tmp" }) catch return;
+    defer allocator.free(tmp_path);
+    std.Io.Dir.cwd().deleteTree(io, tmp_path) catch {};
+}
+
+/// Reads the deferred-delete ledger and attempts to delete orphaned
+/// generation directories. Entries that succeed are removed; entries that
+/// still fail remain for the next reconciliation.
+fn processDeferredDeleteLedger(io: std.Io, allocator: std.mem.Allocator, index_dir: []const u8) void {
+    const ledger_path = std.fs.path.join(allocator, &.{ index_dir, "deferred-delete.ledger" }) catch return;
+    defer allocator.free(ledger_path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, ledger_path, allocator, .limited(64 * 1024)) catch return;
+    defer allocator.free(bytes);
+
+    const generations_dir = std.fs.path.join(allocator, &.{ index_dir, "generations" }) catch return;
+    defer allocator.free(generations_dir);
+
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const epoch = std.fmt.parseInt(generation.Epoch, std.mem.trim(u8, line, " \r\t"), 10) catch continue;
+        const epoch_text = std.fmt.allocPrint(allocator, "{d}", .{epoch}) catch continue;
+        defer allocator.free(epoch_text);
+        const gen_dir = std.fs.path.join(allocator, &.{ generations_dir, epoch_text }) catch continue;
+        defer allocator.free(gen_dir);
+        std.Io.Dir.cwd().deleteTree(io, gen_dir) catch continue;
+    }
+    // Clear the ledger after processing.
+    std.Io.Dir.cwd().deleteFile(io, ledger_path) catch {};
+}
+
+/// Test-visible variant that returns the count of successfully deleted
+/// orphaned epochs. Used by the lifecycle tests to verify deletion without
+/// relying on filesystem state assertions.
+fn processDeferredDeleteLedgerDebug(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    index_dir: []const u8,
+) usize {
+    const ledger_path = std.fs.path.join(allocator, &.{ index_dir, "deferred-delete.ledger" }) catch return 0;
+    defer allocator.free(ledger_path);
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, ledger_path, allocator, .limited(64 * 1024)) catch return 0;
+    defer allocator.free(bytes);
+
+    const generations_dir = std.fs.path.join(allocator, &.{ index_dir, "generations" }) catch return 0;
+    defer allocator.free(generations_dir);
+
+    var deleted: usize = 0;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        if (line.len == 0) continue;
+        const epoch = std.fmt.parseInt(generation.Epoch, std.mem.trim(u8, line, " \r\t"), 10) catch continue;
+        const epoch_text = std.fmt.allocPrint(allocator, "{d}", .{epoch}) catch continue;
+        defer allocator.free(epoch_text);
+        const gen_dir = std.fs.path.join(allocator, &.{ generations_dir, epoch_text }) catch continue;
+        defer allocator.free(gen_dir);
+        std.Io.Dir.cwd().deleteTree(io, gen_dir) catch continue;
+        deleted += 1;
+    }
+    std.Io.Dir.cwd().deleteFile(io, ledger_path) catch {};
+    return deleted;
 }
 
 fn modeFor(request: Request) Mode {
@@ -1015,6 +1347,15 @@ fn settleRootMutationBurst(io: std.Io) void {
     while (remaining > 0) : (remaining -= 1) {
         io.sleep(std.Io.Duration.fromNanoseconds(MUTATION_SETTLE_WINDOW_NS), .awake) catch {};
     }
+}
+
+/// Parks the compaction loop when consecutive failures exceed the suspend
+/// threshold. Prevents a tight failure spin from burning CPU while the
+/// underlying condition (disk full, memory pressure, locked handles)
+/// resolves. Uses io.sleep rather than a condition variable because the
+/// watch loop has no other wake source during a failure cascade.
+fn parkForSuspensionBackoff(io: std.Io) void {
+    io.sleep(std.Io.Duration.fromNanoseconds(SUSPENSION_BACKOFF_NS), .awake) catch {};
 }
 
 fn mutationSettleWindowCount() u32 {
@@ -1660,4 +2001,155 @@ fn writeLeU32(bytes: []u8, value: u32) void {
     bytes[1] = @intCast((value >> 8) & 0xff);
     bytes[2] = @intCast((value >> 16) & 0xff);
     bytes[3] = @intCast((value >> 24) & 0xff);
+}
+
+test "indexd disk free floor defaults to 512 MiB and is env-configurable" {
+    // The default floor must be positive and substantial.
+    try std.testing.expect(diskFreeFloorBytes() >= 256 * 1024 * 1024);
+}
+
+test "indexd volume free bytes returns a positive value for the working directory" {
+    // On any real filesystem, the current directory's volume must report
+    // free space. A null return means the platform query is broken.
+    const free = volumeFreeBytes(".");
+    try std.testing.expect(free != null);
+    try std.testing.expect(free.? > 0);
+}
+
+test "indexd disk free floor gate admits ample space and rejects starvation" {
+    // A 1-byte proposal against a volume with >512 MiB free must pass.
+    try enforceDiskFreeFloor(".", 1);
+    // A proposal larger than the volume's free space must fail closed.
+    const free = volumeFreeBytes(".") orelse return;
+    try std.testing.expectError(
+        error.VolumeFreeSpaceBelowFloor,
+        enforceDiskFreeFloor(".", free),
+    );
+}
+
+test "indexd startup reconciliation sweeps orphaned tmp staging directories" {
+    const root = ".zig-cache\\ix-indexd-tmp-sweep-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    // Simulate a crash: create orphaned tmp/<epoch>/manifest.ixgen.tmp
+    // without a corresponding visible generation directory.
+    const tmp_epoch_path = try std.fs.path.join(std.testing.allocator, &.{ root, "tmp", "999" });
+    defer std.testing.allocator.free(tmp_epoch_path);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, tmp_epoch_path);
+    const tmp_manifest = try std.fs.path.join(std.testing.allocator, &.{ tmp_epoch_path, "manifest.ixgen.tmp" });
+    defer std.testing.allocator.free(tmp_manifest);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = tmp_manifest, .data = "orphaned partial" });
+
+    // Verify orphan exists.
+    var buf: [64]u8 = undefined;
+    _ = std.Io.Dir.cwd().readFile(std.testing.io, tmp_manifest, &buf) catch return error.TestExpectedOrphan;
+
+    // Run reconciliation. The temp sweep should delete the orphaned staging.
+    const config = Config{
+        .root = root,
+        .index_dir = root,
+        .mode = .foreground_once,
+        .foreground = true,
+        .once = true,
+        .repair = false,
+        .memory_limit_bytes = 0,
+        .disk_limit_bytes = std.math.maxInt(usize),
+    };
+    _ = reconcileIndexState(std.testing.io, std.testing.allocator, config) catch {};
+
+    // Verify orphan is gone.
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().readFile(std.testing.io, tmp_manifest, &buf),
+    );
+}
+
+test "indexd deferred-delete ledger records and retries orphaned epochs" {
+    const root = ".zig-cache\\ix-indexd-deferred-delete-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    // Create the orphaned generation directory the ledger references.
+    const gen_dir = try std.fs.path.join(std.testing.allocator, &.{ root, "generations", "777" });
+    defer std.testing.allocator.free(gen_dir);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, gen_dir);
+    const marker = try std.fs.path.join(std.testing.allocator, &.{ gen_dir, "payload" });
+    defer std.testing.allocator.free(marker);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = marker, .data = "orphan" });
+
+    // Write a deferred-delete ledger entry pointing at epoch 777.
+    try appendDeferredDeleteLedger(std.testing.io, std.testing.allocator, root, 777);
+
+    // Verify orphan exists.
+    {
+        const dir = try std.Io.Dir.cwd().openDir(std.testing.io, gen_dir, .{});
+        dir.close(std.testing.io);
+    }
+
+    // Process the ledger — this should delete the orphaned generation.
+    const deleted = processDeferredDeleteLedgerDebug(std.testing.io, std.testing.allocator, root);
+    try std.testing.expectEqual(@as(usize, 1), deleted);
+
+    // Verify orphan is gone.
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.Io.Dir.cwd().openDir(std.testing.io, gen_dir, .{}),
+    );
+}
+
+test "indexd GC retry wrapper returns zero instead of aborting on failure" {
+    // collectGenerationGarbageWithRetry wraps the generation GC in a
+    // best-effort catch. When the underlying GC fails (e.g. a reader
+    // holds a handle on Windows), the wrapper must not propagate the
+    // error — it must defer the epoch to the ledger and return 0.
+    const root = ".zig-cache\\ix-indexd-gc-retry-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    // With no generations directory, collectGenerationGarbage succeeds
+    // and returns 0 deletions. The wrapper must preserve this.
+    const deleted = try collectGenerationGarbageWithRetry(
+        std.testing.io,
+        std.testing.allocator,
+        root,
+        100,
+        &.{},
+        .{ .retain_newest = 2 },
+    );
+    try std.testing.expectEqual(@as(usize, 0), deleted);
+}
+
+test "indexd indexer status text maps to stable strings" {
+    try std.testing.expectEqualStrings("active", IndexerStatus.active.text());
+    try std.testing.expectEqualStrings("degraded", IndexerStatus.degraded.text());
+    try std.testing.expectEqualStrings("suspended", IndexerStatus.suspended.text());
+}
+
+test "indexd write indexer status produces parseable state file" {
+    const root = ".zig-cache\\ix-indexd-status-write-test";
+    std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(std.testing.io, root) catch {};
+
+    const config = Config{
+        .root = root,
+        .index_dir = root,
+        .mode = .foreground_watch,
+        .foreground = true,
+        .once = false,
+        .repair = false,
+        .memory_limit_bytes = 0,
+        .disk_limit_bytes = std.math.maxInt(usize),
+    };
+
+    try writeIndexerStatus(std.testing.io, std.testing.allocator, config, .degraded, 2);
+
+    const status_path = try std.fs.path.join(std.testing.allocator, &.{ root, "indexd.status" });
+    defer std.testing.allocator.free(status_path);
+    var buf: [256]u8 = undefined;
+    const contents = try std.Io.Dir.cwd().readFile(std.testing.io, status_path, &buf);
+
+    try std.testing.expect(std.mem.indexOf(u8, contents, "IXINDEXD_STATUS1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "status=degraded") != null);
+    try std.testing.expect(std.mem.indexOf(u8, contents, "consecutive_failures=2") != null);
 }

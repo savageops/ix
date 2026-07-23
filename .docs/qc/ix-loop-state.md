@@ -1,6 +1,6 @@
 # IX Loop State Capsule
 
-Updated: 2026-07-16
+Updated: 2026-07-23
 
 ## Current objective
 
@@ -52,12 +52,46 @@ regression.
   and retained exactly two. Warm-enabled ordinary search created no daemon and
   no index state. The 4 GiB default root cap is configurable through
   `index_disk_limit_mb` / `IX_INDEX_DISK_LIMIT_MB`.
-- The broad test runner is still not green: 563/576 passed, with unrelated
+- The broad test runner is still not green: 442/455 passed, with unrelated
   warm-cache and Thompson-NFA failures/crashes retained as explicit debt.
+
+## Completed round: bounded index lifecycle (2026-07-23)
+
+The four bounded-lifecycle gaps identified in the prior next-action are closed:
+
+1. **Volume free-space floor** — `enforceDiskFreeFloor` checks actual volume
+   headroom via `GetDiskFreeSpaceExW` (Windows) / `statfs` syscall (Linux/macOS)
+   before any publish, complementing the existing self-quota budget. Configurable
+   via `IX_INDEX_DISK_FREE_FLOOR_MB`, defaults to 512 MiB. Prevents ENOSPC
+   mid-publish which corrupts generations.
+
+2. **Startup/temp cleanup** — `reconcileIndexState` runs before the first
+   publish in every mode. `sweepTempStaging` removes orphaned `tmp/<epoch>/`
+   staging directories from prior crashes. `processDeferredDeleteLedger`
+   retries epochs that failed GC deletion.
+
+3. **Suspension/status accounting** — `IndexerStatus` enum (`active`,
+   `degraded`, `suspended`) with `writeIndexerStatus` persisting to
+   `indexd.status`. The serve/watch loops now degrade on transient compaction
+   failure instead of killing the process. After 3 consecutive failures the
+   loop suspends for 30s backoff, then retries. The prior generation stays
+   valid during degraded state.
+
+4. **Deletion retry semantics** — `collectGenerationGarbageWithRetry` wraps
+   the GC in best-effort catch: if `deleteTree` fails (e.g. Windows reader
+   holding a handle), the epoch is logged to `deferred-delete.ledger` and
+   retried on next startup reconciliation instead of aborting the compaction
+   loop.
+
+Evidence: 8 new tests all pass. Full suite: 442/455 pass (was 434/447 baseline).
+Zero regressions — the 13 pre-existing failures (warm-index + Thompson NFA) are
+unchanged. ReleaseFast builds cleanly.
 
 ## Next action
 
-Complete the remaining bounded-lifecycle result: volume free-space floor,
-startup/temp cleanup, explicit suspension/status accounting, and deletion
-retry semantics. Then replace watcher-triggered full republication with
-coalesced content-identity deltas. Do not re-enable automatic daemon ownership.
+Replace watcher-triggered full republication with coalesced content-identity
+deltas. The write side currently re-indexes the entire corpus on every file
+change; the read side already has delta overlay support
+(`prepareDeltaWarmIndexFrontier`). The writer needs to emit true incremental
+deltas keyed by content hash, not full snapshots. Do not re-enable automatic
+daemon ownership.
