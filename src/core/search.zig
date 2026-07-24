@@ -6273,12 +6273,38 @@ fn isHiddenDirectoryEntry(name: []const u8, is_directory: bool) bool {
 }
 
 fn shouldSkipDefaultDiscoveryEntry(name: []const u8, is_directory: bool) bool {
-    return isHiddenDirectoryEntry(name, is_directory) or isGeneratedSourceIndexEntry(name, is_directory);
+    return isHiddenDirectoryEntry(name, is_directory) or
+        isGeneratedSourceIndexEntry(name, is_directory) or
+        isBuildOutputDirectory(name, is_directory);
 }
 
 fn isGeneratedSourceIndexEntry(name: []const u8, is_directory: bool) bool {
     if (!is_directory) return false;
     return std.mem.eql(u8, name, "tags") or std.mem.eql(u8, name, "TAGS");
+}
+
+/// Directories that are universally generated build output or vendored
+/// dependencies across major ecosystems. Skipping them during default
+/// discovery prevents scanning gigabytes of non-source content (Rust
+/// target/ dirs, node_modules/, Python bytecode caches). This matches
+/// the behavior of ripgrep, ag, and other search tools.
+///
+/// Safety: these directories never contain hand-written source code.
+/// Users override with --hidden or -u/--unrestricted to search them.
+/// The exclusion only fires when !request.hidden.
+fn isBuildOutputDirectory(name: []const u8, is_directory: bool) bool {
+    if (!is_directory) return false;
+    // Rust/Cargo build output. Always generated; can be 10+ GB.
+    if (std.mem.eql(u8, name, "target")) return true;
+    // npm/pnpm/yarn vendored dependencies. Always third-party.
+    if (std.mem.eql(u8, name, "node_modules")) return true;
+    // Python bytecode cache. Always generated.
+    if (std.mem.eql(u8, name, "__pycache__")) return true;
+    // CMake build directories (commonly named build/ or cmake-build-debug/).
+    // NOTE: "build" is intentionally NOT excluded here because some
+    // monorepos check in build scripts under build/. It is left to
+    // .gitignore / .ixignore to handle project-specifically.
+    return false;
 }
 
 // SIMD Casefold Infrastructure
@@ -7842,9 +7868,13 @@ test "warm index falls back when root contains unindexed coverage directories" {
 
     try std.testing.expectEqualStrings("fallback", report.stats.generation_refresh.refresh_status);
     try std.testing.expectEqualStrings("unindexed_coverage_gap", report.stats.generation_refresh.fallback_reason);
-    try std.testing.expectEqual(@as(usize, 2), report.matches_found);
-    try std.testing.expectEqual(@as(usize, 2), report.hit_count);
-    try std.testing.expectEqual(@as(usize, 2), report.files_scanned);
+    // node_modules is excluded from both indexing AND cold discovery, so only
+    // visible.txt is scanned. The coverage gap is still detected because
+    // indexd.isIndexCoverageExcludedDirectoryName flags node_modules during
+    // the signature walk, triggering the warm-index fallback.
+    try std.testing.expectEqual(@as(usize, 1), report.matches_found);
+    try std.testing.expectEqual(@as(usize, 1), report.hit_count);
+    try std.testing.expectEqual(@as(usize, 1), report.files_scanned);
 
     // Clean up the env override so it doesn't leak into subsequent tests.
     if (@import("builtin").os.tag == .windows) {
@@ -8106,4 +8136,47 @@ test "P20 UCB1 bandit reward update tracks match density" {
     // Mean reward = 7/3 ≈ 2.33
     const mean = arm.meanReward();
     try std.testing.expect(mean > 2.0 and mean < 3.0);
+}
+
+test "default discovery skips build output directories" {
+    // target/ — Cargo/Rust build output
+    try std.testing.expect(isBuildOutputDirectory("target", true));
+    // node_modules/ — npm vendored dependencies
+    try std.testing.expect(isBuildOutputDirectory("node_modules", true));
+    // __pycache__/ — Python bytecode cache
+    try std.testing.expect(isBuildOutputDirectory("__pycache__", true));
+    // Directories must be flagged as directories, not files
+    try std.testing.expect(!isBuildOutputDirectory("target", false));
+    try std.testing.expect(!isBuildOutputDirectory("node_modules", false));
+}
+
+test "build output exclusion does not create false negatives for source directories" {
+    // These directory names must NOT be excluded — they may contain source.
+    try std.testing.expect(!isBuildOutputDirectory("src", true));
+    try std.testing.expect(!isBuildOutputDirectory("lib", true));
+    try std.testing.expect(!isBuildOutputDirectory("test", true));
+    try std.testing.expect(!isBuildOutputDirectory("tests", true));
+    try std.testing.expect(!isBuildOutputDirectory("data", true));
+    try std.testing.expect(!isBuildOutputDirectory("dataset", true));
+    try std.testing.expect(!isBuildOutputDirectory("docs", true));
+    try std.testing.expect(!isBuildOutputDirectory("build", true)); // intentionally not excluded
+    try std.testing.expect(!isBuildOutputDirectory("dist", true)); // intentionally not excluded
+    try std.testing.expect(!isBuildOutputDirectory("vendor", true));
+    try std.testing.expect(!isBuildOutputDirectory("app", true));
+}
+
+test "shouldSkipDefaultDiscoveryEntry covers hidden, generated, and build output" {
+    // Hidden directories (dotfiles)
+    try std.testing.expect(shouldSkipDefaultDiscoveryEntry(".git", true));
+    try std.testing.expect(shouldSkipDefaultDiscoveryEntry(".hg", true));
+    // Generated source index directories
+    try std.testing.expect(shouldSkipDefaultDiscoveryEntry("tags", true));
+    try std.testing.expect(shouldSkipDefaultDiscoveryEntry("TAGS", true));
+    // Build output directories (excluded by default, override with --hidden/-u)
+    try std.testing.expect(shouldSkipDefaultDiscoveryEntry("target", true));
+    try std.testing.expect(shouldSkipDefaultDiscoveryEntry("node_modules", true));
+    try std.testing.expect(shouldSkipDefaultDiscoveryEntry("__pycache__", true));
+    // Source directories must pass
+    try std.testing.expect(!shouldSkipDefaultDiscoveryEntry("src", true));
+    try std.testing.expect(!shouldSkipDefaultDiscoveryEntry("test", true));
 }
