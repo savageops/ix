@@ -4,6 +4,15 @@ type: log
 
 # Agent Progress Log
 
+## 2026-07-23 - Five-area performance frontier planning map
+
+Status: planning chain authored; runtime mutation intentionally not started.
+
+- Committed and pushed checkpoint `ea226896` with the paired repo/installed/June benchmark harness.
+- Added planning chain `159-performance-frontier-five-area-map` with baseline, admission, discovery/ignore, byte-shard, warm-index, and terminal review units.
+- Mapped canonical owners, competitor/reference sources, queue overlaps, resource-cap interpretation, benchmark identity requirements, and false-negative boundaries.
+- Runtime admission reachability, threshold economics, ignore/warm parity, byte-shard expansion, and warm-index promotion remain unproven; later implementation chains must close those gates before claiming speed or capability.
+
 ## 2026-07-16 - Warm-index runaway containment implemented
 
 Status: recurrence-critical containment implemented and locally proven; delta indexing and native journal continuity remain future results.
